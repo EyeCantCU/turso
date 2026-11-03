@@ -12,8 +12,8 @@ use turso_core::{CheckpointMode, ConnectOpts, DatabaseOpts, LimboError, Value};
 use turso_ext::ScalarFunction;
 use turso_ext::Value as ExtValue;
 
-mod compat_config;
-mod extension;
+pub mod compat_config;
+pub mod extension;
 
 /// Global flag: when set, all subsequently opened databases enable experimental features.
 static EXPERIMENTAL_ENABLED: AtomicBool = AtomicBool::new(false);
