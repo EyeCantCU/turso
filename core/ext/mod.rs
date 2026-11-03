@@ -352,6 +352,7 @@ impl Database {
         #[cfg(feature = "percentile")]
         crate::percentile::register_extension(&mut ext_api);
         crate::regexp::register_extension(&mut ext_api);
+        crate::rtree::register(&mut self.builtin_syms.write()).map_err(|e| e.to_string())?;
         #[cfg(feature = "fs")]
         {
             let vfslist = add_builtin_vfs_extensions(Some(ext_api)).map_err(|e| e.to_string())?;
