@@ -612,6 +612,7 @@ fn right_join_metadata(
         name: format!("right_join_matches_{}", usize::from(table.internal_id)),
         table_name: table.table.get_name().to_string(),
         root_page: 0,
+        n_key_col: key_columns.len(),
         columns: key_columns,
         unique: true,
         ephemeral: true,

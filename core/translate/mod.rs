@@ -50,6 +50,7 @@ pub(crate) mod vacuum;
 mod values;
 pub(crate) mod view;
 mod window;
+pub(crate) mod without_rowid;
 
 use crate::schema::Schema;
 use crate::storage::pager::Pager;

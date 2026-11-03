@@ -2416,12 +2416,7 @@ fn emit_update_insns<'a>(
     match &target_table.table {
         Table::BTree(ref table) => {
             let record_reg = program.alloc_register();
-            emit_make_record(
-                program,
-                target_table.table.columns().iter(),
-                start,
-                record_reg,
-            );
+            emit_make_record(program, table, start, record_reg);
 
             if not_exists_check_required {
                 program.emit_insn(Insn::NotExists {

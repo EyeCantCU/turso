@@ -13555,10 +13555,15 @@ pub fn op_idx_delete(
                 *state.active_op_state.idx_delete() = OpIdxDeleteState::Verifying;
             }
             OpIdxDeleteState::Verifying => {
-                let rowid = {
+                // An index of a WITHOUT ROWID table has no rowid; the eq_only seek
+                // already found the whole entry.
+                let has_rowid = state.get_cursor(*cursor_id).as_btree_mut().has_rowid();
+                let rowid = if has_rowid {
                     let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
                     return_if_io!(state, cursor.rowid())
+                } else {
+                    Some(0)
                 };
 
                 if rowid.is_none() && *raise_error_if_no_matching_entry {

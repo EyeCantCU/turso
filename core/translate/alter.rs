@@ -2938,12 +2938,7 @@ fn emit_strict_column_conversion(
 }
 
 fn non_virtual_affinity_str(table: &BTreeTable) -> String {
-    table
-        .columns()
-        .iter()
-        .filter(|col| !col.is_virtual_generated())
-        .map(|col| col.affinity().aff_mask())
-        .collect()
+    table.record_affinity_str()
 }
 
 fn translate_rename_virtual_table(

@@ -4361,6 +4361,7 @@ fn ephemeral_index_build(
             table_reference.table.get_name(),
             table_reference.internal_id
         ),
+        n_key_col: ephemeral_columns.len(),
         columns: ephemeral_columns,
         unique: false,
         ephemeral: true,

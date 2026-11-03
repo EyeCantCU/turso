@@ -200,9 +200,6 @@ pub fn translate_create_index(
     let Some(tbl) = table.btree() else {
         crate::bail_parse_error!("virtual tables may not be indexed");
     };
-    if !tbl.has_rowid {
-        bail_parse_error!("CREATE INDEX on WITHOUT ROWID tables is not supported");
-    }
     // Not checked when the schema loads or when a nested statement such as VACUUM
     // replays the stored schema, so databases that already have such an index keep
     // working.
@@ -274,21 +271,25 @@ pub fn translate_create_index(
             })?);
         }
     }
-    let idx = Arc::new(Index {
-        name: idx_name.clone(),
-        table_name: tbl.name.clone(),
-        root_page: 0, //  we dont have access till its created, after we parse the schema table
-        columns,
-        unique,
-        ephemeral: false,
-        has_rowid: tbl.has_rowid,
-        // store the *original* where clause, because we need to rewrite it
-        // before translating, and it cannot reference a table alias
-        where_clause: where_clause.clone(),
-        index_method: index_method.clone(),
-        on_conflict: None,
-        constraint_name: None,
-    });
+    let idx = Arc::new(
+        Index {
+            name: idx_name.clone(),
+            table_name: tbl.name.clone(),
+            root_page: 0, //  we dont have access till its created, after we parse the schema table
+            n_key_col: columns.len(),
+            columns,
+            unique,
+            ephemeral: false,
+            has_rowid: tbl.has_rowid,
+            // store the *original* where clause, because we need to rewrite it
+            // before translating, and it cannot reference a table alias
+            where_clause: where_clause.clone(),
+            index_method: index_method.clone(),
+            on_conflict: None,
+            constraint_name: None,
+        }
+        .with_without_rowid_pk(&tbl)?,
+    );
 
     if !idx.validate_where_expr(&table, resolver) {
         crate::bail_parse_error!(
@@ -440,6 +441,8 @@ pub(crate) fn emit_refill_index(
         column_count: tbl.columns().len(),
     }));
     let columns = &idx.columns;
+    // A WITHOUT ROWID index entry already ends with the primary key.
+    let record_len = columns.len() + tbl.has_rowid as usize;
     let tbl_name = normalize_ident(tbl.name.as_str());
 
     let mut table_references = TableReferences::new(
@@ -510,7 +513,7 @@ pub(crate) fn emit_refill_index(
             skip_row_label = Some(label);
         }
 
-        let start_reg = program.alloc_registers(columns.len() + 1);
+        let start_reg = program.alloc_registers(record_len);
         for (i, col) in columns.iter().enumerate() {
             emit_index_column_value_from_cursor(
                 program,
@@ -522,15 +525,16 @@ pub(crate) fn emit_refill_index(
                 start_reg + i,
             )?;
         }
-        let rowid_reg = start_reg + columns.len();
-        program.emit_insn(Insn::RowId {
-            cursor_id: table_cursor_id,
-            dest: rowid_reg,
-        });
+        if tbl.has_rowid {
+            program.emit_insn(Insn::RowId {
+                cursor_id: table_cursor_id,
+                dest: start_reg + columns.len(),
+            });
+        }
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
             start_reg: to_u32(start_reg),
-            count: to_u32(columns.len() + 1),
+            count: to_u32(record_len),
             dest_reg: to_u32(record_reg),
             index_name: Some(idx.name.clone()),
             affinity_str: None,
@@ -540,7 +544,7 @@ pub(crate) fn emit_refill_index(
             cursor_id: index_cursor_id,
             record_reg,
             unpacked_start: Some(start_reg),
-            unpacked_count: Some((columns.len() + 1) as u32),
+            unpacked_count: Some(record_len as u32),
             flags: IdxInsertFlags::new().use_seek(false),
         });
 
@@ -573,7 +577,7 @@ pub(crate) fn emit_refill_index(
         program.emit_insn(Insn::OpenPseudo {
             cursor_id: pseudo_cursor_id,
             content_reg,
-            num_fields: columns.len() + 1,
+            num_fields: record_len,
         });
 
         program.emit_insn(Insn::OpenRead {
@@ -610,7 +614,7 @@ pub(crate) fn emit_refill_index(
             skip_row_label = Some(label);
         }
 
-        let start_reg = program.alloc_registers(columns.len() + 1);
+        let start_reg = program.alloc_registers(record_len);
         for (i, col) in columns.iter().enumerate() {
             emit_index_column_value_from_cursor(
                 program,
@@ -622,15 +626,16 @@ pub(crate) fn emit_refill_index(
                 start_reg + i,
             )?;
         }
-        let rowid_reg = start_reg + columns.len();
-        program.emit_insn(Insn::RowId {
-            cursor_id: table_cursor_id,
-            dest: rowid_reg,
-        });
+        if tbl.has_rowid {
+            program.emit_insn(Insn::RowId {
+                cursor_id: table_cursor_id,
+                dest: start_reg + columns.len(),
+            });
+        }
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
             start_reg: to_u32(start_reg),
-            count: to_u32(columns.len() + 1),
+            count: to_u32(record_len),
             dest_reg: to_u32(record_reg),
             index_name: Some(idx.name.clone()),
             affinity_str: None,
@@ -683,7 +688,7 @@ pub(crate) fn emit_refill_index(
             program.emit_insn(Insn::SorterCompare {
                 cursor_id: sorter_cursor_id,
                 sorted_record_reg: content_reg,
-                num_regs: columns.len(),
+                num_regs: idx.n_key_col,
                 pc_when_nonequal: goto_label,
             });
             program.emit_insn(Insn::Halt {

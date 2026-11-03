@@ -471,7 +471,11 @@ impl ConstraintInfo {
             constraint_name: index.constraint_name.clone(),
             index_name: Some(index.name.clone()),
             table_name: table.to_string(),
-            column_names: index.columns.iter().map(|col| col.name.clone()).collect(),
+            column_names: index
+                .key_columns()
+                .iter()
+                .map(|col| col.name.clone())
+                .collect(),
             violation_regs: regs,
             row_col_names: vec![],
             parent_table: None,

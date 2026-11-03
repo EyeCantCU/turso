@@ -3182,6 +3182,10 @@ impl Schema {
             // we must process unique_sets in this exact order in order to emit automatic indices schema entries in the same order
             let mut pk_index_added = false;
             for unique_set in &table.unique_sets {
+                // The table b-tree itself is the primary key of a WITHOUT ROWID table.
+                if unique_set.is_primary_key && !table.has_rowid {
+                    continue;
+                }
                 if unique_set.is_primary_key {
                     assert!(
                         table.primary_key_columns.len() == unique_set.columns.len(),
@@ -4253,9 +4257,9 @@ impl Schema {
                 .find(|idx| {
                     idx.unique
                         && idx.where_clause.is_none()
-                        && idx.columns.len() == parent_cols.len()
+                        && idx.n_key_col == parent_cols.len()
                         && idx
-                            .columns
+                            .key_columns()
                             .iter()
                             .zip(parent_cols.iter())
                             .zip(parent_collations.iter())
@@ -4560,6 +4564,7 @@ impl TryClone for Index {
             name: self.name.clone(),
             table_name: self.table_name.clone(),
             root_page: self.root_page,
+            n_key_col: self.n_key_col,
             columns: self.columns.try_clone()?,
             unique: self.unique,
             ephemeral: self.ephemeral,
@@ -5385,6 +5390,48 @@ impl BTreeTable {
 
     pub fn has_virtual_columns(&self) -> bool {
         self.has_virtual_columns
+    }
+
+    /// The PRIMARY KEY of a WITHOUT ROWID table as index columns, in key order,
+    /// with duplicate columns removed.
+    pub fn without_rowid_pk_columns(&self) -> Result<Vec<IndexColumn>> {
+        let pk_set = self.unique_sets.iter().find(|u| u.is_primary_key);
+        let mut cols: Vec<IndexColumn> = Vec::new();
+        for (i, (col_name, order)) in self.primary_key_columns.iter().enumerate() {
+            let Some((pos_in_table, column)) = self.get_column(col_name) else {
+                crate::bail_parse_error!("no such column: {col_name}");
+            };
+            if cols.iter().any(|c| c.pos_in_table == pos_in_table) {
+                continue;
+            }
+            let constraint_col = pk_set.and_then(|u| u.columns.get(i));
+            let explicit_collation = constraint_col.and_then(|c| c.collation);
+            cols.try_push(IndexColumn {
+                name: normalize_ident(col_name),
+                order: *order,
+                nulls_order: constraint_col.and_then(|c| c.nulls_order),
+                pos_in_table,
+                collation: explicit_collation
+                    .map_or_else(|| column.collation(), CollationSeq::Text),
+                explicit_collation,
+                default: column.default.clone(),
+                expr: None,
+            })?;
+        }
+        Ok(cols)
+    }
+
+    /// Affinities of the stored columns in record order.
+    pub fn record_affinity_str(&self) -> String {
+        let mut cols: Vec<(usize, &Column)> = self
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.is_virtual_generated())
+            .map(|(i, c)| (self.logical_to_physical_column(i), c))
+            .collect();
+        cols.sort_by_key(|(physical, _)| *physical);
+        cols.iter().map(|(_, c)| c.affinity().aff_mask()).collect()
     }
 
     pub fn has_stored_generated_columns(&self) -> bool {
@@ -8004,6 +8051,9 @@ pub struct Index {
     pub on_conflict: Option<ResolveType>,
     /// Explicit constraint name from `CONSTRAINT name UNIQUE/PRIMARY KEY`, if any.
     pub constraint_name: Option<String>,
+    /// Number of declared key columns. An index on a WITHOUT ROWID table
+    /// appends the primary key columns it lacks after these (SQLite's nKeyCol).
+    pub n_key_col: usize,
 }
 
 #[allow(dead_code)]
@@ -8162,6 +8212,7 @@ impl Index {
                         name: index_name,
                         table_name: normalize_ident(tbl_name.as_str()),
                         root_page,
+                        n_key_col: index_columns.len(),
                         columns: index_columns,
                         unique: false,
                         ephemeral: false,
@@ -8176,6 +8227,7 @@ impl Index {
                         name: index_name,
                         table_name: normalize_ident(tbl_name.as_str()),
                         root_page,
+                        n_key_col: index_columns.len(),
                         columns: index_columns,
                         unique,
                         ephemeral: false,
@@ -8184,11 +8236,37 @@ impl Index {
                         index_method: None,
                         on_conflict: None,
                         constraint_name: None,
-                    })
+                    }
+                    .with_without_rowid_pk(table)?)
                 }
             }
             _ => todo!("Expected create index statement"),
         }
+    }
+
+    /// Append the primary key columns of a WITHOUT ROWID table that the key
+    /// lacks, as SQLite does: a secondary index entry ends with the row's key.
+    pub fn with_without_rowid_pk(mut self, table: &BTreeTable) -> Result<Self> {
+        if table.has_rowid || self.index_method.is_some() {
+            return Ok(self);
+        }
+        self.n_key_col = self.columns.len();
+        for pk_col in table.without_rowid_pk_columns()? {
+            let is_dup = self.columns[..self.n_key_col].iter().any(|c| {
+                c.expr.is_none()
+                    && c.pos_in_table == pk_col.pos_in_table
+                    && c.collation == pk_col.collation
+            });
+            if !is_dup {
+                self.columns.try_push(pk_col)?;
+            }
+        }
+        Ok(self)
+    }
+
+    /// The key columns that UNIQUE and index pragmas consider.
+    pub fn key_columns(&self) -> &[IndexColumn] {
+        &self.columns[..self.n_key_col.min(self.columns.len())]
     }
 
     /// Check if this is an expression index.
@@ -8252,6 +8330,7 @@ impl Index {
             name: normalize_ident(index_name.as_str()),
             table_name: table.name.clone(),
             root_page,
+            n_key_col: primary_keys.len(),
             columns: primary_keys,
             unique: true,
             ephemeral: false,
@@ -8306,6 +8385,7 @@ impl Index {
             name: normalize_ident(index_name.as_str()),
             table_name: table.name.clone(),
             root_page,
+            n_key_col: unique_cols.len(),
             columns: unique_cols,
             unique: true,
             ephemeral: false,
@@ -8314,7 +8394,8 @@ impl Index {
             index_method: None,
             on_conflict: conflict_clause,
             constraint_name,
-        })
+        }
+        .with_without_rowid_pk(table)?)
     }
 
     /// Given a column position in the table, return the position in the index.

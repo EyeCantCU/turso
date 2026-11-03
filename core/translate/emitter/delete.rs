@@ -24,7 +24,7 @@ use crate::{
         main_loop::{CloseLoop, InitLoop, OpenLoop},
         plan::{
             DeletePlan, EvalAt, JoinOrderMember, JoinedTable, NonFromClauseSubquery, Operation,
-            ResultSetColumn, Search, TableReferences,
+            QueryDestination, ResultSetColumn, Search, TableReferences,
         },
         subquery::{emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery},
         trigger_exec::{fire_trigger, TriggerContext},
@@ -32,6 +32,7 @@ use crate::{
     vdbe::{
         builder::{CursorKey, CursorType, DmlRowForm, ProgramBuilder},
         insn::{ClearBtreeCount, Insn, RegisterOrLiteral},
+        BranchOffset,
     },
     CaptureDataChangesExt, Connection,
 };
@@ -148,6 +149,19 @@ fn emit_row_loop_delete(
             dest: rowset_reg,
             dest_end: None,
         });
+        // A WITHOUT ROWID table collects its primary keys in an ephemeral index.
+        let pk_set = match &rowset_plan.query_destination {
+            QueryDestination::EphemeralIndex {
+                cursor_id, index, ..
+            } => {
+                program.emit_insn(Insn::OpenEphemeral {
+                    cursor_id: *cursor_id,
+                    is_table: false,
+                });
+                Some((*cursor_id, index.columns.len()))
+            }
+            _ => None,
+        };
 
         // Execute the rowset SELECT plan to populate the rowset.
         program.nested(|program| emit_program_for_select(program, resolver, rowset_plan))?;
@@ -203,15 +217,38 @@ fn emit_row_loop_delete(
             });
         }
 
-        program.preassign_label_to_next_insn(rowset_loop_start);
+        let pk_reg = match pk_set {
+            Some((pk_cursor, pk_len)) => {
+                program.emit_insn(Insn::Rewind {
+                    cursor_id: pk_cursor,
+                    pc_if_empty: rowset_loop_end,
+                });
+                program.preassign_label_to_next_insn(rowset_loop_start);
+                let pk_reg = program.alloc_registers(pk_len);
+                for i in 0..pk_len {
+                    program.emit_insn(Insn::Column {
+                        cursor_id: pk_cursor,
+                        column: i,
+                        dest: pk_reg + i,
+                        default: None,
+                    });
+                }
+                Some(pk_reg)
+            }
+            None => {
+                program.preassign_label_to_next_insn(rowset_loop_start);
 
-        // Read next rowid from RowSet
-        // Note: rowset_loop_end will be resolved later when we assign it
-        program.emit_insn(Insn::RowSetRead {
-            rowset_reg,
-            pc_if_empty: rowset_loop_end,
-            dest_reg: rowid_reg,
-        });
+                // Read next rowid from RowSet
+                // Note: rowset_loop_end will be resolved later when we assign it
+                program.emit_insn(Insn::RowSetRead {
+                    rowset_reg,
+                    pc_if_empty: rowset_loop_end,
+                    dest_reg: rowid_reg,
+                });
+                None
+            }
+        };
+        let rowset_loop_next = program.allocate_label();
 
         emit_delete_insns_when_triggers_present(
             connection,
@@ -221,15 +258,25 @@ fn emit_row_loop_delete(
             &mut plan.non_from_clause_subqueries,
             &plan.result_columns,
             rowid_reg,
+            pk_reg,
             table_cursor_id,
             resolver,
             returning_buffer.as_ref(),
         )?;
 
         // Continue loop
-        program.emit_insn(Insn::Goto {
-            target_pc: rowset_loop_start,
-        });
+        program.preassign_label_to_next_insn(rowset_loop_next);
+        match pk_set {
+            Some((pk_cursor, _)) => program.emit_insn(Insn::Next {
+                cursor_id: pk_cursor,
+                pc_if_next: rowset_loop_start,
+                fullscan: false,
+                is_index: true,
+            }),
+            None => program.emit_insn(Insn::Goto {
+                target_pc: rowset_loop_start,
+            }),
+        }
 
         // Assign the end label here, after all loop body code
         program.preassign_label_to_next_insn(rowset_loop_end);
@@ -602,7 +649,7 @@ fn emit_delete_insns<'a>(
     let iteration_idx_delete_ctx = if let Some(index) = iteration_index {
         let iteration_index_cursor =
             program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone()));
-        let num_regs = index.columns.len() + 1;
+        let num_regs = index.columns.len() + index.has_rowid as usize;
         let start_reg = program.alloc_registers(num_regs);
         for (reg_offset, column_index) in index.columns.iter().enumerate() {
             emit_index_column_value_old_image(
@@ -615,10 +662,12 @@ fn emit_delete_insns<'a>(
                 start_reg + reg_offset,
             )?;
         }
-        program.emit_insn(Insn::RowId {
-            cursor_id: main_table_cursor_id,
-            dest: start_reg + num_regs - 1,
-        });
+        if index.has_rowid {
+            program.emit_insn(Insn::RowId {
+                cursor_id: main_table_cursor_id,
+                dest: start_reg + num_regs - 1,
+            });
+        }
         Some((iteration_index_cursor, start_reg, num_regs))
     } else {
         None
@@ -780,7 +829,7 @@ fn emit_delete_row_common(
                 });
                 skip_label
             });
-            let num_regs = index.columns.len() + 1;
+            let num_regs = index.columns.len() + index.has_rowid as usize;
             let start_reg = program.alloc_registers(num_regs);
             for (reg_offset, column_index) in index.columns.iter().enumerate() {
                 emit_index_column_value_old_image(
@@ -793,10 +842,12 @@ fn emit_delete_row_common(
                     start_reg + reg_offset,
                 )?;
             }
-            program.emit_insn(Insn::RowId {
-                cursor_id: main_table_cursor_id,
-                dest: start_reg + num_regs - 1,
-            });
+            if index.has_rowid {
+                program.emit_insn(Insn::RowId {
+                    cursor_id: main_table_cursor_id,
+                    dest: start_reg + num_regs - 1,
+                });
+            }
             program.emit_insn(Insn::IdxDelete {
                 start_reg,
                 num_regs,
@@ -920,6 +971,7 @@ fn emit_delete_insns_when_triggers_present(
     non_from_clause_subqueries: &mut [NonFromClauseSubquery],
     result_columns: &[ResultSetColumn],
     rowid_reg: usize,
+    pk_reg: Option<usize>,
     main_table_cursor_id: usize,
     resolver: &Resolver,
     returning_buffer: Option<&ReturningBufferCtx>,
@@ -928,11 +980,14 @@ fn emit_delete_insns_when_triggers_present(
     let skip_not_found_label = program.allocate_label();
 
     // Skip if row with rowid pulled from the rowset does not exist in the table.
-    program.emit_insn(Insn::NotExists {
-        cursor: main_table_cursor_id,
+    emit_seek_row_to_delete(
+        program,
+        &table_references.joined_tables()[0],
+        main_table_cursor_id,
         rowid_reg,
-        target_pc: skip_not_found_label,
-    });
+        pk_reg,
+        skip_not_found_label,
+    )?;
 
     let table_reference: *const JoinedTable = table_references.joined_tables().first().unwrap();
     if unsafe { &*table_reference }
@@ -1026,11 +1081,14 @@ fn emit_delete_insns_when_triggers_present(
     }
 
     // BEFORE DELETE Triggers may have altered the btree so we need to seek again.
-    program.emit_insn(Insn::NotExists {
-        cursor: main_table_cursor_id,
+    emit_seek_row_to_delete(
+        program,
+        &table_references.joined_tables()[0],
+        main_table_cursor_id,
         rowid_reg,
-        target_pc: skip_not_found_label,
-    });
+        pk_reg,
+        skip_not_found_label,
+    )?;
 
     emit_delete_row_common(
         connection,
@@ -1093,4 +1151,29 @@ fn emit_delete_insns_when_triggers_present(
     program.preassign_label_to_next_insn(skip_not_found_label);
 
     Ok(())
+}
+
+/// Position the table cursor on the row to delete: by rowid, or by the primary
+/// key of a WITHOUT ROWID table.
+fn emit_seek_row_to_delete(
+    program: &mut ProgramBuilder,
+    table: &JoinedTable,
+    cursor_id: usize,
+    rowid_reg: usize,
+    pk_reg: Option<usize>,
+    not_found: BranchOffset,
+) -> Result<()> {
+    match (pk_reg, table.btree()) {
+        (Some(pk_reg), Some(btree)) => crate::translate::without_rowid::emit_seek_row(
+            program, &btree, cursor_id, pk_reg, not_found,
+        ),
+        _ => {
+            program.emit_insn(Insn::NotExists {
+                cursor: cursor_id,
+                rowid_reg,
+                target_pc: not_found,
+            });
+            Ok(())
+        }
+    }
 }

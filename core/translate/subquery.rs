@@ -1081,6 +1081,7 @@ fn get_subquery_parser<'a>(
                     .try_collect::<Result<crate::alloc::Vec<_>>>()??;
 
                 let ephemeral_index = Arc::new(Index {
+                    n_key_col: columns.len(),
                     columns,
                     name: format!("ephemeral_index_where_sub_{subquery_id}"),
                     table_name: String::new(),

@@ -347,7 +347,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
 
     if !index.unique
         || !partial_index_predicate_matches
-        || target.targets.len() != index.columns.len()
+        || target.targets.len() != index.key_columns().len()
     {
         return false;
     }
@@ -361,7 +361,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
         if let Some(conflict_target) = extract_conflict_target(&te.expr) {
             // Simple column reference target: match by name and collation.
             let tname = &conflict_target.col_name;
-            for (i, ic) in index.columns.iter().enumerate() {
+            for (i, ic) in index.key_columns().iter().enumerate() {
                 if matched.get(i) || ic.pos_in_table == EXPR_INDEX_SENTINEL {
                     continue;
                 }
@@ -381,7 +381,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
             // Expression target (e.g. lower(val)): match against expression index
             // columns using semantic equivalence.
             let (target_expr, target_collate) = extract_target_expr(&te.expr);
-            for (i, ic) in index.columns.iter().enumerate() {
+            for (i, ic) in index.key_columns().iter().enumerate() {
                 if matched.get(i) || ic.pos_in_table != EXPR_INDEX_SENTINEL {
                     continue;
                 }
@@ -408,7 +408,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
         }
     }
     // All target columns matched exactly once, and all index columns consumed
-    matched.count() == index.columns.len()
+    matched.count() == index.key_columns().len()
 }
 
 #[derive(Clone, Debug)]
@@ -1431,7 +1431,12 @@ pub fn emit_upsert(
 
     // Build NEW table payload
     let record_reg = program.alloc_register();
-    emit_make_record(program, table.columns().iter(), new_start, record_reg);
+    emit_make_record(
+        program,
+        table.require_btree()?.as_ref(),
+        new_start,
+        record_reg,
+    );
 
     let cdc_wants_before =
         ctx.cdc_table.is_some() && program.capture_data_changes_info().has_before();

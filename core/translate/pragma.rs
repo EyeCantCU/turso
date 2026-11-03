@@ -1157,7 +1157,7 @@ fn query_pragma(
                         index_namespace.id,
                         &index_name,
                     )? {
-                        for (seqno, col) in index.columns.iter().enumerate() {
+                        for (seqno, col) in index.key_columns().iter().enumerate() {
                             program.emit_int(seqno as i64, base_reg);
                             emit_index_column_cid_and_name(program, col, base_reg + 1);
                             program.emit_result_row(base_reg, 3);
@@ -1204,7 +1204,8 @@ fn query_pragma(
                             emit_index_column_cid_and_name(program, col, base_reg + 1);
                             program.emit_int(desc as i64, base_reg + 3);
                             program.emit_string8(coll, base_reg + 4);
-                            program.emit_int(1, base_reg + 5); // key column
+                            // key column; the primary key suffix of a WITHOUT ROWID index is not
+                            program.emit_int((seqno < index.n_key_col) as i64, base_reg + 5);
                             program.emit_result_row(base_reg, 6);
                         }
 

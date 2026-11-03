@@ -51,9 +51,6 @@ fn validate_delete(
     if program.trigger.is_some() && table.virtual_table().is_some() {
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name);
     }
-    if table.btree().is_some_and(|bt| !bt.has_rowid) {
-        crate::bail_parse_error!("DELETE from WITHOUT ROWID tables is not supported");
-    }
 
     // Check if this is a materialized view. Must look up the schema of the
     // table's own database: a table in an attached database can share a name
@@ -145,7 +142,7 @@ pub fn translate_delete(
         // unsafe, so we may need to collect rowids first.
         record_delete_optimizer_safety(delete_plan_inner);
         if delete_plan_inner.safety.requires_stable_write_set() {
-            ensure_delete_uses_rowset(program, delete_plan_inner);
+            ensure_delete_uses_rowset(program, delete_plan_inner)?;
         }
 
         // Rewrite the Delete plan after optimization whenever a RowSet is used (trigger/subquery
@@ -325,7 +322,7 @@ pub fn prepare_delete_plan(
     };
 
     if delete_plan.safety.requires_stable_write_set() {
-        ensure_delete_uses_rowset(program, &mut delete_plan);
+        ensure_delete_uses_rowset(program, &mut delete_plan)?;
     }
 
     Ok(Plan::Delete(Box::new(delete_plan)))
@@ -389,9 +386,9 @@ fn record_delete_optimizer_safety(plan: &mut DeletePlan) {
 /// Convert a DELETE plan into a RowSet-driven delete:
 /// 1. execute a SELECT-like rowid producer into RowSet
 /// 2. iterate RowSet to perform actual deletes
-fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan) {
+fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan) -> Result<()> {
     if plan.rowset_plan.is_some() {
-        return;
+        return Ok(());
     }
 
     let rowid_internal_id = plan
@@ -406,23 +403,50 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
         reg
     });
 
+    // A WITHOUT ROWID table collects primary keys in an ephemeral index instead.
+    let target = plan
+        .table_references
+        .joined_tables()
+        .first()
+        .expect("DELETE should have one target table");
+    let (result_columns, query_destination) = match target.btree().filter(|t| !t.has_rowid) {
+        Some(btree) => {
+            let (result_columns, index) =
+                super::without_rowid::pk_set_columns(&btree, rowid_internal_id)?;
+            let cursor_id = program.alloc_cursor_index(None, &index)?;
+            (
+                result_columns,
+                QueryDestination::EphemeralIndex {
+                    cursor_id,
+                    index,
+                    affinity_str: None,
+                    is_delete: false,
+                },
+            )
+        }
+        None => (
+            vec![ResultSetColumn {
+                expr: Expr::RowId {
+                    database: None,
+                    table: rowid_internal_id,
+                },
+                alias: None,
+                implicit_column_name: None,
+                contains_aggregates: false,
+            }],
+            QueryDestination::RowSet { rowset_reg },
+        ),
+    };
+
     let rowset_plan = SelectPlan {
         table_references: plan.table_references.clone(),
-        result_columns: vec![ResultSetColumn {
-            expr: Expr::RowId {
-                database: None,
-                table: rowid_internal_id,
-            },
-            alias: None,
-            implicit_column_name: None,
-            contains_aggregates: false,
-        }],
+        result_columns,
         where_clause: std::mem::take(&mut plan.where_clause),
         group_by: None,
         order_by: vec![],
         aggregates: vec![],
         limit: None,
-        query_destination: QueryDestination::RowSet { rowset_reg },
+        query_destination,
         join_order: plan
             .table_references
             .joined_tables()
@@ -447,4 +471,5 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
         simple_aggregate: None,
     };
     plan.rowset_plan = Some(rowset_plan);
+    Ok(())
 }

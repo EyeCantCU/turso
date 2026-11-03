@@ -421,7 +421,7 @@ fn estimate_selectivity(
                 // Only use unique selectivity for single-column unique indexes.
                 // For composite unique indexes like tpc-h (l_orderkey, l_linenumber),
                 // the first column alone is NOT unique.
-                if index.unique && index.columns.len() == 1 {
+                if index.unique && index.n_key_col == 1 {
                     return selectivity_when_unique;
                 }
                 if let Some(stats) = table_stats {
@@ -506,7 +506,7 @@ fn selectivity_index_for_column<'a>(
     available_indexes
         .btree_indexes_for_column(table_reference.internal_id, column_pos)
         .find(|index| {
-            if index.unique && index.columns.len() == 1 {
+            if index.unique && index.n_key_col == 1 {
                 return true;
             }
             let Some(table_stats) = table_stats else {
