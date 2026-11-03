@@ -5508,16 +5508,12 @@ fn test_plain_vacuum_empty_schema_physical_contract() -> anyhow::Result<()> {
     let tmp_db = TempDatabase::new_empty();
     let conn = tmp_db.connect_limbo();
 
-    // A truly empty DB (page 1 never allocated) is not a valid VACUUM target —
-    // an existing database that "looks empty" indicates a problem, not a no-op.
-    let err = conn
-        .execute("VACUUM")
-        .expect_err("VACUUM on an uninitialized database should return an error");
-    assert_eq!(
-        err.to_string(),
-        "Internal error: begin_vacuum_blocking_tx can be done on an initialized database (page 1 must already be allocated)",
-        "expected initialization error, got: {err}"
-    );
+    // Like SQLite, VACUUM of a database that has no page 1 yet does nothing.
+    conn.execute("VACUUM")?;
+    conn.execute("CREATE TABLE t(x)")?;
+    conn.execute("INSERT INTO t VALUES (1)")?;
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM t"), 1);
+    assert_eq!(run_integrity_check(&conn), "ok");
     Ok(())
 }
 
@@ -5994,53 +5990,15 @@ fn test_mvcc_vacuum_into_preserves_full_autovacuum_after_reopen() -> anyhow::Res
 }
 
 #[test]
-fn test_plain_vacuum_incremental_autovacuum_still_unsupported() -> anyhow::Result<()> {
-    let opts = DatabaseOpts::new()
-        .with_encryption(true)
-        .with_autovacuum(true);
-    let (_temp_dir, tmp_db) = open_sqlite_autovacuum_db("incremental", opts)?;
-    let conn = tmp_db.connect_limbo();
-
-    let err = conn.execute("VACUUM").unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "Internal error: Incremental auto-vacuum is not supported",
-        "unexpected error: {err}"
-    );
-
-    Ok(())
+fn test_plain_vacuum_preserves_incremental_autovacuum() -> anyhow::Result<()> {
+    assert_plain_vacuum_preserves_autovacuum_mode("incremental", 2)
 }
 
 #[test]
-fn test_vacuum_into_incremental_autovacuum_still_unsupported() -> anyhow::Result<()> {
-    let opts = DatabaseOpts::new()
-        .with_encryption(true)
-        .with_autovacuum(true);
-    let (_temp_dir, tmp_db) = open_sqlite_autovacuum_db("incremental", opts)?;
-    let conn = tmp_db.connect_limbo();
-    let dest_dir = TempDir::new()?;
-    let dest_path = dest_dir.path().join("vacuum-into.db");
-
-    let err = conn
-        .execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))
-        .unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "Internal error: Incremental auto-vacuum is not supported",
-        "unexpected error: {err}"
-    );
-    assert!(
-        !dest_path.exists(),
-        "unsupported VACUUM INTO should not leave an output file behind"
-    );
-
-    Ok(())
+fn test_vacuum_into_preserves_incremental_autovacuum() -> anyhow::Result<()> {
+    assert_vacuum_into_preserves_autovacuum_mode("incremental", 2)
 }
 
-/// Keep one non-ignored plain VACUUM test under the checksum feature so
-/// `read_frames_batch` verifies checksums while reading the temp WAL and
-/// `prepare_frames` writes checksummed source-WAL frames.
-#[cfg(feature = "checksum")]
 #[test]
 fn test_plain_vacuum_checksum_multi_batch() -> anyhow::Result<()> {
     let tmp_db = TempDatabase::new_empty();

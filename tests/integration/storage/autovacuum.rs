@@ -223,6 +223,32 @@ mod pointer_maps {
     }
 
     #[test]
+    fn integrity_check_reports_bad_pointer_map_entries() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("bad-ptrmap.db");
+        {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            c.execute_batch(
+                "PRAGMA page_size=4096; PRAGMA auto_vacuum=FULL; CREATE TABLE t(x);
+                 INSERT INTO t VALUES (randomblob(9000));",
+            )
+            .unwrap();
+        }
+        // Entry of page 3 (t's root) on ptrmap page 2: claim it is an overflow page.
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes[4096], 1, "page 3 should be a root page");
+        bytes[4096] = 4;
+        std::fs::write(&path, bytes).unwrap();
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        let report = format!("{:?}", limbo_exec_rows(&conn, "PRAGMA integrity_check"));
+        assert!(
+            report.contains("Bad ptr map entry key=3 expected=(1,0) got=(4,0)"),
+            "{report}"
+        );
+    }
+
+    #[test]
     fn auto_vacuum_pragma_follows_sqlite() {
         // NONE <-> FULL needs VACUUM once the database has a page 1.
         let db = TempDatabase::new_empty();
