@@ -148,6 +148,7 @@ fn foreign_key_action_name(action: ast::RefAct) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_table_list_rows_for_schema(
     program: &mut ProgramBuilder,
     schema: &Schema,

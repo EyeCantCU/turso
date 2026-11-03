@@ -2530,9 +2530,8 @@ mod tests {
                 let mut rows = Vec::new();
                 let mut stmt = conn3
                     .prepare(
-                        // Exclude sequence backing tables created implicitly
-                        // for AUTOINCREMENT (e.g. for turso_cdc) so this test
-                        // remains focused on user-created tables.
+                        // Exclude the CDC tables so this test remains focused
+                        // on user-created tables.
                         "SELECT * FROM sqlite_schema \
                          WHERE name NOT IN ('turso_cdc', 'turso_cdc_version') \
                          AND name NOT LIKE '\\_\\_turso\\_internal\\_seq\\_%' ESCAPE '\\' \
@@ -2562,7 +2561,7 @@ mod tests {
                             turso_core::Value::Text(turso_core::types::Text::new("table")),
                             turso_core::Value::Text(turso_core::types::Text::new("t")),
                             turso_core::Value::Text(turso_core::types::Text::new("t")),
-                            turso_core::Value::from_i64(7),
+                            turso_core::Value::from_i64(6),
                             turso_core::Value::Text(turso_core::types::Text::new(
                                 "CREATE TABLE t (x TEXT PRIMARY KEY, y)"
                             )),
@@ -2571,7 +2570,7 @@ mod tests {
                             turso_core::Value::Text(turso_core::types::Text::new("table")),
                             turso_core::Value::Text(turso_core::types::Text::new("q")),
                             turso_core::Value::Text(turso_core::types::Text::new("q")),
-                            turso_core::Value::from_i64(9),
+                            turso_core::Value::from_i64(8),
                             turso_core::Value::Text(turso_core::types::Text::new(
                                 "CREATE TABLE q (x TEXT PRIMARY KEY, y)"
                             )),
@@ -2648,7 +2647,7 @@ mod tests {
                             turso_core::Value::Text(turso_core::types::Text::new("table")),
                             turso_core::Value::Text(turso_core::types::Text::new("t")),
                             turso_core::Value::Text(turso_core::types::Text::new("t")),
-                            turso_core::Value::from_i64(7),
+                            turso_core::Value::from_i64(6),
                             turso_core::Value::Text(turso_core::types::Text::new(
                                 "CREATE TABLE t (x TEXT PRIMARY KEY, y)"
                             )),
@@ -2657,7 +2656,7 @@ mod tests {
                             turso_core::Value::Text(turso_core::types::Text::new("index")),
                             turso_core::Value::Text(turso_core::types::Text::new("t_idx")),
                             turso_core::Value::Text(turso_core::types::Text::new("t")),
-                            turso_core::Value::from_i64(9),
+                            turso_core::Value::from_i64(8),
                             turso_core::Value::Text(turso_core::types::Text::new(
                                 "CREATE INDEX t_idx ON t (y)"
                             )),
@@ -2811,7 +2810,7 @@ mod tests {
                         turso_core::Value::Text(turso_core::types::Text::new("table")),
                         turso_core::Value::Text(turso_core::types::Text::new("t")),
                         turso_core::Value::Text(turso_core::types::Text::new("t")),
-                        turso_core::Value::from_i64(7),
+                        turso_core::Value::from_i64(6),
                         turso_core::Value::Text(turso_core::types::Text::new(
                             "CREATE TABLE t (x TEXT PRIMARY KEY, z)"
                         )),
