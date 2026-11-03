@@ -278,6 +278,20 @@ impl VirtualTable {
         }
     }
 
+    /// xIntegrity of a native module; `None` when there is nothing to report.
+    pub(crate) fn integrity(
+        &self,
+        connection: &Arc<Connection>,
+        quick: bool,
+    ) -> crate::Result<Option<String>> {
+        match &self.vtab_type {
+            VirtualTableType::External(crate::ext::ExtensionTable::Native(table)) => {
+                table.integrity(connection, quick)
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub(crate) fn destroy(&self, connection: &Arc<Connection>) -> crate::Result<()> {
         match &self.vtab_type {
             VirtualTableType::Pragma(_) => Ok(()),

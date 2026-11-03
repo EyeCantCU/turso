@@ -3667,7 +3667,14 @@ fn translate_virtual_table_insert(
             OneSelect::Values(values) => (values[0].len(), std::mem::take(values)),
             _ => crate::bail_parse_error!("Virtual tables only support VALUES clause in INSERT"),
         },
-        InsertBody::DefaultValues => (0, vec![vec![]]),
+        // A virtual table has no column defaults: every column is NULL.
+        InsertBody::DefaultValues => {
+            let n = table.columns().iter().filter(|c| !c.hidden()).count();
+            (
+                n,
+                vec![vec![Box::new(ast::Expr::Literal(ast::Literal::Null)); n]],
+            )
+        }
         _ => crate::bail_parse_error!("Unsupported INSERT body for virtual tables"),
     };
     /* *

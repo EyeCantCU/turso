@@ -578,6 +578,10 @@ pub struct Connection {
     pub(super) check_constraints_pragma: AtomicBool,
     /// Track when each virtual table instance is currently in transaction.
     pub(crate) vtab_txn_states: RwLock<HashSet<u64>>,
+    /// Set while VACUUM replays `CREATE VIRTUAL TABLE` into its target: the
+    /// module connects (xConnect) instead of creating, as its shadow tables
+    /// have been copied already.
+    pub(crate) vtab_connect_only: AtomicBool,
     /// One prepared cursor per index-method attachment touched by the active
     /// database transaction. Statement reset transfers cursors here so the
     /// eventual transaction outcome is delivered exactly once per attachment.

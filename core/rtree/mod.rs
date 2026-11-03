@@ -24,7 +24,7 @@ use crate::{Connection, IOResult, LimboError, Result, Value};
 use turso_ext::ConstraintOp;
 use turso_ext::ResultCode;
 
-pub(crate) use funcs::register_functions;
+pub(crate) use funcs::{register_functions, VTAB_INTEGRITY_FUNCTION};
 pub use matchfn::{RtreeMatchCall, RtreeMatchFunction, RtreeQueryInfo};
 
 /// The rtree may have between 1 and 5 dimensions.
@@ -123,7 +123,7 @@ impl Rtree {
             .map(value_int64)
             .unwrap_or(0) as i32;
         if n < 512 - 64 {
-            return Err(LimboError::Corrupt(format!(
+            return Err(LimboError::SqlError(format!(
                 "undersize RTree blobs in \"{}_node\"",
                 self.name
             )));
@@ -493,6 +493,11 @@ impl VirtualTable for RtreeTable {
     fn rollback(&mut self) -> Result<()> {
         self.stmts = None;
         Ok(())
+    }
+
+    fn integrity(&self, connection: &Arc<Connection>, _quick: bool) -> Result<Option<String>> {
+        Ok(funcs::check_table(connection, &self.t.db, &self.t.name)?
+            .map(|report| format!("In RTree {}.{}:\n{report}", self.t.db, self.t.name)))
     }
 
     fn destroy_with_connection(&mut self, connection: &Arc<Connection>) -> Result<()> {

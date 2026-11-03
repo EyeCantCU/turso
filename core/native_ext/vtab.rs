@@ -121,6 +121,10 @@ pub trait VirtualTable: Debug + Send + Sync {
     fn destroy_with_connection(&mut self, _connection: &Arc<Connection>) -> Result<()> {
         self.destroy()
     }
+    /// xIntegrity: problems for `PRAGMA integrity_check` to report, if any.
+    fn integrity(&self, _connection: &Arc<Connection>, _quick: bool) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 pub trait VirtualTableCursor: Send + Sync {
@@ -241,6 +245,14 @@ impl NativeTable {
     pub(crate) fn destroy(&self, connection: &Arc<Connection>) -> Result<()> {
         self.0.write().destroy_with_connection(connection)
     }
+
+    pub(crate) fn integrity(
+        &self,
+        connection: &Arc<Connection>,
+        quick: bool,
+    ) -> Result<Option<String>> {
+        self.0.read().integrity(connection, quick)
+    }
 }
 
 trait TableInstance: Debug + Send + Sync {
@@ -266,6 +278,7 @@ trait TableInstance: Debug + Send + Sync {
     fn rollback(&mut self) -> Result<()>;
     fn rename_with_connection(&mut self, connection: &Arc<Connection>, name: &str) -> Result<()>;
     fn destroy_with_connection(&mut self, connection: &Arc<Connection>) -> Result<()>;
+    fn integrity(&self, connection: &Arc<Connection>, quick: bool) -> Result<Option<String>>;
 }
 
 impl<T: VirtualTable> TableInstance for T {
@@ -328,6 +341,10 @@ impl<T: VirtualTable> TableInstance for T {
 
     fn destroy_with_connection(&mut self, connection: &Arc<Connection>) -> Result<()> {
         VirtualTable::destroy_with_connection(self, connection)
+    }
+
+    fn integrity(&self, connection: &Arc<Connection>, quick: bool) -> Result<Option<String>> {
+        VirtualTable::integrity(self, connection, quick)
     }
 }
 

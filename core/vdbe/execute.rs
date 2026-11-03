@@ -1475,12 +1475,13 @@ pub fn op_vcreate(
     // No lock is held while the module's constructor runs: it may run
     // statements on this connection.
     let module = conn.syms.read().vtab_module(&module_name).cloned();
+    let create = (!conn.vtab_connect_only.load(Ordering::SeqCst)).then_some(&conn);
     let table = crate::VirtualTable::table_for(
         Some(&table_name),
         &module_name,
         args,
         module.as_ref(),
-        Some(&conn),
+        create,
     )?;
     // A table that asks for it joins the transaction, as in SQLite (commit, no begin).
     if table.commits_after_create() {

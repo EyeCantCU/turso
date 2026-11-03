@@ -7,8 +7,7 @@
 use super::cursor::{corrupt, read_i64, read_node, read_u16, read_u32};
 use super::shadow::Stmts;
 use super::{sql, value_double, value_int64, Rtree, RtreeKind};
-use crate::sync::Arc;
-use crate::{Connection, LimboError, Result, Value};
+use crate::{LimboError, Result, Value};
 use std::collections::HashMap;
 
 /// A deserialized cell: a rowid or child node number, and raw coordinates.
