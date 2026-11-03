@@ -870,16 +870,20 @@ fn emit_update_column_values<'a>(
                     program.emit_null(target_reg, None);
                 } else {
                     let self_table_context = match table_column.generated_type() {
-                        GeneratedType::Virtual { .. } => Some(SelfTableContext::ForDML {
-                            dml_ctx: DmlColumnContext::layout(
-                                column_ctx.target_table.table.columns(),
-                                column_ctx.start,
-                                column_ctx.rowid_reg,
-                                column_ctx.layout.clone(),
-                                DmlRowForm::StoredExceptUpdated(column_ctx.updated_columns.clone()),
-                            ),
-                            table: column_ctx.target_table.table.require_btree()?,
-                        }),
+                        GeneratedType::Virtual { .. } | GeneratedType::Stored { .. } => {
+                            Some(SelfTableContext::ForDML {
+                                dml_ctx: DmlColumnContext::layout(
+                                    column_ctx.target_table.table.columns(),
+                                    column_ctx.start,
+                                    column_ctx.rowid_reg,
+                                    column_ctx.layout.clone(),
+                                    DmlRowForm::StoredExceptUpdated(
+                                        column_ctx.updated_columns.clone(),
+                                    ),
+                                ),
+                                table: column_ctx.target_table.table.require_btree()?,
+                            })
+                        }
                         GeneratedType::NotGenerated => None,
                     };
 
@@ -973,7 +977,7 @@ fn emit_update_column_values<'a>(
         } else {
             // Column is not being updated, read it from the table
             match table_column.generated_type() {
-                GeneratedType::NotGenerated => {
+                GeneratedType::Stored { .. } | GeneratedType::NotGenerated => {
                     let column_idx_in_index = column_ctx.index.as_ref().and_then(|(idx, _)| {
                         idx.columns.iter().position(|c| {
                             table_column
@@ -1613,7 +1617,7 @@ fn emit_update_insns<'a>(
             &column_ctx,
             skip_row_label,
             t_ctx,
-            |column| !column.is_virtual_generated(),
+            |column| !column.is_generated(),
         )?;
     }
 
@@ -1680,7 +1684,7 @@ fn emit_update_insns<'a>(
                 &column_ctx,
                 skip_row_label,
                 t_ctx,
-                |column| !column.is_virtual_generated(),
+                |column| !column.is_generated(),
             )?;
         }
         let has_check_constraints = !btree.check_constraints.is_empty();
@@ -1743,7 +1747,7 @@ fn emit_update_insns<'a>(
             &column_ctx,
             skip_row_label,
             t_ctx,
-            Column::is_virtual_generated,
+            Column::is_generated,
         )?;
     }
 

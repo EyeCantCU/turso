@@ -1034,7 +1034,7 @@ pub fn translate_alter_table(
             {
                 let affected = btree.columns_affected_by_update([dropped_index])?;
                 for idx in &affected {
-                    if idx != dropped_index && btree.columns()[idx].is_virtual_generated() {
+                    if idx != dropped_index && btree.columns()[idx].is_generated() {
                         return Err(LimboError::ParseError(format!(
                             "error in table {table_name} after drop column: no such column: {column_name}"
                         )));
@@ -1194,11 +1194,6 @@ pub fn translate_alter_table(
                     }
                 )
             });
-            if is_stored {
-                return Err(LimboError::ParseError(
-                    "cannot add a STORED column".to_string(),
-                ));
-            }
             if is_generated {
                 for c in &col_def.constraints {
                     if let ast::ColumnConstraint::Generated { expr, .. } = &c.constraint {
@@ -1429,7 +1424,8 @@ pub fn translate_alter_table(
             };
 
             let mut computes_default_for_existing_rows = false;
-            if !is_generated {
+            // SQLite adds a STORED column only to an empty table.
+            if !is_generated || is_stored {
                 // Check if we need to verify the table is empty at runtime.
                 let type_default = resolver
                     .schema()
@@ -1458,7 +1454,9 @@ pub fn translate_alter_table(
                     && !computes_default_for_existing_rows
                     && effective_default.is_none_or(crate::util::expr_contains_null);
 
-                let (needs_empty_table_check, error_message) = if needs_notnull_check {
+                let (needs_empty_table_check, error_message) = if is_stored {
+                    (true, "cannot add a STORED column")
+                } else if needs_notnull_check {
                     (true, "Cannot add a NOT NULL column with default value NULL")
                 } else if has_non_constant_default && !computes_default_for_existing_rows {
                     (true, "Cannot add a column with non-constant default")
@@ -2688,7 +2686,7 @@ fn rewrite_index_for_column_rewrite(
             }
             column.default.clone_from(&table_column.default);
             column.expr = table_column
-                .generated_expr()
+                .virtual_generated_expr()
                 .map(|expr| Box::new(expr.clone()));
         }
     }

@@ -18308,7 +18308,7 @@ pub fn op_alter_column(
                     }
                     ic.default.clone_from(&table_column.default);
                     ic.expr = table_column
-                        .generated_expr()
+                        .virtual_generated_expr()
                         .map(|expr| Box::new(expr.clone()));
                 }
             }

@@ -5051,7 +5051,7 @@ impl GeneratedColGraph {
 
         // walk each virtual column's expression once to extract edges
         for (j, col) in columns.iter().enumerate() {
-            let GeneratedType::Virtual { ref expr, .. } = col.generated_type() else {
+            let Some(expr) = col.generated_expr() else {
                 continue;
             };
             let mut direct = BitSet::default();
@@ -5387,6 +5387,10 @@ impl BTreeTable {
         self.has_virtual_columns
     }
 
+    pub fn has_stored_generated_columns(&self) -> bool {
+        self.columns.iter().any(Column::is_stored_generated)
+    }
+
     /// Build a `ColumnLayout` for this table's register mapping.
     pub fn column_layout(&self) -> Result<ColumnLayout, TryReserveError> {
         ColumnLayout::from_btree(self)
@@ -5529,13 +5533,18 @@ impl BTreeTable {
 
             push_collation(&mut sql, column.text_collation());
 
-            if let GeneratedType::Virtual { original_sql, .. } = &column.generated_type() {
+            if let GeneratedType::Virtual { original_sql, .. }
+            | GeneratedType::Stored { original_sql, .. } = &column.generated_type()
+            {
                 if column.generated_always {
                     sql.push_str(" GENERATED ALWAYS");
                 }
                 sql.push_str(" AS (");
                 sql.push_str(original_sql);
                 sql.push(')');
+                if column.is_stored_generated() {
+                    sql.push_str(" STORED");
+                }
             }
 
             // Add column-level CHECK constraints inline
@@ -5821,7 +5830,7 @@ impl BTreeTable {
         {
             let mut guard = self.columns_mut();
             for i in 0..guard.len() {
-                if guard[i].is_virtual_generated() {
+                if guard[i].is_generated() {
                     let mut expr = guard[i].generated_expr().cloned().unwrap();
                     resolve_gencol_expr_columns(&mut expr, &guard)?;
                     *guard[i].generated_expr_mut().unwrap() = expr;
@@ -5924,7 +5933,10 @@ impl BTreeTable {
         for j in targets {
             if !self.columns[j].is_virtual_generated() {
                 deps.set(j)?;
-                continue;
+                // A STORED generated column changes with its dependencies.
+                if !self.columns[j].is_stored_generated() {
+                    continue;
+                }
             }
             for i in graph.dependencies[j].iter() {
                 if !self.columns[i].is_virtual_generated() {
@@ -6768,6 +6780,7 @@ pub fn create_table(
 
                 let mut default = None;
                 let mut generated: Option<Box<Expr>> = None;
+                let mut stored = false;
                 let mut primary_key = false;
                 let mut notnull = false;
                 let mut explicit_notnull = false;
@@ -6786,12 +6799,9 @@ pub fn create_table(
                             ))?;
                         }
                         ast::ColumnConstraint::Generated { expr, typ, .. } => {
-                            if typ
+                            stored = typ
                                 .as_ref()
-                                .is_some_and(|t| matches!(t, ast::GeneratedColumnType::Stored))
-                            {
-                                bail_parse_error!("Stored generated columns are not supported");
-                            }
+                                .is_some_and(|t| matches!(t, ast::GeneratedColumnType::Stored));
                             validate_generated_expr(expr)?;
                             generated = Some(expr.clone());
                         }
@@ -7005,6 +7015,9 @@ pub fn create_table(
                         }
                     )
                 });
+                if stored {
+                    col.set_generated_stored();
+                }
                 col.ty_params = ty_params;
                 if let Some(t) = col_type.as_ref() {
                     col.apply_written_type(t);
@@ -7447,7 +7460,11 @@ pub enum GeneratedType {
         expr: Box<Expr>,
         original_sql: String,
     },
-    // Stored { resolved: Box<Expr>, original_sql: String },
+    /// Like `Virtual`, but the value is computed on write and kept in the record.
+    Stored {
+        expr: Box<Expr>,
+        original_sql: String,
+    },
     NotGenerated,
 }
 
@@ -7553,6 +7570,7 @@ impl Column {
         };
         let mut primary_key_order = SortOrder::Asc;
         let mut collation = None;
+        let mut stored = false;
 
         for ast::NamedColumnConstraint { constraint, .. } in &value.constraints {
             match constraint {
@@ -7586,8 +7604,9 @@ impl Column {
                     }
                     collation.replace(collation_seq);
                 }
-                ast::ColumnConstraint::Generated { expr, .. } => {
+                ast::ColumnConstraint::Generated { expr, typ, .. } => {
                     generated = Some(expr.clone());
+                    stored = matches!(typ, Some(ast::GeneratedColumnType::Stored));
                 }
                 _ => {}
             };
@@ -7647,6 +7666,9 @@ impl Column {
                 }
             )
         });
+        if stored {
+            col.set_generated_stored();
+        }
         col.ty_params = ty_params;
         if let Some(t) = value.col_type.as_ref() {
             col.apply_written_type(t);
@@ -7706,17 +7728,48 @@ impl Column {
     }
 
     #[inline]
+    pub fn is_stored_generated(&self) -> bool {
+        matches!(self.generated_type, GeneratedType::Stored { .. })
+    }
+
+    /// Turn a virtual generated column into a STORED one.
+    pub fn set_generated_stored(&mut self) {
+        let generated_type =
+            std::mem::replace(&mut self.generated_type, GeneratedType::NotGenerated);
+        self.generated_type = match generated_type {
+            GeneratedType::Virtual { expr, original_sql }
+            | GeneratedType::Stored { expr, original_sql } => {
+                GeneratedType::Stored { expr, original_sql }
+            }
+            GeneratedType::NotGenerated => GeneratedType::NotGenerated,
+        };
+    }
+
+    #[inline]
     pub fn generated_expr(&self) -> Option<&Expr> {
         match &self.generated_type {
-            GeneratedType::Virtual { expr, .. } => Some(expr.as_ref()),
+            GeneratedType::Virtual { expr, .. } | GeneratedType::Stored { expr, .. } => {
+                Some(expr.as_ref())
+            }
             GeneratedType::NotGenerated => None,
+        }
+    }
+
+    /// The expression of a VIRTUAL generated column, which index entries compute.
+    #[inline]
+    pub fn virtual_generated_expr(&self) -> Option<&Expr> {
+        match &self.generated_type {
+            GeneratedType::Virtual { expr, .. } => Some(expr.as_ref()),
+            _ => None,
         }
     }
 
     #[inline]
     pub fn generated_expr_mut(&mut self) -> Option<&mut Expr> {
         match &mut self.generated_type {
-            GeneratedType::Virtual { expr, .. } => Some(expr.as_mut()),
+            GeneratedType::Virtual { expr, .. } | GeneratedType::Stored { expr, .. } => {
+                Some(expr.as_mut())
+            }
             GeneratedType::NotGenerated => None,
         }
     }
@@ -7724,6 +7777,10 @@ impl Column {
     #[inline]
     pub fn set_generated_original_sql(&mut self, new_sql: String) {
         if let GeneratedType::Virtual {
+            ref mut original_sql,
+            ..
+        }
+        | GeneratedType::Stored {
             ref mut original_sql,
             ..
         } = self.generated_type
@@ -8923,6 +8980,16 @@ mod tests {
                             ..
                         },
                         GeneratedType::Virtual {
+                            original_sql: expected,
+                            ..
+                        },
+                    ) => assert_eq!(actual, expected, "{sql}"),
+                    (
+                        GeneratedType::Stored {
+                            original_sql: actual,
+                            ..
+                        },
+                        GeneratedType::Stored {
                             original_sql: expected,
                             ..
                         },

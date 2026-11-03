@@ -787,6 +787,17 @@ pub fn emit_upsert(
         DmlRowForm::UserFacing,
         resolver,
     )?;
+    for (col_idx, col) in table.columns().iter().enumerate() {
+        if col.is_generated() && col.notnull() {
+            program.emit_insn(Insn::HaltIfNull {
+                constraint_info: None,
+                target_reg: layout.to_register(new_start, col_idx),
+                err_code: SQLITE_CONSTRAINT_NOTNULL,
+                description: format!("{}.{}", table.get_name(), col.name.as_deref().unwrap_or("")),
+                on_error: constraint_on_error,
+            });
+        }
+    }
 
     if let Some(bt) = table.btree() {
         if bt.is_strict {
@@ -1716,7 +1727,7 @@ fn compute_new_row_virtual_columns(
     form: DmlRowForm,
     resolver: &Resolver,
 ) -> crate::Result<()> {
-    if !ctx.table.has_virtual_columns {
+    if !ctx.table.has_virtual_columns && !ctx.table.has_stored_generated_columns() {
         return Ok(());
     }
     let dml_ctx = DmlColumnContext::layout(
