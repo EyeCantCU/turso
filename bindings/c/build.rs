@@ -11,12 +11,46 @@ fn main() {
     cc::Build::new()
         .file("src/varargs.c")
         .compile("turso_sqlite3_varargs");
+    emit_source_id();
     let profile_dir = target_profile_dir();
     println!("cargo:rustc-link-search=native={}", profile_dir.display());
 
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         configure_msvc_sqlite3();
     }
+}
+
+/// TURSO_SOURCE_ID for sqlite3_sourceid(): "<commit date UTC> <commit id>",
+/// the id zero-padded to SQLite's 64 hex digits. Without git (e.g. a source
+/// tarball) the date of the tracked SQLite release and an all-zero id.
+fn emit_source_id() {
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .env("TZ", "UTC")
+            .args(args)
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    if let Some(head) = git(&["rev-parse", "--git-path", "HEAD"]) {
+        println!("cargo:rerun-if-changed={head}");
+    }
+    println!("cargo:rerun-if-changed=src/varargs.c");
+    let id = git(&["rev-parse", "HEAD"]).filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()));
+    let date = git(&[
+        "log",
+        "-1",
+        "--format=%cd",
+        "--date=format-local:%Y-%m-%d %H:%M:%S",
+    ]);
+    let source_id = match (date, id) {
+        (Some(d), Some(h)) => format!("{d} {h:0<64}"),
+        _ => format!("2025-07-30 19:33:53 {:0<64}", ""),
+    };
+    println!("cargo:rustc-env=TURSO_SOURCE_ID={source_id}");
 }
 
 fn target_profile_dir() -> std::path::PathBuf {

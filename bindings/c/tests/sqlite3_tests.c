@@ -3,6 +3,7 @@
 #include <sqlite3.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -32,6 +33,7 @@ void test_sqlite3_prepare_no_statements();
 void test_sqlite3_close_with_unfinalized_stmt();
 void test_sqlite3_open_v2_flags();
 void test_sqlite3_db_readonly();
+void test_sqlite3_va_list_printf();
 
 int allocated = 0;
 
@@ -63,6 +65,7 @@ int main(void)
     test_sqlite3_close_with_unfinalized_stmt();
     test_sqlite3_open_v2_flags();
     test_sqlite3_db_readonly();
+    test_sqlite3_va_list_printf();
     return 0;
 }
 
@@ -1406,4 +1409,52 @@ void test_sqlite3_db_readonly()
 
     sqlite3_close(db);
     printf("test_sqlite3_db_readonly test passed\n");
+}
+
+static char *call_vmprintf(const char *fmt, ...)
+{
+    va_list ap;
+    char *r;
+    va_start(ap, fmt);
+    r = sqlite3_vmprintf(fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+static char *call_vsnprintf(int n, char *buf, const char *fmt, ...)
+{
+    va_list ap;
+    char *r;
+    va_start(ap, fmt);
+    r = sqlite3_vsnprintf(n, buf, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+void test_sqlite3_va_list_printf()
+{
+    char buf[16];
+    char *s = call_vmprintf("%d-%s-%q-%lld", 7, "abc", "it's", (long long)1 << 40);
+    assert(s != NULL);
+    assert(strcmp(s, "7-abc-it''s-1099511627776") == 0);
+    sqlite3_free(s);
+
+    /* The va_list is consumed from the caller's position, not copied early. */
+    s = call_vmprintf("%s:%s", "a", "b");
+    assert(strcmp(s, "a:b") == 0);
+    sqlite3_free(s);
+
+    memset(buf, 'x', sizeof(buf));
+    assert(call_vsnprintf(sizeof(buf), buf, "%d%s", 42, "tail") == buf);
+    assert(strcmp(buf, "42tail") == 0);
+
+    /* Truncation keeps the result NUL-terminated. */
+    assert(call_vsnprintf(4, buf, "%s", "abcdefgh") == buf);
+    assert(strcmp(buf, "abc") == 0);
+
+    memset(buf, 'x', sizeof(buf));
+    assert(call_vsnprintf(0, buf, "%s", "zz") == buf);
+    assert(buf[0] == 'x');
+
+    printf("test_sqlite3_va_list_printf test passed\n");
 }

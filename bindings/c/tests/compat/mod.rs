@@ -3987,3 +3987,779 @@ mod tests {
         }
     }
 }
+
+mod wrappers {
+    use super::*;
+    use std::ffi::{CStr, CString};
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    type Ctx = *mut libc::c_void;
+    type Val = *mut libc::c_void;
+    type Destructor = unsafe extern "C" fn(*mut libc::c_void);
+
+    #[cfg_attr(
+        all(not(feature = "sqlite3"), not(target_os = "windows")),
+        link(name = "turso_sqlite3")
+    )]
+    #[cfg_attr(
+        all(
+            feature = "sqlite3",
+            not(all(target_os = "windows", target_env = "msvc"))
+        ),
+        link(name = "sqlite3")
+    )]
+    #[cfg_attr(
+        all(feature = "sqlite3", target_os = "windows", target_env = "msvc"),
+        link(name = "sqlite3", kind = "static")
+    )]
+    #[cfg_attr(
+        all(not(feature = "sqlite3"), target_os = "windows"),
+        link(name = "turso_sqlite3", kind = "raw-dylib")
+    )]
+    extern "C" {
+        static sqlite3_version: libc::c_char;
+        fn sqlite3_create_function(
+            db: *mut sqlite3,
+            name: *const libc::c_char,
+            n_args: i32,
+            enc: i32,
+            app: *mut libc::c_void,
+            func: Option<unsafe extern "C" fn(Ctx, i32, *mut Val)>,
+            step: Option<unsafe extern "C" fn()>,
+            fin: Option<unsafe extern "C" fn()>,
+        ) -> i32;
+        fn sqlite3_create_collation(
+            db: *mut sqlite3,
+            name: *const libc::c_char,
+            enc: i32,
+            app: *mut libc::c_void,
+            cmp: Option<
+                unsafe extern "C" fn(
+                    *mut libc::c_void,
+                    i32,
+                    *const libc::c_void,
+                    i32,
+                    *const libc::c_void,
+                ) -> i32,
+            >,
+        ) -> i32;
+        fn sqlite3_prepare(
+            db: *mut sqlite3,
+            sql: *const libc::c_char,
+            n: i32,
+            stmt: *mut *mut sqlite3_stmt,
+            tail: *mut *const libc::c_char,
+        ) -> i32;
+        fn sqlite3_bind_text64(
+            stmt: *mut sqlite3_stmt,
+            idx: i32,
+            text: *const libc::c_char,
+            len: u64,
+            destructor: Option<Destructor>,
+            enc: u8,
+        ) -> i32;
+        fn sqlite3_bind_blob64(
+            stmt: *mut sqlite3_stmt,
+            idx: i32,
+            blob: *const libc::c_void,
+            len: u64,
+            destructor: Option<Destructor>,
+        ) -> i32;
+        fn sqlite3_result_text64(
+            ctx: Ctx,
+            text: *const libc::c_char,
+            len: u64,
+            destructor: Option<Destructor>,
+            enc: u8,
+        );
+        fn sqlite3_result_value(ctx: Ctx, value: Val);
+        fn sqlite3_result_zeroblob(ctx: Ctx, n: i32);
+        fn sqlite3_result_zeroblob64(ctx: Ctx, n: u64) -> i32;
+        fn sqlite3_result_null(ctx: Ctx);
+        fn sqlite3_value_numeric_type(value: Val) -> i32;
+        fn sqlite3_malloc64(n: u64) -> *mut libc::c_void;
+        fn sqlite3_realloc(p: *mut libc::c_void, n: i32) -> *mut libc::c_void;
+        fn sqlite3_realloc64(p: *mut libc::c_void, n: u64) -> *mut libc::c_void;
+        fn sqlite3_sourceid() -> *const libc::c_char;
+        fn sqlite3_keyword_count() -> i32;
+        fn sqlite3_keyword_name(i: i32, name: *mut *const libc::c_char, len: *mut i32) -> i32;
+        fn sqlite3_keyword_check(word: *const libc::c_char, n: i32) -> i32;
+        fn sqlite3_column_origin_name(stmt: *mut sqlite3_stmt, idx: i32) -> *const libc::c_char;
+        fn sqlite3_db_release_memory(db: *mut sqlite3) -> i32;
+        fn sqlite3_system_errno(db: *mut sqlite3) -> i32;
+        fn sqlite3_stmt_isexplain(stmt: *mut sqlite3_stmt) -> i32;
+        fn sqlite3_stmt_explain(stmt: *mut sqlite3_stmt, mode: i32) -> i32;
+        fn sqlite3_error_offset(db: *mut sqlite3) -> i32;
+        fn sqlite3_enable_shared_cache(enable: i32) -> i32;
+        fn sqlite3_bind_text(
+            stmt: *mut sqlite3_stmt,
+            idx: i32,
+            text: *const libc::c_char,
+            len: i32,
+            destructor: Option<Destructor>,
+        ) -> i32;
+        fn sqlite3_result_error_toobig(ctx: Ctx);
+        fn sqlite3_user_data(ctx: Ctx) -> *mut libc::c_void;
+    }
+
+    const SQLITE_TOOBIG: i32 = 18;
+    const SQLITE_BUSY: i32 = 5;
+    const SQLITE_UTF16LE: u8 = 2;
+    const SQLITE_UTF16BE: u8 = 3;
+    const SQLITE_UTF16: u8 = 4;
+    unsafe fn transient() -> Option<Destructor> {
+        std::mem::transmute::<isize, Option<Destructor>>(-1)
+    }
+
+    unsafe fn open() -> *mut sqlite3 {
+        let mut db = ptr::null_mut();
+        assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+        db
+    }
+
+    unsafe fn prepare(db: *mut sqlite3, sql: &CStr) -> *mut sqlite3_stmt {
+        let mut stmt = ptr::null_mut();
+        let rc = sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut());
+        assert_eq!(
+            rc,
+            SQLITE_OK,
+            "{sql:?}: {:?}",
+            CStr::from_ptr(sqlite3_errmsg(db))
+        );
+        stmt
+    }
+
+    unsafe fn exec(db: *mut sqlite3, sql: &CStr) {
+        let rc = sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut());
+        assert_eq!(
+            rc,
+            SQLITE_OK,
+            "{sql:?}: {:?}",
+            CStr::from_ptr(sqlite3_errmsg(db))
+        );
+    }
+
+    unsafe fn text(stmt: *mut sqlite3_stmt, idx: i32) -> Option<String> {
+        let p = sqlite3_column_text(stmt, idx);
+        (!p.is_null()).then(|| CStr::from_ptr(p).to_string_lossy().into_owned())
+    }
+
+    /// Runs a single-row query and returns column 0 as text.
+    unsafe fn query1(db: *mut sqlite3, sql: &CStr) -> Option<String> {
+        let stmt = prepare(db, sql);
+        assert_eq!(sqlite3_step(stmt), SQLITE_ROW, "{sql:?}");
+        let r = text(stmt, 0);
+        sqlite3_finalize(stmt);
+        r
+    }
+
+    unsafe fn arg(argv: *mut Val, i: usize) -> Val {
+        *argv.add(i)
+    }
+
+    #[test]
+    fn test_create_function_and_collation_legacy() {
+        unsafe extern "C" fn twice(ctx: Ctx, _n: i32, argv: *mut Val) {
+            let v = sqlite3_value_int64(arg(argv, 0));
+            sqlite3_result_int64(ctx, v * 2);
+        }
+        unsafe extern "C" fn reverse(
+            _app: *mut libc::c_void,
+            la: i32,
+            a: *const libc::c_void,
+            lb: i32,
+            b: *const libc::c_void,
+        ) -> i32 {
+            let a = std::slice::from_raw_parts(a as *const u8, la as usize);
+            let b = std::slice::from_raw_parts(b as *const u8, lb as usize);
+            match b.cmp(a) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            }
+        }
+        unsafe {
+            let db = open();
+            let rc = sqlite3_create_function(
+                db,
+                c"twice".as_ptr(),
+                1,
+                SQLITE_UTF8,
+                ptr::null_mut(),
+                Some(twice),
+                None,
+                None,
+            );
+            assert_eq!(rc, SQLITE_OK);
+            assert_eq!(query1(db, c"SELECT twice(21)").as_deref(), Some("42"));
+
+            let rc = sqlite3_create_collation(
+                db,
+                c"rev".as_ptr(),
+                SQLITE_UTF8,
+                ptr::null_mut(),
+                Some(reverse),
+            );
+            assert_eq!(rc, SQLITE_OK);
+            exec(
+                db,
+                c"CREATE TABLE t(x TEXT); INSERT INTO t VALUES('a'),('c'),('b')",
+            );
+            let stmt = prepare(db, c"SELECT x FROM t ORDER BY x COLLATE rev");
+            let mut got = String::new();
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                got += &text(stmt, 0).unwrap();
+            }
+            sqlite3_finalize(stmt);
+            assert_eq!(got, "cba");
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_prepare_legacy_with_tail() {
+        unsafe {
+            let db = open();
+            let sql = c"SELECT 1; SELECT 2";
+            let mut stmt = ptr::null_mut();
+            let mut tail = ptr::null();
+            assert_eq!(
+                sqlite3_prepare(db, sql.as_ptr(), -1, &mut stmt, &mut tail),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int(stmt, 0), 1);
+            sqlite3_finalize(stmt);
+            assert_eq!(CStr::from_ptr(tail).to_str().unwrap().trim(), "SELECT 2");
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    static DESTROYED: AtomicI32 = AtomicI32::new(0);
+    unsafe extern "C" fn count_destroy(_p: *mut libc::c_void) {
+        DESTROYED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    unsafe fn bound_text(enc: u8, bytes: &[u8], len: u64) -> Option<String> {
+        let db = open();
+        let stmt = prepare(db, c"SELECT ?1");
+        let rc = sqlite3_bind_text64(stmt, 1, bytes.as_ptr().cast(), len, transient(), enc);
+        assert_eq!(rc, SQLITE_OK);
+        assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+        let r = text(stmt, 0);
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        r
+    }
+
+    #[test]
+    fn test_bind_text64_encodings() {
+        unsafe {
+            let s = "h\u{e9}llo \u{20ac}\u{1f600}";
+            let le: Vec<u8> = s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+            let be: Vec<u8> = s.encode_utf16().flat_map(|u| u.to_be_bytes()).collect();
+            let native: Vec<u8> = s.encode_utf16().flat_map(|u| u.to_ne_bytes()).collect();
+            let got = |enc, b: &[u8]| bound_text(enc, b, b.len() as u64);
+            assert_eq!(got(SQLITE_UTF8 as u8, s.as_bytes()).as_deref(), Some(s));
+            assert_eq!(got(SQLITE_UTF16LE, &le).as_deref(), Some(s));
+            assert_eq!(got(SQLITE_UTF16BE, &be).as_deref(), Some(s));
+            assert_eq!(got(SQLITE_UTF16, &native).as_deref(), Some(s));
+            // An odd trailing byte is ignored.
+            let mut odd = le.clone();
+            odd.push(0x41);
+            assert_eq!(got(SQLITE_UTF16LE, &odd).as_deref(), Some(s));
+            // Explicit length cuts the text (UTF-8 and UTF-16).
+            assert_eq!(
+                bound_text(SQLITE_UTF8 as u8, b"abcdef", 3).as_deref(),
+                Some("abc")
+            );
+            assert_eq!(
+                bound_text(SQLITE_UTF16LE, &le, 4).as_deref(),
+                Some("h\u{e9}")
+            );
+        }
+    }
+
+    #[test]
+    fn test_bind_text64_and_blob64_destructors_and_limits() {
+        unsafe {
+            let db = open();
+            let stmt = prepare(db, c"SELECT ?1");
+            let buf = b"destructor\0";
+            // Too long: SQLITE_TOOBIG, destructor runs immediately, nothing read.
+            DESTROYED.store(0, Ordering::SeqCst);
+            let rc = sqlite3_bind_text64(
+                stmt,
+                1,
+                buf.as_ptr().cast(),
+                2_000_000_000,
+                Some(count_destroy),
+                SQLITE_UTF8 as u8,
+            );
+            assert_eq!(rc, SQLITE_TOOBIG);
+            assert_eq!(DESTROYED.load(Ordering::SeqCst), 1);
+            let rc = sqlite3_bind_blob64(
+                stmt,
+                1,
+                buf.as_ptr().cast(),
+                2_000_000_000,
+                Some(count_destroy),
+            );
+            assert_eq!(rc, SQLITE_TOOBIG);
+            assert_eq!(DESTROYED.load(Ordering::SeqCst), 2);
+            // Success: destructor has run once the statement is finalized.
+            DESTROYED.store(0, Ordering::SeqCst);
+            let rc = sqlite3_bind_text64(
+                stmt,
+                1,
+                buf.as_ptr().cast(),
+                10,
+                Some(count_destroy),
+                SQLITE_UTF8 as u8,
+            );
+            assert_eq!(rc, SQLITE_OK);
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(text(stmt, 0).as_deref(), Some("destructor"));
+            sqlite3_finalize(stmt);
+            assert_eq!(DESTROYED.load(Ordering::SeqCst), 1);
+            // Blob round trip and out-of-range index.
+            let stmt = prepare(db, c"SELECT ?1");
+            let blob = [1u8, 2, 3, 0, 4];
+            assert_eq!(
+                sqlite3_bind_blob64(stmt, 1, blob.as_ptr().cast(), 5, transient()),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_bind_blob64(stmt, 2, blob.as_ptr().cast(), 5, transient()),
+                SQLITE_RANGE
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_type(stmt, 0), 4);
+            assert_eq!(sqlite3_column_bytes(stmt, 0), 5);
+            let p = sqlite3_column_blob(stmt, 0) as *const u8;
+            assert_eq!(std::slice::from_raw_parts(p, 5), &blob);
+            sqlite3_finalize(stmt);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    unsafe extern "C" fn t64(ctx: Ctx, _n: i32, argv: *mut Val) {
+        let mode = sqlite3_value_int(arg(argv, 0));
+        let s = "h\u{e9}llo \u{20ac}";
+        let le: Vec<u8> = s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let be: Vec<u8> = s.encode_utf16().flat_map(|u| u.to_be_bytes()).collect();
+        let native: Vec<u8> = s.encode_utf16().flat_map(|u| u.to_ne_bytes()).collect();
+        // Real destructor: the buffer is released exactly once either way.
+        let heap = |b: &[u8]| {
+            let p = libc::malloc(b.len() + 1) as *mut u8;
+            ptr::copy_nonoverlapping(b.as_ptr(), p, b.len());
+            *p.add(b.len()) = 0;
+            p as *const libc::c_char
+        };
+        unsafe extern "C" fn free_it(p: *mut libc::c_void) {
+            DESTROYED.fetch_add(1, Ordering::SeqCst);
+            libc::free(p);
+        }
+        match mode {
+            1 => sqlite3_result_text64(ctx, heap(s.as_bytes()), s.len() as u64, Some(free_it), 1),
+            2 => sqlite3_result_text64(
+                ctx,
+                heap(&le),
+                le.len() as u64,
+                Some(free_it),
+                SQLITE_UTF16LE,
+            ),
+            3 => sqlite3_result_text64(
+                ctx,
+                heap(&be),
+                be.len() as u64,
+                Some(free_it),
+                SQLITE_UTF16BE,
+            ),
+            4 => sqlite3_result_text64(
+                ctx,
+                heap(&native),
+                native.len() as u64,
+                Some(free_it),
+                SQLITE_UTF16,
+            ),
+            5 => sqlite3_result_text64(ctx, c"static".as_ptr(), 6, None, 1),
+            6 => sqlite3_result_text64(ctx, c"x".as_ptr(), 3_000_000_000, transient(), 1),
+            7 => sqlite3_result_text64(ctx, ptr::null(), 0, None, 1),
+            _ => sqlite3_result_null(ctx),
+        }
+    }
+
+    #[test]
+    fn test_result_text64() {
+        unsafe {
+            let db = open();
+            let rc = sqlite3_create_function(
+                db,
+                c"t64".as_ptr(),
+                1,
+                SQLITE_UTF8,
+                ptr::null_mut(),
+                Some(t64),
+                None,
+                None,
+            );
+            assert_eq!(rc, SQLITE_OK);
+            for mode in 1..=4 {
+                DESTROYED.store(0, Ordering::SeqCst);
+                let sql = CString::new(format!("SELECT t64({mode}), typeof(t64({mode}))")).unwrap();
+                let stmt = prepare(db, &sql);
+                assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+                assert_eq!(
+                    text(stmt, 0).as_deref(),
+                    Some("h\u{e9}llo \u{20ac}"),
+                    "mode {mode}"
+                );
+                assert_eq!(text(stmt, 1).as_deref(), Some("text"));
+                sqlite3_finalize(stmt);
+                assert_eq!(DESTROYED.load(Ordering::SeqCst), 2, "mode {mode}");
+            }
+            assert_eq!(query1(db, c"SELECT t64(5)").as_deref(), Some("static"));
+            assert_eq!(
+                query1(db, c"SELECT typeof(t64(7))").as_deref(),
+                Some("null")
+            );
+            // Over the length limit: the step fails.
+            let stmt = prepare(db, c"SELECT t64(6)");
+            let rc = sqlite3_step(stmt);
+            assert!(rc != SQLITE_ROW && rc != SQLITE_DONE, "rc {rc}");
+            sqlite3_finalize(stmt);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    unsafe extern "C" fn rv(ctx: Ctx, _n: i32, argv: *mut Val) {
+        sqlite3_result_value(ctx, arg(argv, 0));
+    }
+    unsafe extern "C" fn zb(ctx: Ctx, _n: i32, argv: *mut Val) {
+        sqlite3_result_zeroblob(ctx, sqlite3_value_int(arg(argv, 0)));
+    }
+    static ZB64_RC: AtomicI32 = AtomicI32::new(-1);
+    unsafe extern "C" fn zb64(ctx: Ctx, _n: i32, argv: *mut Val) {
+        let n = sqlite3_value_int64(arg(argv, 0)) as u64;
+        ZB64_RC.store(sqlite3_result_zeroblob64(ctx, n), Ordering::SeqCst);
+    }
+    unsafe extern "C" fn nt(ctx: Ctx, _n: i32, argv: *mut Val) {
+        let v = arg(argv, 0);
+        let first = sqlite3_value_numeric_type(v);
+        // The value itself is converted too.
+        assert_eq!(sqlite3_value_type(v), first);
+        sqlite3_result_int(ctx, first);
+    }
+
+    unsafe fn register(
+        db: *mut sqlite3,
+        name: &CStr,
+        n: i32,
+        f: unsafe extern "C" fn(Ctx, i32, *mut Val),
+    ) {
+        let rc = sqlite3_create_function(
+            db,
+            name.as_ptr(),
+            n,
+            SQLITE_UTF8,
+            ptr::null_mut(),
+            Some(f),
+            None,
+            None,
+        );
+        assert_eq!(rc, SQLITE_OK);
+    }
+
+    #[test]
+    fn test_result_value() {
+        unsafe {
+            let db = open();
+            register(db, c"rv", 1, rv);
+            let cases = [
+                (c"SELECT typeof(rv(42)), rv(42)", "integer", "42"),
+                (c"SELECT typeof(rv(1.5)), rv(1.5)", "real", "1.5"),
+                (c"SELECT typeof(rv('txt')), rv('txt')", "text", "txt"),
+                (
+                    c"SELECT typeof(rv(x'0102')), hex(rv(x'0102'))",
+                    "blob",
+                    "0102",
+                ),
+            ];
+            for (sql, ty, v) in cases {
+                let stmt = prepare(db, sql);
+                assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+                assert_eq!(text(stmt, 0).as_deref(), Some(ty), "{sql:?}");
+                assert_eq!(text(stmt, 1).as_deref(), Some(v), "{sql:?}");
+                sqlite3_finalize(stmt);
+            }
+            assert_eq!(
+                query1(db, c"SELECT typeof(rv(NULL))").as_deref(),
+                Some("null")
+            );
+            // Column values of a table work too.
+            exec(db, c"CREATE TABLE t(a); INSERT INTO t VALUES(7),('s')");
+            let stmt = prepare(db, c"SELECT rv(a) FROM t");
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_type(stmt, 0), SQLITE_INTEGER);
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_type(stmt, 0), SQLITE_TEXT);
+            sqlite3_finalize(stmt);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_result_zeroblob() {
+        unsafe {
+            let db = open();
+            register(db, c"zb", 1, zb);
+            register(db, c"zb64", 1, zb64);
+            let stmt = prepare(
+                db,
+                c"SELECT typeof(zb(4)), length(zb(4)), hex(zb(3)), length(zb(-5)), length(zb(0))",
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(text(stmt, 0).as_deref(), Some("blob"));
+            assert_eq!(text(stmt, 1).as_deref(), Some("4"));
+            assert_eq!(text(stmt, 2).as_deref(), Some("000000"));
+            assert_eq!(text(stmt, 3).as_deref(), Some("0"));
+            assert_eq!(text(stmt, 4).as_deref(), Some("0"));
+            sqlite3_finalize(stmt);
+
+            assert_eq!(query1(db, c"SELECT length(zb64(8))").as_deref(), Some("8"));
+            assert_eq!(ZB64_RC.load(Ordering::SeqCst), SQLITE_OK);
+            // Over the length limit: SQLITE_TOOBIG and the step fails.
+            let stmt = prepare(db, c"SELECT zb64(5000000000)");
+            // (Turso reports SQLITE_ERROR where SQLite says SQLITE_TOOBIG.)
+            let rc = sqlite3_step(stmt);
+            assert!(rc != SQLITE_ROW && rc != SQLITE_DONE, "rc {rc}");
+            sqlite3_finalize(stmt);
+            assert_eq!(ZB64_RC.load(Ordering::SeqCst), SQLITE_TOOBIG);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_value_numeric_type() {
+        unsafe {
+            let db = open();
+            register(db, c"nt", 1, nt);
+            let cases: &[(&CStr, i32)] = &[
+                (c"SELECT nt(5)", 1),
+                (c"SELECT nt(1.5)", 2),
+                (c"SELECT nt('12')", 1),
+                (c"SELECT nt('  12  ')", 1),
+                (c"SELECT nt('+7')", 1),
+                (c"SELECT nt('-7')", 1),
+                (c"SELECT nt('1.5')", 2),
+                (c"SELECT nt('.5')", 2),
+                (c"SELECT nt('1.5e3')", 2),
+                (c"SELECT nt('5.0')", 2),
+                (c"SELECT nt('1e3')", 2),
+                (c"SELECT nt('9223372036854775808')", 2),
+                (c"SELECT nt('abc')", 3),
+                (c"SELECT nt('1abc')", 3),
+                (c"SELECT nt('')", 3),
+                (c"SELECT nt('-')", 3),
+                (c"SELECT nt('1e')", 3),
+                (c"SELECT nt('inf')", 3),
+                (c"SELECT nt('nan')", 3),
+                (c"SELECT nt('0x10')", 3),
+                (c"SELECT nt(x'31')", 4),
+                (c"SELECT nt(NULL)", 5),
+            ];
+            for (sql, want) in cases {
+                assert_eq!(
+                    query1(db, sql).as_deref(),
+                    Some(want.to_string().as_str()),
+                    "{sql:?}"
+                );
+            }
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_memory_functions() {
+        unsafe {
+            let p = sqlite3_realloc(ptr::null_mut(), 16) as *mut u8;
+            assert!(!p.is_null());
+            for i in 0..16 {
+                *p.add(i) = i as u8;
+            }
+            let p = sqlite3_realloc64(p.cast(), 4096) as *mut u8;
+            assert!(!p.is_null());
+            for i in 0..16 {
+                assert_eq!(*p.add(i), i as u8);
+            }
+            // Size 0 frees the block and returns NULL.
+            assert!(sqlite3_realloc(p.cast(), 0).is_null());
+            assert!(sqlite3_realloc64(ptr::null_mut(), 0).is_null());
+            // Sizes beyond what can be allocated fail cleanly.
+            assert!(sqlite3_malloc64(u64::MAX).is_null());
+            assert!(sqlite3_realloc64(ptr::null_mut(), u64::MAX).is_null());
+            let p = sqlite3_malloc64(8);
+            assert!(!p.is_null());
+            sqlite3_free(p);
+        }
+    }
+
+    #[test]
+    fn test_sourceid_and_version_symbol() {
+        unsafe {
+            let id = CStr::from_ptr(sqlite3_sourceid()).to_str().unwrap();
+            // "YYYY-MM-DD HH:MM:SS" followed by 64 hex digits.
+            assert_eq!(id.len(), 19 + 1 + 64, "{id}");
+            let (date, hash) = id.split_at(19);
+            let b = date.as_bytes();
+            assert!(b[..4].iter().all(u8::is_ascii_digit) && b[4] == b'-' && b[7] == b'-');
+            assert!(b[10] == b' ' && b[13] == b':' && b[16] == b':');
+            // Builds from patched sources add a suffix like "alt1".
+            assert!(hash[1..].bytes().all(|c| c.is_ascii_alphanumeric()), "{id}");
+            // The exported data symbol matches sqlite3_libversion().
+            let sym = CStr::from_ptr(&sqlite3_version as *const libc::c_char);
+            assert_eq!(sym, CStr::from_ptr(sqlite3_libversion()));
+        }
+    }
+
+    #[test]
+    fn test_keywords() {
+        unsafe {
+            let n = sqlite3_keyword_count();
+            assert!(n > 100, "{n}");
+            let mut seen_select = false;
+            for i in 0..n {
+                let mut name = ptr::null();
+                let mut len = 0;
+                assert_eq!(sqlite3_keyword_name(i, &mut name, &mut len), SQLITE_OK);
+                let word = std::slice::from_raw_parts(name as *const u8, len as usize);
+                assert!(word.iter().all(|c| c.is_ascii_uppercase() || *c == b'_'));
+                assert_eq!(sqlite3_keyword_check(name, len), 1);
+                seen_select |= word == b"SELECT";
+            }
+            assert!(seen_select);
+            let mut name = ptr::null();
+            let mut len = 0;
+            assert_eq!(sqlite3_keyword_name(n, &mut name, &mut len), SQLITE_ERROR);
+            assert_eq!(sqlite3_keyword_name(-1, &mut name, &mut len), SQLITE_ERROR);
+            assert_eq!(sqlite3_keyword_check(c"sElEcT".as_ptr(), 6), 1);
+            assert_eq!(sqlite3_keyword_check(c"selectx".as_ptr(), 6), 1);
+            assert_eq!(sqlite3_keyword_check(c"selectx".as_ptr(), 7), 0);
+            assert_eq!(sqlite3_keyword_check(c"notakeyword".as_ptr(), 11), 0);
+            assert_eq!(sqlite3_keyword_check(c"".as_ptr(), 0), 0);
+        }
+    }
+
+    #[test]
+    fn test_column_origin_name() {
+        unsafe {
+            let db = open();
+            exec(db, c"CREATE TABLE t(a INTEGER, b TEXT)");
+            let stmt = prepare(db, c"SELECT a, b AS bb, a + 1, 'x', t.b FROM t");
+            let name = |i| {
+                let p = sqlite3_column_origin_name(stmt, i);
+                (!p.is_null()).then(|| CStr::from_ptr(p).to_str().unwrap().to_string())
+            };
+            assert_eq!(name(0).as_deref(), Some("a"));
+            assert_eq!(name(1).as_deref(), Some("b"));
+            assert_eq!(name(2), None);
+            assert_eq!(name(3), None);
+            assert_eq!(name(4).as_deref(), Some("b"));
+            assert_eq!(name(5), None);
+            assert_eq!(name(-1), None);
+            // The pointer stays valid and stable until finalize.
+            assert_eq!(
+                sqlite3_column_origin_name(stmt, 1),
+                sqlite3_column_origin_name(stmt, 1)
+            );
+            sqlite3_finalize(stmt);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_stmt_isexplain_and_explain() {
+        unsafe {
+            let db = open();
+            let plain = prepare(db, c"SELECT 1 AS one");
+            let ex = prepare(db, c"EXPLAIN SELECT 1");
+            let eqp = prepare(db, c"EXPLAIN QUERY PLAN SELECT 1");
+            assert_eq!(sqlite3_stmt_isexplain(plain), 0);
+            assert_eq!(sqlite3_stmt_isexplain(ex), 1);
+            assert_eq!(sqlite3_stmt_isexplain(eqp), 2);
+            assert_eq!(sqlite3_stmt_isexplain(ptr::null_mut()), 0);
+            assert_eq!(sqlite3_column_count(ex), 8);
+            assert_eq!(sqlite3_column_count(eqp), 4);
+
+            // Same mode and bad modes.
+            assert_eq!(sqlite3_stmt_explain(plain, 0), SQLITE_OK);
+            assert_eq!(sqlite3_stmt_explain(plain, 3), SQLITE_ERROR);
+            assert_eq!(sqlite3_stmt_explain(plain, -1), SQLITE_ERROR);
+
+            // Normal -> EXPLAIN.
+            assert_eq!(sqlite3_stmt_explain(plain, 1), SQLITE_OK);
+            assert_eq!(sqlite3_stmt_isexplain(plain), 1);
+            assert_eq!(sqlite3_column_count(plain), 8);
+            let mut rows = 0;
+            while sqlite3_step(plain) == SQLITE_ROW {
+                rows += 1;
+                assert!(
+                    text(plain, 1).is_some(),
+                    "row {rows} t0={:?} type1={}",
+                    text(plain, 0),
+                    sqlite3_column_type(plain, 1)
+                );
+            }
+            assert!(rows >= 2, "{rows}");
+            // Finished but not reset: busy, like SQLite.
+            assert_eq!(sqlite3_stmt_explain(plain, 2), SQLITE_BUSY);
+            assert_eq!(sqlite3_reset(plain), SQLITE_OK);
+
+            // EXPLAIN -> EXPLAIN QUERY PLAN -> normal; the query still runs.
+            assert_eq!(sqlite3_stmt_explain(plain, 2), SQLITE_OK);
+            assert_eq!(sqlite3_stmt_isexplain(plain), 2);
+            assert_eq!(sqlite3_column_count(plain), 4);
+            assert_eq!(sqlite3_stmt_explain(plain, 0), SQLITE_OK);
+            assert_eq!(sqlite3_stmt_isexplain(plain), 0);
+            assert_eq!(sqlite3_column_count(plain), 1);
+            assert_eq!(sqlite3_step(plain), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int(plain, 0), 1);
+            assert_eq!(text(plain, 0).as_deref(), Some("1"));
+            // Running statement: busy.
+            assert_eq!(sqlite3_stmt_explain(plain, 1), SQLITE_BUSY);
+
+            // Bindings survive a conversion.
+            let bound = prepare(db, c"SELECT ?1");
+            assert_eq!(sqlite3_bind_int(bound, 1, 77), SQLITE_OK);
+            assert_eq!(sqlite3_stmt_explain(bound, 1), SQLITE_OK);
+            assert_eq!(sqlite3_stmt_explain(bound, 0), SQLITE_OK);
+            assert_eq!(sqlite3_step(bound), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int(bound, 0), 77);
+
+            for s in [plain, ex, eqp, bound] {
+                sqlite3_finalize(s);
+            }
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_misc_leaf_functions() {
+        unsafe {
+            let db = open();
+            assert_eq!(sqlite3_db_release_memory(db), SQLITE_OK);
+            assert_eq!(sqlite3_system_errno(db), 0);
+            // No error yet, so no offset.
+            assert_eq!(sqlite3_error_offset(db), -1);
+            let mut stmt = ptr::null_mut();
+            let rc = sqlite3_prepare_v2(db, c"SELECT 1 +".as_ptr(), -1, &mut stmt, ptr::null_mut());
+            assert_eq!(rc, SQLITE_ERROR);
+            let off = sqlite3_error_offset(db);
+            assert!((-1..=10).contains(&off), "{off}");
+            assert_eq!(sqlite3_enable_shared_cache(1), SQLITE_OK);
+            assert_eq!(sqlite3_enable_shared_cache(0), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+}
