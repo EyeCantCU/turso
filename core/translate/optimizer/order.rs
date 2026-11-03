@@ -391,6 +391,31 @@ pub fn plan_satisfies_order_target(
                     includes_rowid: false,
                 }
             }
+            AccessMethodParams::VirtualTable {
+                candidates,
+                loop_idx,
+            } => {
+                // The table sorted by the ORDER BY it was given; that must be
+                // exactly the rest of the target.
+                let remaining = &order_target.columns[target_col_idx..];
+                let matches_passed = remaining.len() == candidates.order_by.len()
+                    && remaining.iter().zip(&candidates.order_by).all(|(t, o)| {
+                        t.table_id == table_ref.internal_id
+                            && (t.order == SortOrder::Desc) == o.desc
+                            && match t.target {
+                                ColumnTarget::Column(c) => c as i32 == o.column,
+                                ColumnTarget::RowId => o.column == -1,
+                                ColumnTarget::Expr(_) => false,
+                            }
+                    });
+                if !candidates.loops[*loop_idx].order_consumed || !matches_passed {
+                    return false;
+                }
+                OrderConsumption {
+                    consumed: remaining.len(),
+                    includes_rowid: false,
+                }
+            }
             _ => return false,
         };
 

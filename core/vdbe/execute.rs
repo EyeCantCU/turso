@@ -1504,9 +1504,34 @@ pub fn op_vfilter(
             args_reg,
             idx_str,
             idx_num,
+            in_lists,
         },
         insn
     );
+    // IN lists handled all at once: collect each one's values.
+    let mut lists: Vec<Option<Vec<Value>>> = Vec::new();
+    if !in_lists.is_empty() {
+        lists.resize_with(*arg_count, || None);
+        for (arg, list_cursor) in in_lists {
+            let mut values = Vec::new();
+            let cursor = state.get_cursor(*list_cursor).as_btree_mut();
+            return_if_io!(state, cursor.rewind());
+            let mut more = !cursor.is_empty();
+            while more {
+                let cursor = state.get_cursor(*list_cursor).as_btree_mut();
+                if let Some(record) = return_if_io!(state, cursor.record()) {
+                    values.push(match record.get_value_opt(0) {
+                        Some(v) => v.to_owned()?,
+                        None => Value::Null,
+                    });
+                }
+                let cursor = state.get_cursor(*list_cursor).as_btree_mut();
+                return_if_io!(state, cursor.next());
+                more = cursor.has_record();
+            }
+            lists[*arg] = Some(values);
+        }
+    }
     let has_rows = {
         let cursor = get_cursor!(state, *cursor_id);
         let cursor = cursor.as_virtual_mut();
@@ -1519,10 +1544,17 @@ pub fn op_vfilter(
         } else {
             None
         };
-        return_if_io!(
-            state,
-            cursor.filter(*idx_num as i32, idx_str, *arg_count, args)
-        )
+        if lists.is_empty() {
+            return_if_io!(
+                state,
+                cursor.filter(*idx_num as i32, idx_str, *arg_count, args)
+            )
+        } else {
+            return_if_io!(
+                state,
+                cursor.filter_in(*idx_num as i32, idx_str, args, &lists)
+            )
+        }
     };
     // Increment filter_operations metric for virtual table filter
     state.metrics.filter_operations = state.metrics.filter_operations.wrapping_add(1);

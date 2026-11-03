@@ -853,6 +853,9 @@ pub enum Insn {
         args_reg: usize,
         idx_str: Option<usize>,
         idx_num: usize,
+        /// (argument, cursor): IN arguments passed whole, read from the
+        /// ephemeral index of their values.
+        in_lists: Vec<(usize, CursorID)>,
     },
 
     /// Read a column from the current row of the virtual table cursor.

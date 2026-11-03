@@ -25,6 +25,53 @@ pub(super) fn translate_like_base(
     else {
         crate::bail_parse_error!("expected Like expression");
     };
+    // `col LIKE x` on a virtual table column: like(x, col) may be overloaded.
+    let name = match op {
+        ast::LikeOperator::Like => "like",
+        ast::LikeOperator::Glob => "glob",
+        ast::LikeOperator::Match => "match",
+        ast::LikeOperator::Regexp => "regexp",
+    };
+    let arg_count = if escape.is_some() { 3 } else { 2 };
+    let overload = super::translator::vtab_overload(referenced_tables, lhs, arg_count, name);
+    let on_vtab = matches!(lhs.as_ref(), ast::Expr::Column { table, .. }
+        if referenced_tables
+            .and_then(|t| t.find_table_by_internal_id(*table))
+            .is_some_and(|(_, t)| matches!(t, crate::schema::Table::Virtual(_))));
+    if let Some(func) = overload {
+        let start_reg = program.alloc_registers(arg_count);
+        translate_expr(program, referenced_tables, rhs, start_reg, resolver)?;
+        translate_expr(program, referenced_tables, lhs, start_reg + 1, resolver)?;
+        if let Some(escape) = escape {
+            translate_expr(program, referenced_tables, escape, start_reg + 2, resolver)?;
+        }
+        program.emit_insn(Insn::Function {
+            constant_mask: 0,
+            start_reg,
+            dest: target_register,
+            func: FuncCtx {
+                func,
+                arg_count,
+                collation: CollationSeq::BINARY,
+            },
+        });
+        return Ok(target_register);
+    }
+    if on_vtab && *op == ast::LikeOperator::Match {
+        // SQLite's built-in match() fails when it runs.
+        program.emit_insn(Insn::Halt {
+            constraint_info: None,
+            err_code: crate::error::SQLITE_ERROR,
+            description: "unable to use function MATCH in the requested context".to_string(),
+            on_error: None,
+            description_reg: None,
+        });
+        program.emit_insn(Insn::Null {
+            dest: target_register,
+            dest_end: None,
+        });
+        return Ok(target_register);
+    }
     match op {
         ast::LikeOperator::Like | ast::LikeOperator::Glob => {
             let arg_count = if escape.is_some() { 3 } else { 2 };

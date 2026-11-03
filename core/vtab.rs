@@ -275,16 +275,36 @@ impl VirtualTable {
         }
     }
 
-    pub(crate) fn best_index(
+    /// SQLite's full xBestIndex; tables without one go through `best_index`.
+    pub(crate) fn best_index_plan(
         &self,
-        constraints: &[ConstraintInfo],
-        order_by: &[OrderByInfo],
-    ) -> Result<IndexInfo, ResultCode> {
+        req: &crate::native_ext::IndexRequest,
+    ) -> crate::Result<Option<crate::native_ext::IndexPlan>> {
         match &self.vtab_type {
-            VirtualTableType::Pragma(table) => table.best_index(constraints),
-            VirtualTableType::External(table) => table.best_index(constraints, order_by),
-            VirtualTableType::Internal(table) => table.read().best_index(constraints, order_by),
+            VirtualTableType::Pragma(table) => {
+                crate::native_ext::best_index_via_legacy(req, |c, _| table.best_index(c))
+            }
+            VirtualTableType::External(table) => table.best_index_plan(req),
+            VirtualTableType::Internal(table) => {
+                crate::native_ext::best_index_via_legacy(req, |c, o| table.read().best_index(c, o))
+            }
         }
+    }
+
+    /// xFindFunction for a function whose first argument is a column of this table.
+    pub(crate) fn find_function(
+        &self,
+        n_arg: i32,
+        name: &str,
+    ) -> Option<(i32, Arc<crate::function::ExternalFunc>)> {
+        match &self.vtab_type {
+            VirtualTableType::External(table) => table.find_function(n_arg, name),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn find_function_op(&self, n_arg: i32, name: &str) -> Option<i32> {
+        self.find_function(n_arg, name).map(|(op, _)| op)
     }
 
     pub(crate) fn begin(&self) -> crate::Result<()> {
@@ -442,6 +462,26 @@ impl VirtualTableCursor {
             }
         };
         result.map(IOResult::Done).map_err(Into::into)
+    }
+
+    /// `filter` where some arguments are IN lists handled all at once.
+    pub(crate) fn filter_in(
+        &mut self,
+        idx_num: i32,
+        idx_str: Option<String>,
+        args: crate::alloc::Vec<Value>,
+        in_lists: &[Option<Vec<Value>>],
+    ) -> IOResultOr<bool> {
+        match &mut self.inner {
+            VirtualTableCursorInner::External(cursor) => {
+                self.null_flag = false;
+                cursor.filter_in(idx_num, idx_str, args, in_lists)
+            }
+            _ => {
+                let n = args.len();
+                self.filter(idx_num, idx_str, n, args)
+            }
+        }
     }
 
     pub(crate) fn vtab_id(&self) -> Option<u64> {

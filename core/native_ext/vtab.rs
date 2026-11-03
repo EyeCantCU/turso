@@ -1,5 +1,6 @@
-use super::{ConstraintInfo, ExtensionState, IndexInfo, OrderByInfo};
+use super::{ConstraintInfo, ExtensionState, IndexInfo, IndexPlan, IndexRequest, OrderByInfo};
 use crate::alloc::TryClone;
+use crate::function::ExternalFunc;
 use crate::sync::{Arc, RwLock};
 use crate::types::IOResultOr;
 use crate::{Connection, IOResult, LimboError, Result, Value};
@@ -46,6 +47,17 @@ pub trait VirtualTable: Debug + Send + Sync {
         constraints: &[ConstraintInfo],
         order_by: &[OrderByInfo],
     ) -> Result<IndexInfo, ResultCode>;
+    /// SQLite's full xBestIndex; `Ok(None)` is SQLITE_CONSTRAINT. The default
+    /// runs `best_index`.
+    fn best_index_plan(&self, req: &IndexRequest) -> Result<Option<IndexPlan>> {
+        super::index::best_index_via_legacy(req, |c, o| self.best_index(c, o))
+    }
+    /// xFindFunction: an overload of `name`, called with `n_arg` arguments
+    /// whose first is a column of this table, and its code (1, or a
+    /// constraint op of at least 150).
+    fn find_function(&self, _n_arg: i32, _name: &str) -> Option<(i32, Arc<ExternalFunc>)> {
+        None
+    }
     fn readonly(&self) -> bool {
         true
     }
@@ -94,6 +106,17 @@ pub trait VirtualTable: Debug + Send + Sync {
 
 pub trait VirtualTableCursor: Send + Sync {
     fn filter(&mut self, args: &[Value], idx_str: Option<&str>, idx_num: i32) -> IOResultOr<bool>;
+    /// Like `filter`; `in_lists[i]` holds the values of argument `i` when it
+    /// is an IN handled all at once.
+    fn filter_in(
+        &mut self,
+        args: &[Value],
+        _in_lists: &[Option<Vec<Value>>],
+        idx_str: Option<&str>,
+        idx_num: i32,
+    ) -> IOResultOr<bool> {
+        self.filter(args, idx_str, idx_num)
+    }
     fn next(&mut self) -> IOResultOr<bool>;
     fn column(&mut self, column: usize) -> IOResultOr<Value>;
     fn rowid(&self) -> i64;
@@ -132,12 +155,12 @@ impl NativeTable {
         self.0.read().readonly()
     }
 
-    pub(crate) fn best_index(
-        &self,
-        constraints: &[ConstraintInfo],
-        order_by: &[OrderByInfo],
-    ) -> Result<IndexInfo, ResultCode> {
-        self.0.read().best_index(constraints, order_by)
+    pub(crate) fn best_index_plan(&self, req: &IndexRequest) -> Result<Option<IndexPlan>> {
+        self.0.read().best_index_plan(req)
+    }
+
+    pub(crate) fn find_function(&self, n_arg: i32, name: &str) -> Option<(i32, Arc<ExternalFunc>)> {
+        self.0.read().find_function(n_arg, name)
     }
 
     pub(crate) fn open(&self, connection: Arc<Connection>, vtab_id: u64) -> Result<NativeCursor> {
@@ -213,11 +236,8 @@ impl NativeTable {
 
 trait TableInstance: Debug + Send + Sync {
     fn open(&self, connection: Arc<Connection>) -> Result<Box<dyn VirtualTableCursor>>;
-    fn best_index(
-        &self,
-        constraints: &[ConstraintInfo],
-        order_by: &[OrderByInfo],
-    ) -> Result<IndexInfo, ResultCode>;
+    fn best_index_plan(&self, req: &IndexRequest) -> Result<Option<IndexPlan>>;
+    fn find_function(&self, n_arg: i32, name: &str) -> Option<(i32, Arc<ExternalFunc>)>;
     fn readonly(&self) -> bool;
     fn create_update_on_conflict(
         &mut self,
@@ -240,12 +260,12 @@ impl<T: VirtualTable> TableInstance for T {
         Ok(Box::new(VirtualTable::open(self, connection)?))
     }
 
-    fn best_index(
-        &self,
-        constraints: &[ConstraintInfo],
-        order_by: &[OrderByInfo],
-    ) -> Result<IndexInfo, ResultCode> {
-        VirtualTable::best_index(self, constraints, order_by)
+    fn best_index_plan(&self, req: &IndexRequest) -> Result<Option<IndexPlan>> {
+        VirtualTable::best_index_plan(self, req)
+    }
+
+    fn find_function(&self, n_arg: i32, name: &str) -> Option<(i32, Arc<ExternalFunc>)> {
+        VirtualTable::find_function(self, n_arg, name)
     }
 
     fn readonly(&self) -> bool {
