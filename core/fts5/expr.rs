@@ -969,6 +969,12 @@ impl Evaluator {
                                 Detail::None => std::mem::take(pl),
                             };
                         }
+                        // A merged prefix scan (no prefix index) skips rows
+                        // whose filtered list is empty, as SQLite's
+                        // SKIPEMPTY prefix iterator does.
+                        if term.prefix && !has_prefix_index(index, alt) {
+                            dl.retain(|(_, pl)| !pl.is_empty());
+                        }
                     }
                     iters.push(TermIter {
                         entries: std::sync::Arc::new(dl),
@@ -1658,6 +1664,12 @@ fn near_match(lists: &mut [Vec<i64>], sizes: &[usize], near: i32) -> bool {
         *l = o;
     }
     ok
+}
+
+/// Whether a prefix query for `token` is served by a prefix index.
+fn has_prefix_index(index: &Index, token: &[u8]) -> bool {
+    let nchar = char_len(token);
+    index.cfg.prefixes.contains(&nchar)
 }
 
 /// The doclist of a query token (prefix-aware), using a prefix index when

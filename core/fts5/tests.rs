@@ -517,6 +517,18 @@ fn compare_script(stmts: &[&str]) {
     }
 }
 
+// A prefix scan with a column filter skips rows where the filtered list is
+// empty; otherwise a stale nomatch row clears sibling phrase poslists.
+#[test]
+fn fts5_prefix_colset_skips_empty_rows() {
+    compare_script(&[
+        "CREATE VIRTUAL TABLE t USING fts5(a, b, detail=column)",
+        "INSERT INTO t(rowid, a, b) VALUES(10, 'betamax', 'phi'), (12, 'x', 'phi nu'), (14, 'y', 'beta phi')",
+        "SELECT rowid, highlight(t, 1, '[', ']'), bm25(t) FROM t WHERE t MATCH '((b:bet* OR b:nu) AND phi) NOT zzzz' ORDER BY rowid",
+        "SELECT rowid FROM t WHERE t MATCH 'b:bet*' ORDER BY rowid",
+    ]);
+}
+
 #[test]
 fn fts5_external_content() {
     compare_script(&[

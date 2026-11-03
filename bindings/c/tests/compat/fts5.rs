@@ -144,11 +144,14 @@ extern "C" {
         ty: *const c_char,
         d: Option<unsafe extern "C" fn(*mut c_void)>,
     ) -> c_int;
-    fn sqlite3_result_text(ctx: *mut c_void, s: *const c_char, n: c_int, d: isize);
+    fn sqlite3_result_text(
+        ctx: *mut c_void,
+        s: *const c_char,
+        n: c_int,
+        d: Option<unsafe extern "C" fn(*mut c_void)>,
+    );
     fn sqlite3_result_error(ctx: *mut c_void, s: *const c_char, n: c_int);
 }
-
-const SQLITE_TRANSIENT: isize = -1;
 
 unsafe fn fts5_api_of(db: *mut sqlite3) -> *mut fts5_api {
     let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
@@ -351,7 +354,9 @@ unsafe extern "C" fn rowinfo(
     *calls += 1;
     out += &format!("call={}", *calls);
     let c = CString::new(out).unwrap();
-    sqlite3_result_text(sctx, c.as_ptr(), -1, SQLITE_TRANSIENT);
+    // SQLITE_TRANSIENT is the destructor value -1.
+    let transient = std::mem::transmute::<isize, Option<unsafe extern "C" fn(*mut c_void)>>(-1);
+    sqlite3_result_text(sctx, c.as_ptr(), -1, transient);
 }
 
 unsafe extern "C" fn failing(
