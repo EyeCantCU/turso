@@ -295,10 +295,10 @@ pub unsafe extern "C" fn sqlite3_set_errmsg(
     }
     let mut inner = (*db).inner.lock().unwrap();
     if msg.is_null() {
-        set_db_err_code(&mut *inner, errcode);
+        set_db_err_code(&mut inner, errcode);
     } else {
         let msg = CStr::from_ptr(msg).to_string_lossy();
-        set_db_err_msg(&mut *inner, errcode, &msg);
+        set_db_err_msg(&mut inner, errcode, &msg);
     }
     SQLITE_OK
 }
