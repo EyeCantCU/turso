@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tracing::trace;
 use turso_core::dialect::sqlite::{SQLITE_VERSION, SQLITE_VERSION_NUMBER};
+mod errmsg;
 use turso_core::SqliteDialect;
 use turso_core::{CheckpointMode, ConnectOpts, DatabaseOpts, LimboError, Value};
 use turso_ext::ScalarFunction;
@@ -1118,7 +1119,7 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
             return SQLITE_OK;
         }
         Err(err) => {
-            return set_db_err(&mut db, err);
+            return set_db_err_sql(&mut db, err, Some(sql_str));
         }
     };
     if !tail.is_null() {
@@ -3728,7 +3729,12 @@ pub unsafe extern "C" fn sqlite3_table_column_metadata(
 }
 
 fn limbo_err_code(err: &LimboError) -> i32 {
+    if let Some(code) = errmsg::extended_code(err) {
+        return code;
+    }
     match err {
+        LimboError::Constraint(m) if m == "datatype mismatch" => SQLITE_MISMATCH,
+        LimboError::TooBig => SQLITE_TOOBIG,
         LimboError::Corrupt(..) => SQLITE_CORRUPT,
         LimboError::NotADB => SQLITE_NOTADB,
         // A Raise is a constraint error that carries its own conflict
@@ -3755,7 +3761,7 @@ fn limbo_err_code(err: &LimboError) -> i32 {
 fn handle_limbo_err(err: LimboError, container: *mut *mut ffi::c_char) -> i32 {
     let code = limbo_err_code(&err);
     if !container.is_null() {
-        let err_msg = format!("{err}");
+        let err_msg = errmsg::message(&err, None);
         unsafe { *container = CString::new(err_msg).unwrap().into_raw() };
     }
     code
@@ -3763,7 +3769,12 @@ fn handle_limbo_err(err: LimboError, container: *mut *mut ffi::c_char) -> i32 {
 
 /// Store a LimboError on the database handle, returning the SQLite error code.
 unsafe fn set_db_err(db: &mut sqlite3Inner, err: LimboError) -> i32 {
-    set_db_err_msg(db, limbo_err_code(&err), &format!("{err}"))
+    set_db_err_sql(db, err, None)
+}
+
+/// Like `set_db_err`; `sql` lets lexer errors quote the whole bad token.
+unsafe fn set_db_err_sql(db: &mut sqlite3Inner, err: LimboError, sql: Option<&str>) -> i32 {
+    set_db_err_msg(db, limbo_err_code(&err), &errmsg::message(&err, sql)) & db.err_mask
 }
 
 unsafe fn set_db_err_msg(db: &mut sqlite3Inner, code: i32, err_msg: &str) -> i32 {
