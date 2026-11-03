@@ -363,6 +363,35 @@ assert_eq "load_static_extension csv registers the csv module" {1 2 3} \
     }]
 
 # ---------------------------------------------------------------------------
+# Hooks and the authorizer
+# ---------------------------------------------------------------------------
+
+# [db busy] must not install anything else (it once fell into [db authorizer]).
+proc busy_probe {n} { return 0 }
+db busy busy_probe
+assert_eq "db busy leaves no authorizer" {} [db authorizer]
+assert_eq "statements run after db busy" 3 [db one {SELECT 1 + 2}]
+
+set ::hook_log {}
+proc auth_probe {code a1 a2 a3 a4} {
+    if {$code eq "SQLITE_READ"} { lappend ::hook_log "$code $a1 $a2" }
+    return SQLITE_OK
+}
+db eval {CREATE TABLE auth_probe_t(x)}
+db authorizer auth_probe
+db eval {SELECT x FROM auth_probe_t}
+db authorizer {}
+assert_eq "db authorizer reports column reads" {{SQLITE_READ auth_probe_t x}} $::hook_log
+assert_eq "db authorizer {} clears it" {} [db authorizer]
+
+set ::hook_log {}
+proc update_probe {op dbn tbl rowid} { lappend ::hook_log "$op $dbn.$tbl $rowid" }
+db update_hook update_probe
+db eval {INSERT INTO auth_probe_t VALUES(1)}
+db update_hook {}
+assert_eq "db update_hook fires" {{INSERT main.auth_probe_t 1}} $::hook_log
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
