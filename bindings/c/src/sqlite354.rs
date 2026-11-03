@@ -3,12 +3,11 @@
 //! sqlite3_str_truncate/free and sqlite3_result_str, sqlite3_limit (with the
 //! 3.53/3.54 limit ids) and SQLITE_DBCONFIG_FP_DIGITS.
 
-use std::collections::HashMap;
 use std::ffi::{self, CStr};
-use std::sync::{Mutex, Weak};
+use turso_macros::capi_guard;
 
 use crate::{
-    set_db_err_code, set_db_err_msg, sqlite3, sqlite3_result_error_nomem,
+    misc, set_db_err_code, set_db_err_msg, sqlite3, sqlite3_result_error_nomem,
     sqlite3_result_error_toobig, SqliteContext, SQLITE_ERROR, SQLITE_MISUSE, SQLITE_NOMEM,
     SQLITE_OK, SQLITE_STATE_BUSY, SQLITE_STATE_OPEN, SQLITE_TOOBIG,
 };
