@@ -214,7 +214,7 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
             } else {
                 // Handle as a string literal otherwise
                 // Escape backslashes first, then double quotes
-                let mut str = text.replace('\\', "\\\\").replace('"', "\\\"");
+                let mut str = text.as_str().replace('\\', "\\\\").replace('"', "\\\"");
                 // Quote the string to make it a JSON string
                 str.insert(0, '"');
                 str.push('"');
@@ -1079,7 +1079,7 @@ pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
                 return Ok(value.to_owned()?);
             }
 
-            let mut escaped_value = String::with_capacity(t.value.len() + 4);
+            let mut escaped_value = String::with_capacity(t.as_str().len() + 4);
             escaped_value.push('"');
 
             for c in t.as_str().chars() {

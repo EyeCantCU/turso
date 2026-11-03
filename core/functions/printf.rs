@@ -1076,7 +1076,7 @@ fn format_string(output: &mut String, value: &Value, spec: &FormatSpec) {
 fn format_char(output: &mut String, value: &Value, spec: &FormatSpec) {
     // In SQLite SQL context, %c takes the first character of the string representation
     let c = match value {
-        Value::Text(t) => t.value.chars().next().unwrap_or('\0'),
+        Value::Text(t) => t.as_str().chars().next().unwrap_or('\0'),
         _ => {
             let s = coerce_to_string(value);
             s.chars().next().unwrap_or('\0')

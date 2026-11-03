@@ -2933,7 +2933,8 @@ impl Schema {
                         ValueRef::Text(sql) => Some(sql),
                         _ => None,
                     };
-                    let sql = sql_textref.map(|s| s.as_str());
+                    let sql = sql_textref.map(|s| s.to_str_lossy());
+                    let sql = sql.as_deref();
 
                     let acc = state
                         .accumulators
@@ -2945,9 +2946,9 @@ impl Schema {
                     // maps to `Some(INVALID_DB_ID)` until a connection-scoped
                     // reparse runs with a real resolver.
                     self.handle_schema_row(
-                        &ty,
-                        &name,
-                        &table_name,
+                        &ty.to_str_lossy(),
+                        &name.to_str_lossy(),
+                        &table_name.to_str_lossy(),
                         root_page,
                         sql,
                         syms,

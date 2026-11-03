@@ -94,7 +94,7 @@ fn normalized_first_key(values: &[ValueRef<'_>], key_info: &[KeyInfo]) -> (u64, 
                 // Non-binary collation: constant key, always full comparison.
                 (2u64 << NORM_CLASS_SHIFT, false)
             } else {
-                let bytes = t.value.as_bytes();
+                let bytes = t.as_bytes();
                 (normalized_prefix(2, bytes), bytes.len() <= 7)
             }
         }

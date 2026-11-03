@@ -98,9 +98,7 @@ impl Row {
                 Ok(Value::Real(f64::from(*f)))
             }
             turso_sdk_kit::rsapi::Value::Null => Ok(Value::Null),
-            turso_sdk_kit::rsapi::Value::Text(text) => {
-                Ok(Value::Text(text.value.clone().into_owned()))
-            }
+            turso_sdk_kit::rsapi::Value::Text(text) => Ok(Value::Text(text.as_str().to_string())),
             turso_sdk_kit::rsapi::Value::Blob(items) => Ok(Value::Blob(items.to_vec())),
         }
     }

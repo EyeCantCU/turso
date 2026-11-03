@@ -157,7 +157,7 @@ fn hash_sqlite_value<H: Hasher>(value: ValueRef, state: &mut H) {
         }
         ValueRef::Text(text) => {
             2u8.hash(state);
-            text.as_str().hash(state);
+            text.as_bytes().hash(state);
         }
         ValueRef::Blob(blob) => {
             3u8.hash(state);

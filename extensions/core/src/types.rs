@@ -133,6 +133,8 @@ union ValueData {
 enum TextSubtype {
     Text,
     Json,
+    /// Text whose bytes are not valid UTF-8.
+    Bytes,
 }
 
 impl std::fmt::Debug for Value {
@@ -193,12 +195,16 @@ impl TextValue {
     }
 
     fn new_boxed(s: String, sub: TextSubtype) -> Box<Self> {
+        Self::new_boxed_bytes(s.into_bytes(), sub)
+    }
+
+    fn new_boxed_bytes(s: Vec<u8>, sub: TextSubtype) -> Box<Self> {
         let len = s.len();
         // Store the text with a trailing NUL (len + 1 bytes) so the pointer handed to
         // C via sqlite3_value_text is a valid NUL-terminated string, as the SQLite API
         // contract requires (#7982). `len` still counts only the text, so as_str() /
         // to_text() are unchanged.
-        let mut buffer = s.into_bytes();
+        let mut buffer = s;
         buffer.push(0);
         let strbox = Box::into_raw(buffer.into_boxed_slice());
         Box::new(Self {
@@ -218,13 +224,24 @@ impl TextValue {
         }
     }
 
-    fn as_str(&self) -> &str {
+    fn as_bytes(&self) -> &[u8] {
         if self.text.is_null() {
-            return "";
+            return &[];
         }
-        unsafe {
-            std::str::from_utf8_unchecked(std::slice::from_raw_parts(self.text, self.len as usize))
+        unsafe { std::slice::from_raw_parts(self.text, self.len as usize) }
+    }
+
+    /// The text, or for invalid UTF-8 its longest valid prefix.
+    fn as_str(&self) -> &str {
+        let bytes = self.as_bytes();
+        if self._type == TextSubtype::Bytes {
+            let valid = match std::str::from_utf8(bytes) {
+                Ok(_) => bytes.len(),
+                Err(e) => e.valid_up_to(),
+            };
+            return unsafe { std::str::from_utf8_unchecked(&bytes[..valid]) };
         }
+        unsafe { std::str::from_utf8_unchecked(bytes) }
     }
 }
 
@@ -325,6 +342,26 @@ impl Value {
             } else {
                 None
             }
+        }
+    }
+
+    /// Returns the exact bytes of a text value (which need not be UTF-8)
+    pub fn to_text_bytes(&self) -> Option<&[u8]> {
+        unsafe {
+            if self.value_type == ValueType::Text && !self.value.text.is_null() {
+                Some((*self.value.text).as_bytes())
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Whether a text value's bytes are valid UTF-8 (so `to_text` is exact)
+    pub fn is_text_utf8(&self) -> bool {
+        unsafe {
+            self.value_type == ValueType::Text
+                && !self.value.text.is_null()
+                && (*self.value.text)._type != TextSubtype::Bytes
         }
     }
 
@@ -459,6 +496,20 @@ impl Value {
     pub fn from_text(s: String) -> Self {
         let txt_value = TextValue::new_boxed(s, TextSubtype::Text);
         let ptr = Box::into_raw(txt_value);
+        Self {
+            value_type: ValueType::Text,
+            value: ValueData { text: ptr },
+        }
+    }
+
+    /// Creates a new text Value from bytes that need not be valid UTF-8
+    pub fn from_text_bytes(bytes: Vec<u8>) -> Self {
+        let sub = if std::str::from_utf8(&bytes).is_ok() {
+            TextSubtype::Text
+        } else {
+            TextSubtype::Bytes
+        };
+        let ptr = Box::into_raw(TextValue::new_boxed_bytes(bytes, sub));
         Self {
             value_type: ValueType::Text,
             value: ValueData { text: ptr },
