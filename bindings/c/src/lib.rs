@@ -348,8 +348,11 @@ pub struct SqliteContext {
 // SAFETY: SqliteContext is only used single-threaded within a function call.
 unsafe impl Send for SqliteContext {}
 
+// Callbacks into application code are "C-unwind": a foreign exception
+// thrown by one is defined behaviour up to the bridge, whose "C" boundary
+// then aborts the process instead of unwinding through the engine.
 struct FuncSlot {
-    x_func: unsafe extern "C" fn(*mut ffi::c_void, ffi::c_int, *mut *mut ffi::c_void),
+    x_func: unsafe extern "C-unwind" fn(*mut ffi::c_void, ffi::c_int, *mut *mut ffi::c_void),
     p_app: usize,   // *mut c_void stored as usize for Send
     destroy: usize, // Option<unsafe extern "C" fn(*mut c_void)> stored as usize for Send
     name: String,
@@ -482,6 +485,8 @@ static FUNC_BRIDGES: [ScalarFunction; MAX_CUSTOM_FUNCS] = [
 ];
 
 // ===== End custom function infrastructure =====
+
+mod reentrancy;
 
 static INIT_DONE: std::sync::Once = std::sync::Once::new();
 
@@ -1180,6 +1185,7 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> ffi::c_int
         return SQLITE_MISUSE;
     }
     let stmt_ref = &mut *stmt;
+    let _scope = reentrancy::StepScope::cleanup(stmt_ref);
 
     // first, finalize any execution if it was unfinished
     // (for example, many drivers can consume just one row and finalize statement after that, while there still can be work to do)
@@ -1225,6 +1231,7 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     // Nothing here needs the lock while stepping: core's Connection is
     // internally synchronized, and the statement itself was never protected
     // by the handle lock to begin with.
+    let _scope = reentrancy::StepScope::step(stmt);
     let res = stmt.stmt.run_one_step_blocking(|| Ok(()), || Ok(()));
     let rc = match res {
         Ok(Some(_)) => {
@@ -1252,7 +1259,7 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
 }
 
 type exec_callback = Option<
-    unsafe extern "C" fn(
+    unsafe extern "C-unwind" fn(
         context: *mut ffi::c_void,
         n_column: ffi::c_int,
         argv: *mut *mut ffi::c_char,
@@ -1354,6 +1361,7 @@ pub unsafe extern "C" fn sqlite3_reset(stmt: *mut sqlite3_stmt) -> ffi::c_int {
         return SQLITE_OK;
     }
     let stmt = &mut *stmt;
+    let _scope = reentrancy::StepScope::cleanup(stmt);
     // first, finalize any execution if it was unfinished
     // (for example, many drivers can consume just one row and finalize statement after that, while there still can be work to do)
     // (this is necessary because queries like INSERT INTO t VALUES (1), (2), (3) RETURNING id return values within a transaction)
@@ -2556,7 +2564,7 @@ impl TabResult {
 }
 
 #[no_mangle]
-unsafe extern "C" fn sqlite_get_table_cb(
+unsafe extern "C-unwind" fn sqlite_get_table_cb(
     context: *mut ffi::c_void,
     n_column: ffi::c_int,
     argv: *mut *mut ffi::c_char,
@@ -3099,7 +3107,7 @@ pub unsafe extern "C" fn sqlite3_create_collation_v2(
     SQLITE_OK
 }
 
-type CollationCompareFn = unsafe extern "C" fn(
+type CollationCompareFn = unsafe extern "C-unwind" fn(
     *mut ffi::c_void,
     ffi::c_int,
     *const ffi::c_void,
@@ -3158,7 +3166,7 @@ pub unsafe extern "C" fn sqlite3_create_function_v2(
         None => return SQLITE_OK,
     };
     // Cast the opaque fn() pointer to the real scalar callback signature.
-    let x_func: unsafe extern "C" fn(*mut ffi::c_void, ffi::c_int, *mut *mut ffi::c_void) =
+    let x_func: unsafe extern "C-unwind" fn(*mut ffi::c_void, ffi::c_int, *mut *mut ffi::c_void) =
         std::mem::transmute(x_func_raw);
 
     let func_name = match CStr::from_ptr(name).to_str() {

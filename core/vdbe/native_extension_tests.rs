@@ -2633,3 +2633,92 @@ unsafe extern "C" fn c_double(
     let value = unsafe { &*argv }.to_integer().unwrap();
     turso_ext::Value::from_integer(value * 2)
 }
+
+/// Runs its SQL argument as a root statement on the calling connection, the
+/// way the C API runs a statement from inside a user function. With
+/// `nested`, it first enters nested mode while a writer is active.
+#[derive(Debug)]
+struct RunRoot {
+    nested: bool,
+}
+
+impl ScalarFunction for RunRoot {
+    type Call = RunRootCall;
+
+    fn create_call(&self) -> Result<Self::Call> {
+        Ok(RunRootCall {
+            nested: self.nested,
+        })
+    }
+}
+
+struct RunRootCall {
+    nested: bool,
+}
+
+impl ScalarCall for RunRootCall {
+    type Output = Value;
+
+    fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
+        let sql = args[0].get_value().to_text().unwrap().to_string();
+        let nested = self.nested && connection.has_active_write();
+        if nested {
+            connection.start_nested();
+        }
+        let result = connection
+            .prepare(sql)
+            .and_then(|mut stmt| stmt.run_collect_rows());
+        if nested {
+            connection.end_nested();
+        }
+        Ok(IOResult::Done(Value::from_i64(result?.len() as i64)))
+    }
+}
+
+#[test]
+fn root_statement_from_trigger_function_joins_the_outer_writer_when_nested() {
+    for nested in [false, true] {
+        let conn = connection(
+            OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+                ExternalFunc::new_native_scalar(
+                    "run_root".into(),
+                    FunctionArity::Exact(1),
+                    false,
+                    RunRoot { nested },
+                )
+                .unwrap(),
+            ),
+        );
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("CREATE TABLE log(x)").unwrap();
+        conn.execute(
+            "CREATE TRIGGER t_del AFTER DELETE ON t BEGIN \
+             SELECT run_root('INSERT INTO log SELECT count(*) FROM t'); END",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+        assert!(!conn.has_active_write());
+        let result = conn.execute("DELETE FROM t WHERE id = 1");
+        assert!(!conn.has_active_write());
+        assert!(!conn.is_nested_stmt());
+        let log = conn
+            .prepare("SELECT x FROM log")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        if nested {
+            result.unwrap();
+            // The nested insert ran inside the DELETE and saw its change.
+            assert_eq!(log, vec![vec![Value::from_i64(1)]]);
+        } else {
+            // A second top-level writer on the connection is refused.
+            assert!(matches!(
+                result.unwrap_err(),
+                LimboError::StatementsInProgress(_)
+            ));
+            assert!(log.is_empty());
+        }
+        assert!(conn.get_auto_commit());
+    }
+}
