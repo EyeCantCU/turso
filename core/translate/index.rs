@@ -778,9 +778,6 @@ pub fn translate_reindex(
                 "REINDEX is not supported for custom index methods without a backing btree"
             );
         }
-        if !table.has_rowid {
-            bail_parse_error!("REINDEX on WITHOUT ROWID tables is not supported");
-        }
         let index_cursor_id = program.alloc_cursor_index(None, &index)?;
         emit_refill_index(
             program,

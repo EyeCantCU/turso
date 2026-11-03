@@ -2322,16 +2322,28 @@ impl ProgramBuilder {
         self.preassign_label_to_next_insn(loop_start);
 
         let rowid = self.alloc_register();
+        // A WITHOUT ROWID table has no rowid; its rows are keyed by the record.
+        let without_rowid = matches!(
+            self.cursor_ref.get(cursor_id),
+            Some((_, CursorType::BTreeTable(t))) if !t.has_rowid
+        );
 
-        self.emit_insn(Insn::RowId {
-            cursor_id,
-            dest: rowid,
-        });
+        if without_rowid {
+            self.emit_insn(Insn::Null {
+                dest: rowid,
+                dest_end: None,
+            });
+        } else {
+            self.emit_insn(Insn::RowId {
+                cursor_id,
+                dest: rowid,
+            });
 
-        self.emit_insn(Insn::IsNull {
-            reg: rowid,
-            target_pc: loop_end,
-        });
+            self.emit_insn(Insn::IsNull {
+                reg: rowid,
+                target_pc: loop_end,
+            });
+        }
 
         let result = f(self, rowid);
 
