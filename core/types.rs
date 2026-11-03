@@ -105,6 +105,7 @@ pub enum TextRepr {
 #[derive(Clone)]
 pub struct Text {
     buf: Cow<'static, [u8]>,
+    /// Lossy repr: length of the raw bytes (where the lossy view starts). Always 0 for Utf8.
     raw_len: u32,
     pub subtype: TextSubtype,
     repr: TextRepr,
@@ -275,13 +276,13 @@ impl Text {
     }
 
     /// The UTF-8 view of `buf` under this value's repr.
+    #[inline(always)]
     fn as_str_of<'b>(&self, buf: &'b [u8]) -> &'b str {
-        let bytes = match self.repr {
-            TextRepr::Utf8 => buf,
-            _ => &buf[self.raw_len as usize..],
-        };
-        // SAFETY: Utf8 buffers and the lossy view are valid UTF-8.
-        unsafe { std::str::from_utf8_unchecked(bytes) }
+        turso_debug_assert!(self.repr != TextRepr::Utf8 || self.raw_len == 0);
+        turso_debug_assert!(self.raw_len as usize <= buf.len());
+        // SAFETY: raw_len is 0 for Utf8 values and the start of the lossy view
+        // otherwise, so the slice is in bounds and valid UTF-8.
+        unsafe { std::str::from_utf8_unchecked(buf.get_unchecked(self.raw_len as usize..)) }
     }
 
     /// Appends `other`'s bytes, keeping invalid UTF-8 byte-exact.
@@ -429,13 +430,7 @@ impl<'a> TextRef<'a> {
         let bytes = match self.repr {
             TextRepr::Utf8 => self.bytes,
             TextRepr::Lossy => &self.bytes[self.raw_len as usize..],
-            TextRepr::Raw => {
-                let valid = match std::str::from_utf8(self.bytes) {
-                    Ok(_) => self.bytes.len(),
-                    Err(e) => e.valid_up_to(),
-                };
-                &self.bytes[..valid]
-            }
+            TextRepr::Raw => valid_prefix(self.bytes),
         };
         // SAFETY: Utf8 bytes, lossy views and valid prefixes are valid UTF-8.
         unsafe { std::str::from_utf8_unchecked(bytes) }
@@ -709,6 +704,14 @@ impl AnyText for Text {
     }
     fn subtype(&self) -> TextSubtype {
         self.subtype
+    }
+}
+
+#[cold]
+fn valid_prefix(bytes: &[u8]) -> &[u8] {
+    match std::str::from_utf8(bytes) {
+        Ok(_) => bytes,
+        Err(e) => &bytes[..e.valid_up_to()],
     }
 }
 

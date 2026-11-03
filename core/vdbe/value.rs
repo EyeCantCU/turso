@@ -1389,6 +1389,19 @@ impl Value {
             return Ok(Value::Blob(blob));
         }
 
+        if let (Value::Text(l), Value::Text(r)) = (self, rhs) {
+            if l.is_utf8() && r.is_utf8() {
+                let (l, r) = (l.as_str(), r.as_str());
+                if l.len() + r.len() > Self::MAX_BLOB_LENGTH as usize {
+                    return Err(LimboError::TooBig);
+                }
+                let mut joined = String::with_capacity(l.len() + r.len());
+                joined.push_str(l);
+                joined.push_str(r);
+                return Ok(Value::build_text(joined));
+            }
+        }
+
         let Some((lhs, lhs_utf8)) = self.text_bytes() else {
             return Ok(Value::Null);
         };
