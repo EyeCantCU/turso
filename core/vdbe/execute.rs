@@ -15526,8 +15526,7 @@ pub fn op_drop_sequence(
             );
             let root_page = schema
                 .get_btree_table(NamespaceId::ROOT, &backing_table_name)
-                .expect("DROP SEQUENCE: backing table must exist in schema")
-                .root_page;
+                .map_or(0, |table| table.root_page);
             if root_page > 0 {
                 schema.dropped_root_pages.insert(root_page);
             }

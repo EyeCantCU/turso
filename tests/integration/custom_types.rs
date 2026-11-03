@@ -903,6 +903,12 @@ mod tests {
         );
     }
 
+    /// Whether the connection's schema has the types table. The catalog
+    /// listings hide it, but a statement that names it still resolves.
+    fn has_types_table(conn: &std::sync::Arc<turso_core::Connection>) -> bool {
+        conn.prepare("SELECT 1 FROM __turso_internal_types").is_ok()
+    }
+
     /// A failed `CREATE TYPE` must not leave `__turso_internal_types` behind: the types table is
     /// registered in the connection schema before the type SQL is parsed, and the rollback
     /// restores that schema only when the schema cookie was set beforehand.
@@ -927,24 +933,16 @@ mod tests {
                 .display_string()
                 .contains("UNION type cannot have more than 256 variants");
 
-            let tables: Vec<(String, String, String, i64, i64, i64)> =
-                conn.exec_rows("PRAGMA table_list");
             assert!(
-                !tables
-                    .iter()
-                    .any(|(_, name, ..)| name == "__turso_internal_types"),
-                "failed CREATE TYPE left the types table in the schema (mvcc={mvcc}): {tables:?}"
+                !has_types_table(&conn),
+                "failed CREATE TYPE left the types table in the schema (mvcc={mvcc})"
             );
 
             // The connection must still be usable: a later CREATE TYPE has to succeed
             conn.execute("CREATE TYPE t2 BASE text").unwrap();
-            let tables: Vec<(String, String, String, i64, i64, i64)> =
-                conn.exec_rows("PRAGMA table_list");
             assert!(
-                tables
-                    .iter()
-                    .any(|(_, name, ..)| name == "__turso_internal_types"),
-                "CREATE TYPE did not register the types table (mvcc={mvcc}): {tables:?}"
+                has_types_table(&conn),
+                "CREATE TYPE did not register the types table (mvcc={mvcc})"
             );
             conn.close().unwrap();
         }
@@ -973,13 +971,9 @@ mod tests {
                 .display_string()
                 .contains("UNION type cannot have more than 256 variants");
 
-            let tables: Vec<(String, String, String, i64, i64, i64)> =
-                conn.exec_rows("PRAGMA table_list");
             assert!(
-                tables
-                    .iter()
-                    .any(|(_, name, ..)| name == "__turso_internal_types"),
-                "failed CREATE TYPE dropped the existing types table (mvcc={mvcc}): {tables:?}"
+                has_types_table(&conn),
+                "failed CREATE TYPE dropped the existing types table (mvcc={mvcc})"
             );
 
             // The failed type must not be persisted, and the connection must still be usable

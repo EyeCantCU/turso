@@ -159,7 +159,11 @@ pub(crate) fn classify_schema_entries(
                 // table, because copying rows with explicit rowids advances
                 // the target's counters to max(rowid) and the source values
                 // must replace those.
-                if entry.is_sqlite_sequence() || entry.is_autoinc_sequence_backing_table() {
+                if entry.is_sqlite_sequence() {
+                    counter_tables_to_copy.push(idx);
+                } else if entry.is_autoinc_sequence_backing_table() {
+                    // The target creates it only for MVCC; see PrepareCreateTable.
+                    tables_to_create.push(idx);
                     counter_tables_to_copy.push(idx);
                 } else {
                     tables_to_create.push(idx);
@@ -760,6 +764,21 @@ pub(crate) fn vacuum_target_build_step(
 
                 let entry_ordinal = state.tables_to_create[idx];
                 let entry = &state.schema_entries[entry_ordinal];
+                // Only an MVCC target keeps AUTOINCREMENT counter tables. The
+                // user's CREATE TABLE made it if the target is MVCC already;
+                // otherwise a counter table of an older file is dropped here.
+                if entry.is_autoinc_sequence_backing_table()
+                    && (!(config.target_mvcc_enabled || config.copy_mvcc_metadata_table)
+                        || state
+                            .target_conn
+                            .schema
+                            .read()
+                            .get_btree_table(NamespaceId::ROOT, &entry.name)
+                            .is_some())
+                {
+                    state.phase = VacuumTargetBuildPhase::PrepareCreateTable { idx: idx + 1 };
+                    continue;
+                }
                 let sql = table_sql_for_vacuum_replay(&state.target_conn, &entry.sql)?;
 
                 // Temporarily mark the target connection as nested during prepare()
@@ -844,6 +863,22 @@ pub(crate) fn vacuum_target_build_step(
                         };
                         continue;
                     }
+                }
+
+                // A backing table the target did not create has no counter to
+                // keep: the target is not MVCC, and sqlite_sequence has it.
+                if entry.is_autoinc_sequence_backing_table()
+                    && state
+                        .target_conn
+                        .schema
+                        .read()
+                        .get_btree_table(NamespaceId::ROOT, table_name)
+                        .is_none()
+                {
+                    state.phase = VacuumTargetBuildPhase::StartCopyTable {
+                        table_idx: table_idx + 1,
+                    };
+                    continue;
                 }
 
                 // The table copies may have advanced the target's counters

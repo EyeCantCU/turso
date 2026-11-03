@@ -684,17 +684,18 @@ fn test_fts_create_destroy(tmp_db: TempDatabase) {
     let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();
 
+    // An internal statement, as user queries of sqlite_master hide the FTS tables.
     let schema_rows = || {
-        limbo_exec_rows(
-            &conn,
-            "SELECT name FROM sqlite_master WHERE type='table' OR type='index'",
-        )
-        .into_iter()
-        .map(|x| match &x[0] {
-            rusqlite::types::Value::Text(t) => t.clone(),
-            _ => unreachable!(),
+        let mut stmt = conn
+            .prepare_internal("SELECT name FROM sqlite_master WHERE type='table' OR type='index'")
+            .unwrap();
+        let mut rows = Vec::new();
+        stmt.run_with_row_callback(|row| {
+            rows.push(row.get::<&str>(0)?.to_string());
+            Ok(())
         })
-        .collect::<Vec<String>>()
+        .unwrap();
+        rows
     };
 
     // Initially just the docs table

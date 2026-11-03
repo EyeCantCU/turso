@@ -189,6 +189,9 @@ pub struct Resolver<'a> {
     pub(crate) auth_no_truncate: bool,
     /// Column reads already authorized, so each reference is asked about once.
     pub(crate) auth_reads: AuthorizedReads,
+    /// User statements do not see the engine's `__turso_internal_*` rows of
+    /// sqlite_schema, as SQLite's schema holds nothing but user objects.
+    pub(crate) hide_internal_schema_rows: bool,
 }
 
 /// Column reads (table, column; `None` for the rowid) already authorized.
@@ -407,6 +410,7 @@ impl<'a> Resolver<'a> {
             auth_has_attached: false,
             auth_no_truncate: false,
             auth_reads: Rc::default(),
+            hide_internal_schema_rows: false,
         }
     }
 
@@ -446,6 +450,7 @@ impl<'a> Resolver<'a> {
             auth_has_attached: self.auth_has_attached,
             auth_no_truncate: false,
             auth_reads: self.auth_reads.clone(),
+            hide_internal_schema_rows: self.hide_internal_schema_rows,
         }
     }
 
@@ -467,6 +472,7 @@ impl<'a> Resolver<'a> {
             auth_has_attached: self.auth_has_attached,
             auth_no_truncate: false,
             auth_reads: self.auth_reads.clone(),
+            hide_internal_schema_rows: self.hide_internal_schema_rows,
         }
     }
 

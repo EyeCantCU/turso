@@ -4,6 +4,7 @@ mod test_ddl;
 mod test_eqp_json;
 mod test_hash_join_materialization;
 mod test_in_seek;
+mod test_internal_objects;
 mod test_is_seek;
 mod test_materialized_view_commit;
 mod test_multi_index_scan;

@@ -2,21 +2,13 @@
 @skip-file-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
 
 # Test: Create an AUTOINCREMENT table and verify sqlite_sequence is also created.
-#
-# Turso-only: SQLite does not maintain the internal
-# `__turso_internal_seq___turso_internal_autoincrement_*` backing table
-# (Turso's disk-only sequence allocator) so the schema listing differs.
-# The `sqlite_sequence` row creation is exercised by every other
-# AUTOINCREMENT test in this file, so the SQLite cross-check coverage
-# is preserved.
-@skip-if sqlite "Turso-specific internal backing table not present in SQLite"
+# The file holds no object but the table and sqlite_sequence, as in SQLite.
 @cross-check-integrity
 test autoinc-create-sequence-table {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;
 }
 expect {
-    __turso_internal_seq___turso_internal_autoincrement_t1
     sqlite_sequence
     t1
 }
@@ -672,4 +664,48 @@ test autoinc-drop-skips-null-name-sequence-row {
 expect {
 	1|t1|1
 	2||1
+}
+
+# Test: The schema lists the user's objects and sqlite_sequence, nothing else.
+@cross-check-integrity
+test autoinc-schema-has-only-user-objects {
+	CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
+	CREATE INDEX t1y ON t1(y);
+	INSERT INTO t1(y) VALUES('a');
+	SELECT type, name FROM sqlite_schema ORDER BY name;
+	SELECT name FROM pragma_table_list WHERE schema='main' ORDER BY name;
+}
+expect {
+	table|sqlite_sequence
+	table|t1
+	index|t1y
+	sqlite_schema
+	sqlite_sequence
+	t1
+}
+
+# Test: Replaying a dump (schema, rows, sqlite_sequence) continues the sequence.
+@cross-check-integrity
+test autoinc-dump-replay-continues-sequence {
+	CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
+	INSERT INTO t1(y) VALUES('a'),('b'),('c');
+	DELETE FROM t1 WHERE x=3;
+	DROP TABLE t1;
+	CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
+	INSERT INTO t1 VALUES(1,'a');
+	INSERT INTO t1 VALUES(2,'b');
+	DELETE FROM sqlite_sequence;
+	INSERT INTO sqlite_sequence(name,seq) VALUES('t1',3);
+	INSERT INTO t1(y) VALUES('d');
+	SELECT * FROM t1 ORDER BY x;
+	SELECT * FROM sqlite_sequence;
+	SELECT name FROM sqlite_schema ORDER BY name;
+}
+expect {
+	1|a
+	2|b
+	4|d
+	t1|4
+	sqlite_sequence
+	t1
 }

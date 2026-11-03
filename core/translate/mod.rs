@@ -159,6 +159,9 @@ pub fn translate(
         Ok(WalkControl::Continue)
     })?;
 
+    // Namespaced dialects keep user objects under `__turso_internal_` names.
+    resolver.hide_internal_schema_rows = matches!(origin, crate::statement::StatementOrigin::Root)
+        && !resolver.catalog.dialect.supports_namespaces();
     let check_privileges = matches!(origin, crate::statement::StatementOrigin::Root);
     if check_privileges
         && !resolver

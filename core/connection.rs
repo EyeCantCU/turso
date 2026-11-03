@@ -352,6 +352,19 @@ pub enum SyncAutoincrementState {
     },
 }
 
+/// State of [`Connection::create_autoincrement_backing_tables_nonblock`].
+#[derive(Default)]
+pub enum CreateBackingState {
+    #[default]
+    Start,
+    /// Each table takes a CREATE TABLE, then an INSERT of the first counter row.
+    Run {
+        pending: Vec<String>,
+        stmt: Option<Box<Statement>>,
+        inserting: bool,
+    },
+}
+
 /// Per-row sub-state of [`SyncAutoincrementState::Process`].
 #[derive(Default)]
 pub enum SyncRowStep {
@@ -1527,7 +1540,10 @@ impl Connection {
             Ok::<_, crate::alloc::TryReserveError>(())
         })??;
 
-        let stmt = self.prepare("SELECT * FROM sqlite_schema")?;
+        let stmt = self.prepare_with_origin(
+            "SELECT * FROM sqlite_schema",
+            StatementOrigin::EngineMetadataRead,
+        )?;
 
         // MVCC bootstrap connection gets the "baseline" from the DB file and ignores anything in MV store
         let mv_tx = if self.is_mvcc_bootstrap_connection() {
@@ -3020,9 +3036,10 @@ impl Connection {
         // would deadlock against the schema write lock.
         let mut rows_data: Vec<(String, String, String, i64, Option<String>)> = Vec::new();
         {
-            let mut rows = self
-                .query("SELECT * FROM sqlite_schema")?
-                .expect("query must be parsed to statement");
+            let mut rows = self.prepare_with_origin(
+                "SELECT * FROM sqlite_schema",
+                StatementOrigin::EngineMetadataRead,
+            )?;
             rows.run_with_row_callback(|row| {
                 let ty = row.get::<&str>(0)?.to_string();
                 let name = row.get::<&str>(1)?.to_string();
@@ -4238,6 +4255,68 @@ impl Connection {
         Ok(crate::mvcc::database::first_unsafe_sequence_watermark(
             seq, value, is_called,
         ))
+    }
+
+    /// Creates the MVCC counter table of each AUTOINCREMENT table that has
+    /// none, as WAL mode does not make one. Runs in bootstrap, whose
+    /// connection may create engine-owned tables.
+    pub(crate) fn create_autoincrement_backing_tables_nonblock(
+        self: &Arc<Connection>,
+        state: &mut CreateBackingState,
+    ) -> crate::types::IOResultOr<()> {
+        use crate::schema::autoincrement_sequence_name;
+        use crate::translate::sequence::{sequence_backing_table_name, sequence_backing_table_sql};
+        use crate::types::IOResult;
+
+        loop {
+            match state {
+                CreateBackingState::Start => {
+                    let pending =
+                        self.with_schema(MAIN_DB_ID, |s| s.autoincrement_tables_without_backing());
+                    if pending.is_empty() {
+                        return Ok(IOResult::Done(()));
+                    }
+                    *state = CreateBackingState::Run {
+                        pending,
+                        stmt: None,
+                        inserting: false,
+                    };
+                }
+                CreateBackingState::Run {
+                    pending,
+                    stmt,
+                    inserting,
+                } => {
+                    let Some(table) = pending.last() else {
+                        return Ok(IOResult::Done(()));
+                    };
+                    if stmt.is_none() {
+                        let seq_name = autoincrement_sequence_name(table);
+                        let sql = if *inserting {
+                            let backing =
+                                sequence_backing_table_name(&seq_name).replace('"', "\"\"");
+                            format!(
+                                "INSERT INTO \"{backing}\"(value, is_called, start, inc, min, max, cycle) \
+                                 VALUES (1, 0, 1, 1, 1, {}, 0)",
+                                i64::MAX
+                            )
+                        } else {
+                            sequence_backing_table_sql(&seq_name)
+                        };
+                        *stmt = Some(Box::new(self.prepare(sql)?));
+                    }
+                    crate::return_if_io!(stmt
+                        .as_mut()
+                        .expect("statement prepared above")
+                        .run_ignore_rows_nonblock());
+                    *stmt = None;
+                    if *inserting {
+                        pending.pop();
+                    }
+                    *inserting = !*inserting;
+                }
+            }
+        }
     }
 
     /// Sync AUTOINCREMENT backing-table watermarks from `sqlite_sequence`.

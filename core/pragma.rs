@@ -406,12 +406,23 @@ impl PragmaVirtualTableCursor {
             .stmt
             .as_mut()
             .ok_or_else(|| LimboError::InternalError("Statement is missing".into()))?;
-        let result = stmt.step()?;
-        match result {
-            StepResult::Done => Ok(false),
-            _ => {
-                self.pos += 1;
-                Ok(true)
+        // The helper statement is internal, so hide the engine's tables here.
+        let hide_internal = self.pragma_name == "table_list"
+            && self.arg.is_none()
+            && !self.conn.dialect().supports_namespaces();
+        loop {
+            match stmt.step()? {
+                StepResult::Done => return Ok(false),
+                StepResult::Row
+                    if hide_internal
+                        && stmt.row().is_some_and(|row| {
+                            matches!(row.get_value(1), Value::Text(name)
+                                if crate::schema::is_turso_internal_name(name.as_str()))
+                        }) => {}
+                _ => {
+                    self.pos += 1;
+                    return Ok(true);
+                }
             }
         }
     }
