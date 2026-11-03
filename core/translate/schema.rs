@@ -2156,7 +2156,7 @@ fn validate_drop_table(
         // special case, allow dropping `sqlite_stat1`
         && !tbl_name.eq_ignore_ascii_case(STATS_TABLE)
     {
-        bail_parse_error!("Cannot drop system table {}", tbl_name);
+        bail_parse_error!("table {} may not be dropped", tbl_name);
     }
     // Check if this is a materialized view - if so, refuse to drop it with DROP TABLE
     if resolver.with_schema(namespace.database_id, |schema| {
@@ -2205,6 +2205,9 @@ pub fn translate_drop_table(
     program.begin_write_on_database(database_id, schema_cookie)?;
 
     let Some(table) = resolver.with_schema(database_id, |s| s.get_table(namespace.id, name)) else {
+        if resolver.with_schema(database_id, |s| s.get_view(namespace.id, name).is_some()) {
+            bail_parse_error!("use DROP VIEW to delete view {name}");
+        }
         if if_exists {
             return Ok(());
         }

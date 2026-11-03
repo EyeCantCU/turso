@@ -60,7 +60,7 @@ fn validate(
 ) -> Result<()> {
     // Check if someone is trying to ALTER a system table
     if crate::schema::is_system_table(table_name) {
-        crate::bail_parse_error!("table {} may not be modified", table_name);
+        crate::bail_parse_error!("table {} may not be altered", table_name);
     }
     if let ast::AlterTableBody::RenameTo(new_table_name) = alter_table {
         let normalized_new_name = normalize_ident(new_table_name.as_str());

@@ -539,7 +539,7 @@ impl<'a> CatalogContext<'a> {
         let resolved = if let Some(db_name) = &qualified_name.namespace {
             let db_name_normalized = normalize_ident(db_name.as_str());
             self.namespace_named(&db_name_normalized).ok_or_else(|| {
-                LimboError::InvalidArgument(format!("no such database: {db_name_normalized}"))
+                LimboError::InvalidArgument(format!("unknown database {db_name_normalized}"))
             })
         } else if let Some(ctx) = self.database_scope.borrow().as_ref() {
             if ctx.restricts_db_references() {
@@ -613,4 +613,23 @@ impl<'a> CatalogContext<'a> {
     pub(crate) fn name_of_namespace(&self, namespace: NamespaceRef) -> Option<String> {
         self.qualifiers.name_of(namespace)
     }
+}
+
+/// Error for INSERT/UPDATE/DELETE on a name with no table: SQLite names views specially.
+pub(crate) fn dml_no_table_error(
+    resolver: &super::emitter::Resolver,
+    namespace: crate::namespace::NamespaceRef,
+    qualified_name: &ast::QualifiedName,
+) -> LimboError {
+    let name = qualified_name.name.as_str();
+    if resolver
+        .with_schema(namespace.database_id, |s| s.get_view(namespace.id, name))
+        .is_some()
+    {
+        return LimboError::ParseError(format!("cannot modify {name} because it is a view"));
+    }
+    LimboError::ParseError(format!(
+        "no such table: {}",
+        crate::util::table_name_for_error(qualified_name)
+    ))
 }

@@ -3202,8 +3202,7 @@ impl Schema {
                         let col_name = &unique_set.columns.first().unwrap().name;
                         let Some((_, column)) = table.get_column(col_name) else {
                             return Err(LimboError::ParseError(format!(
-                                "Column {col_name} not found in table {}",
-                                table.name
+                                "no such column: {col_name}"
                             )));
                         };
                         if column.is_rowid_alias() {
@@ -3241,8 +3240,8 @@ impl Schema {
                     for unique_column in unique_set.columns.iter() {
                         let Some((pos_in_table, _)) = table.get_column(&unique_column.name) else {
                             return Err(crate::LimboError::ParseError(format!(
-                                "Column {} not found in table {}",
-                                unique_column.name, table.name
+                                "no such column: {}",
+                                unique_column.name
                             )));
                         };
                         column_indices_and_sort_orders
@@ -8168,8 +8167,7 @@ impl Index {
         for (i, (col_name, order)) in table.primary_key_columns.iter().enumerate() {
             let Some((pos_in_table, _)) = table.get_column(col_name) else {
                 return Err(crate::LimboError::ParseError(format!(
-                    "Column {} not found in table {}",
-                    col_name, table.name
+                    "no such column: {col_name}"
                 )));
             };
             let (_, column) = table.get_column(col_name).unwrap();
@@ -8285,7 +8283,7 @@ impl Index {
 
     /// Walk the where_clause Expr of a partial index and validate that it doesn't reference any other
     /// tables or use any disallowed constructs.
-    pub fn validate_where_expr(&self, table: &Table, _resolver: &Resolver) -> bool {
+    pub fn validate_where_expr(&self, table: &Table, resolver: &Resolver) -> bool {
         let Some(where_clause) = &self.where_clause else {
             return true;
         };
@@ -8301,7 +8299,10 @@ impl Index {
         let is_tbl = |ns: &str| normalize_ident(ns) == tbl_norm;
         let is_deterministic_fn = |name: &str, argc: usize| {
             let n = normalize_ident(name);
-            Func::resolve_function(&n, argc).is_ok_and(|f| f.is_some_and(|f| f.is_deterministic()))
+            // The resolver also knows application-defined functions.
+            resolver
+                .resolve_function(&n, argc)
+                .is_ok_and(|f| f.is_some_and(|f| f.is_deterministic()))
         };
 
         let mut ok = true;

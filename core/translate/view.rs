@@ -530,6 +530,16 @@ pub fn translate_drop_view(
         });
     let view_exists = is_regular_view || is_materialized_view || is_broken_view;
 
+    if !view_exists
+        && resolver.with_schema(database_id, |s| {
+            s.get_table(namespace.id, &normalized_view_name).is_some()
+        })
+    {
+        return Err(crate::LimboError::ParseError(format!(
+            "use DROP TABLE to delete table {normalized_view_name}"
+        )));
+    }
+
     if !view_exists && !if_exists {
         return Err(crate::LimboError::ParseError(format!(
             "no such view: {normalized_view_name}"
