@@ -2127,6 +2127,8 @@ pub enum TriggerCmd {
     Update {
         /// `OR`
         or_conflict: Option<ResolveType>,
+        /// schema qualifier, allowed only in TEMP triggers (SQLite 3.53)
+        database: Option<Name>,
         /// table name
         tbl_name: Name,
         /// `SET` assignments
@@ -2140,6 +2142,8 @@ pub enum TriggerCmd {
     Insert {
         /// `OR`
         or_conflict: Option<ResolveType>,
+        /// schema qualifier, allowed only in TEMP triggers (SQLite 3.53)
+        database: Option<Name>,
         /// table name
         tbl_name: Name,
         /// `COLUMNS`
@@ -2153,6 +2157,8 @@ pub enum TriggerCmd {
     },
     /// `DELETE`
     Delete {
+        /// schema qualifier, allowed only in TEMP triggers (SQLite 3.53)
+        database: Option<Name>,
         /// table name
         tbl_name: Name,
         /// `WHERE` clause

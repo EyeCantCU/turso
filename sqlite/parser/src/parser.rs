@@ -4776,6 +4776,18 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `nm` or `nm.nm`; a qualified name is only valid in a TEMP trigger.
+    fn parse_trigger_target(&mut self) -> Result<(Option<Name>, Name)> {
+        let first = self.parse_nm()?;
+        if let Some(tok) = self.peek()? {
+            if tok.token_type == TK_DOT {
+                eat_assert!(self, TK_DOT);
+                return Ok((Some(first), self.parse_nm()?));
+            }
+        }
+        Ok((None, first))
+    }
+
     fn parse_trigger_insert_cmd(&mut self) -> Result<TriggerCmd> {
         let tok = eat_assert!(self, TK_INSERT, TK_REPLACE);
         let resolve_type = match tok.token_type {
@@ -4785,7 +4797,7 @@ impl<'a> Parser<'a> {
         };
 
         eat_expect!(self, TK_INTO);
-        let tbl_name = self.parse_nm()?;
+        let (database, tbl_name) = self.parse_trigger_target()?;
         let col_names = self.parse_nm_list_opt()?;
         let select = self.parse_select()?;
         let (upsert, returning) = self.parse_upsert()?;
@@ -4796,6 +4808,7 @@ impl<'a> Parser<'a> {
         }
         Ok(TriggerCmd::Insert {
             or_conflict: resolve_type,
+            database,
             tbl_name,
             col_names,
             select,
@@ -4807,7 +4820,7 @@ impl<'a> Parser<'a> {
     fn parse_trigger_update_cmd(&mut self) -> Result<TriggerCmd> {
         eat_assert!(self, TK_UPDATE);
         let or_conflict = self.parse_or_conflict()?;
-        let tbl_name = self.parse_nm()?;
+        let (database, tbl_name) = self.parse_trigger_target()?;
         eat_expect!(self, TK_SET);
         let sets = self.parse_set_list()?;
         let from = self.parse_from_clause_opt()?;
@@ -4819,6 +4832,7 @@ impl<'a> Parser<'a> {
         }
         Ok(TriggerCmd::Update {
             or_conflict,
+            database,
             tbl_name,
             sets,
             from,
@@ -4829,7 +4843,7 @@ impl<'a> Parser<'a> {
     fn parse_trigger_delete_cmd(&mut self) -> Result<TriggerCmd> {
         eat_assert!(self, TK_DELETE);
         eat_expect!(self, TK_FROM);
-        let tbl_name = self.parse_nm()?;
+        let (database, tbl_name) = self.parse_trigger_target()?;
         let where_clause = self.parse_where()?;
         if matches!(self.peek()?, Some(tok) if tok.token_type == TK_RETURNING) {
             return Err(Error::Custom(
@@ -4837,6 +4851,7 @@ impl<'a> Parser<'a> {
             ));
         }
         Ok(TriggerCmd::Delete {
+            database,
             tbl_name,
             where_clause,
         })
@@ -12534,6 +12549,7 @@ mod tests {
                     when_clause: None,
                     commands: vec![
                         TriggerCmd::Insert {
+                            database: None,
                             or_conflict: None,
                             tbl_name: Name::exact("foo".to_owned()),
                             col_names: vec![],
@@ -12578,6 +12594,7 @@ mod tests {
                     when_clause: None,
                     commands: vec![
                         TriggerCmd::Insert {
+                            database: None,
                             or_conflict: Some(ResolveType::Rollback),
                             tbl_name: Name::exact("foo".to_owned()),
                             col_names: vec![
@@ -12625,6 +12642,7 @@ mod tests {
                     when_clause: None,
                     commands: vec![
                         TriggerCmd::Insert {
+                            database: None,
                             or_conflict: None,
                             tbl_name: Name::exact("foo".to_owned()),
                             col_names: vec![],
@@ -12691,6 +12709,7 @@ mod tests {
                     when_clause: None,
                     commands: vec![
                         TriggerCmd::Update {
+                            database: None,
                             or_conflict: None,
                             tbl_name: Name::exact("foo".to_owned()),
                             sets: vec![
@@ -12727,6 +12746,35 @@ mod tests {
                     when_clause: None,
                     commands: vec![
                         TriggerCmd::Delete {
+                            database: None,
+                            tbl_name: Name::exact("foo".to_owned()),
+                            where_clause: None,
+                        },
+                    ],
+                })],
+            ),
+            (
+                b"CREATE TEMP TRIGGER foo INSERT ON bar BEGIN DELETE FROM main.foo; END".as_slice(),
+                vec![Cmd::Stmt(Stmt::CreateTrigger {
+                    temporary: true,
+                    if_not_exists: false,
+                    trigger_name: QualifiedName {
+                        namespace: None,
+                        name: Name::exact("foo".to_owned()),
+                        alias: None,
+                    },
+                    time: None,
+                    event: TriggerEvent::Insert,
+                    tbl_name: QualifiedName {
+                        namespace: None,
+                        name: Name::exact("bar".to_owned()),
+                        alias: None,
+                    },
+                    for_each_row: false,
+                    when_clause: None,
+                    commands: vec![
+                        TriggerCmd::Delete {
+                            database: Some(Name::exact("main".to_owned())),
                             tbl_name: Name::exact("foo".to_owned()),
                             where_clause: None,
                         },
@@ -12754,6 +12802,7 @@ mod tests {
                     when_clause: None,
                     commands: vec![
                         TriggerCmd::Delete {
+                            database: None,
                             tbl_name: Name::exact("foo".to_owned()),
                             where_clause: Some(Box::new(Expr::Literal(Literal::Numeric("1".to_owned())))),
                         },

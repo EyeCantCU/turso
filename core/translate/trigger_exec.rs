@@ -270,6 +270,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
     match cmd {
         ast::TriggerCmd::Insert {
             or_conflict,
+            database,
             tbl_name,
             col_names,
             select,
@@ -292,7 +293,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
                 with: None,
                 or_conflict: effective_or_conflict,
                 tbl_name: QualifiedName {
-                    namespace: subprogram_ctx.db_name.clone(),
+                    namespace: database.clone().or_else(|| subprogram_ctx.db_name.clone()),
                     name: tbl_name.clone(),
                     alias: None,
                 },
@@ -303,6 +304,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
         }
         ast::TriggerCmd::Update {
             or_conflict,
+            database,
             tbl_name,
             sets,
             from,
@@ -334,7 +336,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
                 with: None,
                 or_conflict: effective_or_conflict,
                 tbl_name: QualifiedName {
-                    namespace: subprogram_ctx.db_name.clone(),
+                    namespace: database.clone().or_else(|| subprogram_ctx.db_name.clone()),
                     name: tbl_name.clone(),
                     alias: None,
                 },
@@ -346,6 +348,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
             }))
         }
         ast::TriggerCmd::Delete {
+            database,
             tbl_name,
             where_clause,
         } => {
@@ -357,7 +360,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
 
             Ok(ast::Stmt::Delete {
                 tbl_name: QualifiedName {
-                    namespace: subprogram_ctx.db_name.clone(),
+                    namespace: database.clone().or_else(|| subprogram_ctx.db_name.clone()),
                     name: tbl_name.clone(),
                     alias: None,
                 },

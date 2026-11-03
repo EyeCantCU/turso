@@ -4578,6 +4578,7 @@ fn apply_trigger_cmd_for_column_rename(
         ast::TriggerCmd::Delete {
             tbl_name,
             where_clause,
+            ..
         } => {
             let delete_table_name_norm = normalize_ident(tbl_name.as_str());
             if let Some(where_expr) = where_clause {
