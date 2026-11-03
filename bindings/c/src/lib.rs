@@ -13,6 +13,8 @@ use turso_ext::ScalarFunction;
 use turso_ext::Value as ExtValue;
 use turso_macros::capi_guard;
 
+mod wrappers;
+
 /// Global flag: when set, all subsequently opened databases enable experimental features.
 static EXPERIMENTAL_ENABLED: AtomicBool = AtomicBool::new(false);
 static SQLITE_VERSION_C_STRING: OnceLock<CString> = OnceLock::new();
@@ -1807,13 +1809,13 @@ pub unsafe extern "C" fn sqlite3_limit(
 #[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_malloc(n: ffi::c_int) -> *mut ffi::c_void {
-    sqlite3_malloc64(n)
+    sqlite3_malloc64(n.max(0) as u64)
 }
 
 #[capi_guard]
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_malloc64(n: ffi::c_int) -> *mut ffi::c_void {
-    if n <= 0 {
+pub unsafe extern "C" fn sqlite3_malloc64(n: u64) -> *mut ffi::c_void {
+    if n == 0 || n > isize::MAX as u64 {
         return std::ptr::null_mut();
     }
     libc::malloc(n as usize)

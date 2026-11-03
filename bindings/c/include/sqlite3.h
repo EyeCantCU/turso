@@ -236,7 +236,7 @@ void sqlite3_sleep(int _ms);
 
 int sqlite3_limit(sqlite3 *_db, int _id, int _new_value);
 
-void *sqlite3_malloc64(int _n);
+void *sqlite3_malloc64(uint64_t n);
 
 void sqlite3_free(void *_ptr);
 
@@ -459,6 +459,40 @@ int sqlite3_table_column_metadata(
     int *pPrimaryKey,
     int *pAutoinc
 );
+
+/* ---- src/wrappers.rs ---- */
+#include <stdarg.h>
+typedef uint64_t sqlite3_uint64;
+extern const char sqlite3_version[];
+int sqlite3_create_function(sqlite3 *db, const char *zName, int nArg, int eTextRep, void *pApp,
+    void (*xFunc)(void*, int, void**), void (*xStep)(void*, int, void**), void (*xFinal)(void*));
+int sqlite3_create_collation(sqlite3 *db, const char *zName, int eTextRep, void *pArg,
+    int (*xCompare)(void*, int, const void*, int, const void*));
+int sqlite3_prepare(sqlite3 *db, const char *zSql, int nByte, sqlite3_stmt **ppStmt, const char **pzTail);
+char *sqlite3_vmprintf(const char *zFormat, va_list ap);
+char *sqlite3_vsnprintf(int n, char *zBuf, const char *zFormat, va_list ap);
+int sqlite3_bind_text64(sqlite3_stmt *stmt, int idx, const char *z, sqlite3_uint64 n,
+    void (*xDel)(void*), unsigned char enc);
+int sqlite3_bind_blob64(sqlite3_stmt *stmt, int idx, const void *z, sqlite3_uint64 n, void (*xDel)(void*));
+void sqlite3_result_text64(void *ctx, const char *z, sqlite3_uint64 n, void (*xDel)(void*), unsigned char enc);
+void *sqlite3_realloc(void *p, int n);
+void *sqlite3_realloc64(void *p, sqlite3_uint64 n);
+const char *sqlite3_sourceid(void);
+int sqlite3_keyword_count(void);
+int sqlite3_keyword_name(int i, const char **pzName, int *pnName);
+int sqlite3_keyword_check(const char *z, int n);
+void sqlite3_result_value(void *ctx, void *value);
+void sqlite3_result_zeroblob(void *ctx, int n);
+int sqlite3_result_zeroblob64(void *ctx, sqlite3_uint64 n);
+int sqlite3_value_numeric_type(void *value);
+const char *sqlite3_column_origin_name(sqlite3_stmt *stmt, int idx);
+int sqlite3_db_release_memory(sqlite3 *db);
+int sqlite3_system_errno(sqlite3 *db);
+int sqlite3_stmt_isexplain(sqlite3_stmt *stmt);
+int sqlite3_stmt_explain(sqlite3_stmt *stmt, int eMode);
+int sqlite3_error_offset(sqlite3 *db);
+int sqlite3_enable_shared_cache(int enable);
+/* ---- end src/wrappers.rs ---- */
 
 /*
 ** Enable all Turso experimental features for subsequently opened databases.

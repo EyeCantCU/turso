@@ -98,3 +98,45 @@ char *turso_sqlite3_snprintf_va(int n, char *buf, const char *fmt, ...) {
     sqlite3_free(s);
     return buf;
 }
+
+/*
+** va_list-taking variants (sqlite3_vmprintf / sqlite3_vsnprintf). The
+** exported symbols are tail-jumping trampolines in compat_wrappers.rs, so
+** these see the caller's original arguments. The va_list parameter is
+** va_copy'd into a local so the pumps above can take its address on every
+** ABI (on x86_64 a va_list parameter decays to a pointer).
+*/
+char *turso_sqlite3_vmprintf_va(const char *fmt, va_list ap) {
+    va_list cp;
+    char *r;
+
+    va_copy(cp, ap);
+    r = turso_printf_va(fmt, &cp);
+    va_end(cp);
+    return r;
+}
+
+char *turso_sqlite3_vsnprintf_va(int n, char *buf, const char *fmt, va_list ap) {
+    va_list cp;
+    char *s;
+    size_t len;
+
+    if (n <= 0 || !buf) {
+        return buf;
+    }
+    va_copy(cp, ap);
+    s = turso_printf_va(fmt, &cp);
+    va_end(cp);
+    if (!s) {
+        buf[0] = 0;
+        return buf;
+    }
+    len = strlen(s);
+    if (len >= (size_t)n) {
+        len = (size_t)n - 1;
+    }
+    memcpy(buf, s, len);
+    buf[len] = 0;
+    sqlite3_free(s);
+    return buf;
+}
