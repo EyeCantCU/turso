@@ -142,6 +142,7 @@ extern "C" {
     ) -> c_int;
     fn sqlite3_sleep(ms: c_int) -> c_int;
     fn sqlite3_malloc64(n: u64) -> *mut c_void;
+    fn sqlite3_malloc(n: c_int) -> *mut c_void;
     fn sqlite3_free(p: *mut c_void);
 }
 
@@ -272,6 +273,9 @@ fn malloc64_takes_64_bit_size() {
         sqlite3_free(p);
         // Larger than SQLite's 0x7fffff00 limit.
         assert!(sqlite3_malloc64(u64::MAX).is_null());
+        assert!(sqlite3_malloc64(0x7fff_ff00).is_null());
+        assert!(sqlite3_malloc64(0).is_null());
+        assert!(sqlite3_malloc(-1).is_null());
     }
 }
 
