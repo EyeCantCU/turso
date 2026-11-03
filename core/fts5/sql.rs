@@ -18,8 +18,72 @@ pub(crate) fn corrupt_msg(msg: impl Into<String>) -> LimboError {
     LimboError::CorruptVtab(msg.into())
 }
 
+type Compiled = (
+    crate::vdbe::Program,
+    Arc<crate::storage::pager::Pager>,
+    crate::vdbe::builder::QueryMode,
+);
+
+/// Compiled helper statements, reused for the life of a cursor or a
+/// transaction's writes. Holds programs, never live statements, so the
+/// connection is only marked nested while a statement runs.
+#[derive(Default)]
+pub(crate) struct SqlCache(crate::sync::Mutex<std::collections::HashMap<String, Compiled>>);
+
+impl std::fmt::Debug for SqlCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SqlCache")
+    }
+}
+
+thread_local! {
+    static CACHE: std::cell::Cell<*const SqlCache> = const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// Makes `cache` the statement cache of this thread until the guard drops.
+pub(crate) struct CacheScope(*const SqlCache);
+
+pub(crate) fn cache_scope(cache: &SqlCache) -> CacheScope {
+    CacheScope(CACHE.with(|c| c.replace(cache as *const SqlCache)))
+}
+
+impl Drop for CacheScope {
+    fn drop(&mut self) {
+        CACHE.with(|c| c.set(self.0));
+    }
+}
+
+fn statement(conn: &Arc<Connection>, sql: &str) -> Result<crate::Statement> {
+    let cache = CACHE.with(|c| c.get());
+    if cache.is_null() {
+        return conn.prepare_internal(sql);
+    }
+    // SAFETY: the scope guard keeps the cache alive while it is installed.
+    let cache = unsafe { &*cache };
+    let key = format!("{:p}{sql}", Arc::as_ptr(conn));
+    if let Some((program, pager, mode)) = cache.0.lock().get(&key).cloned() {
+        conn.start_nested();
+        return Ok(crate::Statement::new_with_origin(
+            program,
+            pager,
+            mode,
+            0,
+            crate::statement::StatementOrigin::InternalHelper,
+            true,
+        ));
+    }
+    let stmt = conn.prepare_internal(sql)?;
+    let compiled = (
+        stmt.get_program().clone(),
+        stmt.get_pager().clone(),
+        stmt.get_query_mode(),
+    );
+    cache.0.lock().insert(key, compiled);
+    Ok(stmt)
+}
+
 fn prepare(conn: &Arc<Connection>, sql: &str, params: &[Value]) -> Result<crate::Statement> {
-    let mut stmt = conn.prepare_internal(sql)?;
+    let mut stmt = statement(conn, sql)?;
     for (i, v) in params.iter().enumerate() {
         stmt.bind_at(NonZero::new(i + 1).expect("nonzero"), v.clone())?;
     }

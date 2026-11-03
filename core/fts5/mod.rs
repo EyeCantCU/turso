@@ -207,6 +207,7 @@ impl TableInner {
             .remove(&key)
             .unwrap_or_else(|| Writes {
                 pending: index::Pending::new(self.cfg.detail),
+                cache: Arc::default(),
                 totals: None,
             })
     }
@@ -234,6 +235,8 @@ impl TableInner {
         if !w.pending.has_data() && w.totals.is_none() {
             return Ok(());
         }
+        let cache = w.cache.clone();
+        let _scope = sql::cache_scope(&cache);
         let vals = self.vals(conn)?;
         let st = Storage::new(conn, &self.cfg, &vals);
         let r = st.sync(&mut w);
@@ -487,6 +490,8 @@ const OE_REPLACE: u8 = 5;
 impl TableUpdate for Fts5Update {
     fn step(&mut self) -> IOResultOr<Option<i64>> {
         let mut w = self.inner.take_writes(&self.conn);
+        let cache = w.cache.clone();
+        let _scope = sql::cache_scope(&cache);
         let r = self.run(&mut w);
         self.inner.put_writes(&self.conn, w);
         Ok(IOResult::Done(r?))
@@ -696,6 +701,7 @@ pub(crate) struct CursorState {
     auxdata: HashMap<String, Box<dyn Any + Send>>,
     current_aux: String,
     scan_cache: HashMap<i64, Vec<Value>>,
+    sql_cache: Arc<sql::SqlCache>,
 }
 
 impl CursorState {
@@ -720,6 +726,7 @@ impl CursorState {
             auxdata: HashMap::new(),
             current_aux: String::new(),
             scan_cache: HashMap::new(),
+            sql_cache: Arc::default(),
         }
     }
 
@@ -1458,9 +1465,10 @@ impl Drop for Fts5Cursor {
 
 impl VirtualTableCursor for Fts5Cursor {
     fn filter(&mut self, args: &[Value], idx_str: Option<&str>, idx_num: i32) -> IOResultOr<bool> {
-        Ok(IOResult::Done(
-            self.state.lock().filter(args, idx_str, idx_num)?,
-        ))
+        let mut st = self.state.lock();
+        let cache = st.sql_cache.clone();
+        let _scope = sql::cache_scope(&cache);
+        Ok(IOResult::Done(st.filter(args, idx_str, idx_num)?))
     }
 
     fn next(&mut self) -> IOResultOr<bool> {
@@ -1468,7 +1476,10 @@ impl VirtualTableCursor for Fts5Cursor {
     }
 
     fn column(&mut self, column: usize) -> IOResultOr<Value> {
-        Ok(IOResult::Done(self.state.lock().column(column)?))
+        let mut st = self.state.lock();
+        let cache = st.sql_cache.clone();
+        let _scope = sql::cache_scope(&cache);
+        Ok(IOResult::Done(st.column(column)?))
     }
 
     fn rowid(&self) -> i64 {
@@ -1524,6 +1535,8 @@ impl ScalarCall for AuxCall {
             return Err(LimboError::SqlError(format!("no such cursor: {id}")).into());
         }
         let rest: Vec<Value> = args[1..].iter().map(|r| r.get_value().clone()).collect();
+        let cache = st.sql_cache.clone();
+        let _scope = sql::cache_scope(&cache);
         Ok(IOResult::Done(st.call_aux(&self.name, &rest)?))
     }
 }

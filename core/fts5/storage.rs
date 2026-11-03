@@ -20,6 +20,8 @@ const LOCALE_HDR: [u8; 4] = [0x00, 0xE0, 0xB2, 0xEB];
 #[derive(Debug, Clone)]
 pub(crate) struct Writes {
     pub pending: Pending,
+    /// Statements reused across the rows of a transaction.
+    pub cache: Arc<super::sql::SqlCache>,
     /// (row count, per-column token totals) while they differ from disk.
     pub totals: Option<(i64, Vec<i64>)>,
 }
