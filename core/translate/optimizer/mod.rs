@@ -1525,7 +1525,13 @@ fn update_write_set_reason(
             .set_clauses
             .iter()
             .any(|set_clause| set_clause.column_index == ROWID_SENTINEL);
-        if rowid_alias_used || direct_rowid_update {
+        // Changing the primary key moves a WITHOUT ROWID row in the b-tree being scanned.
+        let without_rowid_key_used = !btree_table.has_rowid
+            && plan.set_clauses.iter().any(|set_clause| {
+                set_clause.column_index != ROWID_SENTINEL
+                    && btree_table.columns()[set_clause.column_index].primary_key()
+            });
+        if rowid_alias_used || direct_rowid_update || without_rowid_key_used {
             break 'requires Some(DmlSafetyReason::KeyMutation);
         }
 
@@ -1619,11 +1625,30 @@ fn build_update_write_set_plan(
 ) -> Result<()> {
     let scratch_table_id = program.table_reference_counter.next();
     let is_update_from = !plan.from_tables.joined_tables().is_empty();
-    let columns = if is_update_from {
+    // A WITHOUT ROWID target stores its primary key in trailing scratch columns.
+    let target_pk = match plan.target_table.btree() {
+        Some(bt) if !bt.has_rowid => Some(crate::translate::without_rowid::pk_set_columns(
+            &bt,
+            plan.target_table.internal_id,
+        )?),
+        _ => None,
+    };
+    let mut columns = if is_update_from {
         update_from_scratch_columns(plan.set_clauses.len())?
+    } else if target_pk.is_some() {
+        crate::alloc::Vec::new()
     } else {
         std::iter::once((*ROWID_COLUMN).clone()).try_collect()?
     };
+    if let Some((pk_result_columns, _)) = &target_pk {
+        let first = columns.len();
+        for column in update_from_scratch_columns(first + pk_result_columns.len())?
+            .into_iter()
+            .skip(first)
+        {
+            crate::alloc::TursoVecExt::try_push(&mut columns, column)?;
+        }
+    }
     let ephemeral_table = Arc::new(BTreeTable::new(
         0, // root_page, not relevant for ephemeral table definition
         "ephemeral_scratch".to_string(),
@@ -1658,15 +1683,24 @@ fn build_update_write_set_plan(
     let rowid_internal_id = plan.target_table.internal_id;
 
     let mut result_columns = update_from_set_result_columns;
-    result_columns.push(ResultSetColumn {
-        expr: Expr::RowId {
-            database: None,
-            table: rowid_internal_id,
-        },
-        alias: None,
-        implicit_column_name: None,
-        contains_aggregates: false,
-    });
+    let rowid_mode = match target_pk {
+        Some((pk_result_columns, _)) => {
+            result_columns.extend(pk_result_columns);
+            EphemeralRowidMode::Auto
+        }
+        None => {
+            result_columns.push(ResultSetColumn {
+                expr: Expr::RowId {
+                    database: None,
+                    table: rowid_internal_id,
+                },
+                alias: None,
+                implicit_column_name: None,
+                contains_aggregates: false,
+            });
+            EphemeralRowidMode::FromResultColumns
+        }
+    };
 
     let join_order = default_join_order(&write_set_tables);
     let write_set_select = SelectPlan {
@@ -1680,7 +1714,7 @@ fn build_update_write_set_plan(
         query_destination: QueryDestination::EphemeralTable {
             cursor_id: temp_cursor_id,
             table: ephemeral_table,
-            rowid_mode: EphemeralRowidMode::FromResultColumns,
+            rowid_mode,
         },
         join_order,
         offset: None,

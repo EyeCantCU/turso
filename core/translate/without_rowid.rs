@@ -136,3 +136,26 @@ pub(crate) fn pk_set_columns(
     };
     Ok((result_columns, std::sync::Arc::new(index)))
 }
+
+/// Jump to `target` if the primary keys in `a..` and `b..` are equal.
+pub(crate) fn emit_jump_if_pk_equal(
+    program: &mut ProgramBuilder,
+    table: &BTreeTable,
+    a: usize,
+    b: usize,
+    target: BranchOffset,
+) -> Result<()> {
+    let differ = program.allocate_label();
+    for (i, col) in table.without_rowid_pk_columns()?.iter().enumerate() {
+        program.emit_insn(Insn::Ne {
+            lhs: a + i,
+            rhs: b + i,
+            target_pc: differ,
+            flags: crate::vdbe::insn::CmpInsFlags::default(),
+            collation: col.collation,
+        });
+    }
+    program.emit_insn(Insn::Goto { target_pc: target });
+    program.preassign_label_to_next_insn(differ);
+    Ok(())
+}
