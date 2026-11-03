@@ -87,12 +87,6 @@ mod compat_lifecycle;
 mod guard;
 mod multiprocess;
 
-macro_rules! stub {
-    () => {
-        todo!("{} is not implemented", stringify!($fn));
-    };
-}
-
 /* generic error-codes */
 pub const SQLITE_OK: ffi::c_int = 0; /* Successful result */
 pub const SQLITE_ERROR: ffi::c_int = 1; /* Generic error */

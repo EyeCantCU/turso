@@ -474,10 +474,12 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
     out_stmt: *mut *mut sqlite3_stmt,
     tail: *mut *const ffi::c_char,
 ) -> ffi::c_int {
+    if !out_stmt.is_null() {
+        *out_stmt = std::ptr::null_mut();
+    }
     if db.is_null() || sql.is_null() || out_stmt.is_null() {
         return SQLITE_MISUSE;
     }
-    *out_stmt = std::ptr::null_mut();
     let max_len = conn_of(db)
         .and_then(|c| c.limit(turso_core::limits::LIMIT_SQL_LENGTH))
         .unwrap_or(i32::MAX) as usize;
