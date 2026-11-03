@@ -2255,6 +2255,7 @@ fn emit_check_constraint_bytecode(
     table_name: &str,
     column_mappings: &[(&str, usize)],
 ) -> Result<()> {
+    let _schema_code = resolver.catalog.ddl_guard();
     for check_constraint in check_constraints {
         let expr_result_reg = program.alloc_register();
 

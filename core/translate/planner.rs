@@ -597,7 +597,16 @@ pub fn resolve_window_and_aggregate_functions(
                 let args_count = args.len();
                 let distinctness = Distinctness::from_ast(distinctness.as_ref());
 
-                match Func::resolve_function(name.as_str(), args_count)? {
+                let builtin = if resolver
+                    .catalog
+                    .symbol_table
+                    .has_user_function(name.as_str(), args_count)
+                {
+                    None
+                } else {
+                    Func::resolve_function(name.as_str(), args_count)?
+                };
+                match builtin {
                     Some(Func::Agg(f)) => {
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
@@ -684,7 +693,16 @@ pub fn resolve_window_and_aggregate_functions(
                 }
             }
             Expr::FunctionCallStar { name, filter_over } => {
-                match Func::resolve_function(name.as_str(), 0)? {
+                let builtin = if resolver
+                    .catalog
+                    .symbol_table
+                    .has_user_function(name.as_str(), 0)
+                {
+                    None
+                } else {
+                    Func::resolve_function(name.as_str(), 0)?
+                };
+                match builtin {
                     Some(Func::Agg(f)) => {
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
@@ -2219,6 +2237,12 @@ fn parse_table(
         // sqlite3FixSelect/sqlite3FixSrcList): a view's unqualified names are
         // fixed to the database it was created in, not resolved TEMP-first
         // like an ordinary top-level query.
+        if !resolver.catalog.symbol_table.user_functions.is_empty() {
+            crate::user_function::check_direct_only_select(
+                &view.select_stmt,
+                resolver.catalog.symbol_table,
+            )?;
+        }
         let view_plan = resolver.with_view_scope(namespace, view.name.clone(), || {
             program.with_view_expansion(database_id, &view.name, |program| {
                 prepare_select_plan(

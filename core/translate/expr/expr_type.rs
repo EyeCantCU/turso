@@ -16,6 +16,7 @@ use crate::translate::emitter::Resolver;
 use crate::translate::expr_context::TableMetadata;
 use crate::translate::plan::{Plan, SelectPlan, TableReferences};
 use crate::type_ordering::TypeOrdering;
+use crate::user_function::UserLookup;
 use crate::vdbe::affinity::Affinity;
 use crate::{Result, SymbolTable};
 
@@ -163,6 +164,11 @@ impl<'a> TypeEnv<'a> {
             // The schema is read without the connection's dialect. Both
             // dialects resolve built-in functions the same way.
             Self::Table { syms, .. } => {
+                match syms.resolve_user_function(name, arg_count) {
+                    UserLookup::Found(func) => return Ok(Some(Func::External(func))),
+                    UserLookup::Deleted => return Ok(None),
+                    UserLookup::Missing => {}
+                }
                 match crate::dialect::sqlite::resolve_builtin_function(name, arg_count)? {
                     Some(func) => Ok(Some(func)),
                     None => Ok(syms.resolve_function(name, arg_count).map(Func::External)),

@@ -948,9 +948,13 @@ fn first_aggregate_without_over_clause<'a>(
         if found.is_some() || filter_over.over_clause.is_some() {
             return Ok(WalkControl::Continue);
         }
+        let overridden = resolver
+            .catalog
+            .symbol_table
+            .has_user_function(name.as_str(), args_count);
         let is_aggregate = match crate::function::Func::resolve_function(name.as_str(), args_count)
         {
-            Ok(Some(crate::function::Func::Agg(_))) => true,
+            Ok(Some(crate::function::Func::Agg(_))) if !overridden => true,
             _ => resolver
                 .catalog
                 .symbol_table

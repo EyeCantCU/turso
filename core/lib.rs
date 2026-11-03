@@ -64,6 +64,7 @@ mod function;
 mod functions;
 mod incremental;
 mod incremental_blob;
+pub mod user_function;
 pub use incremental_blob::Blob;
 mod info;
 #[cfg(all(feature = "json", not(any(feature = "fuzz", feature = "bench"))))]

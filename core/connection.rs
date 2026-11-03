@@ -4452,22 +4452,23 @@ impl Connection {
 
     /// Returns external (extension) functions: (name, is_aggregate, argc, deterministic)
     pub fn get_syms_functions(&self) -> Vec<(String, bool, i32, bool)> {
-        self.syms
-            .read()
-            .functions
-            .values()
-            .flat_map(|f| {
-                let is_agg = f.func.is_aggregate();
-                f.func.arg_counts().into_iter().map(move |argc| {
-                    (
-                        f.name.clone(),
-                        is_agg,
-                        argc,
-                        function::Deterministic::is_deterministic(f.as_ref()),
-                    )
-                })
+        let syms = self.syms.read();
+        let user = syms.user_functions.iter().map(|(argc, f)| {
+            let deterministic = function::Deterministic::is_deterministic(f.as_ref());
+            (f.name.clone(), f.func.is_aggregate(), argc, deterministic)
+        });
+        user.chain(syms.functions.values().flat_map(|f| {
+            let is_agg = f.func.is_aggregate();
+            f.func.arg_counts().into_iter().map(move |argc| {
+                (
+                    f.name.clone(),
+                    is_agg,
+                    argc,
+                    function::Deterministic::is_deterministic(f.as_ref()),
+                )
             })
-            .collect()
+        }))
+        .collect()
     }
 
     pub fn register_external_collation(
@@ -5225,6 +5226,8 @@ pub type StepResult = vdbe::StepResult;
 #[derive(Default)]
 pub struct SymbolTable {
     pub functions: HashMap<String, Arc<function::ExternalFunc>>,
+    /// Functions registered through the SQLite C API.
+    pub user_functions: crate::user_function::UserFunctions,
     /// Custom collations by normalized name.
     pub collations: HashMap<String, Arc<function::ExternalCollation>>,
     pub vtabs: HashMap<String, Arc<VirtualTable>>,
@@ -5267,6 +5270,7 @@ impl SymbolTable {
     pub fn new() -> Self {
         Self {
             functions: HashMap::default(),
+            user_functions: Default::default(),
             collations: HashMap::default(),
             vtabs: HashMap::default(),
             vtab_modules: HashMap::default(),
@@ -5278,6 +5282,11 @@ impl SymbolTable {
         name: &str,
         arg_count: usize,
     ) -> Option<Arc<function::ExternalFunc>> {
+        match self.resolve_user_function(name, arg_count) {
+            crate::user_function::UserLookup::Found(func) => return Some(func),
+            crate::user_function::UserLookup::Deleted => return None,
+            crate::user_function::UserLookup::Missing => {}
+        }
         self.functions
             .get(name)
             .cloned()
@@ -5289,6 +5298,55 @@ impl SymbolTable {
             .filter(|func| func.func.matches_arg_count(arg_count))
     }
 
+    /// Looks up a C API function, which shadows built-ins of the same name.
+    pub fn resolve_user_function(
+        &self,
+        name: &str,
+        arg_count: usize,
+    ) -> crate::user_function::UserLookup {
+        if self.user_functions.is_empty() {
+            return crate::user_function::UserLookup::Missing;
+        }
+        match self.user_functions.lookup(name, arg_count) {
+            crate::user_function::UserLookup::Missing => self
+                .user_functions
+                .lookup(&crate::util::normalize_ident(name), arg_count),
+            found => found,
+        }
+    }
+
+    /// Whether the C API function that claims this call is deterministic;
+    /// `None` when no such function exists.
+    pub fn resolve_user_function_deterministic(
+        &self,
+        name: &str,
+        arg_count: usize,
+    ) -> Option<bool> {
+        match self.resolve_user_function(name, arg_count) {
+            crate::user_function::UserLookup::Found(f) => {
+                Some(function::Deterministic::is_deterministic(f.as_ref()))
+            }
+            crate::user_function::UserLookup::Deleted => Some(false),
+            crate::user_function::UserLookup::Missing => None,
+        }
+    }
+
+    /// Whether a C API function of this name exists with any argument count.
+    pub fn has_user_function_name(&self, name: &str) -> bool {
+        self.user_functions.has_name(name)
+            || self
+                .user_functions
+                .has_name(&crate::util::normalize_ident(name))
+    }
+
+    /// Whether a C API function claims this call, even a deleted one.
+    pub fn has_user_function(&self, name: &str, arg_count: usize) -> bool {
+        !matches!(
+            self.resolve_user_function(name, arg_count),
+            crate::user_function::UserLookup::Missing
+        )
+    }
+
     pub fn resolve_collation(&self, name: &str) -> Option<TextCollation> {
         self.collations
             .get(&crate::util::normalize_ident(name))
@@ -5296,6 +5354,7 @@ impl SymbolTable {
     }
 
     pub fn extend(&mut self, other: &SymbolTable) {
+        self.user_functions.extend(&other.user_functions);
         for (name, func) in &other.functions {
             self.functions.insert(name.clone(), func.clone());
         }

@@ -25,6 +25,8 @@ pub trait Deterministic: std::fmt::Display {
 pub struct ExternalFunc {
     pub name: String,
     pub func: ExtFunc,
+    /// SQLite function flags (SQLITE_DIRECTONLY, ...) a C application set.
+    pub flags: u32,
 }
 
 /// A collation that an application registered on a connection: a callback
@@ -257,6 +259,7 @@ impl ExternalFunc {
         Self::validate_arg_count(argc)?;
         Ok(Self {
             name,
+            flags: 0,
             func: ExtFunc::Scalar {
                 context,
                 argc,
@@ -281,6 +284,7 @@ impl ExternalFunc {
         Self::validate_arg_count(argc)?;
         Ok(Self {
             name,
+            flags: 0,
             func: ExtFunc::Aggregate {
                 context,
                 argc,
@@ -294,6 +298,12 @@ impl ExternalFunc {
                 window: None,
             },
         })
+    }
+
+    /// Records the SQLite function flags the application registered.
+    pub fn with_flags(mut self, flags: u32) -> Self {
+        self.flags = flags;
+        self
     }
 
     /// Makes an external aggregate usable as a window function.

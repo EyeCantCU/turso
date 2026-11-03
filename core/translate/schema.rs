@@ -53,6 +53,7 @@ pub(crate) fn validate_check_expr(
     resolver: &CatalogContext,
 ) -> Result<()> {
     let normalized_table = normalize_ident(table_name);
+    let _schema_code = resolver.ddl_guard();
     walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
         match e {
             ast::Expr::Id(name) | ast::Expr::Name(name) => {
@@ -872,8 +873,19 @@ pub(crate) fn validate_generated_function_calls(
     resolver: &CatalogContext,
 ) -> Result<()> {
     walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
-        if let ast::Expr::FunctionCall { name, args, .. } = e {
-            resolver.resolve_function(name.as_str(), args.len())?;
+        let (name, argc) = match e {
+            ast::Expr::FunctionCall { name, args, .. } => (name, args.len()),
+            ast::Expr::FunctionCallStar { name, .. } => (name, 0),
+            _ => return Ok(WalkControl::Continue),
+        };
+        match resolver.resolve_function(name.as_str(), argc)? {
+            None => bail_parse_error!("no such function: {}", name.as_str()),
+            Some(Func::External(f))
+                if !crate::function::Deterministic::is_deterministic(f.as_ref()) =>
+            {
+                bail_parse_error!("non-deterministic functions prohibited in generated columns");
+            }
+            _ => {}
         }
         Ok(WalkControl::Continue)
     })?;

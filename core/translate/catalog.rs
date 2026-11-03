@@ -8,6 +8,7 @@ use crate::function::Func;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::Schema;
 use crate::sync::Arc;
+use crate::user_function::{UserLookup, SQLITE_FUNC_DIRECTONLY};
 use crate::util::normalize_ident;
 use crate::{DatabaseCatalog, LimboError, Result, RwLock, SymbolTable};
 
@@ -27,6 +28,9 @@ pub(crate) struct CatalogContext<'a> {
     /// fresh placeholder schema must be constructed during resolution.
     pub dialect: Arc<dyn crate::dialect::Dialect>,
     pub(super) database_scope: RefCell<Option<DatabaseScopeContext>>,
+    /// Non-zero while compiling schema-level code (CHECK constraints); with a
+    /// view or trigger scope it forbids SQLITE_DIRECTONLY functions.
+    ddl_depth: std::rc::Rc<std::cell::Cell<u32>>,
     /// Cached flag: true when this connection has an active temp database.
     ///
     /// Computed once at context construction to avoid repeated
@@ -51,6 +55,15 @@ pub(crate) struct CatalogContext<'a> {
 /// schema fixer (`sqlite3FixSelect`/`DbFixer` in `src/fix.c`): unqualified
 /// table names inside the object's body resolve within the database the
 /// object itself lives in, not through the normal temp-first search.
+/// Restores the schema-level marker when dropped.
+pub(crate) struct DdlGuard(std::rc::Rc<std::cell::Cell<u32>>);
+
+impl Drop for DdlGuard {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct DatabaseScopeContext {
     /// The namespace the object belongs to.
@@ -92,6 +105,7 @@ impl<'a> CatalogContext<'a> {
             enable_custom_types,
             dialect,
             database_scope: RefCell::new(None),
+            ddl_depth: Default::default(),
             has_temp_schema,
             search_order: qualifiers
                 .search_order(search_path)
@@ -113,6 +127,7 @@ impl<'a> CatalogContext<'a> {
             enable_custom_types: self.enable_custom_types,
             dialect: self.dialect.clone(),
             database_scope: RefCell::new(self.database_scope.borrow().clone()),
+            ddl_depth: self.ddl_depth.clone(),
             has_temp_schema: self.has_temp_schema,
             search_order: self.search_order.clone(),
         }
@@ -131,6 +146,16 @@ impl<'a> CatalogContext<'a> {
             crate::bail_parse_error!("{} require --experimental-custom-types flag", feature);
         }
         Ok(())
+    }
+
+    /// Marks the code compiled until the guard drops as schema-level.
+    pub(crate) fn ddl_guard(&self) -> DdlGuard {
+        self.ddl_depth.set(self.ddl_depth.get() + 1);
+        DdlGuard(self.ddl_depth.clone())
+    }
+
+    fn in_schema_code(&self) -> bool {
+        self.ddl_depth.get() > 0 || self.database_scope.borrow().is_some()
     }
 
     pub(crate) fn with_database_scope<T>(
@@ -167,15 +192,35 @@ impl<'a> CatalogContext<'a> {
         func_name: &str,
         arg_count: usize,
     ) -> Result<Option<Func>, LimboError> {
+        // C API functions shadow built-ins; a deleted one hides them too.
+        match self
+            .symbol_table
+            .resolve_user_function(func_name, arg_count)
+        {
+            UserLookup::Found(func) => {
+                if func.flags & SQLITE_FUNC_DIRECTONLY != 0 && self.in_schema_code() {
+                    crate::bail_parse_error!("unsafe use of {}()", func_name);
+                }
+                return Ok(Some(Func::External(func)));
+            }
+            UserLookup::Deleted => {
+                crate::bail_parse_error!("wrong number of arguments to function {}()", func_name)
+            }
+            UserLookup::Missing => {}
+        }
         // The dialect owns the function name surface of user SQL; extension
         // functions resolve after it.
-        match self.dialect.resolve_function(func_name, arg_count)? {
-            Some(func) => Ok(Some(func)),
-            None => Ok(self
+        let resolved = match self.dialect.resolve_function(func_name, arg_count)? {
+            Some(func) => Some(func),
+            None => self
                 .symbol_table
                 .resolve_function(func_name, arg_count)
-                .map(Func::External)),
+                .map(Func::External),
+        };
+        if resolved.is_none() && self.symbol_table.has_user_function_name(func_name) {
+            crate::bail_parse_error!("wrong number of arguments to function {}()", func_name);
         }
+        Ok(resolved)
     }
 
     pub fn resolve_collation(&self, name: &str) -> Result<TextCollation> {
