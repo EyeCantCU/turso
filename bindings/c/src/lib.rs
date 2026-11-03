@@ -67,6 +67,8 @@ fn default_db_opts() -> DatabaseOpts {
     opts
 }
 
+mod compat_lifecycle;
+
 macro_rules! stub {
     () => {
         todo!("{} is not implemented", stringify!($fn));
@@ -513,22 +515,23 @@ pub unsafe extern "C" fn sqlite3_open(
     if rc != SQLITE_OK {
         return rc;
     }
-    if filename.is_null() {
+    if db_out.is_null() {
         return SQLITE_MISUSE;
     }
-    if db_out.is_null() {
+    *db_out = std::ptr::null_mut();
+    if filename.is_null() {
         return SQLITE_MISUSE;
     }
     let filename_cstr = CStr::from_ptr(filename);
     let filename_str = match filename_cstr.to_str() {
         Ok(s) => s,
-        Err(_) => return SQLITE_MISUSE,
+        Err(_) => return compat_lifecycle::open_failed(db_out, SQLITE_CANTOPEN),
     };
     let io: Arc<dyn turso_core::IO> = match filename_str {
         ":memory:" => Arc::new(turso_core::MemoryIO::new()),
         _ => match turso_core::PlatformIO::new() {
             Ok(io) => Arc::new(io),
-            Err(_) => return SQLITE_CANTOPEN,
+            Err(_) => return compat_lifecycle::open_failed(db_out, SQLITE_CANTOPEN),
         },
     };
     match turso_core::Database::open_file_with_flags(
@@ -540,7 +543,10 @@ pub unsafe extern "C" fn sqlite3_open(
         Arc::new(SqliteDialect),
     ) {
         Ok(db) => {
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = match db.connect(ConnectOpts::new()) {
+                Ok(c) => c,
+                Err(e) => return compat_lifecycle::open_failed_err(db_out, &e),
+            };
             let filename = match filename_str {
                 ":memory:" => CString::new("".to_string()).unwrap(),
                 _ => CString::from(filename_cstr),
@@ -550,7 +556,7 @@ pub unsafe extern "C" fn sqlite3_open(
         }
         Err(e) => {
             trace!("error opening database {}: {:?}", filename_str, e);
-            SQLITE_CANTOPEN
+            compat_lifecycle::open_failed_err(db_out, &e)
         }
     }
 }
@@ -673,13 +679,21 @@ pub unsafe extern "C" fn sqlite3_open_v2(
     if rc != SQLITE_OK {
         return rc;
     }
-    if filename.is_null() || db_out.is_null() {
+    if db_out.is_null() {
+        return SQLITE_MISUSE;
+    }
+    *db_out = std::ptr::null_mut();
+    if filename.is_null() {
         return SQLITE_MISUSE;
     }
     let filename_cstr = CStr::from_ptr(filename);
     let filename_str = match filename_cstr.to_str() {
         Ok(s) => s,
-        Err(_) => return SQLITE_MISUSE,
+        Err(_) => return compat_lifecycle::open_failed(db_out, SQLITE_CANTOPEN),
+    };
+    let flags = match compat_lifecycle::effective_flags(flags, filename_str) {
+        Ok(f) => f,
+        Err(msg) => return compat_lifecycle::open_failed_with(db_out, SQLITE_PERM, &msg),
     };
 
     // Determine the effective filename and whether to use in-memory IO
@@ -687,7 +701,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         if (flags & SQLITE_OPEN_URI) != 0 && filename_str.starts_with("file:") {
             match parse_uri_filename(filename_str) {
                 Ok(result) => result,
-                Err(()) => return SQLITE_CANTOPEN,
+                Err(()) => return compat_lifecycle::open_failed(db_out, SQLITE_CANTOPEN),
             }
         } else if (flags & SQLITE_OPEN_MEMORY) != 0 || filename_str == ":memory:" {
             (":memory:".to_string(), true, false)
@@ -702,6 +716,14 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         } else {
             (filename_str.to_string(), false, false)
         };
+    // Without CREATE a missing file is CANTOPEN; SQLite never creates it.
+    if !use_memory
+        && !filename_str.is_empty()
+        && (flags & SQLITE_OPEN_CREATE) == 0
+        && !std::path::Path::new(&effective_filename).exists()
+    {
+        return compat_lifecycle::open_failed(db_out, SQLITE_CANTOPEN);
+    }
     let temp_path = if filename_str.is_empty() && !use_memory {
         Some(std::path::PathBuf::from(&effective_filename))
     } else {
@@ -729,7 +751,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
             Ok(db) => (db.io.clone(), db),
             Err(e) => {
                 trace!("error opening shared memory database {effective_filename}: {e:?}");
-                return SQLITE_CANTOPEN;
+                return compat_lifecycle::open_failed_err(db_out, &e);
             }
         }
     } else if use_memory {
@@ -745,13 +767,13 @@ pub unsafe extern "C" fn sqlite3_open_v2(
             Ok(db) => (io, db),
             Err(e) => {
                 trace!("error opening memory database: {e:?}");
-                return SQLITE_CANTOPEN;
+                return compat_lifecycle::open_failed_err(db_out, &e);
             }
         }
     } else {
         let io: Arc<dyn turso_core::IO> = match turso_core::PlatformIO::new() {
             Ok(io) => Arc::new(io),
-            Err(_) => return SQLITE_CANTOPEN,
+            Err(_) => return compat_lifecycle::open_failed(db_out, SQLITE_CANTOPEN),
         };
         match turso_core::Database::open_file_with_flags(
             io.clone(),
@@ -764,7 +786,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
             Ok(db) => (io, db),
             Err(e) => {
                 trace!("error opening database {effective_filename}: {e:?}");
-                return SQLITE_CANTOPEN;
+                return compat_lifecycle::open_failed_err(db_out, &e);
             }
         }
     };
@@ -783,7 +805,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         }
         Err(e) => {
             trace!("error connecting to database: {:?}", e);
-            SQLITE_CANTOPEN
+            compat_lifecycle::open_failed_err(db_out, &e)
         }
     }
 }
@@ -1073,12 +1095,20 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
     out_stmt: *mut *mut sqlite3_stmt,
     tail: *mut *const ffi::c_char,
 ) -> ffi::c_int {
-    if raw_db.is_null() || sql.is_null() || out_stmt.is_null() {
+    if out_stmt.is_null() {
+        return SQLITE_MISUSE;
+    }
+    // SQLite always initialises the outputs, even on failure.
+    *out_stmt = std::ptr::null_mut();
+    if !tail.is_null() {
+        *tail = sql;
+    }
+    if raw_db.is_null() || sql.is_null() {
         return SQLITE_MISUSE;
     }
     let db_handle = sqlite3::clone_from_raw(raw_db);
     let mut db = db_handle.inner.lock().unwrap();
-    if db.e_open_state == SQLITE_STATE_ZOMBIE {
+    if db.e_open_state == SQLITE_STATE_ZOMBIE || db.e_open_state == SQLITE_STATE_SICK {
         return set_db_err_code(&mut db, SQLITE_MISUSE);
     }
     // SQLite C-API contract (https://www.sqlite.org/c3ref/prepare.html):
@@ -1118,6 +1148,10 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
             return SQLITE_OK;
         }
         Err(err) => {
+            // As in SQLite, the tail points at the end of the input.
+            if !tail.is_null() {
+                *tail = sql.add(sql_bytes.len());
+            }
             return set_db_err(&mut db, err);
         }
     };
@@ -1752,7 +1786,7 @@ pub unsafe extern "C" fn sqlite3_free(ptr: *mut ffi::c_void) {
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_errcode(db: *mut sqlite3) -> ffi::c_int {
     if db.is_null() {
-        return SQLITE_MISUSE;
+        return SQLITE_NOMEM;
     }
     let db: &sqlite3 = &*db;
     let db = db.inner.lock().unwrap();
@@ -3281,7 +3315,7 @@ pub unsafe extern "C" fn sqlite3_errmsg(db: *mut sqlite3) -> *const ffi::c_char 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_extended_errcode(db: *mut sqlite3) -> ffi::c_int {
     if db.is_null() {
-        return SQLITE_MISUSE;
+        return SQLITE_NOMEM;
     }
     let db: &sqlite3 = &*db;
     let db = db.inner.lock().unwrap();
