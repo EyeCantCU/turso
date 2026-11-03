@@ -1126,6 +1126,7 @@ impl Database {
     /// This avoids opening a file (and acquiring a file lock) when the
     /// database is already open in this process.
     fn lookup_in_registry(
+        io: &Arc<dyn IO>,
         path: &str,
         encryption_opts: &Option<EncryptionOpts>,
         dialect: &dyn Dialect,
@@ -1134,7 +1135,9 @@ impl Database {
         if is_memory_like(path) {
             return Ok(None);
         }
-        let file_id = match io::get_file_id(path) {
+        // Same identity as open_async's registry entry: an IO backend may
+        // name files its own way (e.g. a VFS adapter).
+        let file_id = match io.file_id(path) {
             Ok(id) => id,
             Err(_) => return Ok(None), // file doesn't exist yet
         };
@@ -1222,6 +1225,7 @@ impl Database {
         // lock that would conflict with an already-open Database in this process.
         if use_registry {
             if let Some(db) = Self::lookup_in_registry(
+                io,
                 path,
                 &options.encryption,
                 options.dialect.as_ref(),

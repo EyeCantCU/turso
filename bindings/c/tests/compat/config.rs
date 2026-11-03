@@ -186,7 +186,7 @@ unsafe fn take(p: *mut c_char) -> String {
 /// Serializes tests that touch process-global state.
 static GLOBALS: Mutex<()> = Mutex::new(());
 
-fn lock() -> std::sync::MutexGuard<'static, ()> {
+pub(super) fn lock() -> std::sync::MutexGuard<'static, ()> {
     GLOBALS.lock().unwrap_or_else(|e| e.into_inner())
 }
 

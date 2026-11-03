@@ -14,6 +14,8 @@ use turso_ext::Value as ExtValue;
 
 pub mod compat_config;
 pub mod extension;
+pub mod vfs;
+pub mod vfs_unix;
 
 /// Global flag: when set, all subsequently opened databases enable experimental features.
 static EXPERIMENTAL_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -523,7 +525,10 @@ pub unsafe extern "C" fn sqlite3_open(
         return SQLITE_MISUSE;
     }
     // sqlite3_config(SQLITE_CONFIG_URI, 1): sqlite3_open() accepts "file:" URIs.
-    if compat_config::uri_default() && CStr::from_ptr(filename).to_bytes().starts_with(b"file:") {
+    // A default VFS registered by the application also needs open_v2.
+    if (compat_config::uri_default() && CStr::from_ptr(filename).to_bytes().starts_with(b"file:"))
+        || vfs::default_is_app_vfs()
+    {
         return sqlite3_open_v2(
             filename,
             db_out,
@@ -723,6 +728,16 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         } else {
             (filename_str.to_string(), false, false)
         };
+    if let Some(rc) = vfs::open_v2_via_vfs(
+        filename_str,
+        &effective_filename,
+        use_memory,
+        flags,
+        z_vfs,
+        db_out,
+    ) {
+        return rc;
+    }
     let temp_path = if filename_str.is_empty() && !use_memory {
         Some(std::path::PathBuf::from(&effective_filename))
     } else {
