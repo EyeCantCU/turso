@@ -971,13 +971,36 @@ fn translate_function_call_expr(
             crate::bail_parse_error!("misuse of window function {}()", name.as_str())
         }
         Func::External(_) | Func::Dialect(_) => {
-            let regs = program.alloc_registers(args_count);
+            // fts3_tokenizer() also learns which arguments are bound
+            // parameters (sqlite3_value_frombind), as an extra argument.
+            #[cfg(feature = "fts3")]
+            let frombind =
+                matches!(&func_ctx.func, Func::External(f) if f.name == "fts3_tokenizer").then(
+                    || {
+                        args.iter().enumerate().fold(0i64, |m, (i, a)| {
+                            if matches!(a.as_ref(), ast::Expr::Variable(_)) {
+                                m | (1 << i)
+                            } else {
+                                m
+                            }
+                        })
+                    },
+                );
+            #[cfg(not(feature = "fts3"))]
+            let frombind: Option<i64> = None;
+            let mut func_ctx = func_ctx;
+            let nregs = args_count + frombind.is_some() as usize;
+            let regs = program.alloc_registers(nregs);
             for (i, arg_expr) in args.iter().enumerate() {
                 translate_expr(program, referenced_tables, arg_expr, regs + i, resolver)?;
             }
+            if let Some(mask) = frombind {
+                program.emit_int(mask, regs + args_count);
+                func_ctx.arg_count += 1;
+            }
 
             // Use shared function call helper
-            let arg_registers: Vec<usize> = (regs..regs + args_count).collect();
+            let arg_registers: Vec<usize> = (regs..regs + nregs).collect();
             emit_function_call(program, func_ctx, &arg_registers, target_register)?;
 
             Ok(target_register)

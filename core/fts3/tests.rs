@@ -85,14 +85,39 @@ fn run_sqlite(conn: &rusqlite::Connection, sql: &str) -> Vec<String> {
 /// Text for a deterministic document; `seed` picks words from a vocabulary.
 fn doc(seed: u64, n: usize) -> String {
     const VOCAB: [&str; 24] = [
-        "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa",
-        "lambda", "mu", "running", "runs", "connection", "connected", "one", "two", "three", "x",
-        "ab", "abc", "abd", "Caf\u{e9}",
+        "alpha",
+        "beta",
+        "gamma",
+        "delta",
+        "epsilon",
+        "zeta",
+        "eta",
+        "theta",
+        "iota",
+        "kappa",
+        "lambda",
+        "mu",
+        "running",
+        "runs",
+        "connection",
+        "connected",
+        "one",
+        "two",
+        "three",
+        "x",
+        "ab",
+        "abc",
+        "abd",
+        "Caf\u{e9}",
     ];
-    let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let mut s = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             VOCAB[((s >> 33) % VOCAB.len() as u64) as usize]
         })
         .collect::<Vec<_>>()
@@ -187,7 +212,11 @@ fn writes_match_sqlite_byte_for_byte() {
             conn.execute(&q).unwrap();
             sqlite.execute_batch(&q).unwrap();
             for q in SHADOW.iter() {
-                assert_eq!(run_turso(&conn, q), run_sqlite(&sqlite, q), "{create}: {sp}: {q}");
+                assert_eq!(
+                    run_turso(&conn, q),
+                    run_sqlite(&sqlite, q),
+                    "{create}: {sp}: {q}"
+                );
             }
         }
     }
@@ -214,10 +243,13 @@ fn tables_cross_engines() {
             for (q, e) in QUERIES.iter().zip(&expected) {
                 assert_eq!(&run_turso(&conn, q), e, "{create}: {q}");
             }
-            conn.execute("INSERT INTO t(t) VALUES('integrity-check')").unwrap();
-            conn.execute("INSERT INTO t(a, b) VALUES('alpha new', 'zeta')").unwrap();
+            conn.execute("INSERT INTO t(t) VALUES('integrity-check')")
+                .unwrap();
+            conn.execute("INSERT INTO t(a, b) VALUES('alpha new', 'zeta')")
+                .unwrap();
             conn.execute("DELETE FROM t WHERE docid = 7").unwrap();
-            conn.execute("INSERT INTO t(t) VALUES('integrity-check')").unwrap();
+            conn.execute("INSERT INTO t(t) VALUES('integrity-check')")
+                .unwrap();
         }
         let sqlite = rusqlite::Connection::open(&path).unwrap();
         sqlite
@@ -238,10 +270,12 @@ fn tables_cross_engines() {
 fn pending_terms_follow_the_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let (_db, conn) = open_turso(&dir.path().join("p.db"));
-    conn.execute("CREATE VIRTUAL TABLE t USING fts4(a)").unwrap();
+    conn.execute("CREATE VIRTUAL TABLE t USING fts4(a)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES('kept words')").unwrap();
     conn.execute("BEGIN").unwrap();
-    conn.execute("INSERT INTO t VALUES('pending words')").unwrap();
+    conn.execute("INSERT INTO t VALUES('pending words')")
+        .unwrap();
     assert_eq!(
         run_turso(&conn, "SELECT a FROM t WHERE t MATCH 'words'"),
         vec!["'kept words'", "'pending words'"]
@@ -252,7 +286,8 @@ fn pending_terms_follow_the_transaction() {
         run_turso(&conn, "SELECT a FROM t WHERE t MATCH 'words'"),
         vec!["'kept words'"]
     );
-    conn.execute("INSERT INTO t(t) VALUES('integrity-check')").unwrap();
+    conn.execute("INSERT INTO t(t) VALUES('integrity-check')")
+        .unwrap();
 }
 
 #[test]

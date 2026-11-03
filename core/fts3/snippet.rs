@@ -4,7 +4,7 @@ use super::table::{Ctx, CursorState};
 use super::{corrupt, get_varint, sql_error, value_text, Sql};
 use crate::{LimboError, Result, Value};
 
-fn tokens_of(st: &CursorState, text: &[u8]) -> Result<Vec<(Vec<u8>, i32, i32, i32)>> {
+fn tokens_of(st: &CursorState, text: &[u8]) -> Result<Vec<super::tokenizer::TokenInfo>> {
     let tok = st.tab.tokenizer(Some(&st.conn))?;
     super::tokenizer::tokens(tok.as_ref(), st.langid, text)
 }
@@ -58,19 +58,16 @@ fn best_snippet(
         for (i, &e) in phrases.iter().enumerate() {
             let p = &mut sp[i];
             p.ntoken = ev.ph[e].as_ref().map(|x| x.ntoken).unwrap_or(0);
-            match ev.phrase_poslist(e, icol) {
-                Some(list) => {
-                    if list[0] < 0 {
-                        return Err(corrupt());
-                    }
-                    p.ihead = list[0];
-                    p.itail = list[0];
-                    p.head = Some(0);
-                    p.tail = Some(0);
-                    p.list = list;
-                    p.has_list = true;
+            if let Some(list) = ev.phrase_poslist(e, icol) {
+                if list[0] < 0 {
+                    return Err(corrupt());
                 }
-                None => {}
+                p.ihead = list[0];
+                p.itail = list[0];
+                p.head = Some(0);
+                p.tail = Some(0);
+                p.list = list;
+                p.has_list = true;
             }
         }
     }

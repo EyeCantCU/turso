@@ -914,10 +914,10 @@ fn delete_terms(ctx: &Ctx, rowid: &Value, sz: &mut [u32]) -> Result<bool> {
     let langid = langid_of(tab, &row);
     let docid = value_int(&row[0]);
     pending_docid(ctx, true, langid, docid)?;
-    for i in 1..=tab.ncol() {
-        let icol = i - 1;
+    for (icol, v) in row.iter().enumerate().skip(1).take(tab.ncol()) {
+        let icol = icol - 1;
         if !tab.notindexed[icol] {
-            let text = value_text(&row[i]);
+            let text = value_text(v);
             sz[icol] += pending_add(ctx, langid, text.as_deref(), -1)?;
             sz[tab.ncol()] += text.map(|t| t.len()).unwrap_or(0) as u32;
         }
@@ -1631,7 +1631,7 @@ fn incr_load(ctx: &Ctx, abs: i64, idx: i64, key: &[u8], w: &mut IncrWriter) -> R
     }
     if appendable {
         let height = root.first().copied().unwrap_or(0) as usize;
-        if height < 1 || height >= MAX_APPENDABLE_HEIGHT {
+        if !(1..MAX_APPENDABLE_HEIGHT).contains(&height) {
             return Err(corrupt());
         }
         w.nleaf_est = ((end - start) + 1) / MAX_APPENDABLE_HEIGHT as i64;
@@ -1643,7 +1643,7 @@ fn incr_load(ctx: &Ctx, abs: i64, idx: i64, key: &[u8], w: &mut IncrWriter) -> R
             w.nodes[i].block = w.start + i as i64 * w.nleaf_est;
         }
         w.nodes[height].block = w.start + w.nleaf_est * height as i64;
-        w.nodes[height].data = root.clone();
+        w.nodes[height].data.clone_from(&root);
         let mut i = height as isize;
         while i >= 0 {
             let iu = i as usize;
@@ -1653,7 +1653,7 @@ fn incr_load(ctx: &Ctx, abs: i64, idx: i64, key: &[u8], w: &mut IncrWriter) -> R
                 while !r.done {
                     r.next()?;
                 }
-                w.nodes[iu].key = r.term.clone();
+                w.nodes[iu].key.clone_from(&r.term);
                 if iu > 0 {
                     let child = r.child;
                     let block = ctx.read_block(child)?;

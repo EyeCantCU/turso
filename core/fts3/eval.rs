@@ -288,7 +288,7 @@ impl Eval {
                 ..Default::default()
             };
             if !st.incr {
-                st.all = st.orig.clone();
+                st.all.clone_from(&st.orig);
             }
             ph[i] = Some(st);
         }
@@ -333,10 +333,7 @@ impl Eval {
         let reverse = self.bdesc != self.desc_idx;
         let p = self.ph[i].as_mut().expect("phrase state");
         if p.incr {
-            let k = match p.next {
-                None => 0,
-                Some(k) => k,
-            };
+            let k = p.next.unwrap_or_default();
             if k as usize >= p.orig.len() {
                 return true;
             }
@@ -380,9 +377,9 @@ impl Eval {
         let p = self.phrase(i);
         if let Some(k) = p.list_idx {
             if !p.incr {
-                p.all[k].1 = pl.clone();
+                p.all[k].1.clone_from(&pl);
             } else if p.ntoken == 1 {
-                p.orig[k].1 = pl.clone();
+                p.orig[k].1.clone_from(&pl);
             }
         }
         p.list = Some(pl);

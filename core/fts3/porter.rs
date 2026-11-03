@@ -363,10 +363,8 @@ pub(crate) fn porter_stem(input: &[u8], out: &mut Vec<u8>) {
     }
 
     // Step 5a
-    if r.at(z) == b'e' {
-        if r.m_gt_1(z + 1) || (r.m_eq_1(z + 1) && !r.star_oh(z + 1)) {
-            z += 1;
-        }
+    if r.at(z) == b'e' && (r.m_gt_1(z + 1) || (r.m_eq_1(z + 1) && !r.star_oh(z + 1))) {
+        z += 1;
     }
 
     // Step 5b

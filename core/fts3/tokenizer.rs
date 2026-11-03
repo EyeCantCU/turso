@@ -148,12 +148,11 @@ impl Tokenizer for Simple {
     }
 }
 
+/// A token with its start and end byte offsets and position.
+pub(crate) type TokenInfo = (Vec<u8>, i32, i32, i32);
+
 /// Collects all tokens of `text`.
-pub(crate) fn tokens(
-    tok: &dyn Tokenizer,
-    langid: i32,
-    text: &[u8],
-) -> Result<Vec<(Vec<u8>, i32, i32, i32)>> {
+pub(crate) fn tokens(tok: &dyn Tokenizer, langid: i32, text: &[u8]) -> Result<Vec<TokenInfo>> {
     let mut out = Vec::new();
     tok.tokenize(langid, text, &mut |t, s, e, p| {
         out.push((t.to_vec(), s, e, p));

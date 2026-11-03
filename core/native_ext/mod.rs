@@ -8,7 +8,8 @@ pub use function::{
 };
 pub use turso_ext::{ConstraintInfo, ConstraintUsage, IndexInfo, OrderByInfo, VTabKind};
 pub use vtab::{
-    ConnectInfo, TableHook, TableUpdate, VirtualTable, VirtualTableCursor, VirtualTableModule,
+    ColumnLookup, ConnectInfo, TableHook, TableUpdate, VirtualTable, VirtualTableCursor,
+    VirtualTableModule,
 };
 
 pub use function::AggregateState;

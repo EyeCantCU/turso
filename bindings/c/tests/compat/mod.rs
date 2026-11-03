@@ -3,6 +3,7 @@
 #![allow(unused_imports)]
 use std::ptr;
 
+mod fts3;
 mod vtab;
 
 #[repr(C)]

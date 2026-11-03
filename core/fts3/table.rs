@@ -323,7 +323,7 @@ fn parse_args(
     db: &str,
     name: &str,
     args: &[String],
-    lookup_columns: Option<&dyn Fn(&str) -> Option<Vec<String>>>,
+    lookup_columns: Option<&crate::native_ext::ColumnLookup>,
 ) -> Result<Fts3Table> {
     let fts4 = module.as_bytes().get(3) == Some(&b'4');
     let mut cols: Vec<String> = Vec::new();
@@ -407,7 +407,7 @@ fn parse_args(
     let mut prefixes = vec![0];
     if let Some(pz) = prefix.as_deref().filter(|p| !p.is_empty()) {
         let b = pz.as_bytes();
-        let nindex = 1 + b.iter().filter(|&&c| c == b',').count();
+        let nindex = 1 + pz.matches(',').count();
         let mut p = 0;
         for _ in 0..nindex {
             let (n, v) = expr::read_int(&b[p.min(b.len())..]);
@@ -764,7 +764,7 @@ impl VirtualTable for Fts3Vtab {
                 Ok(())
             }
             TableHook::RollbackTo(level) => {
-                if level as i32 + 1 <= ctx.with_pending(|p| p.savepoint) {
+                if (level as i32) < ctx.with_pending(|p| p.savepoint) {
                     write::pending_clear(&ctx);
                 }
                 Ok(())
@@ -1226,12 +1226,16 @@ impl ScalarCall for TokenizerCall {
 
     fn step(&mut self, conn: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         use super::ctok::{module_from_ptr, module_ptr};
+        // The translator appends a mask of the arguments that are bound parameters.
+        let (args, frombind) = match args.split_last() {
+            Some((m, rest)) if !rest.is_empty() => (rest, value_int(m.get_value())),
+            _ => (args, 0),
+        };
         let name = value_text(args[0].get_value());
         let enabled = conn.fts3.set_tokenizer_enabled(None);
-        let ptr;
-        if args.len() == 2 {
+        let ptr = if args.len() == 2 {
             let v = args[1].get_value();
-            if !enabled && !conn.fts3_bound_args() {
+            if !enabled && frombind & 2 == 0 {
                 return Err(sql_error("fts3tokenize disabled").into());
             }
             let b = match v {
@@ -1248,7 +1252,7 @@ impl ScalarCall for TokenizerCall {
                 .lock()
                 .tokenizers
                 .insert(name.clone(), module_from_ptr(p));
-            ptr = p;
+            p
         } else {
             let m = name
                 .as_ref()
@@ -1260,9 +1264,9 @@ impl ScalarCall for TokenizerCall {
                 ))
                 .into());
             };
-            ptr = module_ptr(m).0;
-        }
-        if enabled || conn.fts3_bound_args() {
+            module_ptr(m).0
+        };
+        if enabled || frombind & 1 != 0 {
             Ok(IOResult::Done(
                 Value::from_slice(&ptr.to_ne_bytes())
                     .map_err(|_| LimboError::InternalError("oom".into()))?,
@@ -1270,14 +1274,6 @@ impl ScalarCall for TokenizerCall {
         } else {
             Ok(IOResult::Done(Value::Null))
         }
-    }
-}
-
-impl Connection {
-    /// Whether the running fts3_tokenizer() call got its arguments from
-    /// bound parameters, which SQLite allows even when it is disabled.
-    pub(crate) fn fts3_bound_args(&self) -> bool {
-        false
     }
 }
 

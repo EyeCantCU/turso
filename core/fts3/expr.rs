@@ -363,11 +363,11 @@ impl Parser<'_> {
                     self.nm(pp).left = None;
                 }
                 let mut q = Some(self.balance(p, max - 1)?);
-                for lvl in 0..max as usize {
+                for leaf_slot in leaves.iter_mut() {
                     let Some(qv) = q else { break };
-                    match leaves[lvl] {
+                    match *leaf_slot {
                         None => {
-                            leaves[lvl] = Some(qv);
+                            *leaf_slot = Some(qv);
                             q = None;
                         }
                         Some(leaf) => {
@@ -378,7 +378,7 @@ impl Parser<'_> {
                             self.nm(qv).parent = Some(f);
                             free = self.n(f).parent;
                             self.nm(f).parent = None;
-                            leaves[lvl] = None;
+                            *leaf_slot = None;
                             q = Some(f);
                         }
                     }

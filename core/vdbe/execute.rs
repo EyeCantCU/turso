@@ -1761,7 +1761,7 @@ pub fn op_vbegin(
         .vtab_id()
         .expect("VBegin on non ext-virtual table cursor");
     let mut states = program.connection.vtab_txn_states.write();
-    if !states.contains_key(&vtab_id) {
+    if let std::collections::hash_map::Entry::Vacant(slot) = states.entry(vtab_id) {
         // Only begin a new transaction if one is not already active for this virtual table module
         let (_, cursor_type) = program
             .cursor_ref
@@ -1778,7 +1778,7 @@ pub fn op_vbegin(
             )
             .into());
         };
-        states.insert(vtab_id, vtab.clone());
+        slot.insert(vtab.clone());
         drop(states);
         vtab.hook(&program.connection, crate::native_ext::TableHook::Begin)?;
     }
