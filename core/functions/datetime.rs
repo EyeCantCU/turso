@@ -2103,7 +2103,7 @@ mod tests {
         assert_eq!(run("2023-01-01", "weekday 0"), "2023-01-01"); // No change
         assert_eq!(run("2023-01-01", "weekday 1"), "2023-01-02"); // Next Monday
         assert_eq!(run("2023-01-01", "WEEKDAY 6"), "2023-01-07"); // Next Saturday
-        // "weekday -N" (SQLite 3.54) goes back to the previous weekday N.
+                                                                  // "weekday -N" (SQLite 3.54) goes back to the previous weekday N.
         assert_eq!(run("2023-01-01", "weekday -6"), "2022-12-31");
         assert_eq!(run("2023-01-04", "weekday -1"), "2023-01-02");
         assert_eq!(run("2023-01-04", "weekday -3"), "2023-01-04");
@@ -2132,7 +2132,10 @@ mod tests {
                 .unwrap()
                 .to_string()
         };
-        assert_eq!(run("2026-11-03 12:34:56", "end of day"), "2026-11-03 23:59:59");
+        assert_eq!(
+            run("2026-11-03 12:34:56", "end of day"),
+            "2026-11-03 23:59:59"
+        );
         assert_eq!(run("2026-02-10", "end of month"), "2026-02-28 23:59:59");
         assert_eq!(run("2024-02-10", "end of month"), "2024-02-29 23:59:59");
         assert_eq!(run("2026-12-15", "END OF MONTH"), "2026-12-31 23:59:59");
