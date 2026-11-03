@@ -84,6 +84,7 @@ impl SqliteWalIndex {
             .create(true)
             .truncate(false)
             .open(wal_path)
+            .or_else(|_| std::fs::File::open(wal_path))
             .map_err(|e| crate::error::io_error(e, "open WAL for wal-index"))?;
         Ok(Self {
             shm,

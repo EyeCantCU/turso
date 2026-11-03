@@ -22,6 +22,9 @@ pub(crate) fn open_file_db(
             Arc::new(SqliteDialect),
         ) {
             Err(LimboError::InvalidArgument(msg)) if msg.contains("multiprocess") => {}
+            // A new file at the path of a renamed, still-open database: its
+            // coordination file belongs to the old one, so open unshared.
+            Err(LimboError::InternalError(msg)) if msg.contains("duplicate same-process") => {}
             res => return res,
         }
     }

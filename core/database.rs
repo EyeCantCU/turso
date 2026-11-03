@@ -1073,11 +1073,18 @@ impl Database {
             .map(str::to_owned)
             .unwrap_or_else(|| format!("{path}-wal"));
         let coordination_path = storage::wal::coordination_path_for_wal_path(&wal_path);
-        let Some(authority) =
-            MappedSharedWalCoordination::open_existing(io, Path::new(&coordination_path), 64)?
-        else {
-            return Ok(());
-        };
+        let authority =
+            match MappedSharedWalCoordination::open_existing(io, Path::new(&coordination_path), 64)
+            {
+                Ok(Some(authority)) => authority,
+                Ok(None) => return Ok(()),
+                // Mapped already by this process for a database that was
+                // renamed while open: not this file's coordination.
+                Err(LimboError::InternalError(msg)) if msg.contains("duplicate same-process") => {
+                    return Ok(())
+                }
+                Err(err) => return Err(err),
+            };
 
         if matches!(
             authority.open_mode(),
