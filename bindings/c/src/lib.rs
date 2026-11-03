@@ -15,6 +15,9 @@ use turso_macros::capi_guard;
 
 mod wrappers;
 
+pub mod compat_config;
+pub mod extension;
+
 /// Global flag: when set, all subsequently opened databases enable experimental features.
 static EXPERIMENTAL_ENABLED: AtomicBool = AtomicBool::new(false);
 static SQLITE_VERSION_C_STRING: OnceLock<CString> = OnceLock::new();
@@ -532,6 +535,15 @@ pub unsafe extern "C" fn sqlite3_open(
     if filename.is_null() {
         return SQLITE_MISUSE;
     }
+    // sqlite3_config(SQLITE_CONFIG_URI, 1): sqlite3_open() accepts "file:" URIs.
+    if compat_config::uri_default() && CStr::from_ptr(filename).to_bytes().starts_with(b"file:") {
+        return sqlite3_open_v2(
+            filename,
+            db_out,
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+            std::ptr::null(),
+        );
+    }
     let filename_cstr = CStr::from_ptr(filename);
     let filename_str = match filename_cstr.to_str() {
         Ok(s) => s,
@@ -562,7 +574,7 @@ pub unsafe extern "C" fn sqlite3_open(
                 _ => CString::from(filename_cstr),
             };
             *db_out = sqlite3::new(io, db, conn, filename).into_raw();
-            SQLITE_OK
+            extension::run_auto_extensions(*db_out)
         }
         Err(e) => {
             trace!("error opening database {}: {:?}", filename_str, e);
@@ -683,7 +695,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
     filename: *const ffi::c_char,
     db_out: *mut *mut sqlite3,
     flags: ffi::c_int,
-    _z_vfs: *const ffi::c_char,
+    z_vfs: *const ffi::c_char,
 ) -> ffi::c_int {
     trace!("sqlite3_open_v2");
     let rc = sqlite3_initialize();
@@ -697,6 +709,15 @@ pub unsafe extern "C" fn sqlite3_open_v2(
     if filename.is_null() {
         return SQLITE_MISUSE;
     }
+    let rc = compat_config::check_open_vfs(z_vfs, flags);
+    if rc != SQLITE_OK {
+        return rc;
+    }
+    let flags = if compat_config::uri_default() {
+        flags | SQLITE_OPEN_URI
+    } else {
+        flags
+    };
     let filename_cstr = CStr::from_ptr(filename);
     let filename_str = match filename_cstr.to_str() {
         Ok(s) => s,
@@ -812,7 +833,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
             let handle = sqlite3::new(io, db, conn, stored_filename);
             handle.inner.lock().unwrap().temp_path = temp_path;
             *db_out = handle.into_raw();
-            SQLITE_OK
+            extension::run_auto_extensions(*db_out)
         }
         Err(e) => {
             trace!("error connecting to database: {:?}", e);
@@ -824,7 +845,9 @@ pub unsafe extern "C" fn sqlite3_open_v2(
 fn temp_database_path() -> std::path::PathBuf {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("turso-temp-{}-{n}.db", std::process::id()))
+    compat_config::temp_directory_override()
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!("turso-temp-{}-{n}.db", std::process::id()))
 }
 
 #[capi_guard]
@@ -848,6 +871,7 @@ pub unsafe extern "C" fn sqlite3_close(db: *mut sqlite3) -> ffi::c_int {
             return SQLITE_BUSY;
         }
     }
+    compat_config::forget_connection(db);
     drop(Arc::from_raw(db));
     SQLITE_OK
 }
@@ -868,6 +892,7 @@ pub unsafe extern "C" fn sqlite3_close_v2(db: *mut sqlite3) -> ffi::c_int {
             inner.e_open_state = SQLITE_STATE_ZOMBIE;
         }
     }
+    compat_config::forget_connection(db);
     drop(Arc::from_raw(db));
     SQLITE_OK
 }
@@ -1759,7 +1784,6 @@ pub unsafe extern "C" fn turso_db_config_int(
     if db.is_null() {
         return SQLITE_MISUSE;
     }
-    let _ = (value, p_out);
     match op {
         // Refused rather than accepted-and-ignored, so a caller that checks
         // the return cannot be misled into believing it toggled anything.
@@ -1777,7 +1801,7 @@ pub unsafe extern "C" fn turso_db_config_int(
         // accept + enforce is safe only if every feature above gains a
         // per-connection defensive gate in core first.
         SQLITE_DBCONFIG_DEFENSIVE => SQLITE_ERROR,
-        _ => SQLITE_ERROR,
+        _ => unsafe { compat_config::db_config_bool(db, op, value, p_out) },
     }
 }
 

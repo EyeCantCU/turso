@@ -499,6 +499,51 @@ int sqlite3_enable_shared_cache(int enable);
 */
 void turso_enable_experimental(void);
 
+/* ---- config / file control / status / VFS / extensions ---- */
+typedef struct sqlite3_vfs sqlite3_vfs;
+
+#define SQLITE_CONFIG_SINGLETHREAD  1
+#define SQLITE_CONFIG_MULTITHREAD   2
+#define SQLITE_CONFIG_SERIALIZED    3
+#define SQLITE_CONFIG_MEMSTATUS     9
+#define SQLITE_CONFIG_LOG          16
+#define SQLITE_CONFIG_URI          17
+
+/* File-control opcodes honoured by sqlite3_file_control(); others return
+** SQLITE_NOTFOUND. */
+#define SQLITE_FCNTL_LAST_ERRNO           4
+#define SQLITE_FCNTL_SIZE_HINT            5
+#define SQLITE_FCNTL_CHUNK_SIZE           6
+#define SQLITE_FCNTL_PERSIST_WAL         10
+#define SQLITE_FCNTL_VFSNAME             12
+#define SQLITE_FCNTL_POWERSAFE_OVERWRITE 13
+#define SQLITE_FCNTL_TEMPFILENAME        16
+#define SQLITE_FCNTL_MMAP_SIZE           18
+#define SQLITE_FCNTL_HAS_MOVED           20
+#define SQLITE_FCNTL_DATA_VERSION        35
+#define SQLITE_FCNTL_SIZE_LIMIT          36
+#define SQLITE_FCNTL_RESERVE_BYTES       38
+#define SQLITE_FCNTL_RESET_CACHE         42
+
+extern char *sqlite3_temp_directory;
+
+int sqlite3_config(int op, ...);
+int sqlite3_test_control(int op, ...);
+int sqlite3_file_control(sqlite3 *db, const char *zDbName, int op, void *pArg);
+int sqlite3_status(int op, int *pCurrent, int *pHighwater, int resetFlag);
+int sqlite3_status64(int op, sqlite3_int64 *pCurrent, sqlite3_int64 *pHighwater, int resetFlag);
+int sqlite3_db_status(sqlite3 *db, int op, int *pCurrent, int *pHighwater, int resetFlag);
+void *sqlite3_db_mutex(sqlite3 *db);
+int sqlite3_unlock_notify(sqlite3 *db, void (*xNotify)(void **apArg, int nArg), void *pArg);
+int sqlite3_auto_extension(void (*xEntryPoint)(void));
+int sqlite3_cancel_auto_extension(void (*xEntryPoint)(void));
+void sqlite3_reset_auto_extension(void);
+int sqlite3_enable_load_extension(sqlite3 *db, int onoff);
+int sqlite3_load_extension(sqlite3 *db, const char *zFile, const char *zProc, char **pzErrMsg);
+sqlite3_vfs *sqlite3_vfs_find(const char *zVfsName);
+int sqlite3_vfs_register(sqlite3_vfs *pVfs, int makeDflt);
+int sqlite3_vfs_unregister(sqlite3_vfs *pVfs);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus
