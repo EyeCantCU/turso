@@ -2422,7 +2422,7 @@ impl WalCoordination for ShmWalCoordination {
         // SQLite readers in other processes pin frames through its read marks.
         #[cfg(target_os = "linux")]
         if let Some(limited) = self.sqlite_index(|index| index.limit_backfill(max_safe_frame)) {
-            max_safe_frame = limited.unwrap_or(self.load_snapshot().nbackfills);
+            max_safe_frame = limited.unwrap_or_else(|_| self.load_snapshot().nbackfills);
         }
         match self.authority.min_active_reader_frame() {
             Some(shared_min) => max_safe_frame.min(shared_min),
