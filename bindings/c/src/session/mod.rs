@@ -4,7 +4,7 @@
 //! the hash-table order matches, so output is byte-identical to SQLite's.
 
 #![allow(clippy::too_many_arguments)]
-// Parts are used by later stages (apply, changegroup, rebaser).
+// Parts are used by a later stage (diff).
 #![allow(dead_code)]
 
 use std::ffi::{self, CStr, CString};
@@ -21,17 +21,16 @@ use crate::{
 };
 
 pub(crate) mod apply;
+pub(crate) mod group;
 pub(crate) mod iter;
 
 pub(crate) const SQLITE_OK: i32 = 0;
 pub(crate) const SQLITE_ERROR: i32 = 1;
 pub(crate) const SQLITE_ABORT: i32 = 4;
-pub(crate) const SQLITE_BUSY: i32 = 5;
 pub(crate) const SQLITE_NOMEM: i32 = 7;
 pub(crate) const SQLITE_CORRUPT: i32 = 11;
 pub(crate) const SQLITE_SCHEMA: i32 = 17;
 pub(crate) const SQLITE_CONSTRAINT: i32 = 19;
-pub(crate) const SQLITE_MISMATCH: i32 = 20;
 pub(crate) const SQLITE_MISUSE: i32 = 21;
 pub(crate) const SQLITE_RANGE: i32 = 25;
 pub(crate) const SQLITE_ROW: i32 = 100;
@@ -430,10 +429,6 @@ impl Stmt {
     pub(crate) unsafe fn col_count(&self) -> i32 {
         sqlite3_column_count(self.0)
     }
-
-    pub(crate) unsafe fn col_value(&self, i: i32) -> *mut ffi::c_void {
-        sqlite3_column_value(self.0, i)
-    }
 }
 
 impl Drop for Stmt {
@@ -512,6 +507,8 @@ pub(crate) struct SessionTable {
     pub(crate) n_entry: usize,
     /// Hash buckets; each chain's head is its last element.
     pub(crate) buckets: Vec<Vec<SessionChange>>,
+    /// SELECT of the column defaults (changegroups only).
+    pub(crate) dflt_stmt: Option<Stmt>,
 }
 
 impl SessionTable {

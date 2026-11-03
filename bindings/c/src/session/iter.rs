@@ -61,10 +61,6 @@ impl SessionInput {
         }
     }
 
-    pub(crate) fn is_stream(&self) -> bool {
-        self.x_input.is_some()
-    }
-
     pub(crate) fn data(&self) -> &[u8] {
         if self.x_input.is_some() {
             &self.buf[..self.n_data]

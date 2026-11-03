@@ -102,12 +102,6 @@ extern "C" {
     fn sqlite3session_changeset_size(p: *mut sqlite3_session) -> i64;
     fn sqlite3session_object_config(p: *mut sqlite3_session, op: c_int, arg: *mut c_void) -> c_int;
     fn sqlite3session_config(op: c_int, arg: *mut c_void) -> c_int;
-    fn sqlite3session_diff(
-        p: *mut sqlite3_session,
-        from: *const c_char,
-        tbl: *const c_char,
-        err: *mut *mut c_char,
-    ) -> c_int;
     fn sqlite3changeset_start(
         pp: *mut *mut sqlite3_changeset_iter,
         n: c_int,
@@ -173,6 +167,72 @@ extern "C" {
         filter: Option<XFilter>,
         conflict: Option<XConflict>,
         ctx: *mut c_void,
+    ) -> c_int;
+    fn sqlite3changeset_invert(
+        n: c_int,
+        p: *const c_void,
+        pn: *mut c_int,
+        pp: *mut *mut c_void,
+    ) -> c_int;
+    fn sqlite3changeset_invert_strm(
+        xi: Option<XInput>,
+        p_in: *mut c_void,
+        xo: Option<XOutput>,
+        p_out: *mut c_void,
+    ) -> c_int;
+    fn sqlite3changeset_concat(
+        na: c_int,
+        pa: *mut c_void,
+        nb: c_int,
+        pb: *mut c_void,
+        pn: *mut c_int,
+        pp: *mut *mut c_void,
+    ) -> c_int;
+    fn sqlite3changeset_concat_strm(
+        xa: Option<XInput>,
+        pa: *mut c_void,
+        xb: Option<XInput>,
+        pb: *mut c_void,
+        xo: Option<XOutput>,
+        p_out: *mut c_void,
+    ) -> c_int;
+    fn sqlite3changegroup_new(pp: *mut *mut c_void) -> c_int;
+    fn sqlite3changegroup_schema(g: *mut c_void, db: *mut sqlite3, z_db: *const c_char) -> c_int;
+    fn sqlite3changegroup_add(g: *mut c_void, n: c_int, p: *mut c_void) -> c_int;
+    fn sqlite3changegroup_add_strm(g: *mut c_void, x: Option<XInput>, p: *mut c_void) -> c_int;
+    fn sqlite3changegroup_add_change(g: *mut c_void, it: *mut sqlite3_changeset_iter) -> c_int;
+    fn sqlite3changegroup_output(g: *mut c_void, pn: *mut c_int, pp: *mut *mut c_void) -> c_int;
+    fn sqlite3changegroup_output_strm(g: *mut c_void, x: Option<XOutput>, p: *mut c_void) -> c_int;
+    fn sqlite3changegroup_config(g: *mut c_void, op: c_int, arg: *mut c_void) -> c_int;
+    fn sqlite3changegroup_delete(g: *mut c_void);
+    fn sqlite3changegroup_change_begin(
+        g: *mut c_void,
+        op: c_int,
+        tab: *const c_char,
+        indirect: c_int,
+        err: *mut *mut c_char,
+    ) -> c_int;
+    fn sqlite3changegroup_change_int64(g: *mut c_void, new: c_int, col: c_int, v: i64) -> c_int;
+    fn sqlite3changegroup_change_null(g: *mut c_void, new: c_int, col: c_int) -> c_int;
+    fn sqlite3changegroup_change_double(g: *mut c_void, new: c_int, col: c_int, v: f64) -> c_int;
+    fn sqlite3changegroup_change_text(
+        g: *mut c_void,
+        new: c_int,
+        col: c_int,
+        v: *const c_char,
+        n: c_int,
+    ) -> c_int;
+    fn sqlite3changegroup_change_blob(
+        g: *mut c_void,
+        new: c_int,
+        col: c_int,
+        v: *const c_void,
+        n: c_int,
+    ) -> c_int;
+    fn sqlite3changegroup_change_finish(
+        g: *mut c_void,
+        discard: c_int,
+        err: *mut *mut c_char,
     ) -> c_int;
     fn sqlite3_value_type(v: *mut c_void) -> c_int;
     fn sqlite3_value_int64(v: *mut c_void) -> i64;
@@ -845,5 +905,307 @@ fn test_session_apply_conflict_resolution() {
         assert_eq!(query(dst, "SELECT count(*) FROM t2"), ["0"]);
         let _ = SQLITE_SCHEMA;
         sqlite3_close(dst);
+    }
+}
+
+/// Changes made after SCHEMA + CHANGES.
+const CHANGES2: &str = "UPDATE t1 SET b = 'TEN' WHERE a = 10;\
+    UPDATE t1 SET b = 'one' WHERE a = 1;\
+    INSERT INTO t1 VALUES(3, 'three', 3);\
+    DELETE FROM t1 WHERE a = 2;\
+    UPDATE t2 SET z = 10 WHERE x = 'a';\
+    DELETE FROM t2 WHERE x = 'c';\
+    INSERT INTO t1 VALUES(30, 'x', 0); DELETE FROM t1 WHERE a = 30;";
+
+/// The changeset for CHANGES2, as made by this engine.
+unsafe fn second_changeset(dir: &std::path::Path) -> Vec<u8> {
+    let db = open(&dir.join("second.db"));
+    exec(db, SCHEMA);
+    exec(db, CHANGES);
+    let mut s = ptr::null_mut();
+    sqlite3session_create(db, c("main").as_ptr(), &mut s);
+    sqlite3session_attach(s, ptr::null());
+    exec(db, CHANGES2);
+    let cs = changeset(s);
+    sqlite3session_delete(s);
+    sqlite3_close(db);
+    cs
+}
+
+const CHANGESET2: &str = "5403010000743100170001000000000000000a0304666f75720000030354454e00170001000000000000000103034f4e45000003036f6e65000900010000000000000002030374776f010000000000000016120001000000000000000303057468726565010000000000000003540302010074320017000301610100000000000000010240220000000000000000024024000000000000090003016301000000000000000302400c000000000000";
+const INVERTED: &str = "5403010000743100090001000000000000000a0304666f7572010000000000000004170001000000000000000103034f4e45000003036f6e6500170001000000000000000200010000000000000016000005120001000000000000000304020102010000000000000003540302010074320017000301610100000000000000010240220000000000000000023ff00000000000001200030162010000000000000002024000000000000000090003016301000000000000000302400c000000000000";
+const CONCAT: &str = "5403010000743100120001000000000000000a030354454e0100000000000000040900010000000000000002030374776f051700010000000000000003040201020000030574687265650054030201007432001700030161010000000000000001023ff000000000000000000240240000000000000900030162010000000000000002024000000000000000";
+
+unsafe fn out_buf(n: c_int, p: *mut c_void, rc: c_int) -> Vec<u8> {
+    assert_eq!(rc, SQLITE_OK);
+    take(n, p)
+}
+
+#[test]
+fn test_session_invert_concat() {
+    unsafe {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cs1 = unhex(CHANGESET);
+        let mut cs2 = second_changeset(dir.path());
+        assert_eq!(hex(&cs2), CHANGESET2);
+        let (mut n, mut p) = (0, ptr::null_mut());
+        let rc = sqlite3changeset_invert(
+            cs1.len() as c_int,
+            cs1.as_ptr() as *const c_void,
+            &mut n,
+            &mut p,
+        );
+        let inv = out_buf(n, p, rc);
+        assert_eq!(hex(&inv), INVERTED);
+        let mut input = Buf(cs1.clone(), 0, 9);
+        let mut out = Buf(Vec::new(), 0, 0);
+        let rc = sqlite3changeset_invert_strm(
+            Some(x_input),
+            &mut input as *mut Buf as *mut c_void,
+            Some(x_output),
+            &mut out as *mut Buf as *mut c_void,
+        );
+        assert_eq!(rc, SQLITE_OK);
+        assert_eq!(out.0, inv);
+        // A patchset cannot be inverted.
+        let ps = unhex(PATCHSET);
+        let rc = sqlite3changeset_invert(
+            ps.len() as c_int,
+            ps.as_ptr() as *const c_void,
+            &mut n,
+            &mut p,
+        );
+        assert_eq!(rc, SQLITE_CORRUPT);
+
+        let rc = sqlite3changeset_concat(
+            cs1.len() as c_int,
+            cs1.as_mut_ptr() as *mut c_void,
+            cs2.len() as c_int,
+            cs2.as_mut_ptr() as *mut c_void,
+            &mut n,
+            &mut p,
+        );
+        let cat = out_buf(n, p, rc);
+        assert_eq!(hex(&cat), CONCAT);
+        let (mut a, mut b) = (Buf(cs1.clone(), 0, 4), Buf(cs2.clone(), 0, 6));
+        let mut out = Buf(Vec::new(), 0, 0);
+        let rc = sqlite3changeset_concat_strm(
+            Some(x_input),
+            &mut a as *mut Buf as *mut c_void,
+            Some(x_input),
+            &mut b as *mut Buf as *mut c_void,
+            Some(x_output),
+            &mut out as *mut Buf as *mut c_void,
+        );
+        assert_eq!(rc, SQLITE_OK);
+        assert_eq!(out.0, cat);
+        // A changeset and a patchset do not mix.
+        let mut ps = unhex(PATCHSET);
+        let rc = sqlite3changeset_concat(
+            cs1.len() as c_int,
+            cs1.as_mut_ptr() as *mut c_void,
+            ps.len() as c_int,
+            ps.as_mut_ptr() as *mut c_void,
+            &mut n,
+            &mut p,
+        );
+        assert_eq!(rc, 1);
+
+        // Applying the concatenation equals applying both changesets.
+        let dst = open(&dir.path().join("dst.db"));
+        exec(dst, SCHEMA);
+        let mut st = Conflicts::default();
+        let ctx = &mut st as *mut Conflicts as *mut c_void;
+        let mut cat = cat;
+        let rc = sqlite3changeset_apply(
+            dst,
+            cat.len() as c_int,
+            cat.as_mut_ptr() as *mut c_void,
+            None,
+            Some(x_conflict),
+            ctx,
+        );
+        assert_eq!(rc, SQLITE_OK);
+        assert!(st.log.is_empty(), "{:?}", st.log);
+        let src = open(&dir.path().join("second.db"));
+        assert_eq!(contents(dst), contents(src));
+        sqlite3_close(src);
+        sqlite3_close(dst);
+    }
+}
+
+const GROUP_ADD_CHANGE: &str = "5403010000743100170001000000000000000103036f6e65000003034f4e450017000100000000000000020005000001000000000000001654030201007432001700030161010000000000000001023ff00000000000000000024022000000000000";
+const GROUP_SCHEMA: &str = "54030100007700120001000000000000000103036f6e650301431200010000000000000002030374776f030464666c7412000100000000000000030305746872656503026333";
+const GROUP_CHANGES: &str = "54030100007700120001000000000000000103036f6e65030143120001000000000000000204020102030464666c7412000100000000000000030305746872656503026333120101000000000000003203056669667479024004000000000000";
+
+#[test]
+fn test_session_changegroup() {
+    unsafe {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cs1 = unhex(CHANGESET);
+        let mut cs2 = second_changeset(dir.path());
+        let mut g = ptr::null_mut();
+        assert_eq!(sqlite3changegroup_new(&mut g), SQLITE_OK);
+        assert_eq!(
+            sqlite3changegroup_add(g, cs1.len() as c_int, cs1.as_mut_ptr() as *mut c_void),
+            SQLITE_OK
+        );
+        let mut input = Buf(cs2.clone(), 0, 3);
+        assert_eq!(
+            sqlite3changegroup_add_strm(g, Some(x_input), &mut input as *mut Buf as *mut c_void),
+            SQLITE_OK
+        );
+        let (mut n, mut p) = (0, ptr::null_mut());
+        let rc = sqlite3changegroup_output(g, &mut n, &mut p);
+        assert_eq!(hex(&out_buf(n, p, rc)), CONCAT);
+        let mut out = Buf(Vec::new(), 0, 0);
+        sqlite3changegroup_output_strm(g, Some(x_output), &mut out as *mut Buf as *mut c_void);
+        assert_eq!(hex(&out.0), CONCAT);
+        let mut patch = 1;
+        sqlite3changegroup_config(g, 1, &mut patch as *mut c_int as *mut c_void);
+        assert_eq!(patch, 0, "fixed once changes are added");
+        let mut ps = unhex(PATCHSET);
+        assert_eq!(
+            sqlite3changegroup_add(g, ps.len() as c_int, ps.as_mut_ptr() as *mut c_void),
+            1
+        );
+        sqlite3changegroup_delete(g);
+
+        // add_change: only the UPDATEs of the first changeset.
+        sqlite3changegroup_new(&mut g);
+        let mut it = ptr::null_mut();
+        sqlite3changeset_start(&mut it, cs1.len() as c_int, cs1.as_mut_ptr() as *mut c_void);
+        assert_eq!(sqlite3changegroup_add_change(g, it), 1, "no current change");
+        while sqlite3changeset_next(it) == SQLITE_ROW {
+            let (mut tab, mut nc, mut op, mut ind) = (ptr::null(), 0, 0, 0);
+            sqlite3changeset_op(it, &mut tab, &mut nc, &mut op, &mut ind);
+            if op == SQLITE_UPDATE {
+                assert_eq!(sqlite3changegroup_add_change(g, it), SQLITE_OK);
+            }
+        }
+        sqlite3changeset_finalize(it);
+        let rc = sqlite3changegroup_output(g, &mut n, &mut p);
+        assert_eq!(hex(&out_buf(n, p, rc)), GROUP_ADD_CHANGE);
+        sqlite3changegroup_delete(g);
+        let _ = &mut cs2;
+
+        // With a schema, changes recorded before ALTER TABLE ADD COLUMN are
+        // padded with the new columns' defaults.
+        let db = open(&dir.path().join("w.db"));
+        exec(db, "CREATE TABLE w(a INTEGER PRIMARY KEY, b)");
+        let mut s = ptr::null_mut();
+        sqlite3session_create(db, c("main").as_ptr(), &mut s);
+        sqlite3session_attach(s, ptr::null());
+        exec(
+            db,
+            "INSERT INTO w VALUES(1, 'one'); INSERT INTO w VALUES(2, 'two');",
+        );
+        let mut old = changeset(s);
+        sqlite3session_delete(s);
+        exec(db, "ALTER TABLE w ADD COLUMN c DEFAULT 'dflt'");
+        sqlite3session_create(db, c("main").as_ptr(), &mut s);
+        sqlite3session_attach(s, ptr::null());
+        exec(
+            db,
+            "UPDATE w SET c = 'C' WHERE a = 1; INSERT INTO w VALUES(3, 'three', 'c3');",
+        );
+        let mut new = changeset(s);
+        sqlite3session_delete(s);
+        sqlite3changegroup_new(&mut g);
+        assert_eq!(
+            sqlite3changegroup_add(g, old.len() as c_int, old.as_mut_ptr() as *mut c_void),
+            SQLITE_OK
+        );
+        assert_eq!(
+            sqlite3changegroup_add(g, new.len() as c_int, new.as_mut_ptr() as *mut c_void),
+            SQLITE_SCHEMA
+        );
+        sqlite3changegroup_delete(g);
+        sqlite3changegroup_new(&mut g);
+        assert_eq!(
+            sqlite3changegroup_schema(g, db, c("main").as_ptr()),
+            SQLITE_OK
+        );
+        assert_eq!(
+            sqlite3changegroup_schema(g, db, c("main").as_ptr()),
+            SQLITE_MISUSE
+        );
+        assert_eq!(
+            sqlite3changegroup_add(g, old.len() as c_int, old.as_mut_ptr() as *mut c_void),
+            SQLITE_OK
+        );
+        assert_eq!(
+            sqlite3changegroup_add(g, new.len() as c_int, new.as_mut_ptr() as *mut c_void),
+            SQLITE_OK
+        );
+        let rc = sqlite3changegroup_output(g, &mut n, &mut p);
+        assert_eq!(hex(&out_buf(n, p, rc)), GROUP_SCHEMA);
+
+        // Changes built value by value.
+        let mut err = ptr::null_mut();
+        assert_eq!(sqlite3changegroup_change_int64(g, 1, 0, 5), SQLITE_MISUSE);
+        assert_eq!(
+            sqlite3changegroup_change_begin(g, 99, c("w").as_ptr(), 0, &mut err),
+            1
+        );
+        assert_eq!(
+            sqlite3changegroup_change_begin(g, SQLITE_INSERT, c("nosuch").as_ptr(), 0, &mut err),
+            1
+        );
+        assert_eq!(
+            CStr::from_ptr(err).to_str().unwrap(),
+            "no such table: nosuch"
+        );
+        sqlite3_free(err as *mut c_void);
+        assert_eq!(
+            sqlite3changegroup_change_begin(g, SQLITE_INSERT, c("w").as_ptr(), 1, &mut err),
+            SQLITE_OK
+        );
+        assert_eq!(
+            sqlite3changegroup_change_begin(g, SQLITE_INSERT, c("w").as_ptr(), 0, &mut err),
+            SQLITE_MISUSE
+        );
+        assert_eq!(sqlite3changegroup_change_int64(g, 1, 3, 1), SQLITE_RANGE);
+        assert_eq!(sqlite3changegroup_change_int64(g, 0, 0, 1), 1);
+        sqlite3changegroup_change_int64(g, 1, 0, 50);
+        sqlite3changegroup_change_text(g, 1, 1, c("fifty").as_ptr(), 3);
+        assert_eq!(sqlite3changegroup_change_finish(g, 0, &mut err), 1);
+        assert_eq!(
+            CStr::from_ptr(err).to_str().unwrap(),
+            "invalid change: column 2 is undefined"
+        );
+        sqlite3_free(err as *mut c_void);
+        sqlite3changegroup_change_begin(g, SQLITE_INSERT, c("w").as_ptr(), 1, ptr::null_mut());
+        sqlite3changegroup_change_int64(g, 1, 0, 50);
+        sqlite3changegroup_change_text(g, 1, 1, c("fifty").as_ptr(), -1);
+        sqlite3changegroup_change_double(g, 1, 2, 2.5);
+        assert_eq!(sqlite3changegroup_change_finish(g, 0, &mut err), SQLITE_OK);
+        assert!(err.is_null());
+        sqlite3changegroup_change_begin(g, SQLITE_UPDATE, c("w").as_ptr(), 0, ptr::null_mut());
+        sqlite3changegroup_change_int64(g, 0, 0, 2);
+        sqlite3changegroup_change_text(g, 0, 1, c("two").as_ptr(), -1);
+        sqlite3changegroup_change_blob(g, 1, 1, b"\x01\x02".as_ptr() as *const c_void, 2);
+        assert_eq!(
+            sqlite3changegroup_change_finish(g, 0, ptr::null_mut()),
+            SQLITE_OK
+        );
+        sqlite3changegroup_change_begin(g, SQLITE_UPDATE, c("w").as_ptr(), 0, ptr::null_mut());
+        sqlite3changegroup_change_null(g, 0, 0);
+        assert_eq!(sqlite3changegroup_change_finish(g, 0, &mut err), 1);
+        assert_eq!(
+            CStr::from_ptr(err).to_str().unwrap(),
+            "invalid change: null value in PK of old.* record"
+        );
+        sqlite3_free(err as *mut c_void);
+        sqlite3changegroup_change_begin(g, SQLITE_DELETE, c("w").as_ptr(), 0, ptr::null_mut());
+        sqlite3changegroup_change_int64(g, 0, 0, 1);
+        assert_eq!(
+            sqlite3changegroup_change_finish(g, 1, ptr::null_mut()),
+            SQLITE_OK
+        );
+        let rc = sqlite3changegroup_output(g, &mut n, &mut p);
+        assert_eq!(hex(&out_buf(n, p, rc)), GROUP_CHANGES);
+        sqlite3changegroup_delete(g);
+        sqlite3_close(db);
     }
 }
