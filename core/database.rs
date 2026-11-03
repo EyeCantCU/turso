@@ -715,6 +715,9 @@ pub struct Database<
     /// address, this can never repeat within a process, so detach/reattach
     /// and close/reopen produce distinguishable values.
     pub(crate) incarnation: u64,
+    /// Process that opened the database. A child inherits the registry across
+    /// fork but must open its own instance: the parent's locks are not its own.
+    owner_pid: u32,
 
     pager_state: Arc<SharedPagerState>,
     /// Key of this database's entry in `DATABASE_MANAGER`, set once the
@@ -881,6 +884,7 @@ impl Database {
                     std::sync::atomic::AtomicU64::new(1);
                 NEXT_DATABASE_INCARNATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             },
+            owner_pid: std::process::id(),
 
             pager_state: Arc::new(SharedPagerState::new(init_page_1)),
             registry_key: OnceLock::new(),
@@ -946,6 +950,24 @@ impl Database {
             .expect("database is registered once");
         registry.insert(key, RegistryEntry::Ready(Arc::downgrade(&db)));
         Ok(db)
+    }
+
+    /// Whether multiprocess WAL can be used for `path` with `io`: a real file
+    /// on a local filesystem and an IO backend with shared-memory support.
+    #[cfg(feature = "fs")]
+    pub fn multiprocess_wal_supported(io: &Arc<dyn IO>, path: &str) -> bool {
+        #[cfg(host_shared_wal)]
+        {
+            !is_memory_like(path)
+                && !path.is_empty()
+                && io.supports_shared_wal_coordination()
+                && Self::path_allows_shared_wal_coordination(Path::new(path)).unwrap_or(false)
+        }
+        #[cfg(not(host_shared_wal))]
+        {
+            let _ = (io, path);
+            false
+        }
     }
 
     #[cfg(feature = "fs")]
@@ -1084,9 +1106,14 @@ impl Database {
             return Ok(());
         }
 
-        let probe_flags = (flags | OpenFlags::Create) & !OpenFlags::NoLock & !OpenFlags::ReadOnly;
-        match io.open_file(path, probe_flags, true) {
-            Ok(_probe_file) => Ok(()),
+        // Probe with a shared lock: it conflicts with a legacy opener's
+        // exclusive lock but not with concurrent multiprocess probes.
+        let probe_flags = (flags | OpenFlags::Create | OpenFlags::NoLock) & !OpenFlags::ReadOnly;
+        match io
+            .open_file(path, probe_flags, true)
+            .and_then(|probe_file| probe_file.lock_file(false))
+        {
+            Ok(()) => Ok(()),
             Err(LimboError::LockingError(_)) => Err(LimboError::LockingError(format!(
                 "Failed opening database '{path}'. Database is already open without experimental multiprocess WAL in another process"
             ))),
@@ -1148,6 +1175,9 @@ impl Database {
             _ => return Ok(None),
         };
         drop(registry);
+        if !db.opened_in_this_process() {
+            return Ok(None);
+        }
 
         // Validate encryption compatibility (key is not stored for security,
         // so we can only check cipher mode)
@@ -1371,6 +1401,8 @@ impl Database {
         // in this case we need to bypass registry (as this is MemoryIO DB) but also preserve original distinction in names (e.g. :memory:-draft and :memory:-synced)
         // so, we bypass registry for all in memory dbs (i.e. db paths which starts with ":memory:")
         if matches!(state.phase, OpenDbAsyncPhase::Init) && !is_memory_like(path) {
+            // An instance inherited across fork; dropped only after the lock.
+            let mut _inherited: Option<Arc<Database>> = None;
             // Briefly lock the registry to check/reserve — never hold across I/O yields.
             let mut registry = DATABASE_MANAGER.lock();
 
@@ -1380,7 +1412,11 @@ impl Database {
                 let key = DatabaseKey::File(file_id);
                 match registry.get(&key) {
                     Some(RegistryEntry::Ready(weak)) => {
-                        if let Some(db) = weak.upgrade() {
+                        let mut live = weak.upgrade();
+                        if live.as_ref().is_some_and(|db| !db.opened_in_this_process()) {
+                            _inherited = live.take();
+                        }
+                        if let Some(db) = live {
                             drop(registry);
                             tracing::debug!("took database {path:?} from the registry");
 
@@ -1397,7 +1433,8 @@ impl Database {
                             Self::check_registry_dialect(&db, options.dialect.as_ref())?;
                             return Ok(IOResult::Done(db));
                         }
-                        // Weak ref expired — treat as absent, fall through to insert Opening.
+                        // Weak ref expired or inherited across fork — treat as
+                        // absent, fall through to insert Opening.
                         registry.insert(key.clone(), RegistryEntry::Opening);
                     }
                     Some(RegistryEntry::Opening) => {
@@ -3617,6 +3654,11 @@ impl Database {
 
     pub fn experimental_attach_enabled(&self) -> bool {
         self.opts.enable_attach
+    }
+
+    /// False in a child that inherited this instance across fork.
+    pub(crate) fn opened_in_this_process(&self) -> bool {
+        self.owner_pid == std::process::id()
     }
 
     pub fn experimental_multiprocess_wal_enabled(&self) -> bool {

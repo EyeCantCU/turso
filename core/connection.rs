@@ -1996,6 +1996,10 @@ impl Connection {
             db_opts = db_opts.with_encryption(true);
         }
         let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
+        if db_opts.enable_multiprocess_wal && !Database::multiprocess_wal_supported(&io, &opts.path)
+        {
+            db_opts = db_opts.with_multiprocess_wal(false);
+        }
         let db = Database::open_file_with_flags(
             io.clone(),
             &opts.path,
