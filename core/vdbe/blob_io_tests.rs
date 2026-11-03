@@ -859,7 +859,6 @@ fn blob_boundary_read_write_sweep() {
 }
 
 #[test]
-#[ignore = "known gap: a second read-write handle inside an explicit transaction returns Busy"]
 fn blob_write_handles_inside_an_explicit_transaction() {
     // Python's sqlite3 module opens handles inside the transaction its INSERT began.
     let conn = fresh_db();
