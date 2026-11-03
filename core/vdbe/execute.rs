@@ -17446,17 +17446,15 @@ pub fn op_integrity_check(
     match state.active_op_state.integrity_check() {
         OpIntegrityCheckState::Start => {
             #[cfg(feature = "autovacuum")]
-            let av_geom = if mv_store.is_none() {
+            let av_geom = {
                 let (mode, geom) = return_if_io!(
                     state,
-                    target_pager.with_header(|h| (
+                    with_header(&target_pager, physical_header_store, program, *db, |h| (
                         crate::storage::pager::autovacuum::mode_from_header(h),
                         target_pager.av_geom(h)
                     ))
                 );
                 (mode != crate::storage::pager::AutoVacuumMode::None).then_some(geom)
-            } else {
-                None
             };
             let (freelist_trunk_page, db_size) = return_if_io!(
                 state,
@@ -17615,8 +17613,9 @@ pub fn op_integrity_check(
                 }
             }
 
+            // MVCC keeps its own copy of the header; only plain databases are checked.
             #[cfg(feature = "autovacuum")]
-            if let Some(geom) = av_geom {
+            if let Some(geom) = av_geom.filter(|_| mv_store.is_none()) {
                 if errors.len() < *max_errors {
                     let errors = std::mem::take(errors);
                     let check_state =
