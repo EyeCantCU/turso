@@ -1,0 +1,174 @@
+@database :memory:
+
+# SQLite stores and reports schema object names as written, while every name
+# lookup folds ASCII case. Turso used to store the names lowercased, so
+# `SELECT name FROM sqlite_schema WHERE name = 'Labels'` found nothing.
+
+setup mixed-case-schema {
+    CREATE TABLE Labels (Id INTEGER PRIMARY KEY, "MixedCol" TEXT UNIQUE, Other);
+    CREATE TABLE "Quoted Tbl" ("Col A" INT, [Col B] TEXT);
+    CREATE INDEX IdxL ON labels(mixedcol, OTHER);
+    CREATE UNIQUE INDEX "Idx Q" ON "quoted tbl"("col a");
+    CREATE VIEW VLab AS SELECT Id, MixedCol FROM LABELS;
+    CREATE TRIGGER TrL AFTER INSERT ON LABELS BEGIN INSERT INTO "QUOTED TBL" VALUES (new.id, new.mixedcol); END;
+    CREATE TABLE Parent(PId INTEGER PRIMARY KEY);
+    CREATE TABLE Child(CId INTEGER PRIMARY KEY, PRef REFERENCES PARENT(pid));
+    INSERT INTO labels VALUES (1, 'x', 'o');
+}
+
+@setup mixed-case-schema
+@cross-check-integrity
+test schema-rows-keep-names-as-written {
+    SELECT type, name, tbl_name FROM sqlite_schema ORDER BY name;
+}
+expect {
+    table|Child|Child
+    index|Idx Q|Quoted Tbl
+    index|IdxL|Labels
+    table|Labels|Labels
+    table|Parent|Parent
+    table|Quoted Tbl|Quoted Tbl
+    trigger|TrL|LABELS
+    view|VLab|VLab
+    index|sqlite_autoindex_Labels_1|Labels
+}
+
+@setup mixed-case-schema
+test exact-name-lookup-in-sqlite-schema {
+    SELECT count(*) FROM sqlite_schema WHERE name = 'Labels';
+    SELECT count(*) FROM sqlite_schema WHERE name = 'labels';
+}
+expect {
+    1
+    0
+}
+
+@setup mixed-case-schema
+test lookups-fold-case {
+    SELECT LABELS.id, Labels.MIXEDCOL FROM labels;
+    SELECT * FROM "QUOTED TBL";
+    SELECT * FROM vlab;
+}
+expect {
+    1|x
+    1|x
+    1|x
+}
+
+@setup mixed-case-schema
+test pragmas-report-names-as-written {
+    SELECT name FROM pragma_index_list('LABELS') ORDER BY name;
+    SELECT name FROM pragma_index_info('idxl');
+    SELECT "table", "from", "to" FROM pragma_foreign_key_list('child');
+    SELECT name, type FROM pragma_table_list WHERE schema = 'main' AND name NOT LIKE 'sqlite%' ORDER BY name;
+}
+expect {
+    IdxL
+    sqlite_autoindex_Labels_1
+    MixedCol
+    Other
+    PARENT|PRef|pid
+    Child|table
+    Labels|table
+    Parent|table
+    Quoted Tbl|table
+    VLab|view
+}
+
+@setup mixed-case-schema
+test unique-error-uses-declared-names {
+    INSERT INTO labels VALUES (2, 'x', 'dup');
+}
+expect error {
+    UNIQUE constraint failed: Labels.MixedCol
+}
+
+@setup mixed-case-schema
+test create-clashing-name-in-other-case-fails {
+    CREATE TABLE LABELS(x);
+}
+expect error {
+    table LABELS already exists
+}
+
+@setup mixed-case-schema
+@cross-check-integrity
+test rename-table-keeps-new-case {
+    ALTER TABLE labels RENAME TO LabelsX;
+    ALTER TABLE "QUOTED tbl" RENAME TO [Other Quoted];
+    INSERT INTO labelsx VALUES (2, 'y', 'z');
+    SELECT type, name, tbl_name FROM sqlite_schema ORDER BY name;
+    SELECT * FROM "other quoted";
+}
+expect {
+    table|Child|Child
+    index|Idx Q|Other Quoted
+    index|IdxL|LabelsX
+    table|LabelsX|LabelsX
+    table|Other Quoted|Other Quoted
+    table|Parent|Parent
+    trigger|TrL|LabelsX
+    view|VLab|VLab
+    index|sqlite_autoindex_LabelsX_1|LabelsX
+    1|x
+    2|y
+}
+
+@setup mixed-case-schema
+@cross-check-integrity
+test drop-objects-named-in-other-case {
+    DROP INDEX IDXL;
+    DROP VIEW vlab;
+    DROP TRIGGER TRL;
+    DROP TABLE "QUOTED TBL";
+    DROP TABLE LABELS;
+    SELECT type, name FROM sqlite_schema ORDER BY name;
+}
+expect {
+    table|Child
+    table|Parent
+}
+
+@cross-check-integrity
+test autoincrement-sequence-row-keeps-table-case {
+    CREATE TABLE AutoInc(Id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO autoinc(v) VALUES (1);
+    ALTER TABLE autoinc RENAME TO AutoInc2;
+    INSERT INTO AUTOINC2(v) VALUES (2);
+    SELECT * FROM sqlite_sequence;
+}
+expect {
+    AutoInc2|2
+}
+
+test analyze-writes-names-as-written {
+    CREATE TABLE StatT(A);
+    CREATE INDEX StatI ON statt(a);
+    INSERT INTO statt VALUES (1), (2);
+    ANALYZE;
+    SELECT tbl, idx FROM sqlite_stat1;
+}
+expect {
+    StatT|StatI
+}
+
+test temp-objects-keep-case {
+    CREATE TEMP TABLE TmpX(A);
+    CREATE TEMP TRIGGER TmpTr AFTER INSERT ON tmpx BEGIN SELECT 1; END;
+    ALTER TABLE tmpx RENAME TO TmpY;
+    SELECT type, name, tbl_name FROM temp.sqlite_schema ORDER BY name;
+}
+expect {
+    trigger|TmpTr|TmpY
+    table|TmpY|TmpY
+}
+
+test integrity-check-finds-indexes-of-mixed-case-tables {
+    CREATE TABLE Table1 (col TEXT NOT NULL PRIMARY KEY);
+    CREATE INDEX Idx1 ON table1(col);
+    INSERT INTO TABLE1 VALUES ('a');
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}

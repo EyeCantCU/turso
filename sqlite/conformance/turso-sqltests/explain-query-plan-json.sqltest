@@ -305,6 +305,6 @@ test table-name-casing-is-not-an-alias {
 }
 expect {
     1|0|0|SCAN mixedcase
-    1|0|0|SCAN mixedcase AS m
+    1|0|0|SCAN MixedCase AS m
     2|0|0|SCAN mixedcase
 }

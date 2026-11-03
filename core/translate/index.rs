@@ -68,6 +68,38 @@ fn canonical_create_index_sql(
     canonical_stmt.to_string()
 }
 
+/// The text to store for an index: the statement as written, as SQLite does,
+/// when it still names the same index, else the canonical text.
+fn stored_create_index_sql(
+    input: &str,
+    stmt: &ast::Stmt,
+    idx_name_in_sql: ast::Name,
+    tbl_name_in_sql: ast::Name,
+) -> String {
+    let mut expected = stmt.clone();
+    let ast::Stmt::CreateIndex {
+        idx_name,
+        tbl_name,
+        if_not_exists,
+        unique,
+        ..
+    } = &mut expected
+    else {
+        unreachable!("stored_create_index_sql requires a CREATE INDEX statement");
+    };
+    let unique = *unique;
+    *if_not_exists = false;
+    idx_name.namespace = None;
+    idx_name.name = idx_name_in_sql.clone();
+    *tbl_name = tbl_name_in_sql.clone();
+    crate::translate::schema_text::verified_create_sql(
+        input,
+        crate::translate::schema_text::CreateKind::Index { unique },
+        &expected,
+    )
+    .unwrap_or_else(|| canonical_create_index_sql(stmt, idx_name_in_sql, tbl_name_in_sql))
+}
+
 fn validate(
     tbl_name: &str,
     idx_name: &str,
@@ -105,6 +137,7 @@ pub fn translate_create_index(
     connection: &Arc<crate::Connection>,
     resolver: &Resolver,
     stmt: ast::Stmt,
+    input: &str,
 ) -> crate::Result<()> {
     let written_stmt = stmt.clone();
     let ast::Stmt::CreateIndex {
@@ -140,12 +173,14 @@ pub fn translate_create_index(
         None => resolver.resolve_existing_table_named(original_tbl_name.as_str())?,
     };
     let database_id = namespace.database_id;
-    let sql = canonical_create_index_sql(
+    let sql = stored_create_index_sql(
+        input,
         &written_stmt,
         resolver.name_in_sql(namespace, &original_idx_name.name),
         resolver.name_in_sql(namespace, &original_tbl_name),
     );
-    let idx_name = normalize_ident(original_idx_name.name.as_str());
+    // The index keeps its name as written; the table is looked up by folded name.
+    let idx_name = original_idx_name.name.as_str().to_string();
     let tbl_name = normalize_ident(original_tbl_name.as_str());
 
     validate(
@@ -344,7 +379,7 @@ pub fn translate_create_index(
         cdc_table.map(|x| x.0),
         SchemaEntryType::Index,
         &resolver.mangle_name(namespace, &idx_name),
-        &resolver.mangle_name(namespace, &tbl_name),
+        &resolver.mangle_name(namespace, &tbl.name),
         root_page_reg,
         Some(sql),
     )?;
@@ -1423,7 +1458,7 @@ pub fn translate_drop_index(
     let mut maybe_index = None;
     let indexes: Vec<_> = resolver.with_schema(database_id, |s| {
         s.indexes(namespace.id)
-            .filter(|idx| idx.name == idx_name)
+            .filter(|idx| idx.name.eq_ignore_ascii_case(&idx_name))
             .cloned()
             .collect()
     });
@@ -1646,7 +1681,7 @@ pub fn translate_optimize(
 
         resolver.with_schema(database_id, |schema| {
             for idx in schema.indexes(namespace.id) {
-                if idx.name == idx_name {
+                if idx.name.eq_ignore_ascii_case(&idx_name) {
                     if idx.index_method.is_some() && !idx.is_backing_btree_index() {
                         indexes_to_optimize.push((database_id, idx.clone()));
                     } else {

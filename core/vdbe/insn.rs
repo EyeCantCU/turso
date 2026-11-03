@@ -287,6 +287,8 @@ pub struct AddColumnData {
     pub column: Column,
     pub check_constraints: Vec<CheckConstraint>,
     pub foreign_keys: Vec<Arc<ForeignKey>>,
+    /// The table's new sqlite_schema text.
+    pub sql: Option<String>,
 }
 
 /// Data for AlterColumn instruction (boxed to keep Insn small).
@@ -2144,6 +2146,8 @@ pub enum Insn {
         namespace: NamespaceId,
         table: String,
         column_index: usize,
+        /// The table's new sqlite_schema text.
+        sql: Option<Box<str>>,
     },
     AddColumn {
         data: Box<AddColumnData>,

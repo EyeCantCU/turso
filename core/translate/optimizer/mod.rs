@@ -372,7 +372,11 @@ fn try_match_index_method_pattern(
         }
     }
 
-    if name.name.as_str() != table.table.get_name() {
+    if !name
+        .name
+        .as_str()
+        .eq_ignore_ascii_case(table.table.get_name())
+    {
         return None;
     }
 

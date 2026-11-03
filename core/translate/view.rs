@@ -362,6 +362,7 @@ pub fn translate_create_view(
     if_not_exists: bool,
     connection: &Arc<crate::Connection>,
     program: &mut ProgramBuilder,
+    input: &str,
 ) -> Result<()> {
     // TEMP views always live in the temp schema. The parser rejects
     // CREATE TEMP VIEW with a database name other than "temp".
@@ -373,7 +374,8 @@ pub fn translate_create_view(
     let database_id = namespace.database_id;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
-    let normalized_view_name = normalize_ident(view_name.name.as_str());
+    // Stored as written; lookups fold case.
+    let normalized_view_name = view_name.name.as_str().to_string();
 
     if if_not_exists
         && resolver.with_schema(database_id, |s| {
@@ -427,12 +429,22 @@ pub fn translate_create_view(
         bind_sequence_names_in_select(&mut select_stmt, resolver)?;
     }
     let stored_view_name = resolver.mangle_name(namespace, &normalized_view_name);
-    let sql = create_view_to_str(
-        "VIEW",
-        &resolver.name_in_sql(namespace, &view_name.name).as_ident(),
-        columns,
-        &select_stmt,
-    );
+    let name_in_sql = resolver.name_in_sql(namespace, &view_name.name);
+    // Store the statement as written, as SQLite does, when it still
+    // describes this view.
+    let expected = ast::Stmt::CreateView {
+        temporary: false,
+        if_not_exists: false,
+        view_name: ast::QualifiedName::single(name_in_sql.clone()),
+        columns: columns.to_vec(),
+        select: select_stmt.clone(),
+    };
+    let sql = crate::translate::schema_text::verified_create_sql(
+        input,
+        crate::translate::schema_text::CreateKind::View,
+        &expected,
+    )
+    .unwrap_or_else(|| create_view_to_str("VIEW", &name_in_sql.as_ident(), columns, &select_stmt));
 
     // Open cursor to sqlite_schema table
     let table = resolver
@@ -694,7 +706,7 @@ pub fn translate_drop_view(
         rhs: view_name_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default(),
-        collation: CollationSeq::for_internal_values(),
+        collation: CollationSeq::NOCASE,
     });
     // Matches view - delete it
     program.emit_insn(Insn::RowId {

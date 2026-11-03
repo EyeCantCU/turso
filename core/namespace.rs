@@ -106,8 +106,9 @@ pub fn demangle_name(supports_namespaces: bool, mangled: &str) -> (NamespaceId, 
 pub fn is_reserved_object_name(supports_namespaces: bool, name: &str) -> bool {
     crate::schema::RESERVED_TABLE_PREFIXES
         .iter()
-        .any(|prefix| name.starts_with(prefix))
-        || (supports_namespaces && name.starts_with(MANGLED_NAME_PREFIX))
+        .any(|prefix| crate::util::starts_with_ignore_ascii_case(name, prefix))
+        || (supports_namespaces
+            && crate::util::starts_with_ignore_ascii_case(name, MANGLED_NAME_PREFIX))
 }
 
 /// A name that qualifies object names in SQL and the namespace it refers

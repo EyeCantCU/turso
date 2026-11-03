@@ -4036,6 +4036,116 @@ mod tests {
             );
         }
     }
+
+    /// Text of each row of `sql`, columns joined with `|`.
+    unsafe fn query_rows(db: *mut sqlite3, sql: &std::ffi::CStr) -> Vec<String> {
+        let mut stmt = ptr::null_mut();
+        assert_eq!(
+            sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut()),
+            SQLITE_OK
+        );
+        let mut rows = Vec::new();
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let row: Vec<String> = (0..sqlite3_column_count(stmt))
+                .map(|i| {
+                    let text = sqlite3_column_text(stmt, i);
+                    if text.is_null() {
+                        String::new()
+                    } else {
+                        std::ffi::CStr::from_ptr(text).to_str().unwrap().to_owned()
+                    }
+                })
+                .collect();
+            rows.push(row.join("|"));
+        }
+        assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+        rows
+    }
+
+    #[test]
+    fn test_identifier_case_preserved() {
+        unsafe {
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE \"MixedT\" (Id INTEGER PRIMARY KEY, \"ColB\" TEXT UNIQUE);
+                      CREATE INDEX MixedIdx ON mixedt(colb);
+                      INSERT INTO MIXEDT VALUES (1, 'a');"
+                        .as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+
+            // Column metadata reports the declared names, whatever the query's case.
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT id, COLB FROM mixedt".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            let text = |p: *const libc::c_char| std::ffi::CStr::from_ptr(p).to_str().unwrap();
+            assert_eq!(text(sqlite3_column_name(stmt, 0)), "Id");
+            assert_eq!(text(sqlite3_column_name(stmt, 1)), "ColB");
+            assert_eq!(text(sqlite3_column_table_name(stmt, 0)), "MixedT");
+            assert_eq!(text(sqlite3_column_table_name(stmt, 1)), "MixedT");
+            assert_eq!(text(sqlite3_column_decltype(stmt, 1)), "TEXT");
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+
+            // The names survive a reopen, and a rename keeps the new spelling.
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                query_rows(
+                    db,
+                    c"SELECT type, name, tbl_name FROM sqlite_master ORDER BY name"
+                ),
+                [
+                    "index|MixedIdx|MixedT",
+                    "table|MixedT|MixedT",
+                    "index|sqlite_autoindex_MixedT_1|MixedT",
+                ]
+            );
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"ALTER TABLE MIXEDT RENAME TO Renamed".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                query_rows(
+                    db,
+                    c"SELECT name, tbl_name FROM sqlite_master ORDER BY name"
+                ),
+                [
+                    "MixedIdx|Renamed",
+                    "Renamed|Renamed",
+                    "sqlite_autoindex_Renamed_1|Renamed",
+                ]
+            );
+            assert_eq!(
+                query_rows(db, c"SELECT name FROM pragma_table_info('renamed')"),
+                ["Id", "ColB"]
+            );
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
 }
 
 mod wrappers {

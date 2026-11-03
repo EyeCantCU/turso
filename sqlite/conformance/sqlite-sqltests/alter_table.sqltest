@@ -3459,7 +3459,7 @@ test alter-table-add-column-preserve-schema-collate-locale {
     SELECT sql FROM sqlite_schema WHERE name = 'tbl';
 }
 expect {
-    CREATE TABLE tbl (c TEXT COLLATE "fr-FR", d)
+    CREATE TABLE tbl (c TEXT COLLATE 'fr-FR', d)
 }
 
 @skip-if mvcc "views not supported in MVCC mode"

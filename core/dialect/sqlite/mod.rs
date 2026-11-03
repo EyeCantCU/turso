@@ -63,16 +63,33 @@ impl super::Dialect for SqliteDialect {
 
     fn format_table_sql(
         &self,
-        _input: &str,
+        input: &str,
         tbl_name: &turso_parser::ast::QualifiedName,
         body: &turso_parser::ast::CreateTableBody,
     ) -> crate::Result<String> {
         match body {
-            turso_parser::ast::CreateTableBody::ColumnsAndConstraints { .. } => Ok(format!(
-                "CREATE TABLE {} {}",
-                tbl_name.name.as_ident(),
-                body
-            )),
+            turso_parser::ast::CreateTableBody::ColumnsAndConstraints { .. } => {
+                // Store the statement as written, as SQLite does, when it
+                // still describes this table.
+                let expected = turso_parser::ast::Stmt::CreateTable {
+                    temporary: false,
+                    if_not_exists: false,
+                    tbl_name: turso_parser::ast::QualifiedName::single(tbl_name.name.clone()),
+                    body: body.clone(),
+                };
+                if let Some(sql) = crate::translate::schema_text::verified_create_sql(
+                    input,
+                    crate::translate::schema_text::CreateKind::Table,
+                    &expected,
+                ) {
+                    return Ok(sql);
+                }
+                Ok(format!(
+                    "CREATE TABLE {} {}",
+                    tbl_name.name.as_ident(),
+                    body
+                ))
+            }
             turso_parser::ast::CreateTableBody::AsSelect(_) => {
                 crate::bail_parse_error!("CREATE TABLE AS SELECT is not supported")
             }

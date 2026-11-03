@@ -37,6 +37,7 @@ pub(crate) mod result_row;
 pub(crate) mod roles;
 pub(crate) mod rollback;
 pub(crate) mod schema;
+pub(crate) mod schema_text;
 pub(crate) mod select;
 pub(crate) mod sequence;
 pub(crate) mod stmt_journal;
@@ -323,7 +324,7 @@ fn translate_statement(
             translate_tx_commit(name, resolver.schema(), resolver, program)?
         }
         ast::Stmt::CreateIndex { .. } => {
-            translate_create_index(program, connection, resolver, stmt)?;
+            translate_create_index(program, connection, resolver, stmt, input)?;
         }
         ast::Stmt::CreateTable {
             temporary,
@@ -363,6 +364,7 @@ fn translate_statement(
             program,
             &commands,
             when_clause.as_deref(),
+            input,
         )?,
         ast::Stmt::CreateView {
             view_name,
@@ -379,6 +381,7 @@ fn translate_statement(
             if_not_exists,
             connection,
             program,
+            input,
         )?,
         ast::Stmt::CreateMaterializedView {
             view_name,

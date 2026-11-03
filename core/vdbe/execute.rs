@@ -11760,6 +11760,7 @@ pub fn op_function(
                 panic!("sqlite_schema.name should be TEXT")
             };
             let name = name.to_string();
+            let name_for_sql_cache = name.clone();
 
             let Value::Text(tbl_name) = &state.registers[*start_reg + 2].get_value() else {
                 panic!("sqlite_schema.tbl_name should be TEXT")
@@ -11774,7 +11775,8 @@ pub fn op_function(
 
             let sql = &state.registers[*start_reg + 4].get_value().clone();
 
-            let (new_name, new_tbl_name, new_sql) = match alter_func {
+            use crate::translate::schema_text::{preserve_renamed_text, RenameQuote};
+            let (new_name, new_tbl_name, new_sql, quote) = match alter_func {
                 AlterTableFunc::RenameTable => {
                     let rename_from = {
                         match &state.registers[*start_reg + 5].get_value() {
@@ -11789,23 +11791,27 @@ pub fn op_function(
                             _ => panic!("rename_to parameter should be TEXT"),
                         }
                     };
-                    let rename_to = normalize_ident(original_rename_to.as_str());
                     let supports_namespaces = program.connection.dialect().supports_namespaces();
                     let row_namespace =
                         crate::namespace::demangle_name(supports_namespaces, &name).0;
 
-                    let new_name = if let Some(column) =
-                        &name.strip_prefix(&format!("sqlite_autoindex_{rename_from}_"))
-                    {
-                        format!("sqlite_autoindex_{rename_to}_{column}")
-                    } else if name == rename_from {
-                        rename_to.clone()
-                    } else {
-                        name
-                    };
+                    // Names are matched folding case and written as the
+                    // new name is spelled, like SQLite.
+                    let autoindex_prefix = format!("sqlite_autoindex_{rename_from}_");
+                    let new_name =
+                        if crate::util::starts_with_ignore_ascii_case(&name, &autoindex_prefix) {
+                            format!(
+                                "sqlite_autoindex_{original_rename_to}_{}",
+                                &name[autoindex_prefix.len()..]
+                            )
+                        } else if name.eq_ignore_ascii_case(&rename_from) {
+                            original_rename_to.to_string()
+                        } else {
+                            name
+                        };
 
-                    let new_tbl_name = if tbl_name == rename_from {
-                        rename_to.clone()
+                    let new_tbl_name = if tbl_name.eq_ignore_ascii_case(&rename_from) {
+                        original_rename_to.to_string()
                     } else {
                         tbl_name
                     };
@@ -11914,7 +11920,7 @@ pub fn op_function(
                                             rewrite_check_expr_table_refs(
                                                 expr,
                                                 &rename_from,
-                                                &rename_to,
+                                                original_rename_to.as_str(),
                                             );
                                             // The captured source text no longer
                                             // matches the rewritten expression.
@@ -11931,7 +11937,7 @@ pub fn op_function(
                                                 rewrite_check_expr_table_refs(
                                                     expr,
                                                     &rename_from,
-                                                    &rename_to,
+                                                    original_rename_to.as_str(),
                                                 );
                                                 *source = None;
                                             }
@@ -12095,7 +12101,12 @@ pub fn op_function(
                         }
                     };
 
-                    (new_name, new_tbl_name, new_sql)
+                    (
+                        new_name,
+                        new_tbl_name,
+                        new_sql,
+                        Some((original_rename_to.to_string(), RenameQuote::Always)),
+                    )
                 }
                 AlterTableFunc::AlterColumn | AlterTableFunc::RenameColumn => {
                     let table = {
@@ -12391,9 +12402,29 @@ pub fn op_function(
                         }
                     };
 
-                    (name, tbl_name, new_sql)
+                    let quote = matches!(alter_func, AlterTableFunc::RenameColumn).then(|| {
+                        let quote = if column_def.col_name.quoted() {
+                            RenameQuote::Always
+                        } else {
+                            RenameQuote::AsWritten
+                        };
+                        (column_def.col_name.as_str().to_string(), quote)
+                    });
+                    (name, tbl_name, new_sql, quote)
                 }
             };
+            // Like SQLite, a rename only edits the renamed tokens of the stored text.
+            let new_sql = match (new_sql, sql, quote) {
+                (Some(new_sql), Value::Text(old_sql), Some((new_name, quote))) => Some(
+                    preserve_renamed_text(old_sql.as_str(), new_sql, &new_name, quote),
+                ),
+                (new_sql, ..) => new_sql,
+            };
+            if let (Some(new_sql), "table") = (&new_sql, entry_type.as_str()) {
+                state
+                    .altered_table_sql
+                    .push((name_for_sql_cache, new_sql.clone()));
+            }
 
             state.registers[*dest].set_value(r#type.clone());
             state.registers[*dest + 1].set_text(Text::from(new_name))?;
@@ -17923,18 +17954,45 @@ fn sql_might_reference_identifier(sql: &str, ident: &str) -> bool {
 fn rewrite_trigger_for_table_rename(
     trigger: &mut crate::schema::Trigger,
     normalized_from: &str,
-    normalized_to: &str,
+    new_name: &str,
 ) {
     let old_sql = trigger.sql.clone();
     for cmd in &mut trigger.commands {
-        rewrite_trigger_cmd_table_refs(cmd, normalized_from, normalized_to);
+        rewrite_trigger_cmd_table_refs(cmd, normalized_from, new_name);
     }
     if let Some(ref mut when) = trigger.when_clause {
-        rewrite_check_expr_table_refs(when, normalized_from, normalized_to);
+        rewrite_check_expr_table_refs(when, normalized_from, new_name);
     }
     let new_sql = regenerate_trigger_sql(trigger);
     if new_sql != old_sql {
-        trigger.sql = new_sql;
+        // Matches the text the rename writes to sqlite_schema.
+        trigger.sql = crate::translate::schema_text::preserve_renamed_text(
+            &old_sql,
+            new_sql,
+            new_name,
+            crate::translate::schema_text::RenameQuote::Always,
+        );
+    }
+}
+
+/// Gives the in-memory tables the sqlite_schema text that ALTER TABLE wrote
+/// for them; `renamed` is the table renamed by the statement, if any.
+fn apply_altered_table_sql(
+    schema: &mut crate::schema::Schema,
+    namespace: NamespaceId,
+    altered: Vec<(String, String)>,
+    renamed: Option<(&str, &str)>,
+) {
+    for (row_name, sql) in altered {
+        let name = match renamed {
+            Some((from, to)) if row_name.eq_ignore_ascii_case(from) => to,
+            _ => row_name.as_str(),
+        };
+        if let Some(table) = schema.table_mut(namespace, name) {
+            if let Table::BTree(btree) = Arc::make_mut(table) {
+                Arc::make_mut(btree).sql = Some(sql);
+            }
+        }
     }
 }
 
@@ -17958,18 +18016,20 @@ pub fn op_rename_table(
     let normalized_to = normalize_ident(to.as_str());
 
     let conn = program.connection.clone();
+    let altered = std::mem::take(&mut state.altered_table_sql);
 
     conn.with_database_schema_mut(*db, |schema| -> crate::Result<()> {
         if let Some(mut indexes) = schema.take_indices(*namespace, &normalized_from) {
             // An automatic index is named after the table's mangled name, the
             // name its schema row has.
             let mangled_from = crate::namespace::mangle_name(*namespace, &normalized_from);
-            let mangled_to = crate::namespace::mangle_name(*namespace, &normalized_to);
+            let mangled_to = crate::namespace::mangle_name(*namespace, to);
             let autoindex_prefix = format!("sqlite_autoindex_{mangled_from}_");
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
-                normalized_to.clone_into(&mut index.table_name);
-                if let Some(suffix) = index.name.strip_prefix(&autoindex_prefix) {
+                to.clone_into(&mut index.table_name);
+                if crate::util::starts_with_ignore_ascii_case(&index.name, &autoindex_prefix) {
+                    let suffix = &index.name[autoindex_prefix.len()..];
                     index.name = format!("sqlite_autoindex_{mangled_to}_{suffix}");
                 }
             });
@@ -17991,27 +18051,23 @@ pub fn op_rename_table(
                     if fk.parent_namespace == *namespace
                         && normalize_ident(&fk.parent_table) == normalized_from
                     {
-                        fk.parent_table.clone_from(&normalized_to);
+                        fk.parent_table.clone_from(to);
                     }
                 }
 
                 // Rewrite table-qualified refs in CHECK constraints
                 for check in &mut btree.check_constraints {
-                    rewrite_check_expr_table_refs(
-                        &mut check.expr,
-                        &normalized_from,
-                        &normalized_to,
-                    );
+                    rewrite_check_expr_table_refs(&mut check.expr, &normalized_from, to);
                     // The captured source text no longer matches the
                     // rewritten expression.
                     check.source = None;
                 }
 
-                normalized_to.clone_into(&mut btree.name);
-                normalized_to.clone_into(&mut btree.declared_name);
+                to.clone_into(&mut btree.name);
+                to.clone_into(&mut btree.declared_name);
             }
             Table::Virtual(vtab) => {
-                Arc::make_mut(vtab).name.clone_from(&normalized_to);
+                Arc::make_mut(vtab).name.clone_from(to);
             }
             _ => panic!("only btree and virtual tables can be renamed"),
         }
@@ -18032,7 +18088,7 @@ pub fn op_rename_table(
                         && normalize_ident(&fk_arc.parent_table) == normalized_from
                     {
                         let fk = Arc::make_mut(fk_arc);
-                        fk.parent_table.clone_from(&normalized_to);
+                        fk.parent_table.clone_from(to);
                     }
                 }
             }
@@ -18043,8 +18099,8 @@ pub fn op_rename_table(
         if let Some(mut triggers) = schema.take_triggers(*namespace, &normalized_from) {
             for trigger_arc in &mut triggers {
                 let trigger = Arc::make_mut(trigger_arc);
-                normalized_to.clone_into(&mut trigger.table_name);
-                rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
+                to.clone_into(&mut trigger.table_name);
+                rewrite_trigger_for_table_rename(trigger, &normalized_from, to);
             }
             schema.insert_triggers(*namespace, normalized_to.to_owned(), triggers);
         }
@@ -18099,7 +18155,7 @@ pub fn op_rename_table(
                 continue;
             }
             let trigger = Arc::make_mut(trigger_arc);
-            rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
+            rewrite_trigger_for_table_rename(trigger, &normalized_from, to);
         }
 
         let qualifiers = table_qualifiers(schema, *namespace);
@@ -18130,9 +18186,15 @@ pub fn op_rename_table(
                     .view_mut(view_namespace, &view_name)
                     .expect("view being rewritten should be in schema"),
             );
-            view.sql = new_sql;
+            view.sql = crate::translate::schema_text::preserve_renamed_text(
+                &view.sql,
+                new_sql,
+                to,
+                crate::translate::schema_text::RenameQuote::Always,
+            );
             view.select_stmt = new_select;
         }
+        apply_altered_table_sql(schema, *namespace, altered, Some((from, to)));
 
         Ok(())
     })??;
@@ -18155,8 +18217,8 @@ pub fn op_rename_table(
                     };
                     if targets_renamed_database {
                         let trigger = Arc::make_mut(&mut trigger_arc);
-                        normalized_to.clone_into(&mut trigger.table_name);
-                        rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
+                        to.clone_into(&mut trigger.table_name);
+                        rewrite_trigger_for_table_rename(trigger, &normalized_from, to);
                         triggers_to_rename.push_back(trigger_arc);
                     } else {
                         triggers_to_keep.push_back(trigger_arc);
@@ -18181,7 +18243,7 @@ pub fn op_rename_table(
                     continue;
                 }
                 let trigger = Arc::make_mut(trigger_arc);
-                rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
+                rewrite_trigger_for_table_rename(trigger, &normalized_from, to);
             }
             Ok(())
         })??;
@@ -18262,7 +18324,8 @@ pub fn op_drop_column(
             db,
             namespace,
             table,
-            column_index
+            column_index,
+            sql
         },
         insn
     );
@@ -18297,6 +18360,7 @@ pub fn op_drop_column(
 
         let btree = Arc::make_mut(btree);
         btree.columns_mut().remove(*column_index);
+        btree.sql = sql.as_deref().map(str::to_string);
         // Remove column-level CHECK constraints for the dropped column
         let col_name = column_name.clone();
         btree.check_constraints.retain(|c| {
@@ -18422,6 +18486,7 @@ pub fn op_add_column(
 
         let btree = Arc::make_mut(btree);
         btree.columns_mut().try_push(data.column.clone())?;
+        btree.sql.clone_from(&data.sql);
         // Update CHECK constraints to include any constraints from the new column
         btree.check_constraints = new_check_constraints;
         // Update foreign keys to include any FK constraints from the new column
@@ -18546,6 +18611,7 @@ pub fn op_alter_column(
         Vec::new()
     };
 
+    let altered = std::mem::take(&mut state.altered_table_sql);
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         let (table_arc, indexes) = schema
             .table_with_indices_mut(*namespace, &normalized_table_name)
@@ -18724,6 +18790,7 @@ pub fn op_alter_column(
                 }
             }
         }
+        apply_altered_table_sql(schema, *namespace, altered, None);
         Ok(())
     })??;
 
@@ -18734,13 +18801,24 @@ pub fn op_alter_column(
             })??;
         }
 
+        let quote = if definition.col_name.quoted() {
+            crate::translate::schema_text::RenameQuote::Always
+        } else {
+            crate::translate::schema_text::RenameQuote::AsWritten
+        };
         for (view_namespace, view_name, rewritten) in view_rewrites {
+            let new_name = &new_name;
             conn.with_database_schema_mut(
                 view_namespace.database_id,
                 move |schema| -> crate::Result<()> {
                     if let Some(view_arc) = schema.view_mut(view_namespace.id, &view_name) {
                         let view = Arc::make_mut(view_arc);
-                        view.sql = rewritten.sql;
+                        view.sql = crate::translate::schema_text::preserve_renamed_text(
+                            &view.sql,
+                            rewritten.sql,
+                            new_name,
+                            quote,
+                        );
                         view.select_stmt = rewritten.select_stmt;
                         view.columns = rewritten.columns;
                     }

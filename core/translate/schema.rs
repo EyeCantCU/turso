@@ -1184,7 +1184,8 @@ pub fn translate_create_table(
         resolver.resolve_namespace_for_create(&tbl_name)?
     };
     let database_id = namespace.database_id;
-    let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
+    // Stored as written; lookups fold case.
+    let normalized_tbl_name = tbl_name.name.as_str().to_string();
     if create_table_is_noop(resolver, temporary, if_not_exists, &tbl_name) {
         // SQLite still reports such a statement as not read-only.
         program.flags.set_readonly(false);
