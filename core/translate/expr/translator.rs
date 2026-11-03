@@ -202,7 +202,16 @@ fn translate_expr_by_kind(
         ast::Expr::Column { .. } => {
             translate_column_expr(program, referenced_tables, expr, target_register, resolver)
         }
-        ast::Expr::RowId { .. } => {
+        ast::Expr::RowId { table, .. } => {
+            if crate::authorizer::check_column_read(resolver, referenced_tables, *table, None)?
+                == crate::authorizer::Auth::Ignore
+            {
+                program.emit_insn(Insn::Null {
+                    dest: target_register,
+                    dest_end: None,
+                });
+                return Ok(target_register);
+            }
             translate_rowid_expr(program, referenced_tables, expr, target_register)
         }
         ast::Expr::InList { .. } => {
@@ -2464,6 +2473,19 @@ fn translate_column_expr(
     else {
         unreachable!("translate_column_expr expects Expr::Column");
     };
+    if crate::authorizer::check_column_read(
+        resolver,
+        referenced_tables,
+        *table_ref_id,
+        Some(*column),
+    )? == crate::authorizer::Auth::Ignore
+    {
+        program.emit_insn(Insn::Null {
+            dest: target_register,
+            dest_end: None,
+        });
+        return Ok(target_register);
+    }
     // A table cursor override identifies a row from a separate table read.
     // The planned index cursors do not identify that row, so use the override directly.
     let has_table_cursor_override = program.has_table_cursor_override(*table_ref_id);

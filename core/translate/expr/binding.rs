@@ -120,6 +120,37 @@ enum QualifiedNameMatch {
 #[turso_macros::trace_stack]
 pub fn bind_and_rewrite_expr<'a>(
     top_level_expr: &mut ast::Expr,
+    referenced_tables: Option<&'a mut TableReferences>,
+    result_columns: Option<&'a [ResultSetColumn]>,
+    resolver: &Resolver<'_>,
+    binding_behavior: BindingBehavior,
+) -> Result<()> {
+    if resolver.authorizer.is_none() {
+        return bind_and_rewrite_expr_inner(
+            top_level_expr,
+            referenced_tables,
+            result_columns,
+            resolver,
+            binding_behavior,
+        );
+    }
+    // With an authorizer, ask about each column as soon as it is bound.
+    let mut referenced_tables = referenced_tables;
+    bind_and_rewrite_expr_inner(
+        top_level_expr,
+        referenced_tables.as_deref_mut(),
+        result_columns,
+        resolver,
+        binding_behavior,
+    )?;
+    if let Some(tables) = referenced_tables {
+        crate::authorizer::authorize_column_reads(resolver, tables, top_level_expr)?;
+    }
+    Ok(())
+}
+
+fn bind_and_rewrite_expr_inner<'a>(
+    top_level_expr: &mut ast::Expr,
     mut referenced_tables: Option<&'a mut TableReferences>,
     result_columns: Option<&'a [ResultSetColumn]>,
     resolver: &Resolver<'_>,
@@ -512,6 +543,12 @@ pub fn bind_and_rewrite_expr<'a>(
                         false,
                         &resolver.catalog,
                     )?;
+                    if crate::authorizer::check_function(resolver, name.as_str())?
+                        == crate::authorizer::Auth::Ignore
+                    {
+                        *expr = Expr::Literal(ast::Literal::Null);
+                        return Ok(WalkControl::SkipChildren);
+                    }
                     // For functions that need star expansion (json_object, jsonb_object),
                     // expand the * to all columns from the referenced tables as key-value pairs
                     // This needs to happen during bind/rewrite so WHERE clauses can use these functions
@@ -597,6 +634,12 @@ pub fn bind_and_rewrite_expr<'a>(
                         &resolver.catalog,
                     )?;
                     validate_custom_type_function_call(name.as_str(), args, resolver)?;
+                    if crate::authorizer::check_function(resolver, name.as_str())?
+                        == crate::authorizer::Auth::Ignore
+                    {
+                        *expr = Expr::Literal(ast::Literal::Null);
+                        return Ok(WalkControl::SkipChildren);
+                    }
                 }
                 _ => {}
             }
