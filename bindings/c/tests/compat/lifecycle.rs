@@ -291,3 +291,23 @@ fn finalizing_unfinished_reader_keeps_explicit_transaction() {
         assert_eq!(sqlite3_close(db), SQLITE_OK);
     }
 }
+
+#[test]
+fn limit_defaults_and_updates() {
+    extern "C" {
+        fn sqlite3_limit(db: *mut sqlite3, id: i32, new_value: i32) -> i32;
+    }
+    unsafe {
+        let (rc, db) = open_v2(":memory:", 0x6);
+        assert_eq!(rc, SQLITE_OK);
+        assert_eq!(sqlite3_limit(db, 2, -1), 2000); // COLUMN
+        assert_eq!(sqlite3_limit(db, 3, -1), 1000); // EXPR_DEPTH
+        assert_eq!(sqlite3_limit(db, 9, -1), 250_000); // VARIABLE_NUMBER
+        assert_eq!(sqlite3_limit(db, 2, 100), 2000);
+        assert_eq!(sqlite3_limit(db, 2, -1), 100);
+        assert_eq!(sqlite3_limit(db, 2, 1_000_000), 100); // clamped to the hard maximum
+        assert_eq!(sqlite3_limit(db, 2, -1), 2000);
+        assert_eq!(sqlite3_limit(db, 99, -1), -1);
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}
