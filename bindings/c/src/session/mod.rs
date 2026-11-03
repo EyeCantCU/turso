@@ -20,6 +20,7 @@ use crate::{
     sqlite3_value_double, sqlite3_value_int64, sqlite3_value_text, sqlite3_value_type,
 };
 
+pub(crate) mod apply;
 pub(crate) mod iter;
 
 pub(crate) const SQLITE_OK: i32 = 0;

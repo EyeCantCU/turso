@@ -664,3 +664,186 @@ unsafe fn contents(db: *mut sqlite3) -> Vec<String> {
     v.extend(query(db, "SELECT 't2', * FROM t2 ORDER BY x"));
     v
 }
+
+#[test]
+fn test_session_apply_sqlite_changeset() {
+    unsafe {
+        let dir = tempfile::tempdir().unwrap();
+        let src = open(&dir.path().join("src.db"));
+        exec(src, SCHEMA);
+        exec(src, CHANGES);
+        let dst = open(&dir.path().join("dst.db"));
+        exec(dst, SCHEMA);
+        let mut st = Conflicts::default();
+        let ctx = &mut st as *mut Conflicts as *mut c_void;
+        // CHANGESET was made by SQLite.
+        let mut cs = unhex(CHANGESET);
+        let rc = sqlite3changeset_apply(
+            dst,
+            cs.len() as c_int,
+            cs.as_mut_ptr() as *mut c_void,
+            None,
+            Some(x_conflict),
+            ctx,
+        );
+        assert_eq!(rc, SQLITE_OK);
+        assert!(st.log.is_empty(), "{:?}", st.log);
+        assert_eq!(contents(dst), contents(src));
+        // Applying it again conflicts on every change.
+        let rc = sqlite3changeset_apply(
+            dst,
+            cs.len() as c_int,
+            cs.as_mut_ptr() as *mut c_void,
+            None,
+            Some(x_conflict),
+            ctx,
+        );
+        assert_eq!(rc, SQLITE_OK);
+        assert_eq!(
+            st.log,
+            [
+                "CONFLICT t1 18 (10,'four',4)",
+                "DATA t1 23 (1,'ONE',1.5)",
+                "DATA t1 23 (2,'two',22)",
+                "NOTFOUND t1 9",
+                "DATA t2 23 ('a',1,9.0)",
+                "NOTFOUND t2 9",
+                "CONFLICT t2 18 ('c',3,3.5)",
+            ]
+        );
+        // Inverting it restores the original rows.
+        let rc = sqlite3changeset_apply_v2(
+            dst,
+            cs.len() as c_int,
+            cs.as_mut_ptr() as *mut c_void,
+            None,
+            Some(x_conflict),
+            ctx,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            SQLITE_CHANGESETAPPLY_INVERT,
+        );
+        assert_eq!(rc, SQLITE_OK);
+        let orig = open(&dir.path().join("orig.db"));
+        exec(orig, SCHEMA);
+        assert_eq!(contents(dst), contents(orig));
+        // The patchset applies as well, here through a stream.
+        let mut input = Buf(unhex(PATCHSET), 0, 7);
+        let rc = sqlite3changeset_apply_strm(
+            dst,
+            Some(x_input),
+            &mut input as *mut Buf as *mut c_void,
+            None,
+            Some(x_conflict),
+            ctx,
+        );
+        assert_eq!(rc, SQLITE_OK);
+        assert_eq!(contents(dst), contents(src));
+        for db in [src, dst, orig] {
+            sqlite3_close(db);
+        }
+    }
+}
+
+#[test]
+fn test_session_apply_conflict_resolution() {
+    unsafe {
+        let dir = tempfile::tempdir().unwrap();
+        let dst = open(&dir.path().join("dst.db"));
+        exec(dst, SCHEMA);
+        exec(
+            dst,
+            "DELETE FROM t1; DELETE FROM t2;\
+             INSERT INTO t1 VALUES(1,'a',10),(2,'b2',20),(3,'c3',30),(10,'x',99);\
+             INSERT INTO t2 VALUES('a',1,8.0),('b',2,2.0);",
+        );
+        let mut cs = unhex(CHANGESET);
+        let mut st = Conflicts {
+            answer: SQLITE_CHANGESET_REPLACE,
+            ..Default::default()
+        };
+        let ctx = &mut st as *mut Conflicts as *mut c_void;
+        let (mut nrb, mut rb) = (0, ptr::null_mut());
+        let rc = sqlite3changeset_apply_v2(
+            dst,
+            cs.len() as c_int,
+            cs.as_mut_ptr() as *mut c_void,
+            None,
+            Some(x_conflict),
+            ctx,
+            &mut rb,
+            &mut nrb,
+            0,
+        );
+        assert_eq!(rc, SQLITE_OK);
+        assert_eq!(
+            st.log,
+            [
+                "CONFLICT t1 18 (10,'x',99)",
+                "DATA t1 23 (1,'a',10)",
+                "DATA t1 23 (2,'b2',20)",
+                "DATA t1 9 (3,'c3',30)",
+                "DATA t2 23 ('a',1,8.0)",
+            ]
+        );
+        assert_eq!(
+            contents(dst),
+            [
+                "t1|1|ONE|10",
+                "t1|2|b2|22",
+                "t1|10|four|4",
+                "t2|a|1|9.0",
+                "t2|c|3|3.5",
+            ]
+        );
+        assert_eq!(
+            hex(&take(nrb, rb)),
+            "5403010000743100120101000000000000000a0304666f7572010000000000000004120101000000000000000103034f4e450012010100000000000000020001000000000000001609010100000000000000030402010201000000000000000354030201007432001201030161010000000000000001024022000000000000"
+        );
+
+        // ABORT rolls the whole apply back.
+        exec(dst, "DELETE FROM t1; INSERT INTO t1 VALUES(2,'zz',20);");
+        st.log.clear();
+        st.answer = SQLITE_CHANGESET_ABORT;
+        let rc = sqlite3changeset_apply(
+            dst,
+            cs.len() as c_int,
+            cs.as_mut_ptr() as *mut c_void,
+            None,
+            Some(x_conflict),
+            ctx,
+        );
+        assert_eq!(rc, SQLITE_ABORT);
+        assert_eq!(query(dst, "SELECT * FROM t1"), ["2|zz|20"]);
+
+        // A table the filter rejects, or whose schema differs, is skipped.
+        exec(
+            dst,
+            "DROP TABLE t2; CREATE TABLE t2(x TEXT PRIMARY KEY, y);",
+        );
+        st.log.clear();
+        st.answer = SQLITE_CHANGESET_OMIT;
+        let rc = sqlite3changeset_apply(
+            dst,
+            cs.len() as c_int,
+            cs.as_mut_ptr() as *mut c_void,
+            Some(skip_t2),
+            Some(x_conflict),
+            ctx,
+        );
+        assert_eq!(rc, SQLITE_OK);
+        assert_eq!(query(dst, "SELECT count(*) FROM t2"), ["0"]);
+        let rc = sqlite3changeset_apply(
+            dst,
+            cs.len() as c_int,
+            cs.as_mut_ptr() as *mut c_void,
+            None,
+            Some(x_conflict),
+            ctx,
+        );
+        assert_eq!(rc, SQLITE_OK);
+        assert_eq!(query(dst, "SELECT count(*) FROM t2"), ["0"]);
+        let _ = SQLITE_SCHEMA;
+        sqlite3_close(dst);
+    }
+}
