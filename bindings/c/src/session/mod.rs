@@ -9,13 +9,16 @@ use std::ffi::{self, CStr, CString};
 use std::ptr;
 use turso_ext::Value as ExtValue;
 
+use crate::value_conv::{
+    sqlite3_value_blob, sqlite3_value_bytes, sqlite3_value_double, sqlite3_value_int64,
+    sqlite3_value_text,
+};
 use crate::{
     sqlite3, sqlite3_bind_blob, sqlite3_bind_double, sqlite3_bind_int64, sqlite3_bind_null,
     sqlite3_bind_text, sqlite3_column_blob, sqlite3_column_bytes, sqlite3_column_count,
     sqlite3_column_double, sqlite3_column_int64, sqlite3_column_text, sqlite3_column_type,
     sqlite3_column_value, sqlite3_errmsg, sqlite3_exec, sqlite3_finalize, sqlite3_prepare_v2,
-    sqlite3_reset, sqlite3_step, sqlite3_stmt, sqlite3_value_blob, sqlite3_value_bytes,
-    sqlite3_value_double, sqlite3_value_int64, sqlite3_value_text, sqlite3_value_type,
+    sqlite3_reset, sqlite3_step, sqlite3_stmt, sqlite3_value_type,
 };
 
 pub(crate) mod apply;
