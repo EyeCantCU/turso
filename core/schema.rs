@@ -169,7 +169,8 @@ pub const AUTOINCREMENT_SEQ_PREFIX: &str = "__turso_internal_autoincrement_";
 
 /// Name of the hidden sequence owned by an AUTOINCREMENT table.
 pub fn autoincrement_sequence_name(table_name: &str) -> String {
-    String::from(AUTOINCREMENT_SEQ_PREFIX) + table_name
+    // Folded so the internal name does not depend on how the table is spelled.
+    String::from(AUTOINCREMENT_SEQ_PREFIX) + &normalize_ident(table_name)
 }
 
 struct SequenceBackingTableSource {
@@ -1694,7 +1695,7 @@ impl Schema {
 
     pub fn trigger_mut(&mut self, namespace: NamespaceId, name: &str) -> Option<&mut Arc<Trigger>> {
         self.triggers_mut(namespace)
-            .find(|trigger| trigger.name == name)
+            .find(|trigger| trigger.name.eq_ignore_ascii_case(name))
     }
 
     /// Takes every trigger of `table_name` out of the namespace.
@@ -2083,7 +2084,7 @@ impl Schema {
         !objects
             .indexes
             .iter()
-            .any(|idx| idx.1.iter().any(|i| i.name == name))
+            .any(|idx| idx.1.iter().any(|i| i.name.eq_ignore_ascii_case(name)))
     }
 
     pub fn add_materialized_view(
@@ -2536,10 +2537,12 @@ impl Schema {
         let objects = self.namespace(namespace);
         let table_name = normalize_ident(table_name);
         let name = normalize_ident(name);
-        objects
-            .triggers
-            .get(&table_name)
-            .and_then(|triggers| triggers.iter().find(|t| t.name == name).cloned())
+        objects.triggers.get(&table_name).and_then(|triggers| {
+            triggers
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(&name))
+                .cloned()
+        })
     }
 
     pub fn get_triggers_for_table(
@@ -2562,7 +2565,7 @@ impl Schema {
             .triggers
             .values()
             .flatten()
-            .find(|t| t.name == name)
+            .find(|t| t.name.eq_ignore_ascii_case(&name))
             .cloned()
     }
 
@@ -2772,7 +2775,7 @@ impl Schema {
             .indexes
             .get(&name)?
             .iter()
-            .find(|index| index.name == index_name)
+            .find(|index| index.name.eq_ignore_ascii_case(index_name))
     }
 
     pub fn remove_indices_for_table(&mut self, namespace: NamespaceId, table_name: &str) {
@@ -2787,7 +2790,7 @@ impl Schema {
             .indexes
             .get_mut(&name)
             .expect("Must have the index")
-            .retain_mut(|other_idx| other_idx.name != idx.name);
+            .retain_mut(|other_idx| !other_idx.name.eq_ignore_ascii_case(&idx.name));
         self.analyze_stats.remove_index(namespace, &name, &idx.name);
     }
 
@@ -2799,7 +2802,7 @@ impl Schema {
 
     pub fn table_set_has_index(&mut self, namespace: NamespaceId, table_name: &str) {
         let objects = self.namespace_mut(namespace);
-        objects.has_indexes.insert(table_name.to_string());
+        objects.has_indexes.insert(normalize_ident(table_name));
     }
 
     /// Update [Schema] by scanning the first root page (sqlite_schema)
@@ -4292,9 +4295,10 @@ impl Schema {
                 let Some(bt) = t.btree() else {
                     return false;
                 };
-                bt.foreign_keys
-                    .iter()
-                    .any(|fk| fk.parent_namespace == namespace && fk.parent_table == table_name)
+                bt.foreign_keys.iter().any(|fk| {
+                    fk.parent_namespace == namespace
+                        && fk.parent_table.eq_ignore_ascii_case(table_name)
+                })
             })
         })
     }
@@ -5741,7 +5745,7 @@ impl BTreeTable {
                 unique_set
                     .columns
                     .iter()
-                    .find(|column| column.name == column_name)
+                    .find(|column| column.name.eq_ignore_ascii_case(column_name))
             })
             .and_then(|column| column.collation)
     }
@@ -6519,7 +6523,8 @@ pub fn create_table(
     root_page: i64,
     supports_namespaces: bool,
 ) -> Result<BTreeTable> {
-    let table_name = normalize_ident(tbl_name);
+    // Keep the name as written; lookups fold case.
+    let table_name = tbl_name.to_string();
     trace!("Creating table {}", table_name);
     let has_rowid;
     let mut has_autoincrement = false;
@@ -6646,14 +6651,14 @@ pub fn create_table(
                         .map(|ic| normalize_ident(ic.col_name.as_str()))
                         .try_collect()?;
                     // derive parent columns: explicit or default to parent PK
-                    let mangled_parent_table = normalize_ident(clause.tbl_name.as_str());
+                    let mangled_parent_table = clause.tbl_name.as_str().to_string();
                     let (parent_namespace, parent_table) =
                         demangle_name(supports_namespaces, &mangled_parent_table);
                     let parent_table = parent_table.to_string();
                     let parent_columns: Box<[String]> = clause
                         .columns
                         .iter()
-                        .map(|ic| normalize_ident(ic.col_name.as_str()))
+                        .map(|ic| ic.col_name.as_str().to_string())
                         .try_collect()?;
 
                     // Only check arity if parent columns were explicitly listed
@@ -6878,7 +6883,7 @@ pub fn create_table(
                                     clause.tbl_name.as_str()
                                 );
                             }
-                            let mangled_parent_table = normalize_ident(clause.tbl_name.as_str());
+                            let mangled_parent_table = clause.tbl_name.as_str().to_string();
                             let (parent_namespace, parent_table) =
                                 demangle_name(supports_namespaces, &mangled_parent_table);
                             let fk = ForeignKey {
@@ -6888,7 +6893,7 @@ pub fn create_table(
                                 parent_columns: clause
                                     .columns
                                     .iter()
-                                    .map(|c| normalize_ident(c.col_name.as_str()))
+                                    .map(|c| c.col_name.as_str().to_string())
                                     .try_collect()?,
                                 on_delete: clause
                                     .args
@@ -8073,7 +8078,7 @@ impl Index {
         match cmd {
             Some(Cmd::Stmt(Stmt::CreateIndex {
                 idx_name,
-                tbl_name,
+                tbl_name: _,
                 columns,
                 unique,
                 where_clause,
@@ -8081,7 +8086,7 @@ impl Index {
                 with_clause,
                 ..
             })) => {
-                let index_name = normalize_ident(idx_name.name.as_str());
+                let index_name = idx_name.name.as_str().to_string();
                 let index_columns = resolve_sorted_columns(table, &columns, schema, syms)?;
                 if let Some(using) = using {
                     if where_clause.is_some() {
@@ -8103,7 +8108,7 @@ impl Index {
                     let descriptor = module.attach(&configuration)?;
                     Ok(Index {
                         name: index_name,
-                        table_name: normalize_ident(tbl_name.as_str()),
+                        table_name: table.name.clone(),
                         root_page,
                         columns: index_columns,
                         unique: false,
@@ -8117,7 +8122,7 @@ impl Index {
                 } else {
                     Ok(Index {
                         name: index_name,
-                        table_name: normalize_ident(tbl_name.as_str()),
+                        table_name: table.name.clone(),
                         root_page,
                         columns: index_columns,
                         unique,
@@ -8176,7 +8181,7 @@ impl Index {
             let explicit_collation = constraint_columns.get(i).and_then(|c| c.collation);
             primary_keys
                 .push_within_capacity(IndexColumn {
-                    name: normalize_ident(col_name),
+                    name: column.name.clone().unwrap_or_else(|| col_name.clone()),
                     order: *order,
                     nulls_order: constraint_columns.get(i).and_then(|c| c.nulls_order),
                     pos_in_table,
@@ -8192,7 +8197,7 @@ impl Index {
         assert!(primary_keys.len() == column_count);
 
         Ok(Index {
-            name: normalize_ident(index_name.as_str()),
+            name: index_name,
             table_name: table.name.clone(),
             root_page,
             columns: primary_keys,
@@ -8232,7 +8237,7 @@ impl Index {
             let explicit_collation = constraint_columns.get(i).and_then(|c| c.collation);
             unique_cols
                 .push_within_capacity(IndexColumn {
-                    name: normalize_ident(col.name.as_ref().unwrap()),
+                    name: col.name.clone().unwrap(),
                     order: *sort_order,
                     nulls_order: constraint_columns.get(i).and_then(|c| c.nulls_order),
                     pos_in_table,
@@ -8246,7 +8251,7 @@ impl Index {
         }
 
         Ok(Index {
-            name: normalize_ident(index_name.as_str()),
+            name: index_name,
             table_name: table.name.clone(),
             root_page,
             columns: unique_cols,

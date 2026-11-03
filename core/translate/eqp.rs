@@ -27,9 +27,16 @@ pub struct EqpTable {
 impl EqpTable {
     pub(crate) fn from_joined(table: &JoinedTable) -> Self {
         let name = table.table.get_name();
+        // A reference that only differs from the table name in case is not an alias.
+        if name.eq_ignore_ascii_case(&table.identifier) {
+            return Self {
+                name: table.identifier.clone(),
+                alias: None,
+            };
+        }
         Self {
             name: name.to_string(),
-            alias: (name != table.identifier).then(|| table.identifier.clone()),
+            alias: Some(table.identifier.clone()),
         }
     }
 

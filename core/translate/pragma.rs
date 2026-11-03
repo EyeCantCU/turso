@@ -1369,7 +1369,12 @@ fn query_pragma(
                             program.emit_int(id as i64, base_reg);
                             program.emit_int(idx as i64, base_reg + 1);
                             program.emit_string8(fk.parent_table.clone(), base_reg + 2);
-                            program.emit_string8(child_column.clone(), base_reg + 3);
+                            // Report the column as declared in the table.
+                            let from = table
+                                .get_column(child_column)
+                                .and_then(|(_, c)| c.name.clone())
+                                .unwrap_or_else(|| child_column.clone());
+                            program.emit_string8(from, base_reg + 3);
                             program.emit_string8(parent_column.to_string(), base_reg + 4);
                             program.emit_string8(
                                 foreign_key_action_name(fk.on_update).to_string(),

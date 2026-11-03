@@ -327,7 +327,7 @@ fn emit_rename_sqlite_sequence_entry(
             rhs: row_name_to_replace_reg,
             target_pc: continue_loop_label,
             flags: CmpInsFlags::default().jump_if_null(),
-            collation: CollationSeq::for_internal_values(),
+            collation: CollationSeq::NOCASE,
         });
 
         program.emit_column_or_rowid(seq_cursor_id, 1, sequence_value_reg);
@@ -407,7 +407,7 @@ fn emit_delete_sqlite_sequence_entry(
             rhs: row_name_to_delete_reg,
             target_pc: continue_loop_label,
             flags: CmpInsFlags::default().jump_if_null(),
-            collation: CollationSeq::for_internal_values(),
+            collation: CollationSeq::NOCASE,
         });
 
         program.emit_insn(Insn::Delete {
@@ -720,7 +720,7 @@ fn emit_column_constraints_validation(
                 op: Operation::default_scan_for(&table),
                 unmatched_right_rows_plan: None,
                 table,
-                identifier: resolved_table.name.clone(),
+                identifier: normalize_ident(&resolved_table.name),
                 has_alias: false,
                 internal_id: program.table_reference_counter.next(),
                 join_info: None,
@@ -893,7 +893,7 @@ pub fn translate_alter_table(
                 || btree.unique_sets.iter().any(|set| {
                     set.columns
                         .iter()
-                        .any(|c| c.name == normalize_ident(column_name))
+                        .any(|c| c.name.eq_ignore_ascii_case(column_name))
                 })
             {
                 return Err(LimboError::ParseError(format!(
@@ -931,7 +931,7 @@ pub fn translate_alter_table(
                     let mut table_references = TableReferences::new(
                         vec![],
                         vec![OuterQueryReference {
-                            identifier: table_name.to_string(),
+                            identifier: normalize_ident(table_name),
                             has_alias: false,
                             internal_id: TableInternalId::from(0),
                             table: Table::BTree(Arc::new(btree.clone())),
@@ -1321,7 +1321,7 @@ pub fn translate_alter_table(
                             .map(|fk| fk.decl_order)
                             .max()
                             .map_or(0, |order| order + 1);
-                        let mangled_parent_table = normalize_ident(clause.tbl_name.as_str());
+                        let mangled_parent_table = clause.tbl_name.as_str().to_string();
                         let (parent_namespace, parent_table) = demangle_name(
                             resolver.catalog.dialect.supports_namespaces(),
                             &mangled_parent_table,
@@ -1336,7 +1336,7 @@ pub fn translate_alter_table(
                             parent_columns: clause
                                 .columns
                                 .iter()
-                                .map(|c| normalize_ident(c.col_name.as_str()))
+                                .map(|c| c.col_name.as_str().to_string())
                                 .collect::<Vec<_>>()
                                 .into_boxed_slice(),
                             on_delete: clause
@@ -1663,9 +1663,7 @@ pub fn translate_alter_table(
                 program.emit_string8_new_reg(mangled_table_name.clone());
                 program.mark_last_insn_constant();
 
-                program.emit_string8_new_reg(
-                    resolver.mangle_name(namespace, &normalize_ident(new_name)),
-                );
+                program.emit_string8_new_reg(resolver.mangle_name(namespace, new_name));
                 program.mark_last_insn_constant();
 
                 let out = program.alloc_registers(5);
@@ -1710,7 +1708,7 @@ pub fn translate_alter_table(
                 });
             });
 
-            let mangled_new_name = resolver.mangle_name(namespace, &normalized_new_name);
+            let mangled_new_name = resolver.mangle_name(namespace, new_name);
             emit_rename_sqlite_sequence_entry(
                 program,
                 resolver,

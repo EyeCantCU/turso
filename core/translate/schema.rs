@@ -1159,7 +1159,8 @@ pub fn translate_create_table(
     let database_id = namespace.database_id;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
-    let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
+    // Stored as written; lookups fold case.
+    let normalized_tbl_name = tbl_name.name.as_str().to_string();
     let mangled_tbl_name = resolver.mangle_name(namespace, &normalized_tbl_name);
     let tbl_name_in_sql = ast::QualifiedName {
         namespace: None,

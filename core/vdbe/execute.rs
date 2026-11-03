@@ -11742,23 +11742,27 @@ pub fn op_function(
                             _ => panic!("rename_to parameter should be TEXT"),
                         }
                     };
-                    let rename_to = normalize_ident(original_rename_to.as_str());
                     let supports_namespaces = program.connection.dialect().supports_namespaces();
                     let row_namespace =
                         crate::namespace::demangle_name(supports_namespaces, &name).0;
 
-                    let new_name = if let Some(column) =
-                        &name.strip_prefix(&format!("sqlite_autoindex_{rename_from}_"))
-                    {
-                        format!("sqlite_autoindex_{rename_to}_{column}")
-                    } else if name == rename_from {
-                        rename_to.clone()
-                    } else {
-                        name
-                    };
+                    // Names are matched folding case and written as the
+                    // new name is spelled, like SQLite.
+                    let autoindex_prefix = format!("sqlite_autoindex_{rename_from}_");
+                    let new_name =
+                        if crate::util::starts_with_ignore_ascii_case(&name, &autoindex_prefix) {
+                            format!(
+                                "sqlite_autoindex_{original_rename_to}_{}",
+                                &name[autoindex_prefix.len()..]
+                            )
+                        } else if name.eq_ignore_ascii_case(&rename_from) {
+                            original_rename_to.to_string()
+                        } else {
+                            name
+                        };
 
-                    let new_tbl_name = if tbl_name == rename_from {
-                        rename_to.clone()
+                    let new_tbl_name = if tbl_name.eq_ignore_ascii_case(&rename_from) {
+                        original_rename_to.to_string()
                     } else {
                         tbl_name
                     };
@@ -11867,7 +11871,7 @@ pub fn op_function(
                                             rewrite_check_expr_table_refs(
                                                 expr,
                                                 &rename_from,
-                                                &rename_to,
+                                                original_rename_to.as_str(),
                                             );
                                             // The captured source text no longer
                                             // matches the rewritten expression.
@@ -11884,7 +11888,7 @@ pub fn op_function(
                                                 rewrite_check_expr_table_refs(
                                                     expr,
                                                     &rename_from,
-                                                    &rename_to,
+                                                    original_rename_to.as_str(),
                                                 );
                                                 *source = None;
                                             }
@@ -17659,12 +17663,13 @@ pub fn op_rename_table(
             // An automatic index is named after the table's mangled name, the
             // name its schema row has.
             let mangled_from = crate::namespace::mangle_name(*namespace, &normalized_from);
-            let mangled_to = crate::namespace::mangle_name(*namespace, &normalized_to);
+            let mangled_to = crate::namespace::mangle_name(*namespace, to);
             let autoindex_prefix = format!("sqlite_autoindex_{mangled_from}_");
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
-                normalized_to.clone_into(&mut index.table_name);
-                if let Some(suffix) = index.name.strip_prefix(&autoindex_prefix) {
+                to.clone_into(&mut index.table_name);
+                if crate::util::starts_with_ignore_ascii_case(&index.name, &autoindex_prefix) {
+                    let suffix = &index.name[autoindex_prefix.len()..];
                     index.name = format!("sqlite_autoindex_{mangled_to}_{suffix}");
                 }
             });
@@ -17686,27 +17691,23 @@ pub fn op_rename_table(
                     if fk.parent_namespace == *namespace
                         && normalize_ident(&fk.parent_table) == normalized_from
                     {
-                        fk.parent_table.clone_from(&normalized_to);
+                        fk.parent_table.clone_from(to);
                     }
                 }
 
                 // Rewrite table-qualified refs in CHECK constraints
                 for check in &mut btree.check_constraints {
-                    rewrite_check_expr_table_refs(
-                        &mut check.expr,
-                        &normalized_from,
-                        &normalized_to,
-                    );
+                    rewrite_check_expr_table_refs(&mut check.expr, &normalized_from, to);
                     // The captured source text no longer matches the
                     // rewritten expression.
                     check.source = None;
                 }
 
-                normalized_to.clone_into(&mut btree.name);
-                normalized_to.clone_into(&mut btree.declared_name);
+                to.clone_into(&mut btree.name);
+                to.clone_into(&mut btree.declared_name);
             }
             Table::Virtual(vtab) => {
-                Arc::make_mut(vtab).name.clone_from(&normalized_to);
+                Arc::make_mut(vtab).name.clone_from(to);
             }
             _ => panic!("only btree and virtual tables can be renamed"),
         }
@@ -17727,7 +17728,7 @@ pub fn op_rename_table(
                         && normalize_ident(&fk_arc.parent_table) == normalized_from
                     {
                         let fk = Arc::make_mut(fk_arc);
-                        fk.parent_table.clone_from(&normalized_to);
+                        fk.parent_table.clone_from(to);
                     }
                 }
             }
@@ -17738,8 +17739,8 @@ pub fn op_rename_table(
         if let Some(mut triggers) = schema.take_triggers(*namespace, &normalized_from) {
             for trigger_arc in &mut triggers {
                 let trigger = Arc::make_mut(trigger_arc);
-                normalized_to.clone_into(&mut trigger.table_name);
-                rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
+                to.clone_into(&mut trigger.table_name);
+                rewrite_trigger_for_table_rename(trigger, &normalized_from, to);
             }
             schema.insert_triggers(*namespace, normalized_to.to_owned(), triggers);
         }
@@ -17794,7 +17795,7 @@ pub fn op_rename_table(
                 continue;
             }
             let trigger = Arc::make_mut(trigger_arc);
-            rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
+            rewrite_trigger_for_table_rename(trigger, &normalized_from, to);
         }
 
         let qualifiers = table_qualifiers(schema, *namespace);
@@ -17850,8 +17851,8 @@ pub fn op_rename_table(
                     };
                     if targets_renamed_database {
                         let trigger = Arc::make_mut(&mut trigger_arc);
-                        normalized_to.clone_into(&mut trigger.table_name);
-                        rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
+                        to.clone_into(&mut trigger.table_name);
+                        rewrite_trigger_for_table_rename(trigger, &normalized_from, to);
                         triggers_to_rename.push_back(trigger_arc);
                     } else {
                         triggers_to_keep.push_back(trigger_arc);
@@ -17876,7 +17877,7 @@ pub fn op_rename_table(
                     continue;
                 }
                 let trigger = Arc::make_mut(trigger_arc);
-                rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
+                rewrite_trigger_for_table_rename(trigger, &normalized_from, to);
             }
             Ok(())
         })??;

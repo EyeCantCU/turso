@@ -145,7 +145,8 @@ pub fn translate_create_index(
         resolver.name_in_sql(namespace, &original_idx_name.name),
         resolver.name_in_sql(namespace, &original_tbl_name),
     );
-    let idx_name = normalize_ident(original_idx_name.name.as_str());
+    // The index keeps its name as written; the table is looked up by folded name.
+    let idx_name = original_idx_name.name.as_str().to_string();
     let tbl_name = normalize_ident(original_tbl_name.as_str());
 
     validate(
@@ -344,7 +345,7 @@ pub fn translate_create_index(
         cdc_table.map(|x| x.0),
         SchemaEntryType::Index,
         &resolver.mangle_name(namespace, &idx_name),
-        &resolver.mangle_name(namespace, &tbl_name),
+        &resolver.mangle_name(namespace, &tbl.name),
         root_page_reg,
         Some(sql),
     )?;
@@ -1423,7 +1424,7 @@ pub fn translate_drop_index(
     let mut maybe_index = None;
     let indexes: Vec<_> = resolver.with_schema(database_id, |s| {
         s.indexes(namespace.id)
-            .filter(|idx| idx.name == idx_name)
+            .filter(|idx| idx.name.eq_ignore_ascii_case(&idx_name))
             .cloned()
             .collect()
     });
@@ -1646,7 +1647,7 @@ pub fn translate_optimize(
 
         resolver.with_schema(database_id, |schema| {
             for idx in schema.indexes(namespace.id) {
-                if idx.name == idx_name {
+                if idx.name.eq_ignore_ascii_case(&idx_name) {
                     if idx.index_method.is_some() && !idx.is_backing_btree_index() {
                         indexes_to_optimize.push((database_id, idx.clone()));
                     } else {

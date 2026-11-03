@@ -373,7 +373,8 @@ pub fn translate_create_view(
     let database_id = namespace.database_id;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
-    let normalized_view_name = normalize_ident(view_name.name.as_str());
+    // Stored as written; lookups fold case.
+    let normalized_view_name = view_name.name.as_str().to_string();
 
     if if_not_exists
         && resolver.with_schema(database_id, |s| {
@@ -694,7 +695,7 @@ pub fn translate_drop_view(
         rhs: view_name_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default(),
-        collation: CollationSeq::for_internal_values(),
+        collation: CollationSeq::NOCASE,
     });
     // Matches view - delete it
     program.emit_insn(Insn::RowId {
