@@ -45,7 +45,9 @@ extern "C" {
     fn sqlite3_exec(
         db: *mut sqlite3,
         sql: *const c_char,
-        cb: *mut c_void,
+        cb: Option<
+            unsafe extern "C" fn(*mut c_void, c_int, *mut *mut c_char, *mut *mut c_char) -> c_int,
+        >,
         arg: *mut c_void,
         err: *mut *mut c_char,
     ) -> c_int;
@@ -61,7 +63,7 @@ extern "C" {
         tail: *mut *const c_char,
     ) -> c_int;
     fn sqlite3_step(stmt: *mut sqlite3_stmt) -> c_int;
-    fn sqlite3_column_text(stmt: *mut sqlite3_stmt, idx: c_int) -> *const u8;
+    fn sqlite3_column_text(stmt: *mut sqlite3_stmt, idx: c_int) -> *const c_char;
     fn sqlite3_column_type(stmt: *mut sqlite3_stmt, idx: c_int) -> c_int;
     fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> c_int;
     fn sqlite3_free(p: *mut c_void);
@@ -92,8 +94,8 @@ extern "C" {
         enc: c_int,
         app: *mut c_void,
         func: Option<XFunc>,
-        step: Option<XFunc>,
-        fin: Option<unsafe extern "C" fn(*mut c_void)>,
+        step: Option<unsafe extern "C" fn()>,
+        fin: Option<unsafe extern "C" fn()>,
         destroy: Option<unsafe extern "C" fn(*mut c_void)>,
     ) -> c_int;
     fn sqlite3_str_new(db: *mut sqlite3) -> *mut sqlite3_str;
@@ -130,13 +132,7 @@ unsafe fn open(path: &str) -> *mut sqlite3 {
 
 unsafe fn exec(db: *mut sqlite3, sql: &str) {
     let sql = CString::new(sql).unwrap();
-    let rc = sqlite3_exec(
-        db,
-        sql.as_ptr(),
-        ptr::null_mut(),
-        ptr::null_mut(),
-        ptr::null_mut(),
-    );
+    let rc = sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut());
     assert_eq!(rc, SQLITE_OK, "{:?}", CStr::from_ptr(sqlite3_errmsg(db)));
 }
 
@@ -151,12 +147,7 @@ unsafe fn query_text(db: *mut sqlite3, sql: &str, flags: u32) -> Option<String> 
         None
     } else {
         let p = sqlite3_column_text(stmt, 0);
-        Some(
-            CStr::from_ptr(p as *const c_char)
-                .to_str()
-                .unwrap()
-                .to_owned(),
-        )
+        Some(CStr::from_ptr(p).to_str().unwrap().to_owned())
     };
     sqlite3_finalize(stmt);
     out
