@@ -314,6 +314,12 @@ const unsigned char *sqlite3_value_text(void *value);
 
 const void *sqlite3_value_blob(void *value);
 
+int sqlite3_bind_pointer(sqlite3_stmt *stmt, int idx, void *p, const char *type, void (*destructor)(void *));
+
+void *sqlite3_value_pointer(void *value, const char *type);
+
+void sqlite3_result_pointer(void *context, void *p, const char *type, void (*destructor)(void *));
+
 int sqlite3_value_bytes(void *value);
 
 void *sqlite3_value_dup(void *value);

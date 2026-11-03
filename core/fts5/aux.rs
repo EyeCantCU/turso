@@ -7,11 +7,11 @@ use crate::{LimboError, Result, Value};
 use std::any::Any;
 
 /// SQLITE_RANGE from an API call.
-pub(crate) const RANGE: i32 = 25;
+pub const RANGE: i32 = 25;
 
 /// Errors an API method can report: an SQLite result code or an error.
 #[derive(Debug)]
-pub(crate) enum ApiError {
+pub enum ApiError {
     Code(i32),
     Err(LimboError),
 }
@@ -22,10 +22,10 @@ impl From<LimboError> for ApiError {
     }
 }
 
-pub(crate) type ApiResult<T> = std::result::Result<T, ApiError>;
+pub type ApiResult<T> = std::result::Result<T, ApiError>;
 
 /// What an auxiliary function can ask about the current row.
-pub(crate) trait AuxApi {
+pub trait AuxApi {
     fn column_count(&self) -> i32;
     fn row_count(&mut self) -> ApiResult<i64>;
     fn column_total_size(&mut self, col: i32) -> ApiResult<i64>;
@@ -49,6 +49,23 @@ pub(crate) trait AuxApi {
     fn column_locale(&mut self, col: i32) -> ApiResult<Option<Vec<u8>>>;
     fn auxdata(&mut self) -> Option<&mut Box<dyn Any + Send>>;
     fn set_auxdata(&mut self, data: Box<dyn Any + Send>);
+    /// Removes and returns the auxdata (xGetAuxdata with bClear).
+    fn take_auxdata(&mut self) -> Option<Box<dyn Any + Send>>;
+    /// The position list of a phrase in the current row (as xPhraseFirst reads it).
+    fn phrase_poslist(&mut self, phrase: i32) -> ApiResult<Vec<u8>>;
+    /// The column list of a phrase (detail=columns), for xPhraseFirstColumn.
+    fn phrase_collist(&mut self, phrase: i32) -> ApiResult<Vec<u8>>;
+    /// Calls `cb` for each row matching phrase `phrase` alone; `cb` returns
+    /// false to stop (xQueryPhrase).
+    fn query_phrase(
+        &mut self,
+        phrase: i32,
+        cb: &mut dyn FnMut(&mut dyn AuxApi) -> ApiResult<bool>,
+    ) -> ApiResult<()>;
+    /// The text of token `token` of phrase `phrase` in the query.
+    fn query_token(&mut self, phrase: i32, token: i32) -> ApiResult<Vec<u8>>;
+    /// The detail mode: 0 full, 1 none, 2 columns.
+    fn detail(&self) -> i32;
 }
 
 fn to_result(e: ApiError) -> LimboError {

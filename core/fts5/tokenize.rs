@@ -5,19 +5,19 @@ use crate::sync::{Arc, RwLock};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-pub(crate) const SQLITE_OK: i32 = 0;
-pub(crate) const SQLITE_ERROR: i32 = 1;
-pub(crate) const SQLITE_DONE: i32 = 101;
+pub const SQLITE_OK: i32 = 0;
+pub const SQLITE_ERROR: i32 = 1;
+pub const SQLITE_DONE: i32 = 101;
 
-pub(crate) const TOKENIZE_QUERY: i32 = 0x0001;
-pub(crate) const TOKENIZE_PREFIX: i32 = 0x0002;
-pub(crate) const TOKENIZE_DOCUMENT: i32 = 0x0004;
-pub(crate) const TOKENIZE_AUX: i32 = 0x0008;
-pub(crate) const TOKEN_COLOCATED: i32 = 0x0001;
+pub const TOKENIZE_QUERY: i32 = 0x0001;
+pub const TOKENIZE_PREFIX: i32 = 0x0002;
+pub const TOKENIZE_DOCUMENT: i32 = 0x0004;
+pub const TOKENIZE_AUX: i32 = 0x0008;
+pub const TOKEN_COLOCATED: i32 = 0x0001;
 
 /// Pattern matching a tokenizer supports for LIKE/GLOB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Pattern {
+pub enum Pattern {
     None,
     Like,
     Glob,
@@ -25,9 +25,9 @@ pub(crate) enum Pattern {
 
 /// Token callback: (tflags, token, start, end) -> SQLite result code.
 /// `SQLITE_DONE` stops the tokenizer without an error.
-pub(crate) type TokenCallback<'a> = dyn FnMut(i32, &[u8], i32, i32) -> i32 + 'a;
+pub type TokenCallback<'a> = dyn FnMut(i32, &[u8], i32, i32) -> i32 + 'a;
 
-pub(crate) trait Tokenizer: Send + Sync {
+pub trait Tokenizer: Send + Sync {
     /// Returns an SQLite result code.
     fn tokenize(
         &self,
@@ -41,7 +41,7 @@ pub(crate) trait Tokenizer: Send + Sync {
     }
 }
 
-pub(crate) trait TokenizerModule: Send + Sync {
+pub trait TokenizerModule: Send + Sync {
     /// Creates a tokenizer instance; `Err` holds an SQLite result code.
     fn create(&self, args: &[String]) -> Result<Box<dyn Tokenizer>, i32>;
 }

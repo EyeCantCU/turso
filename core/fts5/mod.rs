@@ -4,6 +4,7 @@
 //! %_idx, %_content, %_docsize and %_config exactly as SQLite does, so FTS5
 //! tables can move between SQLite and turso in either direction.
 
+pub mod api;
 mod aux;
 mod config;
 mod expr;
@@ -74,12 +75,15 @@ pub(crate) fn register(syms: &mut SymbolTable) {
             name.to_string(),
             FunctionArity::Variadic,
             false,
-            AuxFunction { name },
+            AuxFunction {
+                name: name.to_string(),
+            },
         ) {
             syms.functions.insert(name.to_string(), Arc::new(f));
         }
     }
-    let simple: [(&'static str, FunctionArity); 3] = [
+    let simple: [(&'static str, FunctionArity); 4] = [
+        ("fts5", FunctionArity::Exact(1)),
         ("fts5_source_id", FunctionArity::Exact(0)),
         ("fts5_locale", FunctionArity::Exact(2)),
         ("fts5_insttoken", FunctionArity::Exact(1)),
@@ -1003,9 +1007,14 @@ impl CursorState {
     /// Runs an auxiliary function on the current row.
     fn call_aux(&mut self, name: &str, args: &[Value]) -> Result<Value> {
         let prev = std::mem::replace(&mut self.current_aux, name.to_ascii_lowercase());
-        let r = match aux::call_builtin(name, self, args) {
-            Some(r) => r,
-            None => Err(err(format!("no such function: {name}"))),
+        // Functions registered through fts5_api take precedence, as in SQLite.
+        let r = if let Some(f) = api::find_aux(name) {
+            f.call(self, args)
+        } else {
+            match aux::call_builtin(name, self, args) {
+                Some(r) => r,
+                None => Err(err(format!("no such function: {name}"))),
+            }
         };
         self.current_aux = prev;
         r
@@ -1347,6 +1356,93 @@ impl AuxApi for CursorState {
     fn set_auxdata(&mut self, data: Box<dyn Any + Send>) {
         self.auxdata.insert(self.current_aux.clone(), data);
     }
+
+    fn take_auxdata(&mut self) -> Option<Box<dyn Any + Send>> {
+        let key = self.current_aux.clone();
+        self.auxdata.remove(&key)
+    }
+
+    fn phrase_poslist(&mut self, phrase: i32) -> ApiResult<Vec<u8>> {
+        if phrase < 0 || phrase >= self.phrase_count() {
+            return Err(ApiError::Code(aux::RANGE));
+        }
+        Ok(self
+            .poslists()?
+            .get(phrase as usize)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn phrase_collist(&mut self, phrase: i32) -> ApiResult<Vec<u8>> {
+        if phrase < 0 || phrase >= self.phrase_count() {
+            return Err(ApiError::Code(aux::RANGE));
+        }
+        if self.cfg().detail != Detail::Columns {
+            return self.phrase_poslist(phrase);
+        }
+        Ok(self
+            .eval
+            .as_ref()
+            .and_then(|ev| ev.phrase_collist(phrase as usize))
+            .unwrap_or_default())
+    }
+
+    fn query_phrase(
+        &mut self,
+        phrase: i32,
+        cb: &mut dyn FnMut(&mut dyn AuxApi) -> ApiResult<bool>,
+    ) -> ApiResult<()> {
+        let Some(expr) = &self.expr else {
+            return Err(ApiError::Code(aux::RANGE));
+        };
+        if phrase < 0 || phrase as usize >= expr.phrase_count() {
+            return Err(ApiError::Code(aux::RANGE));
+        }
+        let single = expr.single_phrase(phrase as usize);
+        let vals = self.vals()?;
+        let index = Index::new(&self.conn, &self.inner.cfg, &vals);
+        let (s, _) = index.store.read_structure()?;
+        let w = self.inner.peek_writes(&self.conn);
+        let ev = Evaluator::new(
+            &single,
+            &index,
+            &s,
+            w.as_ref().map(|w| &w.pending),
+            (SMALLEST_INT64, LARGEST_INT64),
+        )?;
+        let mut sub = CursorState::new(0, self.inner.clone(), self.conn.clone());
+        sub.plan = Plan::Match;
+        sub.expr = Some(single);
+        sub.eval = Some(ev);
+        sub.vals = Some(vals);
+        while !sub.eof() {
+            if !cb(&mut sub)? {
+                break;
+            }
+            sub.next();
+        }
+        Ok(())
+    }
+
+    fn query_token(&mut self, phrase: i32, token: i32) -> ApiResult<Vec<u8>> {
+        let Some(expr) = &self.expr else {
+            return Err(ApiError::Code(aux::RANGE));
+        };
+        expr.phrases
+            .get(phrase.max(0) as usize)
+            .filter(|_| phrase >= 0)
+            .and_then(|p| p.terms.get(token.max(0) as usize).filter(|_| token >= 0))
+            .map(|t| t.alts[0].clone())
+            .ok_or(ApiError::Code(aux::RANGE))
+    }
+
+    fn detail(&self) -> i32 {
+        match self.cfg().detail {
+            Detail::Full => 0,
+            Detail::None => 1,
+            Detail::Columns => 2,
+        }
+    }
 }
 
 pub(crate) struct Fts5Cursor {
@@ -1385,20 +1481,22 @@ impl VirtualTableCursor for Fts5Cursor {
 /// An auxiliary function called as an SQL function; the first argument is
 /// the value of the table's hidden column, the cursor id.
 #[derive(Debug)]
-struct AuxFunction {
-    name: &'static str,
+pub(crate) struct AuxFunction {
+    pub(crate) name: String,
 }
 
 impl ScalarFunction for AuxFunction {
     type Call = AuxCall;
 
     fn create_call(&self) -> Result<Self::Call> {
-        Ok(AuxCall { name: self.name })
+        Ok(AuxCall {
+            name: self.name.clone(),
+        })
     }
 }
 
-struct AuxCall {
-    name: &'static str,
+pub(crate) struct AuxCall {
+    name: String,
 }
 
 impl ScalarCall for AuxCall {
@@ -1426,7 +1524,7 @@ impl ScalarCall for AuxCall {
             return Err(LimboError::SqlError(format!("no such cursor: {id}")).into());
         }
         let rest: Vec<Value> = args[1..].iter().map(|r| r.get_value().clone()).collect();
-        Ok(IOResult::Done(st.call_aux(self.name, &rest)?))
+        Ok(IOResult::Done(st.call_aux(&self.name, &rest)?))
     }
 }
 
@@ -1450,8 +1548,12 @@ struct SimpleCall {
 impl ScalarCall for SimpleCall {
     type Output = Value;
 
-    fn step(&mut self, _connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
+    fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         let v = match self.name {
+            "fts5" => {
+                api::run_fts5_function_hook(connection, args[0].get_value());
+                Value::Null
+            }
             "fts5_source_id" => Value::build_text(FTS5_SOURCE_ID),
             "fts5_locale" => {
                 let loc = value_text(args[0].get_value()).unwrap_or_default();
