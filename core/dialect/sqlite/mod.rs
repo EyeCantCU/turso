@@ -21,10 +21,10 @@ use turso_ext::VTabKind;
 /// This is the source of truth for the SQLite version Turso tracks. Keep
 /// [`SQLITE_VERSION_NUMBER`], `scripts/install-sqlite3.sh`, README.md, and
 /// COMPAT.md in sync when bumping it.
-pub const SQLITE_VERSION: &str = "3.50.4";
+pub const SQLITE_VERSION: &str = "3.54.1";
 
 /// Integer form of [`SQLITE_VERSION`] used by `sqlite3_libversion_number()`.
-pub const SQLITE_VERSION_NUMBER: i32 = 3_050_004;
+pub const SQLITE_VERSION_NUMBER: i32 = 3_054_001;
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 use crate::function::FtsFunc;

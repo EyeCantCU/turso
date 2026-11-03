@@ -5,9 +5,9 @@
 
 set -e
 
-# Keep in sync with SQLITE_VERSION in core/dialect/sqlite.rs (3.50.4).
-SQLITE_VERSION="${SQLITE_VERSION:-3500400}"
-SQLITE_YEAR="${SQLITE_YEAR:-2025}"
+# Keep in sync with SQLITE_VERSION in core/dialect/sqlite.rs (3.54.1).
+SQLITE_VERSION="${SQLITE_VERSION:-3540100}"
+SQLITE_YEAR="${SQLITE_YEAR:-2026}"
 
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
