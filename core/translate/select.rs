@@ -555,7 +555,9 @@ fn prepare_one_select_plan(
                 }
             }
 
-            if plan.result_columns.len() > crate::types::MAX_COLUMN {
+            if plan.result_columns.len()
+                > connection.limit(crate::limits::LIMIT_COLUMN).unwrap_or(0) as usize
+            {
                 crate::bail_parse_error!("too many columns in result set");
             }
 
@@ -845,7 +847,7 @@ fn prepare_one_select_plan(
                 crate::bail_parse_error!("LIMIT clause is not allowed with VALUES clause");
             }
             let len = values[0].len();
-            if len > crate::types::MAX_COLUMN {
+            if len > connection.limit(crate::limits::LIMIT_COLUMN).unwrap_or(0) as usize {
                 crate::bail_parse_error!("too many columns in result set");
             }
             let mut result_columns = Vec::with_capacity(len);

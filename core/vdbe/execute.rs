@@ -4621,6 +4621,7 @@ pub fn op_transaction_inner(
                 if statement_writes_db
                     && !conn.is_nested_stmt()
                     && !state.is_active_write
+                    && !state.is_blob_handle
                     && active_writers > 0
                 {
                     return Err(
@@ -5134,14 +5135,16 @@ pub fn op_transaction_inner(
                 let is_top_level_statement = !program.connection.is_nested_stmt();
                 if statement_writes_db && is_top_level_statement {
                     if !state.is_active_write {
-                        let previous = program
-                            .connection
-                            .n_active_writes
-                            .fetch_add(1, Ordering::SeqCst);
-                        turso_assert!(
-                            previous == 0,
-                            "starting a writer while {previous} writer(s) are already active"
-                        );
+                        if !state.is_blob_handle {
+                            let previous = program
+                                .connection
+                                .n_active_writes
+                                .fetch_add(1, Ordering::SeqCst);
+                            turso_assert!(
+                                previous == 0,
+                                "starting a writer while {previous} writer(s) are already active"
+                            );
+                        }
                         turso_assert!(
                             program.connection.transaction_changes.is_empty(),
                             "write statement started with view changes left by an earlier statement"
@@ -5973,6 +5976,17 @@ pub fn op_program(
                 // and save last_insert_rowid so it can be restored after the trigger finishes.
                 let (is_trigger, saved_last_insert_rowid, saved_last_changes_value) =
                     if let Some(ref trigger) = statement.get_trigger() {
+                        let max_depth = program
+                            .connection
+                            .limit(crate::limits::LIMIT_TRIGGER_DEPTH)
+                            .unwrap_or(0) as usize;
+                        if program.connection.executing_triggers.read().len() >= max_depth {
+                            return Err(LimboError::SqlError(
+                                "triggers nested too deep".to_string(),
+                            )
+                            .into());
+                        }
+                        program.connection.trace_trigger(trigger);
                         program.connection.start_trigger_execution(trigger.clone());
                         (
                             true,
@@ -10375,6 +10389,7 @@ pub fn op_function(
                         },
                     };
 
+                    check_like_pattern_length(program, pattern_cow.len())?;
                     let matches = Value::exec_glob(&pattern_cow, &match_cow)?;
                     state.registers[*dest].set_int(matches as i64);
                 }
@@ -10441,6 +10456,7 @@ pub fn op_function(
                         // 3. and 4. Prepare Pattern and Text, then execute Like.
                         let matches = match (pattern_value, match_value) {
                             (Value::Text(pattern), Value::Text(text)) => {
+                                check_like_pattern_length(program, pattern.as_str().len())?;
                                 Value::exec_like(pattern.as_str(), text.as_str(), escape_char)?
                             }
                             _ => exec_like_converted(pattern_value, match_value, escape_char)?,
@@ -10821,6 +10837,9 @@ pub fn op_function(
             #[cfg(not(target_family = "wasm"))]
             ScalarFunc::LoadExtension => {
                 if !program.connection.can_load_extensions() {
+                    if program.connection.extension_loader().is_some() {
+                        return Err(LimboError::SqlError("not authorized".to_string()).into());
+                    }
                     crate::bail_parse_error!("runtime extension loading is disabled");
                 }
                 if !program.connection.current_role_is_superuser() {
@@ -10832,9 +10851,16 @@ pub fn op_function(
                     ))
                     .into());
                 }
-                let extension = &state.registers[*start_reg];
-                let ext = resolve_ext_path(&extension.get_value().to_string())?;
-                program.connection.load_extension(ext)?;
+                if let Some(loader) = program.connection.extension_loader() {
+                    let file = state.registers[*start_reg].get_value().to_string();
+                    let entry = (arg_count > 1)
+                        .then(|| state.registers[*start_reg + 1].get_value().to_string());
+                    loader(&file, entry.as_deref()).map_err(LimboError::SqlError)?;
+                } else {
+                    let extension = &state.registers[*start_reg];
+                    let ext = resolve_ext_path(&extension.get_value().to_string())?;
+                    program.connection.load_extension(ext)?;
+                }
             }
             ScalarFunc::StrfTime => {
                 let values =
@@ -12490,6 +12516,20 @@ pub(crate) type OpAttachState = crate::dialect::sqlite::attach::AttachDatabaseSt
 
 /// LIKE with an operand that is not TEXT: both are converted to TEXT first.
 #[inline(never)]
+/// Enforces SQLITE_LIMIT_LIKE_PATTERN_LENGTH.
+fn check_like_pattern_length(program: &Program, len: usize) -> Result<()> {
+    let max = program
+        .connection
+        .limit(crate::limits::LIMIT_LIKE_PATTERN_LENGTH)
+        .unwrap_or(0) as usize;
+    if len > max {
+        return Err(LimboError::SqlError(
+            "LIKE or GLOB pattern too complex".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn exec_like_converted(
     pattern_value: &Value,
     match_value: &Value,

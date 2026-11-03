@@ -1530,9 +1530,11 @@ fn translate_function_call_expr(
                 #[cfg(feature = "fs")]
                 #[cfg(not(target_family = "wasm"))]
                 ScalarFunc::LoadExtension => {
-                    let args = expect_arguments_exact!(args, 1, srf);
-                    let start_reg = program.alloc_register();
-                    translate_expr(program, referenced_tables, &args[0], start_reg, resolver)?;
+                    let args = expect_arguments_max!(args, 2, srf);
+                    let start_reg = program.alloc_registers(args.len());
+                    for (i, arg) in args.iter().enumerate() {
+                        translate_expr(program, referenced_tables, arg, start_reg + i, resolver)?;
+                    }
                     program.emit_insn(Insn::Function {
                         constant_mask: 0,
                         start_reg,

@@ -192,6 +192,13 @@ codegen-units = 4
 panic = "abort"
 lto = "thin"
 
+# libturso_sqlite3 as a drop-in libsqlite3: a Rust panic must unwind so the C API
+# guard can turn it into an error code. The release profile aborts.
+# cargo build --profile release-capi -p turso_sqlite3
+[profile.release-capi]
+inherits = "release"
+panic = "unwind"
+
 [profile.pg-dump-fuzzer]
 inherits = "release"
 panic = "unwind"

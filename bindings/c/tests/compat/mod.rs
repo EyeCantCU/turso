@@ -227,6 +227,8 @@ mod config;
 mod hooks;
 mod stubs;
 
+mod misc;
+
 mod tests {
     use super::*;
 
