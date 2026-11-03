@@ -791,30 +791,17 @@ pub(crate) fn pattern_expr(
 }
 
 // ------------------------------------------------------------------ evaluation
-
-/// A term's doclist: rowid -> position list (or column list).
-type Doclist = HashMap<i64, Vec<u8>>;
-
-/// Evaluates an expression against the index.
-pub(crate) struct Evaluator {
-    pub detail: Detail,
-    /// Per phrase, per term: the doclist (synonyms and prefixes merged).
-    terms: Vec<Vec<Doclist>>,
-    /// Matching rowids, ascending.
-    pub rows: Vec<i64>,
-}
+//
+// A port of fts5_expr.c's node iterators (Next/Test per node type) over
+// materialized term doclists, so that matching rows and the per-phrase
+// position lists seen by auxiliary functions are exactly SQLite's.
 
 /// Merges position lists, removing duplicates.
 fn merge_poslists(lists: &[&[u8]]) -> Vec<u8> {
     let mut all: Vec<i64> = lists.iter().flat_map(|l| poslist_positions(l)).collect();
     all.sort_unstable();
     all.dedup();
-    let mut out = Vec::new();
-    let mut w = PoslistWriter::default();
-    for p in all {
-        w.append(&mut out, p);
-    }
-    out
+    positions_to_poslist(&all)
 }
 
 /// Merges column lists (detail=columns), removing duplicates.
@@ -841,14 +828,11 @@ fn merge_collists(lists: &[&[u8]]) -> Vec<u8> {
 
 /// Keeps only positions in the given columns.
 fn filter_poslist(pl: &[u8], cols: &[usize]) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut w = PoslistWriter::default();
-    for p in poslist_positions(pl) {
-        if cols.contains(&(pos_col(p) as usize)) {
-            w.append(&mut out, p);
-        }
-    }
-    out
+    let kept: Vec<i64> = poslist_positions(pl)
+        .into_iter()
+        .filter(|p| cols.contains(&(pos_col(*p) as usize)))
+        .collect();
+    positions_to_poslist(&kept)
 }
 
 fn filter_collist(cl: &[u8], cols: &[usize]) -> Vec<u8> {
@@ -864,6 +848,695 @@ fn filter_collist(cl: &[u8], cols: &[usize]) -> Vec<u8> {
         }
     }
     out
+}
+
+fn positions_to_poslist(pos: &[i64]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut w = PoslistWriter::default();
+    for &p in pos {
+        w.append(&mut out, p);
+    }
+    out
+}
+
+/// An index iterator over one term's doclist.
+#[derive(Clone)]
+struct TermIter {
+    entries: std::sync::Arc<Vec<(i64, Vec<u8>)>>,
+    idx: usize,
+}
+
+impl TermIter {
+    fn eof(&self) -> bool {
+        self.idx >= self.entries.len()
+    }
+    fn rowid(&self) -> i64 {
+        self.entries.get(self.idx).map_or(0, |e| e.0)
+    }
+    fn data(&self) -> &[u8] {
+        self.entries.get(self.idx).map_or(&[], |e| e.1.as_slice())
+    }
+    fn next(&mut self) {
+        self.idx += 1;
+    }
+    /// sqlite3Fts5IterNextFrom (ascending): the first rowid >= `from`.
+    fn next_from(&mut self, from: i64) {
+        let rest = &self.entries[self.idx.min(self.entries.len())..];
+        self.idx += rest.partition_point(|e| e.0 < from);
+    }
+}
+
+#[derive(Clone)]
+struct ETerm {
+    /// The term's iterator, then one per synonym.
+    iters: Vec<TermIter>,
+    first: bool,
+}
+
+#[derive(Clone)]
+struct EPhrase {
+    terms: Vec<ETerm>,
+    poslist: Vec<u8>,
+    /// The node holding this phrase.
+    node: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    Eof,
+    Term,
+    String,
+    And,
+    Or,
+    Not,
+}
+
+#[derive(Clone)]
+struct ENode {
+    kind: Kind,
+    eof: bool,
+    nomatch: bool,
+    rowid: i64,
+    children: Vec<usize>,
+    phrases: Vec<usize>,
+    near: i32,
+    colset: bool,
+}
+
+/// The state of one query (Fts5Expr with its iterators).
+#[derive(Clone)]
+pub(crate) struct Evaluator {
+    pub detail: Detail,
+    nodes: Vec<ENode>,
+    phrases: Vec<EPhrase>,
+    root: usize,
+    last: i64,
+}
+
+fn rowid_cmp(a: i64, b: i64) -> std::cmp::Ordering {
+    a.cmp(&b)
+}
+
+impl Evaluator {
+    /// Builds the iterators for `expr` and positions on the first match in
+    /// [first, last] (sqlite3Fts5ExprFirst).
+    pub(crate) fn new(
+        expr: &Expr,
+        index: &Index,
+        s: &Structure,
+        pending: Option<&Pending>,
+        rowid_range: (i64, i64),
+    ) -> Result<Self> {
+        let cfg = index.cfg;
+        let detail = cfg.detail;
+        let mut ev = Evaluator {
+            detail,
+            nodes: Vec::new(),
+            phrases: Vec::new(),
+            root: 0,
+            last: rowid_range.1,
+        };
+        // Phrases first, with their doclists (colset-filtered).
+        for (pi, phrase) in expr.phrases.iter().enumerate() {
+            let colset = expr.phrase_nearset(pi).and_then(|n| n.colset.clone());
+            let mut terms = Vec::with_capacity(phrase.terms.len());
+            for term in &phrase.terms {
+                let mut iters = Vec::with_capacity(term.alts.len());
+                for alt in &term.alts {
+                    let mut dl = query_token(index, s, pending, alt, term.prefix)?;
+                    if let Some(cols) = &colset {
+                        for (_, pl) in dl.iter_mut() {
+                            *pl = match detail {
+                                Detail::Full => filter_poslist(pl, cols),
+                                Detail::Columns => filter_collist(pl, cols),
+                                Detail::None => std::mem::take(pl),
+                            };
+                        }
+                    }
+                    iters.push(TermIter {
+                        entries: std::sync::Arc::new(dl),
+                        idx: 0,
+                    });
+                }
+                terms.push(ETerm {
+                    iters,
+                    first: term.first,
+                });
+            }
+            ev.phrases.push(EPhrase {
+                terms,
+                poslist: Vec::new(),
+                node: 0,
+            });
+        }
+        ev.root = ev.build(&expr.root, expr);
+        let root = ev.root;
+        ev.node_first(root);
+        if !ev.nodes[root].eof && rowid_cmp(ev.nodes[root].rowid, rowid_range.0).is_lt() {
+            ev.node_next(root, Some(rowid_range.0));
+        }
+        while ev.nodes[root].nomatch {
+            ev.node_next(root, None);
+        }
+        if rowid_cmp(ev.nodes[root].rowid, ev.last).is_gt() {
+            ev.nodes[root].eof = true;
+        }
+        Ok(ev)
+    }
+
+    fn build(&mut self, node: &Node, expr: &Expr) -> usize {
+        let idx = self.nodes.len();
+        self.nodes.push(ENode {
+            kind: Kind::Eof,
+            eof: false,
+            nomatch: false,
+            rowid: 0,
+            children: Vec::new(),
+            phrases: Vec::new(),
+            near: 0,
+            colset: false,
+        });
+        let (kind, children, phrases, near, colset) = match node {
+            Node::Eof(n) => (
+                Kind::Eof,
+                Vec::new(),
+                n.as_ref().map(|n| n.phrases.clone()).unwrap_or_default(),
+                0,
+                false,
+            ),
+            Node::String(n) => {
+                let p = &expr.phrases[n.phrases[0]];
+                let term = n.phrases.len() == 1
+                    && p.terms.len() == 1
+                    && p.terms[0].alts.len() == 1
+                    && !p.terms[0].first;
+                (
+                    if term { Kind::Term } else { Kind::String },
+                    Vec::new(),
+                    n.phrases.clone(),
+                    n.near,
+                    n.colset.is_some(),
+                )
+            }
+            Node::And(c) | Node::Or(c) => {
+                let kids = c.iter().map(|n| self.build(n, expr)).collect();
+                (
+                    if matches!(node, Node::And(_)) {
+                        Kind::And
+                    } else {
+                        Kind::Or
+                    },
+                    kids,
+                    Vec::new(),
+                    0,
+                    false,
+                )
+            }
+            Node::Not(a, b) => {
+                let kids = vec![self.build(a, expr), self.build(b, expr)];
+                (Kind::Not, kids, Vec::new(), 0, false)
+            }
+        };
+        for &p in &phrases {
+            if p < self.phrases.len() {
+                self.phrases[p].node = idx;
+            }
+        }
+        let n = &mut self.nodes[idx];
+        n.kind = kind;
+        n.children = children;
+        n.phrases = phrases;
+        n.near = near;
+        n.colset = colset;
+        idx
+    }
+
+    pub(crate) fn eof(&self) -> bool {
+        self.nodes[self.root].eof
+    }
+
+    pub(crate) fn rowid(&self) -> i64 {
+        self.nodes[self.root].rowid
+    }
+
+    /// sqlite3Fts5ExprNext
+    pub(crate) fn next(&mut self) {
+        let root = self.root;
+        loop {
+            self.node_next(root, None);
+            if !self.nodes[root].nomatch {
+                break;
+            }
+        }
+        if rowid_cmp(self.nodes[root].rowid, self.last).is_gt() {
+            self.nodes[root].eof = true;
+        }
+    }
+
+    /// sqlite3Fts5ExprPoslist: phrase `i`'s position list at the current row.
+    pub(crate) fn phrase_poslist(&self, i: usize) -> Option<&[u8]> {
+        let p = self.phrases.get(i)?;
+        let node = &self.nodes[p.node];
+        (!node.eof && node.rowid == self.nodes[self.root].rowid).then_some(p.poslist.as_slice())
+    }
+
+    /// The colset-filtered column list of phrase `i` (detail=columns).
+    pub(crate) fn phrase_collist(&self, i: usize) -> Option<Vec<u8>> {
+        let p = self.phrases.get(i)?;
+        let node = &self.nodes[p.node];
+        if node.eof || node.rowid != self.nodes[self.root].rowid || p.poslist.is_empty() {
+            return None;
+        }
+        let term = p.terms.first()?;
+        let row = node.rowid;
+        let lists: Vec<&[u8]> = term
+            .iters
+            .iter()
+            .filter(|it| !it.eof() && it.rowid() == row && !it.data().is_empty())
+            .map(|it| it.data())
+            .collect();
+        Some(if lists.len() == 1 {
+            lists[0].to_vec()
+        } else {
+            merge_collists(&lists)
+        })
+    }
+
+    fn set_eof(&mut self, n: usize) {
+        self.nodes[n].eof = true;
+        self.nodes[n].nomatch = false;
+        for c in self.nodes[n].children.clone() {
+            self.set_eof(c);
+        }
+    }
+
+    fn zero_poslist(&mut self, n: usize) {
+        match self.nodes[n].kind {
+            Kind::String | Kind::Term => {
+                for p in self.nodes[n].phrases.clone() {
+                    self.phrases[p].poslist.clear();
+                }
+            }
+            _ => {
+                for c in self.nodes[n].children.clone() {
+                    self.zero_poslist(c);
+                }
+            }
+        }
+    }
+
+    /// fts5NodeCompare: EOF nodes sort last.
+    fn node_cmp(&self, a: usize, b: usize) -> std::cmp::Ordering {
+        use std::cmp::Ordering::*;
+        if self.nodes[b].eof {
+            return Less;
+        }
+        if self.nodes[a].eof {
+            return Greater;
+        }
+        rowid_cmp(self.nodes[a].rowid, self.nodes[b].rowid)
+    }
+
+    /// fts5ExprNodeFirst
+    fn node_first(&mut self, n: usize) {
+        self.nodes[n].eof = false;
+        self.nodes[n].nomatch = false;
+        match self.nodes[n].kind {
+            Kind::String | Kind::Term => self.near_init_all(n),
+            Kind::Eof => {
+                self.nodes[n].eof = true;
+            }
+            kind => {
+                let kids = self.nodes[n].children.clone();
+                let mut neof = 0;
+                for &c in &kids {
+                    self.node_first(c);
+                    neof += self.nodes[c].eof as usize;
+                }
+                self.nodes[n].rowid = self.nodes[kids[0]].rowid;
+                match kind {
+                    Kind::And if neof > 0 => self.set_eof(n),
+                    Kind::Or if neof == kids.len() => self.set_eof(n),
+                    Kind::Not => self.nodes[n].eof = self.nodes[kids[0]].eof,
+                    _ => {}
+                }
+            }
+        }
+        self.node_test(n);
+    }
+
+    /// fts5ExprNearInitAll: EOF if some term matches nothing.
+    fn near_init_all(&mut self, n: usize) {
+        for p in self.nodes[n].phrases.clone() {
+            let ph = &mut self.phrases[p];
+            if ph.terms.is_empty() {
+                self.nodes[n].eof = true;
+                return;
+            }
+            for t in ph.terms.iter_mut() {
+                let mut hit = false;
+                for it in t.iters.iter_mut() {
+                    it.idx = 0;
+                    if !it.eof() {
+                        hit = true;
+                    }
+                }
+                if !hit {
+                    self.nodes[n].eof = true;
+                    return;
+                }
+            }
+        }
+        self.nodes[n].eof = false;
+    }
+
+    fn node_test(&mut self, n: usize) {
+        if self.nodes[n].eof {
+            return;
+        }
+        match self.nodes[n].kind {
+            Kind::String => self.test_string(n),
+            Kind::Term => self.test_term(n),
+            Kind::And => self.test_and(n),
+            Kind::Or => self.test_or(n),
+            Kind::Not => self.test_not(n),
+            Kind::Eof => {}
+        }
+    }
+
+    fn node_next(&mut self, n: usize, from: Option<i64>) {
+        match self.nodes[n].kind {
+            Kind::String => self.next_string(n, from),
+            Kind::Term => self.next_term(n, from),
+            Kind::And => {
+                let c0 = self.nodes[n].children[0];
+                self.node_next(c0, from);
+                self.test_and(n);
+            }
+            Kind::Or => self.next_or(n, from),
+            Kind::Not => {
+                let c0 = self.nodes[n].children[0];
+                self.node_next(c0, from);
+                self.test_not(n);
+            }
+            Kind::Eof => {
+                self.nodes[n].eof = true;
+            }
+        }
+    }
+
+    // ---- TERM
+
+    fn test_term(&mut self, n: usize) {
+        let p = self.nodes[n].phrases[0];
+        let it = &self.phrases[p].terms[0].iters[0];
+        let (rowid, data) = (it.rowid(), it.data().to_vec());
+        let empty = data.is_empty() && self.detail != Detail::None;
+        // detail=none iterators report one byte of "data" per entry.
+        self.phrases[p].poslist = if self.detail == Detail::None {
+            vec![1]
+        } else {
+            data
+        };
+        self.nodes[n].rowid = rowid;
+        self.nodes[n].nomatch = empty;
+    }
+
+    fn next_term(&mut self, n: usize, from: Option<i64>) {
+        let p = self.nodes[n].phrases[0];
+        let it = &mut self.phrases[p].terms[0].iters[0];
+        match from {
+            Some(f) => it.next_from(f),
+            None => it.next(),
+        }
+        if !it.eof() {
+            self.test_term(n);
+        } else {
+            self.nodes[n].eof = true;
+            self.nodes[n].nomatch = false;
+        }
+    }
+
+    // ---- STRING
+
+    /// fts5ExprSynonymRowid (ascending): the smallest rowid of any synonym.
+    fn synonym_rowid(t: &ETerm) -> Option<i64> {
+        t.iters.iter().filter(|i| !i.eof()).map(|i| i.rowid()).min()
+    }
+
+    fn test_string(&mut self, n: usize) {
+        let phrases = self.nodes[n].phrases.clone();
+        let first = &self.phrases[phrases[0]].terms[0];
+        let mut last = if first.iters.len() > 1 {
+            Self::synonym_rowid(first).unwrap_or(0)
+        } else {
+            first.iters[0].rowid()
+        };
+        loop {
+            let mut matched = true;
+            for &p in &phrases {
+                for t in self.phrases[p].terms.iter_mut() {
+                    if t.iters.len() > 1 {
+                        if Self::synonym_rowid(t) == Some(last) {
+                            continue;
+                        }
+                        matched = false;
+                        // fts5ExprSynonymAdvanceto
+                        for it in t.iters.iter_mut() {
+                            if !it.eof() && last > it.rowid() {
+                                it.next_from(last);
+                            }
+                        }
+                        match Self::synonym_rowid(t) {
+                            Some(r) => last = r,
+                            None => {
+                                self.nodes[n].nomatch = false;
+                                self.nodes[n].eof = true;
+                                return;
+                            }
+                        }
+                    } else {
+                        let it = &mut t.iters[0];
+                        if it.rowid() == last && !it.eof() {
+                            continue;
+                        }
+                        matched = false;
+                        // fts5ExprAdvanceto
+                        if last > it.rowid() {
+                            it.next_from(last);
+                            if it.eof() {
+                                self.nodes[n].eof = true;
+                                return;
+                            }
+                        }
+                        last = it.rowid();
+                    }
+                }
+            }
+            if matched {
+                break;
+            }
+        }
+        self.nodes[n].rowid = last;
+        self.nodes[n].nomatch = !self.near_test(n);
+    }
+
+    fn next_string(&mut self, n: usize, from: Option<i64>) {
+        self.nodes[n].nomatch = false;
+        let p0 = self.nodes[n].phrases[0];
+        let t = &mut self.phrases[p0].terms[0];
+        let eof;
+        if t.iters.len() > 1 {
+            let r = Self::synonym_rowid(t);
+            let mut all_eof = true;
+            for it in t.iters.iter_mut() {
+                if !it.eof() {
+                    let ii = it.rowid();
+                    if Some(ii) == r || from.is_some_and(|f| ii != f && ii < f) {
+                        match from {
+                            Some(f) => it.next_from(f),
+                            None => it.next(),
+                        }
+                        if !it.eof() {
+                            all_eof = false;
+                        }
+                    } else {
+                        all_eof = false;
+                    }
+                }
+            }
+            eof = all_eof;
+        } else {
+            let it = &mut t.iters[0];
+            match from {
+                Some(f) => it.next_from(f),
+                None => it.next(),
+            }
+            eof = it.eof();
+        }
+        self.nodes[n].eof = eof;
+        if !eof {
+            self.test_string(n);
+        }
+    }
+
+    /// The merged position list of a term at `row` (fts5ExprSynonymList).
+    fn term_poslist(t: &ETerm, row: i64) -> Vec<u8> {
+        if t.iters.len() == 1 {
+            return t.iters[0].data().to_vec();
+        }
+        let lists: Vec<&[u8]> = t
+            .iters
+            .iter()
+            .filter(|it| !it.eof() && it.rowid() == row && !it.data().is_empty())
+            .map(|it| it.data())
+            .collect();
+        if lists.len() == 1 {
+            lists[0].to_vec()
+        } else {
+            merge_poslists(&lists)
+        }
+    }
+
+    /// fts5ExprNearTest
+    fn near_test(&mut self, n: usize) -> bool {
+        let row = self.nodes[n].rowid;
+        let phrases = self.nodes[n].phrases.clone();
+        if self.detail != Detail::Full {
+            let p = phrases[0];
+            let hit = self.phrases[p].terms[0].iters.iter().any(|it| {
+                !it.eof()
+                    && it.rowid() == row
+                    && (self.detail == Detail::None || !it.data().is_empty())
+            });
+            self.phrases[p].poslist = if hit { vec![1] } else { Vec::new() };
+            return hit;
+        }
+        let colset = self.nodes[n].colset;
+        let mut i = 0;
+        while i < phrases.len() {
+            let p = phrases[i];
+            let ph = &self.phrases[p];
+            if ph.terms.len() > 1 || ph.terms[0].iters.len() > 1 || colset || ph.terms[0].first {
+                let lists: Vec<Vec<i64>> = ph
+                    .terms
+                    .iter()
+                    .map(|t| poslist_positions(&Self::term_poslist(t, row)))
+                    .collect();
+                let pos = phrase_match(&lists, ph.terms[0].first);
+                self.phrases[p].poslist = positions_to_poslist(&pos);
+                if pos.is_empty() {
+                    break;
+                }
+            } else {
+                self.phrases[p].poslist = ph.terms[0].iters[0].data().to_vec();
+            }
+            i += 1;
+        }
+        if i != phrases.len() {
+            return false;
+        }
+        if phrases.len() == 1 {
+            return true;
+        }
+        let mut lists: Vec<Vec<i64>> = phrases
+            .iter()
+            .map(|&p| poslist_positions(&self.phrases[p].poslist))
+            .collect();
+        let sizes: Vec<usize> = phrases
+            .iter()
+            .map(|&p| self.phrases[p].terms.len())
+            .collect();
+        let ok = near_match(&mut lists, &sizes, self.nodes[n].near);
+        for (&p, l) in phrases.iter().zip(lists) {
+            self.phrases[p].poslist = positions_to_poslist(&l);
+        }
+        ok
+    }
+
+    // ---- AND / OR / NOT
+
+    fn test_and(&mut self, n: usize) {
+        let kids = self.nodes[n].children.clone();
+        let mut last = self.nodes[n].rowid;
+        loop {
+            self.nodes[n].nomatch = false;
+            let mut matched = true;
+            let mut eof = false;
+            for &c in &kids {
+                if rowid_cmp(last, self.nodes[c].rowid).is_gt() {
+                    self.node_next(c, Some(last));
+                }
+                if self.nodes[c].eof {
+                    self.set_eof(n);
+                    eof = true;
+                    break;
+                } else if last != self.nodes[c].rowid {
+                    matched = false;
+                    last = self.nodes[c].rowid;
+                }
+                if self.nodes[c].nomatch {
+                    self.nodes[n].nomatch = true;
+                }
+            }
+            if eof || matched {
+                break;
+            }
+        }
+        if self.nodes[n].nomatch && n != self.root {
+            self.zero_poslist(n);
+        }
+        self.nodes[n].rowid = last;
+    }
+
+    fn test_or(&mut self, n: usize) {
+        let kids = self.nodes[n].children.clone();
+        let mut next = kids[0];
+        for &c in &kids[1..] {
+            let cmp = self.node_cmp(next, c);
+            if cmp.is_gt() || (cmp.is_eq() && !self.nodes[c].nomatch) {
+                next = c;
+            }
+        }
+        self.nodes[n].rowid = self.nodes[next].rowid;
+        self.nodes[n].eof = self.nodes[next].eof;
+        self.nodes[n].nomatch = self.nodes[next].nomatch;
+    }
+
+    fn next_or(&mut self, n: usize, from: Option<i64>) {
+        let last = self.nodes[n].rowid;
+        for c in self.nodes[n].children.clone() {
+            if !self.nodes[c].eof {
+                let r = self.nodes[c].rowid;
+                if r == last || from.is_some_and(|f| rowid_cmp(r, f).is_lt()) {
+                    self.node_next(c, from);
+                }
+            }
+        }
+        self.test_or(n);
+    }
+
+    fn test_not(&mut self, n: usize) {
+        let (p1, p2) = (self.nodes[n].children[0], self.nodes[n].children[1]);
+        while !self.nodes[p1].eof {
+            let mut cmp = self.node_cmp(p1, p2);
+            if cmp.is_gt() {
+                let r = self.nodes[p1].rowid;
+                self.node_next(p2, Some(r));
+                cmp = self.node_cmp(p1, p2);
+            }
+            if !cmp.is_eq() || self.nodes[p2].nomatch {
+                break;
+            }
+            self.node_next(p1, None);
+        }
+        self.nodes[n].eof = self.nodes[p1].eof;
+        self.nodes[n].nomatch = self.nodes[p1].nomatch;
+        self.nodes[n].rowid = self.nodes[p1].rowid;
+        if self.nodes[p1].eof {
+            self.zero_poslist(p2);
+        }
+    }
 }
 
 /// fts5ExprPhraseIsMatch: positions where the terms are adjacent.
@@ -897,9 +1570,7 @@ fn phrase_match(lists: &[Vec<i64>], first: bool) -> Vec<i64> {
             }
         }
         if !first || pos_off(ipos) == 0 {
-            if out.last() != Some(&ipos) {
-                out.push(ipos);
-            }
+            out.push(ipos);
         }
         for (i, l) in lists.iter().enumerate() {
             idx[i] += 1;
@@ -930,7 +1601,7 @@ fn near_match(lists: &mut [Vec<i64>], sizes: &[usize], near: i32) -> bool {
             self.pos == LOOKAHEAD_EOF
         }
     }
-    let inputs: Vec<Vec<i64>> = lists.iter().map(|l| l.clone()).collect();
+    let inputs: Vec<Vec<i64>> = lists.to_vec();
     let mut readers: Vec<Reader> = inputs
         .iter()
         .map(|a| {
@@ -990,211 +1661,6 @@ fn near_match(lists: &mut [Vec<i64>], sizes: &[usize], near: i32) -> bool {
         *l = o;
     }
     ok
-}
-
-fn positions_to_poslist(pos: &[i64]) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut w = PoslistWriter::default();
-    for &p in pos {
-        w.append(&mut out, p);
-    }
-    out
-}
-
-impl Evaluator {
-    /// Loads every term's doclist and computes the matching rows.
-    pub(crate) fn new(
-        expr: &Expr,
-        index: &Index,
-        s: &Structure,
-        pending: Option<&Pending>,
-        rowid_range: (i64, i64),
-    ) -> Result<Self> {
-        let cfg = index.cfg;
-        let detail = cfg.detail;
-        let mut terms = Vec::with_capacity(expr.phrases.len());
-        for (pi, phrase) in expr.phrases.iter().enumerate() {
-            let colset = expr.phrase_nearset(pi).and_then(|n| n.colset.clone());
-            let mut tl = Vec::with_capacity(phrase.terms.len());
-            for term in &phrase.terms {
-                let mut merged: HashMap<i64, Vec<Vec<u8>>> = HashMap::new();
-                for alt in &term.alts {
-                    for (rowid, pl) in query_token(index, s, pending, alt, term.prefix)? {
-                        if rowid < rowid_range.0 || rowid > rowid_range.1 {
-                            continue;
-                        }
-                        merged.entry(rowid).or_default().push(pl);
-                    }
-                }
-                let mut dl = Doclist::with_capacity(merged.len());
-                for (rowid, lists) in merged {
-                    let refs: Vec<&[u8]> = lists.iter().map(|v| v.as_slice()).collect();
-                    let mut pl = match detail {
-                        Detail::Full if refs.len() > 1 => merge_poslists(&refs),
-                        Detail::Columns if refs.len() > 1 => merge_collists(&refs),
-                        _ => lists.into_iter().next().unwrap(),
-                    };
-                    if let Some(cols) = &colset {
-                        pl = match detail {
-                            Detail::Full => filter_poslist(&pl, cols),
-                            Detail::Columns => filter_collist(&pl, cols),
-                            Detail::None => pl,
-                        };
-                    }
-                    dl.insert(rowid, pl);
-                }
-                tl.push(dl);
-            }
-            terms.push(tl);
-        }
-        let mut ev = Evaluator {
-            detail,
-            terms,
-            rows: Vec::new(),
-        };
-        let mut candidates = ev.candidates(&expr.root);
-        candidates.sort_unstable();
-        candidates.dedup();
-        let mut scratch = vec![None; expr.phrases.len()];
-        ev.rows = candidates
-            .into_iter()
-            .filter(|&r| ev.eval(&expr.root, r, &mut scratch, expr))
-            .collect();
-        Ok(ev)
-    }
-
-    /// Rows that could match: every term of a leaf present.
-    fn candidates(&self, node: &Node) -> Vec<i64> {
-        match node {
-            Node::Eof(_) => Vec::new(),
-            Node::String(n) => {
-                let mut acc: Option<Vec<i64>> = None;
-                for &p in &n.phrases {
-                    for dl in &self.terms[p] {
-                        let keys: Vec<i64> = match &acc {
-                            None => dl.keys().copied().collect(),
-                            Some(a) => a.iter().copied().filter(|r| dl.contains_key(r)).collect(),
-                        };
-                        acc = Some(keys);
-                    }
-                }
-                acc.unwrap_or_default()
-            }
-            Node::And(c) => {
-                let mut acc: Option<Vec<i64>> = None;
-                for n in c {
-                    let mut k = self.candidates(n);
-                    if let Some(a) = &acc {
-                        let set: std::collections::HashSet<i64> = a.iter().copied().collect();
-                        k.retain(|r| set.contains(r));
-                    }
-                    acc = Some(k);
-                }
-                acc.unwrap_or_default()
-            }
-            Node::Or(c) => c.iter().flat_map(|n| self.candidates(n)).collect(),
-            Node::Not(a, _) => self.candidates(a),
-        }
-    }
-
-    /// Tests `node` at `row`; on a match fills the phrase poslists of the
-    /// leaves that contribute (others are left as None).
-    fn eval(&self, node: &Node, row: i64, out: &mut [Option<Vec<u8>>], expr: &Expr) -> bool {
-        match node {
-            Node::Eof(_) => false,
-            Node::String(n) => self.eval_string(n, row, out, expr),
-            Node::And(c) => {
-                let mut tmp = out.to_vec();
-                for n in c {
-                    if !self.eval(n, row, &mut tmp, expr) {
-                        return false;
-                    }
-                }
-                out.clone_from_slice(&tmp);
-                true
-            }
-            Node::Or(c) => {
-                let mut any = false;
-                for n in c {
-                    let mut tmp = out.to_vec();
-                    if self.eval(n, row, &mut tmp, expr) {
-                        out.clone_from_slice(&tmp);
-                        any = true;
-                    }
-                }
-                any
-            }
-            Node::Not(a, b) => {
-                let mut tmp = out.to_vec();
-                if !self.eval(a, row, &mut tmp, expr) {
-                    return false;
-                }
-                let mut scratch = out.to_vec();
-                if self.eval(b, row, &mut scratch, expr) {
-                    return false;
-                }
-                out.clone_from_slice(&tmp);
-                true
-            }
-        }
-    }
-
-    fn eval_string(&self, n: &Nearset, row: i64, out: &mut [Option<Vec<u8>>], expr: &Expr) -> bool {
-        if self.detail != Detail::Full {
-            let p = n.phrases[0];
-            let Some(pl) = self.terms[p].first().and_then(|dl| dl.get(&row)) else {
-                return false;
-            };
-            if self.detail == Detail::Columns && pl.is_empty() {
-                return false;
-            }
-            out[p] = Some(pl.clone());
-            return true;
-        }
-        let mut lists: Vec<Vec<i64>> = Vec::with_capacity(n.phrases.len());
-        for &p in &n.phrases {
-            let phrase = &expr.phrases[p];
-            let mut tl = Vec::with_capacity(phrase.terms.len());
-            for dl in &self.terms[p] {
-                let Some(pl) = dl.get(&row) else {
-                    return false;
-                };
-                tl.push(poslist_positions(pl));
-            }
-            let first = phrase.terms.first().is_some_and(|t| t.first);
-            let pos = if tl.len() == 1 && !first {
-                std::mem::take(&mut tl[0])
-            } else {
-                phrase_match(&tl, first)
-            };
-            if pos.is_empty() {
-                return false;
-            }
-            lists.push(pos);
-        }
-        if lists.len() > 1 {
-            let sizes: Vec<usize> = n
-                .phrases
-                .iter()
-                .map(|&p| expr.phrases[p].terms.len())
-                .collect();
-            if !near_match(&mut lists, &sizes, n.near) {
-                return false;
-            }
-        }
-        for (&p, l) in n.phrases.iter().zip(lists) {
-            out[p] = Some(positions_to_poslist(&l));
-        }
-        true
-    }
-
-    /// The per-phrase position lists (or column lists) of a matching row;
-    /// None for phrases that do not contribute to the match.
-    pub(crate) fn row_poslists(&self, expr: &Expr, row: i64) -> Vec<Option<Vec<u8>>> {
-        let mut out = vec![None; expr.phrases.len()];
-        self.eval(&expr.root, row, &mut out, expr);
-        out
-    }
 }
 
 /// The doclist of a query token (prefix-aware), using a prefix index when

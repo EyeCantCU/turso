@@ -1274,9 +1274,9 @@ impl SegWriter {
     fn append_poslist_data(&mut self, store: &Store, data: &[u8]) -> Result<()> {
         let mut a = data;
         while self.buf.len() + self.pgidx.len() + a.len() >= self.pgsz {
-            let req = self.pgsz - self.buf.len() - self.pgidx.len();
+            let req = self.pgsz as i64 - self.buf.len() as i64 - self.pgidx.len() as i64;
             let mut ncopy = 0;
-            while ncopy < req {
+            while (ncopy as i64) < req {
                 get_varint(a, &mut ncopy);
             }
             let ncopy = ncopy.min(a.len());
@@ -1301,14 +1301,16 @@ impl SegWriter {
     }
 }
 
-fn poslist_prefix(a: &[u8], nmax: usize) -> usize {
+/// The size of the longest prefix of whole varints of `a` that fits in
+/// `nmax` bytes; always at least one varint.
+fn poslist_prefix(a: &[u8], nmax: i64) -> usize {
     let mut ret = 0;
     get_varint32(a, &mut ret);
-    if ret < nmax {
+    if (ret as i64) < nmax {
         loop {
             let mut i = ret;
             get_varint32(a, &mut i);
-            if i > nmax {
+            if i as i64 > nmax {
                 break;
             }
             ret = i;
@@ -1573,8 +1575,10 @@ impl<'a> Index<'a> {
                             let pl = &doclist[off..off + ncopy];
                             let mut ipos = 0;
                             loop {
-                                let nspace = pgsz - w.buf.len() - w.pgidx.len();
-                                let n = if ncopy - ipos <= nspace {
+                                // May be negative: the rowid can overfill the page.
+                                let nspace =
+                                    pgsz as i64 - w.buf.len() as i64 - w.pgidx.len() as i64;
+                                let n = if (ncopy - ipos) as i64 <= nspace {
                                     ncopy - ipos
                                 } else {
                                     poslist_prefix(&pl[ipos..], nspace)

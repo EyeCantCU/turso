@@ -26,6 +26,7 @@ use crate::native_ext::{
     ScalarCall, ScalarFunction, TableUpdate, VTabKind, VirtualTable, VirtualTableCursor,
     VirtualTableModule,
 };
+use crate::sync::Weak;
 use crate::sync::{Arc, Mutex};
 use crate::types::IOResultOr;
 use crate::{Connection, IOResult, LimboError, Register, Result, Value};
@@ -36,7 +37,7 @@ use sql::err;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{LazyLock, Weak};
+use std::sync::LazyLock;
 use storage::{Storage, Writes};
 use turso_ext::{ConstraintOp, ResultCode};
 
@@ -649,6 +650,13 @@ fn special_insert(
 // ------------------------------------------------------------------ cursors
 
 static NEXT_CURSOR_ID: AtomicI64 = AtomicI64::new(1);
+/// Tables found through their `*id` special query (used by fts5vocab).
+static TABLES_BY_ID: LazyLock<Mutex<HashMap<i64, Weak<TableInner>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub(crate) fn table_by_special_id(id: i64) -> Option<Arc<TableInner>> {
+    TABLES_BY_ID.lock().get(&id).and_then(|w| w.upgrade())
+}
 static CURSORS: LazyLock<Mutex<HashMap<i64, Weak<Mutex<CursorState>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -720,14 +728,18 @@ impl CursorState {
     }
 
     fn eof(&self) -> bool {
-        self.pos >= self.rows.len()
+        match (&self.plan, &self.eval) {
+            (Plan::Match, Some(ev)) => ev.eof(),
+            _ => self.pos >= self.rows.len(),
+        }
     }
 
     fn rowid(&self) -> i64 {
-        if self.plan == Plan::Special {
-            return 0;
+        match (&self.plan, &self.eval) {
+            (Plan::Special, _) => 0,
+            (Plan::Match, Some(ev)) => ev.rowid(),
+            _ => self.rows.get(self.pos).copied().unwrap_or(0),
         }
-        self.rows.get(self.pos).copied().unwrap_or(0)
     }
 
     fn vals(&mut self) -> Result<ConfigValues> {
@@ -842,10 +854,6 @@ impl CursorState {
                 w.as_ref().map(|w| &w.pending),
                 (first, last),
             )?;
-            self.rows = ev.rows.clone();
-            if self.desc {
-                self.rows.reverse();
-            }
             self.eval = Some(ev);
             self.expr = Some(e);
             self.plan = Plan::Match;
@@ -901,6 +909,9 @@ impl CursorState {
             self.special = 0;
         } else if word.eq_ignore_ascii_case("id") {
             self.special = self.id;
+            let mut map = TABLES_BY_ID.lock();
+            map.retain(|_, w| w.strong_count() > 0);
+            map.insert(self.id, Arc::downgrade(&self.inner));
         } else {
             return Err(err(format!("unknown special query: {word}")));
         }
@@ -913,7 +924,11 @@ impl CursorState {
             self.pos = self.rows.len();
             return false;
         }
-        self.pos += 1;
+        if let (Plan::Match, Some(ev)) = (&self.plan, &mut self.eval) {
+            ev.next();
+        } else {
+            self.pos += 1;
+        }
         self.new_row();
         !self.eof()
     }
@@ -997,9 +1012,14 @@ impl CursorState {
         if let Some(p) = &self.poslists {
             return Ok(p.clone());
         }
-        let row = self.rowid();
-        let p = match (&self.expr, &self.eval) {
-            (Some(e), Some(ev)) => ev.row_poslists(e, row),
+        let p: Vec<Option<Vec<u8>>> = match (&self.expr, &self.eval) {
+            (Some(e), Some(ev)) => (0..e.phrase_count())
+                .map(|i| {
+                    ev.phrase_poslist(i)
+                        .filter(|p| !p.is_empty())
+                        .map(|p| p.to_vec())
+                })
+                .collect(),
             _ => Vec::new(),
         };
         let p = if self.cfg().detail != Detail::Full {
@@ -1274,14 +1294,19 @@ impl AuxApi for CursorState {
         let index = Index::new(&self.conn, &self.inner.cfg, &vals);
         let (s, _) = index.store.read_structure()?;
         let w = self.inner.peek_writes(&self.conn);
-        let ev = Evaluator::new(
+        let mut ev = Evaluator::new(
             &single,
             &index,
             &s,
             w.as_ref().map(|w| &w.pending),
             (SMALLEST_INT64, LARGEST_INT64),
         )?;
-        Ok(ev.rows.len() as i64)
+        let mut n = 0;
+        while !ev.eof() {
+            n += 1;
+            ev.next();
+        }
+        Ok(n)
     }
 
     fn column_locale(&mut self, col: i32) -> ApiResult<Option<Vec<u8>>> {

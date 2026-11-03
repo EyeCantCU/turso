@@ -311,6 +311,81 @@ fn snippet_score(
     Ok((score, adj as i32))
 }
 
+/// Scores the instances of column `i` for snippet(). `consider(score,
+/// start, colsize)` records a candidate and returns the best score so far.
+/// An error with `true` means a call failed and the column loop must stop.
+fn snippet_column(
+    api: &mut dyn AuxApi,
+    i: i32,
+    ntoken: i32,
+    ninst: i32,
+    seen: &mut [bool],
+    consider: &mut dyn FnMut(i32, i32, i32) -> i32,
+) -> std::result::Result<(), (bool, ApiError)> {
+    let stop = |e: ApiError| (true, e);
+    let cont = |e: ApiError| (false, e);
+    let doc = api.column_text(i).map_err(stop)?.unwrap_or_default();
+    let locale = api.column_locale(i).map_err(stop)?;
+    // Sentence starts: tokens after '.' or ':' and whitespace.
+    let mut first: Vec<i32> = Vec::new();
+    let mut spos = 0;
+    api.tokenize(&doc, locale.as_deref(), &mut |tflags, _t, s, _e| {
+        if tflags & TOKEN_COLOCATED == 0 {
+            if spos > 0 {
+                let mut k = s as i64 - 1;
+                let mut c = 0u8;
+                while k >= 0 {
+                    c = doc[k as usize];
+                    if !matches!(c, b' ' | b'\t' | b'\n' | b'\r') {
+                        break;
+                    }
+                    k -= 1;
+                }
+                if k != s as i64 - 1 && (c == b'.' || c == b':') {
+                    first.push(spos);
+                }
+            } else {
+                first.push(0);
+            }
+            spos += 1;
+        }
+        0
+    })
+    .map_err(stop)?;
+    let ndocsize = api.column_size(i).map_err(stop)?;
+    for ii in 0..ninst {
+        let (_ip, ic, io) = api.inst(ii).map_err(cont)?;
+        if ic != i {
+            continue;
+        }
+        if io > ndocsize {
+            return Err(cont(ApiError::Err(super::sql::corrupt())));
+        }
+        seen.iter_mut().for_each(|s| *s = false);
+        let (score, adj) = snippet_score(api, ndocsize, seen, i, io, ntoken).map_err(cont)?;
+        let best = consider(score, adj, ndocsize);
+        if !first.is_empty() && ndocsize > ntoken {
+            let mut jj = 0;
+            while jj < first.len() - 1 {
+                if first[jj + 1] > io {
+                    break;
+                }
+                jj += 1;
+            }
+            if first[jj] < io {
+                seen.iter_mut().for_each(|s| *s = false);
+                let (mut score, _) =
+                    snippet_score(api, ndocsize, seen, i, first[jj], ntoken).map_err(cont)?;
+                score += if first[jj] == 0 { 120 } else { 100 };
+                if score > best {
+                    consider(score, first[jj], ndocsize);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn snippet(api: &mut dyn AuxApi, args: &[Value]) -> ApiResult<Value> {
     if args.len() != 5 {
         return Err(ApiError::Err(err(
@@ -330,77 +405,40 @@ fn snippet(api: &mut dyn AuxApi, args: &[Value]) -> ApiResult<Value> {
     let mut best_start = 0;
     let mut best_score = 0;
     let mut ncolsize = 0;
+    // Errors follow fts5SnippetFunction's rc: a later column's calls
+    // overwrite an error from an earlier column.
+    let mut rc: ApiResult<()> = Ok(());
     for i in 0..ncol {
         if !(col < 0 || col == i) {
             continue;
         }
-        let doc = api.column_text(i)?.unwrap_or_default();
-        let locale = api.column_locale(i)?;
-        // Sentence starts: tokens after '.' or ':' and whitespace.
-        let mut first: Vec<i32> = Vec::new();
-        let mut spos = 0;
-        api.tokenize(&doc, locale.as_deref(), &mut |tflags, _t, s, _e| {
-            if tflags & TOKEN_COLOCATED == 0 {
-                if spos > 0 {
-                    let mut k = s as i64 - 1;
-                    let mut c = 0u8;
-                    while k >= 0 {
-                        c = doc[k as usize];
-                        if !matches!(c, b' ' | b'\t' | b'\n' | b'\r') {
-                            break;
-                        }
-                        k -= 1;
-                    }
-                    if k != s as i64 - 1 && (c == b'.' || c == b':') {
-                        first.push(spos);
-                    }
-                } else {
-                    first.push(0);
+        let r = snippet_column(
+            api,
+            i,
+            ntoken,
+            ninst,
+            &mut seen,
+            &mut |score, start, size| {
+                if score > best_score {
+                    best_score = score;
+                    best_col = i;
+                    best_start = start;
+                    ncolsize = size;
                 }
-                spos += 1;
-            }
-            0
-        })?;
-        let ndocsize = api.column_size(i)?;
-        for ii in 0..ninst {
-            let (_ip, ic, io) = api.inst(ii)?;
-            if ic != i {
-                continue;
-            }
-            if io > ndocsize {
-                return Err(ApiError::Err(super::sql::corrupt()));
-            }
-            seen.iter_mut().for_each(|s| *s = false);
-            let (score, adj) = snippet_score(api, ndocsize, &mut seen, i, io, ntoken)?;
-            if score > best_score {
-                best_score = score;
-                best_col = i;
-                best_start = adj;
-                ncolsize = ndocsize;
-            }
-            if !first.is_empty() && ndocsize > ntoken {
-                let mut jj = 0;
-                while jj < first.len() - 1 {
-                    if first[jj + 1] > io {
-                        break;
-                    }
-                    jj += 1;
-                }
-                if first[jj] < io {
-                    seen.iter_mut().for_each(|s| *s = false);
-                    let (mut score, _) =
-                        snippet_score(api, ndocsize, &mut seen, i, first[jj], ntoken)?;
-                    score += if first[jj] == 0 { 120 } else { 100 };
-                    if score > best_score {
-                        best_score = score;
-                        best_col = i;
-                        best_start = first[jj];
-                        ncolsize = ndocsize;
-                    }
+                best_score
+            },
+        );
+        match r {
+            Ok(()) => rc = Ok(()),
+            Err((stop, e)) => {
+                rc = Err(e);
+                if stop {
+                    break;
                 }
             }
         }
     }
+    rc?;
     let input = api.column_text(best_col)?;
     if ncolsize == 0 {
         ncolsize = api.column_size(best_col)?;
