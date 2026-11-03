@@ -4406,10 +4406,12 @@ impl Wal for WalFile {
         // Install connection state with a fresh snapshot.
         let snapshot = self.load_coordination_snapshot();
         self.install_connection_state(WalConnectionState::new(snapshot, ReadGuardKind::None));
-        turso_assert!(
-            self.with_shared(|shared| shared.runtime.write_lock.write()),
-            "begin_vacuum_blocking_tx: write lock held after VACUUM lock acquired"
-        );
+        // Through the coordination so a cross-process writer lock is taken
+        // too; only another process can still be holding it here.
+        if !self.coordination.try_begin_write_tx() {
+            drop(vacuum_lock_guard);
+            return Err(LimboError::Busy);
+        }
         if self
             .write_lock_held
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -5853,20 +5855,15 @@ impl WalFileShared {
         };
         let wal_size = file.size()?;
 
-        let frame_size = WAL_FRAME_HEADER_SIZE as u64 + snapshot.page_size as u64;
         let fresh = SharedWalCoordinationHeader {
             reader_slot_count: snapshot.reader_slot_count,
             ..Default::default()
         };
-        if authority.open_mode() == SharedWalCoordinationOpenMode::Exclusive
-            && snapshot != fresh
-            && ((snapshot.max_frame > 0
-                && wal_size < WAL_HEADER_SIZE as u64 + snapshot.max_frame * frame_size)
-                || (wal_size == 0 && db_file.size()? == 0))
-        {
-            // The WAL lost frames, or WAL and database were both removed, while
-            // no process had them open: the persisted authority describes
-            // nothing on disk, so let the WAL scan seed it afresh.
+        if authority.open_mode() == SharedWalCoordinationOpenMode::Exclusive && snapshot != fresh {
+            // Like SQLite's wal-index recovery on first open: with no other
+            // process attached, the WAL file is the only truth. It may have
+            // been truncated, replaced, zeroed or removed (with the database)
+            // since the authority was persisted, so rebuild from a WAL scan.
             authority.discard_durable_frame_index_for_exclusive_rebuild();
             authority.install_snapshot(fresh);
             return sqlite3_ondisk::build_shared_wal(&file, io);
@@ -8735,59 +8732,6 @@ pub mod test {
 
     #[cfg(host_shared_wal)]
     #[test]
-    fn test_open_shared_from_authority_reuses_trusted_snapshot_after_exclusive_reopen() {
-        let dir = tempfile::tempdir().unwrap();
-        let wal_path = dir.path().join("test.db-wal");
-        let shm_path = dir.path().join("test.db-tshm");
-        let io = shared_wal_test_io();
-        let snapshot = write_test_wal_with_single_commit_frame(&io, &wal_path);
-        {
-            let authority =
-                Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
-            authority.install_snapshot(snapshot);
-            authority.record_frame(7, 1);
-        }
-        let reopened_authority =
-            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
-        assert_eq!(
-            reopened_authority.open_mode(),
-            SharedWalCoordinationOpenMode::Exclusive
-        );
-
-        let shared = WalFileShared::open_shared_from_authority_if_exists(
-            &io,
-            wal_path.to_str().unwrap(),
-            crate::OpenFlags::Create,
-            &reopened_authority,
-            &open_test_db_file_for_wal(&io, &wal_path),
-        )
-        .unwrap();
-
-        let shared = shared.read();
-        assert_eq!(shared.metadata.max_frame.load(Ordering::Acquire), 1);
-        assert_eq!(shared.metadata.nbackfills.load(Ordering::Acquire), 0);
-        assert_eq!(
-            shared.metadata.transaction_count.load(Ordering::Acquire),
-            snapshot.transaction_count
-        );
-        assert_eq!(
-            shared.metadata.last_checksum,
-            (snapshot.checksum_1, snapshot.checksum_2)
-        );
-        assert_eq!(
-            shared.runtime.epoch.load(Ordering::Acquire),
-            snapshot.checkpoint_epoch
-        );
-        assert!(shared.metadata.initialized.load(Ordering::Acquire));
-        assert!(!shared
-            .metadata
-            .loaded_from_disk_scan
-            .load(Ordering::Acquire));
-        assert!(shared.runtime.frame_cache.lock().is_empty());
-    }
-
-    #[cfg(host_shared_wal)]
-    #[test]
     fn test_shm_coordination_live_overflow_returns_busy_without_runtime_disk_scan() {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test-live-overflow.db-wal");
@@ -9015,127 +8959,6 @@ pub mod test {
         assert_eq!(
             shared.runtime.frame_cache.lock().get(&7).cloned(),
             Some(vec![1])
-        );
-    }
-
-    #[cfg(host_shared_wal)]
-    #[test]
-    fn test_open_shared_from_authority_rebuilt_authority_persists_across_exclusive_reopen() {
-        let dir = tempfile::tempdir().unwrap();
-        let wal_path = dir.path().join("test-republish.db-wal");
-        let shm_path = dir.path().join("test-republish.db-tshm");
-        let io = shared_wal_test_io();
-        let snapshot = write_test_wal_with_single_commit_frame(&io, &wal_path);
-        let authority =
-            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
-        authority.install_snapshot(snapshot);
-
-        let exclusive = WalFileShared::open_shared_from_authority_if_exists(
-            &io,
-            wal_path.to_str().unwrap(),
-            crate::OpenFlags::Create,
-            &authority,
-            &open_test_db_file_for_wal(&io, &wal_path),
-        )
-        .unwrap();
-        assert!(exclusive
-            .read()
-            .metadata
-            .loaded_from_disk_scan
-            .load(Ordering::Acquire));
-        assert!(
-            authority.iter_latest_frames(0, u64::MAX).is_empty(),
-            "open_shared_from_authority_if_exists should not republish authority before coordination reconciliation"
-        );
-
-        let exclusive_coordination = ShmWalCoordination::new(exclusive, authority.clone());
-        assert_eq!(authority.iter_latest_frames(0, u64::MAX), vec![(7, 1)]);
-        assert_eq!(exclusive_coordination.find_frame(7, 0, 1, None), Some(1));
-
-        drop(exclusive_coordination);
-        drop(authority);
-
-        let reopened_authority =
-            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
-        assert_eq!(
-            reopened_authority.open_mode(),
-            SharedWalCoordinationOpenMode::Exclusive
-        );
-
-        let reopened_shared = WalFileShared::open_shared_from_authority_if_exists(
-            &io,
-            wal_path.to_str().unwrap(),
-            crate::OpenFlags::Create,
-            &reopened_authority,
-            &open_test_db_file_for_wal(&io, &wal_path),
-        )
-        .unwrap();
-        assert!(!reopened_shared
-            .read()
-            .metadata
-            .loaded_from_disk_scan
-            .load(Ordering::Acquire));
-        let reopened_coordination = ShmWalCoordination::new(reopened_shared, reopened_authority);
-        assert_eq!(reopened_coordination.find_frame(7, 0, 1, None), Some(1));
-    }
-
-    #[cfg(host_shared_wal)]
-    #[test]
-    fn test_open_shared_from_authority_exclusive_disk_scan_does_not_downgrade_newer_zero_frame_generation(
-    ) {
-        let dir = tempfile::tempdir().unwrap();
-        let wal_path = dir.path().join("test-zero-frame-reopen.db-wal");
-        let shm_path = dir.path().join("test-zero-frame-reopen.db-tshm");
-        let io = shared_wal_test_io();
-        let prior_generation = write_test_wal_with_single_commit_frame(&io, &wal_path);
-        let authority =
-            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
-        let restarted_generation = SharedWalCoordinationHeader {
-            max_frame: 0,
-            nbackfills: 0,
-            transaction_count: prior_generation.transaction_count,
-            visibility_generation: prior_generation.visibility_generation,
-            checkpoint_seq: prior_generation.checkpoint_seq.wrapping_add(1),
-            checkpoint_epoch: prior_generation.checkpoint_epoch,
-            page_size: prior_generation.page_size,
-            salt_1: prior_generation.salt_1.wrapping_add(1),
-            salt_2: prior_generation.salt_2.wrapping_add(1),
-            checksum_1: prior_generation.checksum_1,
-            checksum_2: prior_generation.checksum_2,
-            reader_slot_count: prior_generation.reader_slot_count,
-        };
-        authority.install_snapshot(restarted_generation);
-
-        let shared = WalFileShared::open_shared_from_authority_if_exists(
-            &io,
-            wal_path.to_str().unwrap(),
-            crate::OpenFlags::Create,
-            &authority,
-            &open_test_db_file_for_wal(&io, &wal_path),
-        )
-        .unwrap();
-        assert!(shared
-            .read()
-            .metadata
-            .loaded_from_disk_scan
-            .load(Ordering::Acquire));
-
-        let coordination = ShmWalCoordination::new(shared.clone(), authority.clone());
-        let reopened = coordination.load_snapshot();
-        assert_eq!(reopened.max_frame, 0);
-        assert_eq!(reopened.nbackfills, 0);
-        assert_eq!(reopened.checkpoint_seq, restarted_generation.checkpoint_seq);
-        assert_eq!(
-            authority.snapshot().checkpoint_seq,
-            restarted_generation.checkpoint_seq
-        );
-        assert!(
-            !coordination.wal_is_initialized(),
-            "preserving a newer zero-frame generation must require the first append to rewrite the WAL header"
-        );
-        assert!(
-            shared.read().runtime.frame_cache.lock().is_empty(),
-            "older WAL frames from a prior generation must not survive zero-frame authority recovery"
         );
     }
 
@@ -9436,63 +9259,6 @@ pub mod test {
                 AuthoritySnapshotRebuildReason::WalHeaderUnreadable
             )
         );
-    }
-
-    #[cfg(host_shared_wal)]
-    #[test]
-    fn test_open_shared_from_authority_keeps_zero_length_wal_uninitialized_after_exclusive_reopen()
-    {
-        let dir = tempfile::tempdir().unwrap();
-        let wal_path = dir.path().join("test-empty.db-wal");
-        let shm_path = dir.path().join("test-empty.db-tshm");
-        let io = shared_wal_test_io();
-
-        io.open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
-            .unwrap();
-        {
-            let authority =
-                Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
-            authority.install_snapshot(SharedWalCoordinationHeader {
-                max_frame: 0,
-                nbackfills: 0,
-                transaction_count: 9,
-                visibility_generation: 1,
-                checkpoint_seq: 5,
-                checkpoint_epoch: 7,
-                page_size: 4096,
-                salt_1: 17,
-                salt_2: 23,
-                checksum_1: 31,
-                checksum_2: 37,
-                reader_slot_count: 64,
-            });
-        }
-        let reopened_authority =
-            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
-        assert_eq!(
-            reopened_authority.open_mode(),
-            SharedWalCoordinationOpenMode::Exclusive
-        );
-
-        // A truncated WAL next to a live database, not a removed database.
-        std::fs::write(wal_path.with_extension("db"), vec![0u8; 4096]).unwrap();
-        let shared = WalFileShared::open_shared_from_authority_if_exists(
-            &io,
-            wal_path.to_str().unwrap(),
-            crate::OpenFlags::Create,
-            &reopened_authority,
-            &open_test_db_file_for_wal(&io, &wal_path),
-        )
-        .unwrap();
-
-        let shared = shared.read();
-        assert_eq!(shared.metadata.max_frame.load(Ordering::Acquire), 0);
-        assert_eq!(shared.metadata.last_checksum, (31, 37));
-        assert!(!shared.metadata.initialized.load(Ordering::Acquire));
-        assert!(!shared
-            .metadata
-            .loaded_from_disk_scan
-            .load(Ordering::Acquire));
     }
 
     #[cfg(host_shared_wal)]
