@@ -3,6 +3,8 @@
 #![allow(unused_imports)]
 use std::ptr;
 
+mod lifecycle;
+
 #[repr(C)]
 struct sqlite3 {
     _private: [u8; 0],
@@ -220,8 +222,6 @@ const SQLITE_UTF8: i32 = 1;
 const SQLITE_OPEN_READWRITE: i32 = 0x00000002;
 const SQLITE_OPEN_CREATE: i32 = 0x00000004;
 const SQLITE_OPEN_URI: i32 = 0x00000040;
-
-mod lifecycle;
 
 mod tests {
     use super::*;
