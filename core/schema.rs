@@ -6480,17 +6480,16 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
                 bail_parse_error!("window functions prohibited in generated columns");
             }
             let arg_count = args.len();
-            let Some(func) = Func::resolve_function(name.as_str(), arg_count)? else {
-                return Err(LimboError::ParseError(format!(
-                    "could not resolve function {}",
-                    name.as_str()
-                )));
-            };
-            if matches!(func, Func::Agg(_)) {
-                bail_parse_error!("aggregate functions prohibited in generated columns");
-            }
-            if !is_deterministic_schema_function_call(&func, args) {
-                bail_parse_error!("non-deterministic functions prohibited in generated columns");
+            // Not a built-in: a C API function, checked where the connection is known.
+            if let Some(func) = Func::resolve_function(name.as_str(), arg_count)? {
+                if matches!(func, Func::Agg(_)) {
+                    bail_parse_error!("aggregate functions prohibited in generated columns");
+                }
+                if !is_deterministic_schema_function_call(&func, args) {
+                    bail_parse_error!(
+                        "non-deterministic functions prohibited in generated columns"
+                    );
+                }
             }
             for arg in args {
                 validate_generated_expr(arg)?;
@@ -6501,18 +6500,15 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
             if filter_over.over_clause.is_some() {
                 bail_parse_error!("window functions prohibited in generated columns");
             }
-            let Some(func) = Func::resolve_function(name.as_str(), 0)? else {
-                return Err(LimboError::ParseError(format!(
-                    "could not resolve function {}",
-                    name.as_str()
-                )));
-            };
-
-            if matches!(func, Func::Agg(_)) {
-                bail_parse_error!("aggregate functions prohibited in generated columns");
-            }
-            if !func.is_deterministic() {
-                bail_parse_error!("non-deterministic functions prohibited in generated columns");
+            if let Some(func) = Func::resolve_function(name.as_str(), 0)? {
+                if matches!(func, Func::Agg(_)) {
+                    bail_parse_error!("aggregate functions prohibited in generated columns");
+                }
+                if !func.is_deterministic() {
+                    bail_parse_error!(
+                        "non-deterministic functions prohibited in generated columns"
+                    );
+                }
             }
         }
 
@@ -8403,6 +8399,7 @@ impl Index {
     /// Walk the where_clause Expr of a partial index and validate that it doesn't reference any other
     /// tables or use any disallowed constructs.
     pub fn validate_where_expr(&self, table: &Table, resolver: &Resolver) -> bool {
+        let syms = resolver.catalog.symbol_table;
         let Some(where_clause) = &self.where_clause else {
             return true;
         };
@@ -8418,7 +8415,10 @@ impl Index {
         let is_tbl = |ns: &str| normalize_ident(ns) == tbl_norm;
         let is_deterministic_fn = |name: &str, argc: usize| {
             let n = normalize_ident(name);
-            // The resolver also knows application-defined functions.
+            if let Some(user) = syms.resolve_user_function_deterministic(&n, argc) {
+                return user;
+            }
+            // The resolver also knows other application-defined functions.
             resolver
                 .resolve_function(&n, argc)
                 .is_ok_and(|f| f.is_some_and(|f| f.is_deterministic()))

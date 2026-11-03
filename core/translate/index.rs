@@ -1157,7 +1157,8 @@ fn resolve_sorted_columns_with_catalog(
                 expr,
             }
         } else {
-            if !validate_index_expression(unwrapped_expr, table) {
+            crate::user_function::check_direct_only(unwrapped_expr, syms)?;
+            if !validate_index_expression(unwrapped_expr, table, syms) {
                 if let ast::Expr::Id(name) | ast::Expr::Name(name) = unwrapped_expr {
                     crate::bail_parse_error!("no such column: {}", name.as_str());
                 }
@@ -1301,7 +1302,7 @@ fn resolve_index_column<'a>(
 /// Expressions in CREATE INDEX statements may not use subqueries.
 /// Additionally, a standalone string literal is interpreted as a column name (for backwards
 /// compatibility with SQLite), not as a string literal. It is rejected if no such column exists.
-fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
+fn validate_index_expression(expr: &Expr, table: &BTreeTable, syms: &SymbolTable) -> bool {
     // A top-level string literal would have been handled by resolve_index_column().
     // If we get here with a string literal, it means the column doesn't exist.
     // (SQLite interprets standalone string literals as column names for backwards compat.)
@@ -1321,6 +1322,9 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
     let is_tbl = |ns: &str| normalize_ident(ns).eq_ignore_ascii_case(&tbl_norm);
     let is_deterministic_fn = |name: &str, args: &[Box<Expr>]| {
         let n = normalize_ident(name);
+        if let Some(user) = syms.resolve_user_function_deterministic(&n, args.len()) {
+            return user;
+        }
         Func::resolve_function(&n, args.len())
             .is_ok_and(|f| f.is_some_and(|f| is_deterministic_schema_function_call(&f, args)))
     };

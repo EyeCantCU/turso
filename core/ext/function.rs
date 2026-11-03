@@ -26,6 +26,7 @@ impl ExternalFunc {
         arity.validate()?;
         Ok(Self {
             name,
+            flags: 0,
             func: ExtFunc::NativeScalar {
                 arity,
                 deterministic,
@@ -43,6 +44,7 @@ impl ExternalFunc {
         Self::validate_arg_count(argc)?;
         Ok(Self {
             name,
+            flags: 0,
             func: ExtFunc::NativeAggregate {
                 argc,
                 function: Arc::new(function),

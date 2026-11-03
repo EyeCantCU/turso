@@ -231,6 +231,7 @@ const SQLITE_OPEN_URI: i32 = 0x00000040;
 mod config;
 mod hooks;
 mod stubs;
+mod udf;
 
 mod abi_values;
 mod errmsg;

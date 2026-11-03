@@ -22,22 +22,10 @@ use turso_ext::{AggCtx, ValueType as ExtValueType};
 // Aggregates
 // ---------------------------------------------------------------------------
 
-type XStep = unsafe extern "C" fn(*mut ffi::c_void, ffi::c_int, *mut *mut ffi::c_void);
-type XFinal = unsafe extern "C" fn(*mut ffi::c_void);
-type XDestroy = unsafe extern "C" fn(*mut ffi::c_void);
-
-struct AggReg {
-    x_step: Option<XStep>,
-    x_final: Option<XFinal>,
-    x_value: Option<XFinal>,
-    x_inverse: Option<XStep>,
-    p_app: usize,
-    destroy: Option<XDestroy>,
-    db: usize,
-}
+use crate::udf::UdfReg;
 
 struct AggState {
-    reg: *const AggReg,
+    reg: *const UdfReg,
     buf: *mut ffi::c_void,
     finalized: bool,
 }
@@ -47,9 +35,9 @@ thread_local! {
     static AGG_STACK: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
 }
 
-unsafe extern "C" fn agg_init(context: usize) -> *mut AggCtx {
+pub(crate) unsafe extern "C" fn agg_init(context: usize) -> *mut AggCtx {
     let state = Box::into_raw(Box::new(AggState {
-        reg: context as *const AggReg,
+        reg: context as *const UdfReg,
         buf: std::ptr::null_mut(),
         finalized: false,
     }));
@@ -59,7 +47,7 @@ unsafe extern "C" fn agg_init(context: usize) -> *mut AggCtx {
 }
 
 unsafe fn agg_invoke(
-    reg: &AggReg,
+    reg: &UdfReg,
     state: *mut AggState,
     f: impl FnOnce(&mut SqliteContext),
 ) -> ExtValue {
@@ -77,13 +65,13 @@ unsafe fn agg_invoke(
     sctx.result
 }
 
-unsafe extern "C" fn agg_step(
+pub(crate) unsafe extern "C" fn agg_step(
     context: usize,
     ctx: *mut AggCtx,
     argc: i32,
     argv: *const ExtValue,
 ) -> ExtValue {
-    let reg = &*(context as *const AggReg);
+    let reg = &*(context as *const UdfReg);
     let state = (*ctx).state as *mut AggState;
     let Some(x_step) = reg.x_step else {
         return ExtValue::null();
@@ -106,13 +94,13 @@ unsafe extern "C" fn agg_step(
     }
 }
 
-unsafe extern "C" fn agg_inverse(
+pub(crate) unsafe extern "C" fn agg_inverse(
     context: usize,
     ctx: *mut AggCtx,
     argc: i32,
     argv: *const ExtValue,
 ) -> ExtValue {
-    let reg = &*(context as *const AggReg);
+    let reg = &*(context as *const UdfReg);
     let state = (*ctx).state as *mut AggState;
     let Some(x_inverse) = reg.x_inverse else {
         return ExtValue::null();
@@ -135,8 +123,8 @@ unsafe extern "C" fn agg_inverse(
     }
 }
 
-unsafe extern "C" fn agg_value(context: usize, ctx: *mut AggCtx) -> ExtValue {
-    let reg = &*(context as *const AggReg);
+pub(crate) unsafe extern "C" fn agg_value(context: usize, ctx: *mut AggCtx) -> ExtValue {
+    let reg = &*(context as *const UdfReg);
     let state = (*ctx).state as *mut AggState;
     let Some(x_value) = reg.x_value else {
         return ExtValue::null();
@@ -146,8 +134,8 @@ unsafe extern "C" fn agg_value(context: usize, ctx: *mut AggCtx) -> ExtValue {
     })
 }
 
-unsafe extern "C" fn agg_final(context: usize, ctx: *mut AggCtx) -> ExtValue {
-    let reg = &*(context as *const AggReg);
+pub(crate) unsafe extern "C" fn agg_final(context: usize, ctx: *mut AggCtx) -> ExtValue {
+    let reg = &*(context as *const UdfReg);
     let state = (*ctx).state as *mut AggState;
     (*state).finalized = true;
     let Some(x_final) = reg.x_final else {
@@ -161,7 +149,7 @@ unsafe extern "C" fn agg_final(context: usize, ctx: *mut AggCtx) -> ExtValue {
 /// Frees the per-group state. If xFinal never ran (xStep failed, or the
 /// statement was abandoned) run it once so the application can release
 /// whatever it keeps in the aggregate context, as SQLite guarantees.
-unsafe extern "C" fn agg_destroy_state(ctx_addr: usize) {
+pub(crate) unsafe extern "C" fn agg_destroy_state(ctx_addr: usize) {
     let ctx = Box::from_raw(ctx_addr as *mut AggCtx);
     let state = Box::from_raw(ctx.state as *mut AggState);
     let reg = &*state.reg;
@@ -177,123 +165,6 @@ unsafe extern "C" fn agg_destroy_state(ctx_addr: usize) {
     if !state.buf.is_null() {
         libc::free(state.buf);
     }
-}
-
-unsafe extern "C" fn agg_destroy_reg(context: usize) {
-    let reg = Box::from_raw(context as *mut AggReg);
-    if let Some(d) = reg.destroy {
-        d(reg.p_app as *mut ffi::c_void);
-    }
-}
-
-/// Register an xStep/xFinal aggregate. Called from sqlite3_create_function_v2.
-pub(crate) unsafe fn create_aggregate(
-    db: *mut sqlite3,
-    name: *const ffi::c_char,
-    n_args: ffi::c_int,
-    p_app: *mut ffi::c_void,
-    x_step: Option<unsafe extern "C" fn()>,
-    x_final: Option<unsafe extern "C" fn()>,
-    destroy: Option<unsafe extern "C" fn()>,
-) -> ffi::c_int {
-    register_agg(
-        db, name, n_args, p_app, x_step, x_final, None, None, destroy,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-unsafe fn register_agg(
-    db: *mut sqlite3,
-    name: *const ffi::c_char,
-    n_args: ffi::c_int,
-    p_app: *mut ffi::c_void,
-    x_step: Option<unsafe extern "C" fn()>,
-    x_final: Option<unsafe extern "C" fn()>,
-    x_value: Option<unsafe extern "C" fn()>,
-    x_inverse: Option<unsafe extern "C" fn()>,
-    destroy: Option<unsafe extern "C" fn()>,
-) -> ffi::c_int {
-    let destroy: Option<XDestroy> = destroy.map(|f| std::mem::transmute(f));
-    let fail = |rc: ffi::c_int, msg: &str| -> ffi::c_int {
-        if let Some(d) = destroy {
-            d(p_app);
-        }
-        let mut inner = (*db).inner.lock().unwrap();
-        set_db_err_msg(&mut inner, rc, msg)
-    };
-    // SQLite requires xStep and xFinal together.
-    let (Some(x_step), Some(x_final)) = (x_step, x_final) else {
-        return fail(SQLITE_MISUSE, "invalid aggregate function definition");
-    };
-    if !(-1..=127).contains(&n_args) {
-        return fail(SQLITE_MISUSE, "invalid function argument count");
-    }
-    let reg = Box::into_raw(Box::new(AggReg {
-        x_step: Some(std::mem::transmute::<unsafe extern "C" fn(), XStep>(x_step)),
-        x_final: Some(std::mem::transmute::<unsafe extern "C" fn(), XFinal>(
-            x_final,
-        )),
-        x_value: x_value.map(|f| std::mem::transmute::<unsafe extern "C" fn(), XFinal>(f)),
-        x_inverse: x_inverse.map(|f| std::mem::transmute::<unsafe extern "C" fn(), XStep>(f)),
-        p_app: p_app as usize,
-        destroy,
-        db: db as usize,
-    }));
-    let name_str = CStr::from_ptr(name).to_string_lossy().into_owned();
-    let inner = (*db).inner.lock().unwrap();
-    let rc = match (x_value, x_inverse) {
-        (Some(_), Some(_)) => {
-            let value: turso_ext::FinalizeFunction = agg_value;
-            let inverse: turso_ext::StepFunction = agg_inverse;
-            let window = turso_core::ExternalWindowCallbacks { value, inverse };
-            let r = inner.conn._register_window_function(
-                &name_str,
-                n_args,
-                reg as usize,
-                (agg_init, agg_step, agg_final),
-                window,
-                Some(agg_destroy_reg),
-                Some(agg_destroy_state),
-                None,
-            );
-            match r {
-                Ok(()) => turso_ext::ResultCode::OK,
-                Err(_) => turso_ext::ResultCode::Error,
-            }
-        }
-        _ => {
-            let api = inner.conn._build_turso_ext();
-            let rc = (api.register_aggregate_function)(
-                api.ctx,
-                name,
-                n_args,
-                reg as usize,
-                agg_init,
-                agg_step,
-                agg_final,
-                Some(agg_destroy_reg),
-                Some(agg_destroy_state),
-                None,
-            );
-            inner.conn._free_extension_ctx(api);
-            rc
-        }
-    };
-    drop(inner);
-    if rc != turso_ext::ResultCode::OK {
-        // Registration failed before ownership of `reg` was taken.
-        let reg = Box::from_raw(reg);
-        if let Some(d) = reg.destroy {
-            d(reg.p_app as *mut ffi::c_void);
-        }
-        let mut inner = (*db).inner.lock().unwrap();
-        return set_db_err_msg(
-            &mut inner,
-            SQLITE_ERROR,
-            "unable to register aggregate function",
-        );
-    }
-    SQLITE_OK
 }
 
 #[capi_guard]
@@ -321,48 +192,6 @@ pub unsafe extern "C" fn sqlite3_aggregate_context(
         st.buf = libc::calloc(1, n as usize);
     }
     st.buf
-}
-
-#[capi_guard]
-#[no_mangle]
-pub unsafe extern "C" fn sqlite3_create_window_function(
-    db: *mut sqlite3,
-    name: *const ffi::c_char,
-    n_args: ffi::c_int,
-    _enc: ffi::c_int,
-    p_app: *mut ffi::c_void,
-    x_step: Option<unsafe extern "C" fn()>,
-    x_final: Option<unsafe extern "C" fn()>,
-    x_value: Option<unsafe extern "C" fn()>,
-    x_inverse: Option<unsafe extern "C" fn()>,
-    destroy: Option<unsafe extern "C" fn()>,
-) -> ffi::c_int {
-    if db.is_null() || name.is_null() {
-        return SQLITE_MISUSE;
-    }
-    if x_step.is_none() && x_final.is_none() && x_value.is_none() && x_inverse.is_none() {
-        // Delete; a missing function is not an error.
-        let inner = (*db).inner.lock().unwrap();
-        let api = inner.conn._build_turso_ext();
-        (api.unregister_function)(api.ctx, name);
-        inner.conn._free_extension_ctx(api);
-        return SQLITE_OK;
-    }
-    if x_value.is_some() != x_inverse.is_some() {
-        let mut inner = (*db).inner.lock().unwrap();
-        if let Some(d) = destroy {
-            let d: XDestroy = std::mem::transmute(d);
-            d(p_app);
-        }
-        return set_db_err_msg(
-            &mut inner,
-            SQLITE_MISUSE,
-            "invalid window function definition",
-        );
-    }
-    register_agg(
-        db, name, n_args, p_app, x_step, x_final, x_value, x_inverse, destroy,
-    )
 }
 
 // ---------------------------------------------------------------------------
