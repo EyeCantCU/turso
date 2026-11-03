@@ -97,6 +97,7 @@ pub unsafe extern "C" fn sqlite3_reset_auto_extension() {
 /// handle is left in the "sick" state with the error recorded, as SQLite does;
 /// the caller still owns it and must close it.
 pub(crate) unsafe fn run_auto_extensions(db: *mut sqlite3) -> ffi::c_int {
+    crate::misc::on_open(db);
     let mut i = 0;
     loop {
         // Re-read the list each step: an entry point may (un)register others.
@@ -140,6 +141,11 @@ pub unsafe extern "C" fn sqlite3_enable_load_extension(
         return SQLITE_MISUSE;
     }
     set_load_extension_enabled(db, onoff != 0);
+    // Unlike SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, this also enables the
+    // SQL function load_extension().
+    if let Ok(inner) = (*db).inner.lock() {
+        inner.conn.set_load_extension_enabled(onoff != 0);
+    }
     SQLITE_OK
 }
 
@@ -196,6 +202,16 @@ pub unsafe extern "C" fn sqlite3_load_extension(
     if db.is_null() || z_file.is_null() {
         return SQLITE_MISUSE;
     }
+    load_extension_internal(db, z_file, _z_proc, pz_err_msg)
+}
+
+#[cfg(not(unix))]
+pub(crate) unsafe fn load_extension_internal(
+    _db: *mut sqlite3,
+    _z_file: *const ffi::c_char,
+    _z_proc: *const ffi::c_char,
+    pz_err_msg: *mut *mut ffi::c_char,
+) -> ffi::c_int {
     set_err(
         pz_err_msg,
         "extension loading is not supported on this platform",
@@ -221,6 +237,18 @@ pub unsafe extern "C" fn sqlite3_load_extension(
         set_err(pz_err_msg, "not authorized");
         return SQLITE_ERROR;
     }
+    load_extension_internal(db, z_file, z_proc, pz_err_msg)
+}
+
+/// Loads `z_file` without checking the enable flag; also behind the SQL
+/// function `load_extension()`, which has its own flag.
+#[cfg(unix)]
+pub(crate) unsafe fn load_extension_internal(
+    db: *mut sqlite3,
+    z_file: *const ffi::c_char,
+    z_proc: *const ffi::c_char,
+    pz_err_msg: *mut *mut ffi::c_char,
+) -> ffi::c_int {
     let file = CStr::from_ptr(z_file).to_string_lossy().into_owned();
     if file.len() > 512 {
         set_err(pz_err_msg, "full pathname is too long");

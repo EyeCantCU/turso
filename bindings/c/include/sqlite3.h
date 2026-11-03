@@ -93,10 +93,29 @@ int sqlite3_close_v2(sqlite3 *db);
 
 const char *sqlite3_db_filename(sqlite3 *db, const char *db_name);
 
-int sqlite3_trace_v2(sqlite3 *_db,
-                     unsigned int _mask,
-                     void (*_callback)(unsigned int, void*, void*, void*),
-                     void *_context);
+#define SQLITE_TRACE_STMT 0x01
+#define SQLITE_TRACE_PROFILE 0x02
+#define SQLITE_TRACE_ROW 0x04
+#define SQLITE_TRACE_CLOSE 0x08
+
+int sqlite3_trace_v2(sqlite3 *db,
+                     unsigned int mask,
+                     int (*callback)(unsigned int, void*, void*, void*),
+                     void *context);
+
+void *sqlite3_trace(sqlite3 *db, void (*xTrace)(void*, const char*), void *context);
+
+void *sqlite3_profile(sqlite3 *db, void (*xProfile)(void*, const char*, uint64_t), void *context);
+
+int sqlite3_collation_needed(sqlite3 *db,
+                             void *context,
+                             void (*callback)(void*, sqlite3*, int, const char*));
+
+int sqlite3_collation_needed16(sqlite3 *db,
+                               void *context,
+                               void (*callback)(void*, sqlite3*, int, const void*));
+
+int sqlite3_open16(const void *filename, sqlite3 **db_out);
 
 void sqlite3_progress_handler(sqlite3 *_db, int _n, int (*_callback)(void *), void *_context);
 
@@ -234,7 +253,20 @@ sqlite3 *sqlite3_db_handle(sqlite3_stmt *_stmt);
 
 void sqlite3_sleep(int _ms);
 
-int sqlite3_limit(sqlite3 *_db, int _id, int _new_value);
+#define SQLITE_LIMIT_LENGTH 0
+#define SQLITE_LIMIT_SQL_LENGTH 1
+#define SQLITE_LIMIT_COLUMN 2
+#define SQLITE_LIMIT_EXPR_DEPTH 3
+#define SQLITE_LIMIT_COMPOUND_SELECT 4
+#define SQLITE_LIMIT_VDBE_OP 5
+#define SQLITE_LIMIT_FUNCTION_ARG 6
+#define SQLITE_LIMIT_ATTACHED 7
+#define SQLITE_LIMIT_LIKE_PATTERN_LENGTH 8
+#define SQLITE_LIMIT_VARIABLE_NUMBER 9
+#define SQLITE_LIMIT_TRIGGER_DEPTH 10
+#define SQLITE_LIMIT_WORKER_THREADS 11
+
+int sqlite3_limit(sqlite3 *db, int id, int new_value);
 
 void *sqlite3_malloc64(int _n);
 
@@ -359,6 +391,8 @@ int sqlite3_blob_open(sqlite3 *_db,
 int sqlite3_blob_read(void *_blob, void *_data, int _n, int _offset);
 
 int sqlite3_blob_write(void *_blob, const void *_data, int _n, int _offset);
+
+int sqlite3_blob_reopen(void *blob, int64_t rowid);
 
 int sqlite3_blob_bytes(void *_blob);
 
