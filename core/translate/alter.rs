@@ -1395,6 +1395,9 @@ pub fn translate_alter_table(
                     }
                 }
             }
+            resolver.with_schema(database_id, |schema| {
+                btree.check_keys_are_not_lossy(schema, std::iter::empty())
+            })?;
 
             // Propagate domain CHECK and NOT NULL constraints to the newly
             // added column. Without this, columns typed with a domain would
@@ -2017,6 +2020,12 @@ pub fn translate_alter_table(
 
             let altered_table = if let Some(replacement_column) = &replacement_column {
                 let mut table = btree.clone();
+                if let (Some(old_name), Some(new_name)) = (
+                    btree.columns()[column_index].name.as_deref(),
+                    replacement_column.name.as_deref(),
+                ) {
+                    table.rename_column_in_keys(old_name, new_name);
+                }
                 table.columns_mut()[column_index] = replacement_column.clone();
                 table.resolve_custom_types(resolver.schema());
                 let column = &table.columns()[column_index];
@@ -2038,6 +2047,12 @@ pub fn translate_alter_table(
             };
 
             if let Some(altered_table) = &altered_table {
+                resolver.with_schema(database_id, |schema| {
+                    altered_table.check_keys_are_not_lossy(
+                        schema,
+                        table_indexes.iter().flat_map(|index| index.columns.iter()),
+                    )
+                })?;
                 reject_change_of_indexed_column_order(
                     &original_btree,
                     altered_table,

@@ -249,6 +249,9 @@ pub fn translate_create_index(
             }
         }
     }
+    resolver.with_schema(database_id, |schema| {
+        tbl.check_keys_are_not_lossy(schema, columns.iter())
+    })?;
 
     if !with_clause.is_empty() && using.is_none() {
         crate::bail_parse_error!(
