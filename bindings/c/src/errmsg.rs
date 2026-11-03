@@ -100,6 +100,8 @@ pub fn message(err: &LimboError, sql: Option<&str>) -> String {
         | LimboError::ParseFloatError(_)
         | LimboError::InvalidDate(_)
         | LimboError::InvalidTime(_) => rewrite(&err.to_string()),
+        // Application-defined functions report their own text.
+        LimboError::ExtensionError(msg) => msg.clone(),
         LimboError::LexerError(e) => parser_message(e, sql),
         // Core appends the result code the shell would print.
         LimboError::Constraint(msg) => strip_code_suffix(msg).to_string(),
