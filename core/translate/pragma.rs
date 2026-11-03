@@ -437,10 +437,12 @@ fn update_pragma(
                 Expr::Literal(Literal::String(s)) => s.clone(),
                 _ => parse_string(&value)?,
             };
+            // Like SQLite, an unrecognised mode just queries the current one.
             let mode_bytes = mode.as_bytes();
             match_ignore_ascii_case!(match mode_bytes {
-                b"EXCLUSIVE" => {}
-                _ => bail_parse_error!("locking_mode must be EXCLUSIVE"),
+                b"EXCLUSIVE" => connection.set_locking_mode_exclusive(true),
+                b"NORMAL" => connection.set_locking_mode_exclusive(false),
+                _ => {}
             });
             query_pragma(
                 PragmaName::LockingMode,
@@ -965,7 +967,12 @@ fn query_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::LockingMode => {
-            program.emit_string8("exclusive".to_string(), register);
+            let mode = if connection.get_locking_mode_exclusive() {
+                "exclusive"
+            } else {
+                "normal"
+            };
+            program.emit_string8(mode.to_string(), register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)

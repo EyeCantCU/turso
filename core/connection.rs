@@ -474,6 +474,8 @@ pub struct Connection {
     pub(super) dqs_dml: AtomicBool,
     /// Deprecated pragma: when ON, column names include table prefix (TABLE.COLUMN)
     pub(super) full_column_names: AtomicBool,
+    /// `PRAGMA locking_mode`: true for EXCLUSIVE, false for NORMAL.
+    pub(super) locking_mode_exclusive: AtomicBool,
     /// Deprecated pragma: when ON (default), column refs use just the column name
     pub(super) short_column_names: AtomicBool,
     /// Simulator-only planner control used by the differential fuzzer.
@@ -3742,6 +3744,15 @@ impl Connection {
 
     pub fn set_full_column_names(&self, value: bool) {
         self.full_column_names.store(value, Ordering::SeqCst);
+        self.bump_prepare_context_generation();
+    }
+
+    pub fn get_locking_mode_exclusive(&self) -> bool {
+        self.locking_mode_exclusive.load(Ordering::SeqCst)
+    }
+
+    pub fn set_locking_mode_exclusive(&self, value: bool) {
+        self.locking_mode_exclusive.store(value, Ordering::SeqCst);
         self.bump_prepare_context_generation();
     }
 

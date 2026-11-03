@@ -2820,6 +2820,7 @@ impl Database {
             interrupt_requested: AtomicBool::new(false),
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
             full_column_names: AtomicBool::new(false),
+            locking_mode_exclusive: AtomicBool::new(false),
             short_column_names: AtomicBool::new(true),
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: crate::connection::AtomicSubqueryUnnestingMode::new(
