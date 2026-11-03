@@ -13,6 +13,7 @@ use turso_ext::ScalarFunction;
 use turso_ext::Value as ExtValue;
 
 mod hooks;
+mod session;
 
 /// Global flag: when set, all subsequently opened databases enable experimental features.
 static EXPERIMENTAL_ENABLED: AtomicBool = AtomicBool::new(false);
