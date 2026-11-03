@@ -23,6 +23,7 @@ pub mod index_method;
 pub mod io;
 #[cfg(all(feature = "json", any(feature = "fuzz", feature = "bench")))]
 pub mod json;
+pub mod limits;
 #[cfg(all(
     test,
     feature = "fs",
@@ -86,6 +87,7 @@ mod stats;
 #[cfg(feature = "time")]
 mod time;
 mod translate;
+mod trigger_trace;
 mod util;
 #[cfg(feature = "uuid")]
 mod uuid;
@@ -124,7 +126,10 @@ pub use cdc::{
 };
 #[cfg(feature = "simulator")]
 pub use connection::SubqueryUnnestingMode;
-pub use connection::{resolve_ext_path, Connection, Row, StepResult, SymbolTable};
+pub use connection::{
+    resolve_ext_path, Connection, ExtensionLoader, Row, StepResult, SymbolTable,
+    TriggerTraceCallback,
+};
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 pub use connection_hooks::{ConnectionHooks, SavepointMemo};
 pub use database::is_memory_like;
@@ -163,7 +168,7 @@ pub use io::{
     SyscallIO, WriteCompletion, IO,
 };
 pub use namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
-pub use numeric::{nonnan::NonNan, Numeric};
+pub use numeric::{format_float, nonnan::NonNan, Numeric};
 pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
 pub use storage::{
     buffer_pool::BufferPool,

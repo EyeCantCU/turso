@@ -2779,6 +2779,9 @@ impl Database {
             data_sync_retry: AtomicBool::new(false),
             busy_handler: RwLock::new(BusyHandler::None),
             progress_handler: ProgressHandler::new(),
+            limits: Default::default(),
+            trigger_trace: RwLock::new(None),
+            extension_loader: RwLock::new(None),
             query_timeout_ms: AtomicU64::new(0),
             interrupt_requested: AtomicBool::new(false),
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
@@ -2795,6 +2798,7 @@ impl Database {
             n_active_writes: AtomicI32::new(0),
             n_active_root_statements: AtomicI32::new(0),
             n_active_blob_statements: AtomicI32::new(0),
+            n_active_blob_writers: AtomicI32::new(0),
             statement_activity: Arc::new(Mutex::new(
                 crate::connection::StatementActivity::default(),
             )),

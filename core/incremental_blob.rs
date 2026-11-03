@@ -72,6 +72,10 @@ pub struct Blob {
     /// was written after open). The paused program stays alive, but every later op
     /// keeps failing — SQLite's SQLITE_ABORT contract for expired handles.
     expired: bool,
+    /// What `reopen` needs to open the same column at another row.
+    conn: Arc<Connection>,
+    table: String,
+    column: String,
 }
 
 impl std::fmt::Debug for Blob {
@@ -136,6 +140,25 @@ impl Blob {
             other => Err(LimboError::InternalError(format!(
                 "blob write returned unexpected ack {other:?}"
             ))),
+        }
+    }
+
+    /// Move the handle to another row of the same column (`sqlite3_blob_reopen`).
+    /// On failure the handle is expired: every later access fails.
+    pub fn reopen(&mut self, rowid: i64) -> Result<()> {
+        let reopened = self
+            .conn
+            .blob_open(&self.table, &self.column, rowid, !self.read_only);
+        match reopened {
+            Ok(new) => {
+                // The old handle only held its row; a close error does not matter.
+                let _ = std::mem::replace(self, new).close();
+                Ok(())
+            }
+            Err(err) => {
+                self.expired = true;
+                Err(err)
+            }
         }
     }
 
@@ -354,7 +377,7 @@ impl Connection {
         // Excluded from the explicit-checkpoint guard's active-statement
         // count: the handle parks at its row for its whole lifetime, and an
         // open blob handle must not block checkpointing until it is closed.
-        stmt.mark_as_blob_handle();
+        stmt.mark_as_blob_handle(read_write);
         // Step to the "ready" row: the cursor is open and positioned on the row, and
         // the row carries the value's byte length (BlobLen), which also validated
         // that the value is byte-addressable (TEXT or BLOB, not null/integer/real).
@@ -382,6 +405,9 @@ impl Connection {
             len,
             read_only: !read_write,
             expired: false,
+            conn: self.clone(),
+            table: table.to_string(),
+            column: column.to_string(),
         })
     }
 }
