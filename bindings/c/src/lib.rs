@@ -11,6 +11,7 @@ use turso_core::SqliteDialect;
 use turso_core::{CheckpointMode, ConnectOpts, DatabaseOpts, LimboError, Value};
 use turso_ext::ScalarFunction;
 use turso_ext::Value as ExtValue;
+use turso_macros::capi_guard;
 
 /// Global flag: when set, all subsequently opened databases enable experimental features.
 static EXPERIMENTAL_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -26,6 +27,7 @@ pub static mut sqlite3_search_count: ffi::c_int = 0;
 /// btree_varint_test command (upstream test3.c). `buf` must have room for
 /// 9 bytes. Returns the number of bytes written. Not part of the sqlite3
 /// API.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn turso_test_put_varint(buf: *mut u8, value: u64) -> ffi::c_int {
     let buf = unsafe { std::slice::from_raw_parts_mut(buf, 9) };
@@ -36,6 +38,7 @@ pub unsafe extern "C" fn turso_test_put_varint(buf: *mut u8, value: u64) -> ffi:
 /// [`turso_test_put_varint`]. `buf` must hold at least 9 readable bytes.
 /// Returns the number of bytes consumed and stores the decoded value in
 /// `*out`, or returns 0 if the bytes are not a valid varint.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn turso_test_get_varint(buf: *const u8, out: *mut u64) -> ffi::c_int {
     let buf = unsafe { std::slice::from_raw_parts(buf, 9) };
@@ -49,6 +52,7 @@ pub unsafe extern "C" fn turso_test_get_varint(buf: *const u8, out: *mut u64) ->
 }
 
 /// Enable all experimental features for databases opened after this call.
+#[capi_guard]
 #[no_mangle]
 pub extern "C" fn turso_enable_experimental() {
     EXPERIMENTAL_ENABLED.store(true, Ordering::Release);
@@ -68,6 +72,7 @@ fn default_db_opts() -> DatabaseOpts {
 }
 
 mod compat_lifecycle;
+mod guard;
 
 macro_rules! stub {
     () => {
@@ -487,6 +492,7 @@ static FUNC_BRIDGES: [ScalarFunction; MAX_CUSTOM_FUNCS] = [
 
 static INIT_DONE: std::sync::Once = std::sync::Once::new();
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_initialize() -> ffi::c_int {
     INIT_DONE.call_once(|| {
@@ -499,11 +505,13 @@ pub unsafe extern "C" fn sqlite3_initialize() -> ffi::c_int {
     SQLITE_OK
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_shutdown() -> ffi::c_int {
     SQLITE_OK
 }
 
+#[capi_guard]
 #[no_mangle]
 #[allow(clippy::arc_with_non_send_sync)]
 pub unsafe extern "C" fn sqlite3_open(
@@ -667,6 +675,7 @@ fn parse_uri_filename(uri: &str) -> Result<(String, bool, bool), ()> {
     Ok((path, is_memory, cache_shared))
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_open_v2(
     filename: *const ffi::c_char,
@@ -816,6 +825,7 @@ fn temp_database_path() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("turso-temp-{}-{n}.db", std::process::id()))
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_close(db: *mut sqlite3) -> ffi::c_int {
     trace!("sqlite3_close");
@@ -840,6 +850,7 @@ pub unsafe extern "C" fn sqlite3_close(db: *mut sqlite3) -> ffi::c_int {
     SQLITE_OK
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_close_v2(db: *mut sqlite3) -> ffi::c_int {
     trace!("sqlite3_close_v2");
@@ -859,6 +870,7 @@ pub unsafe extern "C" fn sqlite3_close_v2(db: *mut sqlite3) -> ffi::c_int {
     SQLITE_OK
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_db_filename(
     db: *mut sqlite3,
@@ -878,6 +890,7 @@ pub unsafe extern "C" fn sqlite3_db_filename(
     inner.filename.as_ptr()
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_trace_v2(
     _db: *mut sqlite3,
@@ -890,6 +903,7 @@ pub unsafe extern "C" fn sqlite3_trace_v2(
     stub!();
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_progress_handler(
     db: *mut sqlite3,
@@ -943,6 +957,7 @@ type BusyHandlerFn = unsafe extern "C" fn(*mut ffi::c_void, ffi::c_int) -> ffi::
 /// There can only be a single busy handler defined for each database connection. Setting a new
 /// busy handler clears any previously set handler. Note that calling sqlite3_busy_timeout()
 /// will change the busy handler and thus clear any previously set busy handler.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_busy_handler(
     db: *mut sqlite3,
@@ -994,6 +1009,7 @@ pub unsafe extern "C" fn sqlite3_busy_handler(
 ///
 /// There can only be a single busy handler for a database connection. Setting a busy timeout
 /// clears any previously set busy handler.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_db_readonly(
     db: *mut sqlite3,
@@ -1027,6 +1043,7 @@ fn database_readonly(conn: &turso_core::Connection, name: &str) -> ffi::c_int {
     conn.is_readonly(database_id) as ffi::c_int
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_busy_timeout(db: *mut sqlite3, ms: ffi::c_int) -> ffi::c_int {
     if db.is_null() {
@@ -1066,6 +1083,7 @@ pub type sqlite3_authorizer_callback = unsafe extern "C" fn(
 /// silently lose the enforcement they registered for. PHP ignores this
 /// return value when it installs its authorizer at open, so refusing does
 /// not break it. Implement for real once core grows an authorization hook.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_set_authorizer(
     db: *mut sqlite3,
@@ -1078,6 +1096,7 @@ pub unsafe extern "C" fn sqlite3_set_authorizer(
     SQLITE_ERROR
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_context_db_handle(context: *mut ffi::c_void) -> *mut ffi::c_void {
     if context.is_null() {
@@ -1087,6 +1106,7 @@ pub unsafe extern "C" fn sqlite3_context_db_handle(context: *mut ffi::c_void) ->
     ctx.db as *mut ffi::c_void
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_prepare_v2(
     raw_db: *mut sqlite3,
@@ -1185,6 +1205,7 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
 /// `prep_flags` parameter (e.g. SQLITE_PREPARE_PERSISTENT) which is a hint
 /// to the query planner. Turso does not use these hints yet, so we delegate
 /// directly to sqlite3_prepare_v2.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_prepare_v3(
     db: *mut sqlite3,
@@ -1208,6 +1229,7 @@ unsafe fn stmt_run_to_completion(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     SQLITE_OK
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     if stmt.is_null() {
@@ -1248,6 +1270,7 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> ffi::c_int
     result
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     let stmt = &mut *stmt;
@@ -1298,6 +1321,7 @@ type exec_callback = Option<
 /// every statement is prepared with sqlite3_prepare_v2 and the next one
 /// starts at the tail it returns, so comments, quoted text and trigger
 /// bodies are split by the parser, never by a semicolon search.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_exec(
     db: *mut sqlite3,
@@ -1381,6 +1405,7 @@ pub unsafe extern "C" fn sqlite3_exec(
     rc
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_reset(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     if stmt.is_null() {
@@ -1402,6 +1427,7 @@ pub unsafe extern "C" fn sqlite3_reset(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     result
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_changes64(db: *mut sqlite3) -> i64 {
     let db: &sqlite3 = &*db;
@@ -1409,11 +1435,13 @@ pub unsafe extern "C" fn sqlite3_changes64(db: *mut sqlite3) -> i64 {
     inner.conn.changes()
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_changes(db: *mut sqlite3) -> ffi::c_int {
     sqlite3_changes64(db) as ffi::c_int
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_stmt_readonly(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     if stmt.is_null() {
@@ -1428,6 +1456,7 @@ pub unsafe extern "C" fn sqlite3_stmt_readonly(stmt: *mut sqlite3_stmt) -> ffi::
 
 /// True if the statement has been stepped but has neither returned
 /// SQLITE_DONE nor been reset.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_stmt_busy(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     if stmt.is_null() {
@@ -1436,6 +1465,7 @@ pub unsafe extern "C" fn sqlite3_stmt_busy(stmt: *mut sqlite3_stmt) -> ffi::c_in
     (*stmt).stmt.is_busy() as ffi::c_int
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_stmt_status(
     stmt: *mut sqlite3_stmt,
@@ -1471,6 +1501,7 @@ pub unsafe extern "C" fn sqlite3_stmt_status(
 }
 
 /// Iterate over all prepared statements in the database.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_next_stmt(
     db: *mut sqlite3,
@@ -1489,6 +1520,7 @@ pub unsafe extern "C" fn sqlite3_next_stmt(
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_serialize(
     _db: *mut sqlite3,
@@ -1500,6 +1532,7 @@ pub unsafe extern "C" fn sqlite3_serialize(
     stub!();
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_deserialize(
     _db: *mut sqlite3,
@@ -1511,6 +1544,7 @@ pub unsafe extern "C" fn sqlite3_deserialize(
     stub!();
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_get_autocommit(db: *mut sqlite3) -> ffi::c_int {
     if db.is_null() {
@@ -1525,6 +1559,7 @@ pub unsafe extern "C" fn sqlite3_get_autocommit(db: *mut sqlite3) -> ffi::c_int 
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_total_changes64(db: *mut sqlite3) -> i64 {
     let db: &sqlite3 = &*db;
@@ -1532,11 +1567,13 @@ pub unsafe extern "C" fn sqlite3_total_changes64(db: *mut sqlite3) -> i64 {
     inner.conn.total_changes()
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_total_changes(db: *mut sqlite3) -> ffi::c_int {
     sqlite3_total_changes64(db) as ffi::c_int
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_last_insert_rowid(db: *mut sqlite3) -> i64 {
     let db: &sqlite3 = &*db;
@@ -1544,6 +1581,7 @@ pub unsafe extern "C" fn sqlite3_last_insert_rowid(db: *mut sqlite3) -> i64 {
     inner.conn.last_insert_rowid()
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_interrupt(db: *mut sqlite3) {
     if db.is_null() {
@@ -1606,6 +1644,7 @@ extern "C" {
 /// specifier grammar) dictates the C type pulled for each argument slot.
 /// Returns a malloc'd NUL-terminated string for sqlite3_free, or NULL when
 /// fmt is NULL or allocation fails.
+#[capi_guard]
 #[no_mangle]
 #[deny(unsafe_op_in_unsafe_fn)]
 pub unsafe extern "C" fn turso_printf_va(
@@ -1706,6 +1745,7 @@ pub unsafe extern "C" fn sqlite3_db_config(_db: *mut ffi::c_void, _op: ffi::c_in
 /// boolean DBCONFIG ops and forwards here. For boolean ops, a negative value
 /// queries the current setting without changing it, and the resulting state
 /// is written through `p_out` when non-NULL, as in SQLite.
+#[capi_guard]
 #[no_mangle]
 #[deny(unsafe_op_in_unsafe_fn)]
 pub unsafe extern "C" fn turso_db_config_int(
@@ -1739,6 +1779,7 @@ pub unsafe extern "C" fn turso_db_config_int(
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_db_handle(stmt: *mut sqlite3_stmt) -> *mut sqlite3 {
     if stmt.is_null() {
@@ -1747,11 +1788,13 @@ pub unsafe extern "C" fn sqlite3_db_handle(stmt: *mut sqlite3_stmt) -> *mut sqli
     Arc::as_ptr(&(*stmt).db) as *mut sqlite3
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_sleep(_ms: ffi::c_int) {
     stub!();
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_limit(
     _db: *mut sqlite3,
@@ -1761,11 +1804,13 @@ pub unsafe extern "C" fn sqlite3_limit(
     stub!();
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_malloc(n: ffi::c_int) -> *mut ffi::c_void {
     sqlite3_malloc64(n)
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_malloc64(n: ffi::c_int) -> *mut ffi::c_void {
     if n <= 0 {
@@ -1774,6 +1819,7 @@ pub unsafe extern "C" fn sqlite3_malloc64(n: ffi::c_int) -> *mut ffi::c_void {
     libc::malloc(n as usize)
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_free(ptr: *mut ffi::c_void) {
     if ptr.is_null() {
@@ -1783,6 +1829,7 @@ pub unsafe extern "C" fn sqlite3_free(ptr: *mut ffi::c_void) {
 }
 
 /// Returns the error code for the most recent failed API call to connection.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_errcode(db: *mut sqlite3) -> ffi::c_int {
     if db.is_null() {
@@ -1803,6 +1850,7 @@ pub unsafe extern "C" fn sqlite3_errcode(db: *mut sqlite3) -> ffi::c_int {
 /// disabled (the default), sqlite3_errcode and statement results report only
 /// the primary result code; sqlite3_extended_errcode always reports the
 /// extended code either way.
+#[capi_guard]
 #[no_mangle]
 #[deny(unsafe_op_in_unsafe_fn)]
 pub unsafe extern "C" fn sqlite3_extended_result_codes(
@@ -1823,11 +1871,13 @@ pub unsafe extern "C" fn sqlite3_extended_result_codes(
     SQLITE_OK
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_errstr(_err: ffi::c_int) -> *const ffi::c_char {
     sqlite3_errstr_impl(_err)
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_user_data(context: *mut ffi::c_void) -> *mut ffi::c_void {
     if context.is_null() {
@@ -1837,6 +1887,7 @@ pub unsafe extern "C" fn sqlite3_user_data(context: *mut ffi::c_void) -> *mut ff
     ctx.p_app
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_backup_init(
     _dest_db: *mut sqlite3,
@@ -1847,6 +1898,7 @@ pub unsafe extern "C" fn sqlite3_backup_init(
     stub!();
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_backup_step(
     _backup: *mut ffi::c_void,
@@ -1855,16 +1907,19 @@ pub unsafe extern "C" fn sqlite3_backup_step(
     stub!();
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_backup_remaining(_backup: *mut ffi::c_void) -> ffi::c_int {
     stub!();
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_backup_pagecount(_backup: *mut ffi::c_void) -> ffi::c_int {
     stub!();
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_backup_finish(_backup: *mut ffi::c_void) -> ffi::c_int {
     stub!();
@@ -1872,6 +1927,7 @@ pub unsafe extern "C" fn sqlite3_backup_finish(_backup: *mut ffi::c_void) -> ffi
 
 /// Returns the statement's original SQL text. The pointer is owned by the
 /// statement and stays valid until sqlite3_finalize.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_sql(stmt: *mut sqlite3_stmt) -> *const ffi::c_char {
     if stmt.is_null() {
@@ -1884,6 +1940,7 @@ pub unsafe extern "C" fn sqlite3_sql(stmt: *mut sqlite3_stmt) -> *const ffi::c_c
 /// rendered by Statement::expanded_sql in turso_core. The returned buffer is
 /// allocated with sqlite3_malloc and must be released by the caller with
 /// sqlite3_free.
+#[capi_guard]
 #[no_mangle]
 #[deny(unsafe_op_in_unsafe_fn)]
 pub unsafe extern "C" fn sqlite3_expanded_sql(stmt: *mut sqlite3_stmt) -> *mut ffi::c_char {
@@ -1909,6 +1966,7 @@ pub unsafe extern "C" fn sqlite3_expanded_sql(stmt: *mut sqlite3_stmt) -> *mut f
 
 /// Number of columns in the current row, or 0 when no row is available
 /// (before the first step, after SQLITE_DONE, or after a reset).
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_data_count(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     if stmt.is_null() {
@@ -1921,6 +1979,7 @@ pub unsafe extern "C" fn sqlite3_data_count(stmt: *mut sqlite3_stmt) -> ffi::c_i
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_bind_parameter_count(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     let stmt = &*stmt;
@@ -1955,6 +2014,7 @@ unsafe fn sqlite3_bind_result(
 /// The returned pointer is owned by the statement and stays valid until
 /// finalize, as documented; names are cached on the statement rather than
 /// leaked per call.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_bind_parameter_name(
     stmt: *mut sqlite3_stmt,
@@ -1982,6 +2042,7 @@ pub unsafe extern "C" fn sqlite3_bind_parameter_name(
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_bind_parameter_index(
     stmt: *mut sqlite3_stmt,
@@ -2004,6 +2065,7 @@ pub unsafe extern "C" fn sqlite3_bind_parameter_index(
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_bind_null(stmt: *mut sqlite3_stmt, idx: ffi::c_int) -> ffi::c_int {
     if stmt.is_null() {
@@ -2019,6 +2081,7 @@ pub unsafe extern "C" fn sqlite3_bind_null(stmt: *mut sqlite3_stmt, idx: ffi::c_
     sqlite3_bind_result(stmt, result)
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_bind_int(
     stmt: *mut sqlite3_stmt,
@@ -2028,6 +2091,7 @@ pub unsafe extern "C" fn sqlite3_bind_int(
     sqlite3_bind_int64(stmt, idx, val)
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_bind_int64(
     stmt: *mut sqlite3_stmt,
@@ -2046,6 +2110,7 @@ pub unsafe extern "C" fn sqlite3_bind_int64(
     sqlite3_bind_result(stmt, result)
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_bind_double(
     stmt: *mut sqlite3_stmt,
@@ -2064,6 +2129,7 @@ pub unsafe extern "C" fn sqlite3_bind_double(
     sqlite3_bind_result(stmt, result)
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_bind_text(
     stmt: *mut sqlite3_stmt,
@@ -2135,6 +2201,7 @@ pub unsafe extern "C" fn sqlite3_bind_text(
     SQLITE_OK
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_bind_blob(
     stmt: *mut sqlite3_stmt,
@@ -2183,6 +2250,7 @@ pub unsafe extern "C" fn sqlite3_bind_blob(
     SQLITE_OK
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_clear_bindings(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     if stmt.is_null() {
@@ -2195,6 +2263,7 @@ pub unsafe extern "C" fn sqlite3_clear_bindings(stmt: *mut sqlite3_stmt) -> ffi:
     SQLITE_OK
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_type(
     stmt: *mut sqlite3_stmt,
@@ -2215,12 +2284,14 @@ pub unsafe extern "C" fn sqlite3_column_type(
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_count(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     let stmt = &mut *stmt;
     stmt.stmt.num_columns() as ffi::c_int
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_decltype(
     stmt: *mut sqlite3_stmt,
@@ -2239,6 +2310,7 @@ pub unsafe extern "C" fn sqlite3_column_decltype(
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_name(
     stmt: *mut sqlite3_stmt,
@@ -2260,6 +2332,7 @@ pub unsafe extern "C" fn sqlite3_column_name(
     c_string.into_raw()
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_table_name(
     stmt: *mut sqlite3_stmt,
@@ -2309,6 +2382,7 @@ unsafe fn column_value(stmt: *mut sqlite3_stmt, idx: ffi::c_int) -> Option<&'sta
 /// column read through column_int64 parses like CAST, an integer read
 /// through column_text renders as its decimal text, and so on); they never
 /// fail on a legal call.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_int64(stmt: *mut sqlite3_stmt, idx: ffi::c_int) -> i64 {
     match column_value(stmt, idx) {
@@ -2321,6 +2395,7 @@ pub unsafe extern "C" fn sqlite3_column_int64(stmt: *mut sqlite3_stmt, idx: ffi:
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_int(
     stmt: *mut sqlite3_stmt,
@@ -2329,6 +2404,7 @@ pub unsafe extern "C" fn sqlite3_column_int(
     sqlite3_column_int64(stmt, idx) as ffi::c_int
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_double(stmt: *mut sqlite3_stmt, idx: ffi::c_int) -> f64 {
     match column_value(stmt, idx) {
@@ -2367,6 +2443,7 @@ unsafe fn column_text_cache(stmt: *mut sqlite3_stmt, idx: ffi::c_int) -> Option<
     Some(&stmt.text_cache[i])
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_blob(
     stmt: *mut sqlite3_stmt,
@@ -2383,6 +2460,7 @@ pub unsafe extern "C" fn sqlite3_column_blob(
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_bytes(
     stmt: *mut sqlite3_stmt,
@@ -2396,6 +2474,7 @@ pub unsafe extern "C" fn sqlite3_column_bytes(
 
 // sqlite3_value_* functions interpret the void* as a pointer to turso_ext::Value,
 // which is what the function bridge passes for custom scalar function arguments.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_type(value: *mut ffi::c_void) -> ffi::c_int {
     if value.is_null() {
@@ -2412,6 +2491,7 @@ pub unsafe extern "C" fn sqlite3_value_type(value: *mut ffi::c_void) -> ffi::c_i
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_int64(value: *mut ffi::c_void) -> i64 {
     if value.is_null() {
@@ -2421,11 +2501,13 @@ pub unsafe extern "C" fn sqlite3_value_int64(value: *mut ffi::c_void) -> i64 {
     v.to_integer().unwrap_or(0)
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_int(value: *mut ffi::c_void) -> ffi::c_int {
     sqlite3_value_int64(value) as ffi::c_int
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_double(value: *mut ffi::c_void) -> f64 {
     if value.is_null() {
@@ -2435,6 +2517,7 @@ pub unsafe extern "C" fn sqlite3_value_double(value: *mut ffi::c_void) -> f64 {
     v.to_float().unwrap_or(0.0)
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_text(value: *mut ffi::c_void) -> *const ffi::c_uchar {
     if value.is_null() {
@@ -2447,6 +2530,7 @@ pub unsafe extern "C" fn sqlite3_value_text(value: *mut ffi::c_void) -> *const f
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_blob(value: *mut ffi::c_void) -> *const ffi::c_void {
     if value.is_null() {
@@ -2459,6 +2543,7 @@ pub unsafe extern "C" fn sqlite3_value_blob(value: *mut ffi::c_void) -> *const f
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_bytes(value: *mut ffi::c_void) -> ffi::c_int {
     if value.is_null() {
@@ -2475,6 +2560,7 @@ pub unsafe extern "C" fn sqlite3_value_bytes(value: *mut ffi::c_void) -> ffi::c_
 /// Deep-copies an `sqlite3_value`.  Returns a heap-allocated copy that must
 /// be freed with `sqlite3_value_free`.  Diesel uses this to create
 /// `OwnedSqliteValue` instances.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_dup(value: *mut ffi::c_void) -> *mut ffi::c_void {
     if value.is_null() {
@@ -2498,6 +2584,7 @@ pub unsafe extern "C" fn sqlite3_value_dup(value: *mut ffi::c_void) -> *mut ffi:
 }
 
 /// Frees a value previously allocated by `sqlite3_value_dup`.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_free(value: *mut ffi::c_void) {
     if value.is_null() {
@@ -2506,6 +2593,7 @@ pub unsafe extern "C" fn sqlite3_value_free(value: *mut ffi::c_void) {
     let _ = Box::from_raw(value as *mut ExtValue);
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_text(
     stmt: *mut sqlite3_stmt,
@@ -2521,6 +2609,7 @@ pub unsafe extern "C" fn sqlite3_column_text(
 /// result row.  The pointer remains valid until the next `sqlite3_step()`,
 /// `sqlite3_reset()`, or `sqlite3_finalize()`.  Diesel uses this via
 /// `sqlite3_column_value` → `sqlite3_value_dup` to read all column types.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_value(
     stmt: *mut sqlite3_stmt,
@@ -2636,6 +2725,7 @@ unsafe extern "C" fn sqlite_get_table_cb(
     SQLITE_OK
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_get_table(
     db: *mut sqlite3,
@@ -2723,6 +2813,7 @@ pub unsafe extern "C" fn sqlite3_get_table(
     SQLITE_OK
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_free_table(az_result: *mut *mut ffi::c_char) {
     if az_result.is_null() {
@@ -2743,6 +2834,7 @@ pub unsafe extern "C" fn sqlite3_free_table(az_result: *mut *mut ffi::c_char) {
 // sqlite3_result_* functions set the return value of a custom SQL function.
 // The context pointer is a *mut SqliteContext cast to void*.
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_result_null(context: *mut ffi::c_void) {
     if context.is_null() {
@@ -2752,6 +2844,7 @@ pub unsafe extern "C" fn sqlite3_result_null(context: *mut ffi::c_void) {
     ctx.result = ExtValue::null();
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_result_int64(context: *mut ffi::c_void, val: i64) {
     if context.is_null() {
@@ -2761,11 +2854,13 @@ pub unsafe extern "C" fn sqlite3_result_int64(context: *mut ffi::c_void, val: i6
     ctx.result = ExtValue::from_integer(val);
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_result_int(context: *mut ffi::c_void, val: ffi::c_int) {
     sqlite3_result_int64(context, val as i64);
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_result_double(context: *mut ffi::c_void, val: f64) {
     if context.is_null() {
@@ -2775,6 +2870,7 @@ pub unsafe extern "C" fn sqlite3_result_double(context: *mut ffi::c_void, val: f
     ctx.result = ExtValue::from_float(val);
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_result_text(
     context: *mut ffi::c_void,
@@ -2804,6 +2900,7 @@ pub unsafe extern "C" fn sqlite3_result_text(
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_result_blob(
     context: *mut ffi::c_void,
@@ -2828,6 +2925,7 @@ pub unsafe extern "C" fn sqlite3_result_blob(
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_result_error_nomem(context: *mut ffi::c_void) {
     if context.is_null() {
@@ -2837,6 +2935,7 @@ pub unsafe extern "C" fn sqlite3_result_error_nomem(context: *mut ffi::c_void) {
     ctx.result = ExtValue::error(turso_ext::ResultCode::OoM);
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_result_error_toobig(context: *mut ffi::c_void) {
     if context.is_null() {
@@ -2846,6 +2945,7 @@ pub unsafe extern "C" fn sqlite3_result_error_toobig(context: *mut ffi::c_void) 
     ctx.result = ExtValue::error(turso_ext::ResultCode::Error);
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_result_error(
     context: *mut ffi::c_void,
@@ -2867,6 +2967,7 @@ pub unsafe extern "C" fn sqlite3_result_error(
     ctx.result = ExtValue::error_with_message(msg);
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_aggregate_context(
     _context: *mut ffi::c_void,
@@ -2880,6 +2981,7 @@ pub unsafe extern "C" fn sqlite3_aggregate_context(
 // must now sit in its own minimal `unsafe {}` with a SAFETY note, and the compiler
 // rejects any that escapes — so the pointer-validation logic is provably outside the
 // unsafe surface and the unsafe surface stays as small as the hazard.
+#[capi_guard]
 #[no_mangle]
 #[deny(unsafe_op_in_unsafe_fn)]
 pub unsafe extern "C" fn sqlite3_blob_open(
@@ -2943,6 +3045,7 @@ pub unsafe extern "C" fn sqlite3_blob_open(
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 #[deny(unsafe_op_in_unsafe_fn)]
 pub unsafe extern "C" fn sqlite3_blob_read(
@@ -2984,6 +3087,7 @@ pub unsafe extern "C" fn sqlite3_blob_read(
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 #[deny(unsafe_op_in_unsafe_fn)]
 pub unsafe extern "C" fn sqlite3_blob_write(
@@ -3021,6 +3125,7 @@ pub unsafe extern "C" fn sqlite3_blob_write(
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 #[deny(unsafe_op_in_unsafe_fn)]
 pub unsafe extern "C" fn sqlite3_blob_bytes(blob: *mut ffi::c_void) -> ffi::c_int {
@@ -3038,6 +3143,7 @@ pub unsafe extern "C" fn sqlite3_blob_bytes(blob: *mut ffi::c_void) -> ffi::c_in
         .expect("blob length exceeds the SQLite length limit")
 }
 
+#[capi_guard]
 #[no_mangle]
 #[deny(unsafe_op_in_unsafe_fn)]
 pub unsafe extern "C" fn sqlite3_blob_close(blob: *mut ffi::c_void) -> ffi::c_int {
@@ -3055,6 +3161,7 @@ pub unsafe extern "C" fn sqlite3_blob_close(blob: *mut ffi::c_void) -> ffi::c_in
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_stricmp(
     a: *const ffi::c_char,
@@ -3063,6 +3170,7 @@ pub unsafe extern "C" fn sqlite3_stricmp(
     sqlite3_strnicmp(a, b, ffi::c_int::MAX)
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_strnicmp(
     a: *const ffi::c_char,
@@ -3096,6 +3204,7 @@ pub unsafe extern "C" fn sqlite3_strnicmp(
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_create_collation_v2(
     db: *mut sqlite3,
@@ -3171,6 +3280,7 @@ unsafe extern "C" fn collation_bridge_destroy(context: usize) {
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_create_function_v2(
     db: *mut sqlite3,
@@ -3268,6 +3378,7 @@ pub unsafe extern "C" fn sqlite3_create_function_v2(
     SQLITE_OK
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_create_window_function(
     _db: *mut sqlite3,
@@ -3285,6 +3396,7 @@ pub unsafe extern "C" fn sqlite3_create_window_function(
 }
 
 /// Returns the error message for the most recent failed API call to connection.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_errmsg(db: *mut sqlite3) -> *const ffi::c_char {
     if db.is_null() {
@@ -3312,6 +3424,7 @@ pub unsafe extern "C" fn sqlite3_errmsg(db: *mut sqlite3) -> *const ffi::c_char 
 }
 
 /// Returns the extended error code for the most recent failed API call to connection.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_extended_errcode(db: *mut sqlite3) -> ffi::c_int {
     if db.is_null() {
@@ -3330,6 +3443,7 @@ pub unsafe extern "C" fn sqlite3_extended_errcode(db: *mut sqlite3) -> ffi::c_in
     db.err_code
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_complete(sql: *const ffi::c_char) -> ffi::c_int {
     if sql.is_null() {
@@ -3342,11 +3456,13 @@ pub unsafe extern "C" fn sqlite3_complete(sql: *const ffi::c_char) -> ffi::c_int
         .map_or(0, |&b| (b == b';') as ffi::c_int)
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_threadsafe() -> ffi::c_int {
     1
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_libversion() -> *const ffi::c_char {
     SQLITE_VERSION_C_STRING
@@ -3356,6 +3472,7 @@ pub unsafe extern "C" fn sqlite3_libversion() -> *const ffi::c_char {
         .as_ptr()
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_libversion_number() -> ffi::c_int {
     SQLITE_VERSION_NUMBER
@@ -3420,6 +3537,7 @@ fn sqlite3_errstr_impl(rc: i32) -> *const ffi::c_char {
     msg.as_ptr() as *const ffi::c_char
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_wal_checkpoint(
     db: *mut sqlite3,
@@ -3434,6 +3552,7 @@ pub unsafe extern "C" fn sqlite3_wal_checkpoint(
     )
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_wal_checkpoint_v2(
     db: *mut sqlite3,
@@ -3496,6 +3615,7 @@ pub unsafe extern "C" fn sqlite3_wal_checkpoint_v2(
 /// - The `db` must be a valid pointer to a `sqlite3` database connection.
 /// - The `p_frame_count` must be a valid pointer to a `u32` that will store
 ///   the number of frames in the WAL file.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn libsql_wal_frame_count(
     db: *mut sqlite3,
@@ -3533,6 +3653,7 @@ pub unsafe extern "C" fn libsql_wal_frame_count(
 /// - The `p_frame` must be a valid pointer to a `u8` that will store
 ///   the frame data.
 /// - The `frame_len` must be the size of the frame.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn libsql_wal_get_frame(
     db: *mut sqlite3,
@@ -3569,6 +3690,7 @@ pub unsafe extern "C" fn libsql_wal_get_frame(
 /// - The `frame_no` must be a valid frame index.
 /// - The `p_frame` must be a valid pointer to a `u8` that stores the frame data.
 /// - The `frame_len` must be the size of the frame.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn libsql_wal_insert_frame(
     db: *mut sqlite3,
@@ -3601,6 +3723,7 @@ pub unsafe extern "C" fn libsql_wal_insert_frame(
 /// sqlite3_wal_autocheckpoint() which only disables automatic checkpoints
 /// for the current connection, but still allows checkpointing when the
 /// connection is closed.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn libsql_wal_disable_checkpoint(db: *mut sqlite3) -> ffi::c_int {
     if db.is_null() {
@@ -3620,6 +3743,7 @@ fn sqlite3_safety_check_sick_or_ok(db: &sqlite3Inner) -> bool {
 }
 
 // https://sqlite.org/c3ref/table_column_metadata.html
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_table_column_metadata(
     db: *mut sqlite3,

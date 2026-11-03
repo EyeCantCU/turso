@@ -7,6 +7,14 @@ extern "C" {
     fn sqlite3_extended_errcode(db: *mut sqlite3) -> i32;
 }
 
+#[cfg(not(feature = "sqlite3"))]
+extern "C" {
+    fn turso_test_panic(db: *mut sqlite3) -> i32;
+    fn turso_test_panic_stmt(stmt: *mut sqlite3_stmt) -> i32;
+    fn turso_test_panic_ptr() -> *const libc::c_char;
+    fn turso_test_panic_value(stmt: *mut sqlite3_stmt) -> i32;
+}
+
 const SQLITE_NOMEM: i32 = 7;
 const SQLITE_PERM: i32 = 3;
 const SQLITE_READONLY: i32 = 8;
@@ -189,5 +197,49 @@ fn uri_mode_rwc_requires_create_flag() {
         assert_eq!(rc, SQLITE_OK);
         assert_eq!(sqlite3_close(db), SQLITE_OK);
         assert!(path.exists());
+    }
+}
+
+#[cfg(all(not(feature = "sqlite3"), panic = "unwind"))]
+mod panics {
+    use super::*;
+
+    #[test]
+    fn panic_on_handle_becomes_error_code() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(turso_test_panic(db), 2);
+            assert_eq!(sqlite3_errcode(db), 2);
+            assert!(errmsg(db).contains("injected panic"), "{}", errmsg(db));
+            // The connection stays usable.
+            assert_eq!(sqlite3_exec_ok(db, c"CREATE TABLE t(a)"), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn panic_on_stmt_records_error_on_its_db() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let mut stmt = ptr::null_mut();
+            let rc = sqlite3_prepare_v2(db, c"SELECT 1".as_ptr(), -1, &mut stmt, ptr::null_mut());
+            assert_eq!(rc, SQLITE_OK);
+            assert_eq!(turso_test_panic_stmt(stmt), 2);
+            assert!(errmsg(db).contains("injected panic"));
+            assert_eq!(turso_test_panic_value(stmt), 0);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn panic_without_handle_returns_null() {
+        unsafe {
+            assert!(turso_test_panic_ptr().is_null());
+            // NULL handles are tolerated.
+            assert_eq!(turso_test_panic(ptr::null_mut()), 2);
+        }
     }
 }
