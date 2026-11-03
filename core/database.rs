@@ -700,6 +700,9 @@ pub struct Database<
     pub(crate) shared_wal: Arc<RwLock<WalFileShared>>,
     #[cfg(host_shared_wal)]
     shared_wal_coordination: OnceLock<Arc<MappedSharedWalCoordination>>,
+    /// SQLite lock bytes held while the database is shared across processes.
+    #[cfg(all(host_shared_wal, target_os = "linux"))]
+    sqlite_shm_interlock: OnceLock<storage::sqlite_shm_interlock::SqliteShmInterlock>,
     pub(crate) open_flags: OpenFlags,
     // Use parking lot RwLock here and not `crate::sync::RwLock` because it relies on `data_ptr` and that is experimental
     // in std.
@@ -864,6 +867,8 @@ impl Database {
             shared_wal,
             #[cfg(host_shared_wal)]
             shared_wal_coordination: OnceLock::new(),
+            #[cfg(all(host_shared_wal, target_os = "linux"))]
+            sqlite_shm_interlock: OnceLock::new(),
             db_file,
             builtin_syms: parking_lot::RwLock::new(syms),
             dialect,
@@ -3198,6 +3203,15 @@ impl Database {
                 64,
             )?)
         };
+        #[cfg(target_os = "linux")]
+        if self.sqlite_shm_interlock.get().is_none() {
+            let interlock = storage::sqlite_shm_interlock::SqliteShmInterlock::acquire(
+                &self.io,
+                &self.path,
+                || !authority.is_last_process_mapping(),
+            )?;
+            let _ = self.sqlite_shm_interlock.set(interlock);
+        }
         let _ = self.shared_wal_coordination.set(authority.clone());
         Ok(Some(
             self.shared_wal_coordination
