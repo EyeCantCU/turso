@@ -763,19 +763,21 @@ expect {
     1
 }
 
-test printf-empty-format-null {
-    SELECT printf('') IS NULL;
+# SQLite 3.54 returns '' (not NULL) for an empty result.
+test printf-empty-format-not-null {
+    SELECT printf('') IS NULL, typeof(printf(''));
 }
 expect {
-    1
+    0|text
 }
 
-test printf-empty-result-not-null-constraint {
+test printf-empty-result-satisfies-not-null {
     CREATE TABLE printf_empty_not_null(x TEXT NOT NULL);
     INSERT INTO printf_empty_not_null VALUES (printf('', NULL));
+    SELECT count(*), length(x) FROM printf_empty_not_null;
 }
-expect error {
-    NOT NULL constraint failed: printf_empty_not_null.x
+expect {
+    1|0
 }
 
 test printf-format-blob {

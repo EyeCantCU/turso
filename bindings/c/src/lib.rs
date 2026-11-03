@@ -1589,6 +1589,12 @@ pub unsafe extern "C" fn turso_printf_va(
     let mut args = Vec::new();
     for slot in turso_core::printf_c_arg_plan(&fmt_str) {
         use turso_core::PrintfCArg;
+        if slot == PrintfCArg::IntPtr {
+            // %n: consume the int* without writing through it.
+            // SAFETY: the caller passed a pointer for this slot.
+            let _ = unsafe { turso_va_ptr(ap) };
+            continue;
+        }
         // SAFETY: the plan mirrors the engine's specifier grammar, so each
         // pump reads the C type the caller passed for that slot.
         let value = unsafe {
@@ -1624,6 +1630,7 @@ pub unsafe extern "C" fn turso_printf_va(
                         .unwrap_or('\u{fffd}');
                     turso_core::Value::build_text(c.to_string())
                 }
+                PrintfCArg::IntPtr => unreachable!(),
             }
         };
         args.push(value);
