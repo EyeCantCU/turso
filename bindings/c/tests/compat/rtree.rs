@@ -235,6 +235,27 @@ fn test_rtree_basic_c_api() {
     }
 }
 
+#[test]
+fn test_rtreecheck_reports_corruption() {
+    unsafe {
+        let db = open_mem();
+        exec_ok(db, "CREATE VIRTUAL TABLE rt USING rtree(id, x0, x1)");
+        exec_ok(db, "INSERT INTO rt VALUES(1, 0, 1), (2, 2, 3)");
+        // Shadow tables are writable outside defensive mode.
+        exec_ok(db, "DELETE FROM rt_rowid WHERE rowid = 2");
+        exec_ok(db, "INSERT INTO rt_parent VALUES(99, 1)");
+        assert_eq!(
+            query(db, "SELECT rtreecheck('rt')"),
+            vec![vec![
+                "Mapping (2 -> 1) missing from %_rowid table\n\
+                 Wrong number of entries in %_rowid table - expected 2, actual 1\n\
+                 Wrong number of entries in %_parent table - expected 0, actual 1"
+            ]]
+        );
+        sqlite3_close(db);
+    }
+}
+
 static GEOM_USER_FREED: AtomicI32 = AtomicI32::new(0);
 
 unsafe extern "C" fn free_user(p: *mut c_void) {
