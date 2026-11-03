@@ -134,10 +134,13 @@ struct NameTok {
     start: usize,
     end: usize,
     quoted: bool,
+    /// A bare keyword, which may or may not be used as a name.
+    keyword: bool,
     value: String,
 }
 
-fn name_tokens(sql: &str) -> Option<Vec<NameTok>> {
+/// The names of `sql`; with `keywords`, also its bare keywords.
+fn name_tokens(sql: &str, keywords: bool) -> Option<Vec<NameTok>> {
     let mut out = Vec::new();
     let mut bracket: Option<usize> = None;
     // The tokens partition the input, but some carry static text, so spans
@@ -153,6 +156,7 @@ fn name_tokens(sql: &str) -> Option<Vec<NameTok>> {
                     start: open,
                     end,
                     quoted: true,
+                    keyword: false,
                     value: sql[open + 1..start].to_string(),
                 });
                 bracket = None;
@@ -164,8 +168,9 @@ fn name_tokens(sql: &str) -> Option<Vec<NameTok>> {
             // A keyword used as a name is written bare and printed quoted.
             t if t == TokenType::TK_ID
                 || t == TokenType::TK_STRING
-                || is_word(&sql.as_bytes()[start..end]) =>
+                || (keywords && is_word(&sql.as_bytes()[start..end])) =>
             {
+                let keyword = t != TokenType::TK_ID && t != TokenType::TK_STRING;
                 let text = &sql[start..end];
                 let quoted = matches!(text.as_bytes()[0], b'"' | b'\'' | b'`');
                 let value = if quoted {
@@ -178,6 +183,7 @@ fn name_tokens(sql: &str) -> Option<Vec<NameTok>> {
                     start,
                     end,
                     quoted,
+                    keyword,
                     value,
                 });
             }
@@ -220,18 +226,44 @@ fn patch_renamed(
     // The canonical texts of the old and new statements line up token for
     // token; the written text lines up with the old canonical one.
     let canonical = old_stmt.to_string();
-    let written = name_tokens(old_sql)?;
-    let old = name_tokens(&canonical)?;
-    let new = name_tokens(new_sql)?;
-    if written.len() != old.len() || old.len() != new.len() {
+    let written = name_tokens(old_sql, true)?;
+    let old = name_tokens(&canonical, true)?;
+    let new = name_tokens(new_sql, false)?;
+    // Align the written text with the canonical one. Names anchor the
+    // alignment; keywords that only one side spells (NOT NULL / NOTNULL)
+    // are skipped. A bare keyword written as a name is quoted canonically.
+    let mut matched = Vec::with_capacity(new.len());
+    let (mut wi, mut oi) = (0, 0);
+    while oi < old.len() {
+        let o = &old[oi];
+        let Some(w) = written.get(wi) else {
+            if o.keyword {
+                oi += 1;
+                continue;
+            }
+            return None;
+        };
+        let same_kind = w.keyword == o.keyword || (w.keyword && !o.keyword && o.quoted);
+        if same_kind && w.value.eq_ignore_ascii_case(&o.value) {
+            if !o.keyword {
+                matched.push((w, o));
+            }
+            wi += 1;
+            oi += 1;
+        } else if w.keyword {
+            wi += 1;
+        } else if o.keyword {
+            oi += 1;
+        } else {
+            return None;
+        }
+    }
+    if written[wi..].iter().any(|w| !w.keyword) || matched.len() != new.len() {
         return None;
     }
     let mut out = String::with_capacity(old_sql.len() + 16);
     let mut pos = 0;
-    for ((w, o), n) in written.iter().zip(&old).zip(&new) {
-        if !w.value.eq_ignore_ascii_case(&o.value) {
-            return None;
-        }
+    for ((w, o), n) in matched.into_iter().zip(&new) {
         if o.value == n.value {
             continue;
         }
