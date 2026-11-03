@@ -222,6 +222,7 @@ const SQLITE_OPEN_CREATE: i32 = 0x00000004;
 const SQLITE_OPEN_URI: i32 = 0x00000040;
 
 mod stubs;
+mod udf;
 
 mod tests {
     use super::*;
