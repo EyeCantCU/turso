@@ -301,9 +301,9 @@ impl<'a> Storage<'a> {
             sizes[i] = sz as i64;
         }
         let totals = self.load_totals(w)?;
-        for i in 0..ncol {
-            totals.1[i] -= sizes[i];
-            if totals.1[i] < 0 {
+        for (t, s) in totals.1.iter_mut().zip(&sizes) {
+            *t -= s;
+            if *t < 0 {
                 return Err(corrupt());
             }
         }
@@ -468,8 +468,8 @@ impl<'a> Storage<'a> {
             sizes[i] = sz as i64;
         }
         let totals = self.load_totals(w)?;
-        for i in 0..ncol {
-            totals.1[i] += sizes[i];
+        for (t, s) in totals.1.iter_mut().zip(&sizes) {
+            *t += s;
         }
         totals.0 += 1;
         self.insert_docsize(w, rowid, &buf)

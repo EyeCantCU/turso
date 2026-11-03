@@ -823,8 +823,8 @@ impl CursorState {
         }
         self.desc = idx_num & BI_ORDER_DESC != 0;
         if eq.is_some() {
-            le = eq.clone();
-            ge = eq.clone();
+            le.clone_from(&eq);
+            ge.clone_from(&eq);
         }
         let limit = |v: &Option<Value>, d: i64| v.as_ref().and_then(numeric_int).unwrap_or(d);
         let first = limit(&ge, SMALLEST_INT64);
@@ -1222,7 +1222,7 @@ impl AuxApi for CursorState {
         &mut self,
         text: &[u8],
         locale: Option<&[u8]>,
-        cb: &mut dyn FnMut(i32, &[u8], i32, i32) -> i32,
+        cb: &mut tokenize::TokenCallback,
     ) -> ApiResult<()> {
         let tok = self
             .inner

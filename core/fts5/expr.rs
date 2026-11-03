@@ -6,7 +6,6 @@ use super::index::{char_len, Index, Pending, Structure, MAIN_PREFIX};
 use super::tokenize::{TOKENIZE_PREFIX, TOKENIZE_QUERY, TOKEN_COLOCATED};
 use super::varint::*;
 use crate::Result;
-use std::collections::HashMap;
 
 const MAX_TOKEN_SIZE: usize = 32768;
 const DEFAULT_NEARDIST: i32 = 10;

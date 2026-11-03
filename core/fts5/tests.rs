@@ -340,7 +340,7 @@ fn fuzz_case(seed: u64, case: &Case, nops: usize, nqueries: usize) {
     let spath = temp_path(&dir, "s.db");
     let t = open(&tpath);
     let s = rusqlite::Connection::open(&spath).unwrap();
-    let mut both = |sql: &str| {
+    let both = |sql: &str| {
         let a = tq(&t, sql);
         let b = sq(&s, sql);
         if norm_floats(&a) != norm_floats(&b) {
@@ -630,4 +630,149 @@ fn fts5_options_and_errors() {
         "SELECT name FROM sqlite_schema WHERE name LIKE 'tri3%' ORDER BY name",
         "SELECT rowid FROM tri3 WHERE tri3 MATCH 'uic'",
     ]);
+}
+
+/// Runs sqlite/conformance/turso-sqltests/fts5.sqltest on turso (its
+/// expectations were produced with SQLite 3.54).
+#[test]
+fn fts5_sqltest_file() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../sqlite/conformance/turso-sqltests/fts5.sqltest"
+    ))
+    .unwrap();
+    let block = |s: &str, start: usize| -> (String, usize) {
+        let open = s[start..].find("{\n").unwrap() + start + 2;
+        let close = s[open..].find("\n}").unwrap() + open;
+        (s[open..close].to_string(), close + 2)
+    };
+    let mut setups = std::collections::HashMap::new();
+    let mut pos = 0;
+    let mut pending_setup: Option<String> = None;
+    let mut ntests = 0;
+    while pos < src.len() {
+        let line_end = src[pos..].find('\n').map_or(src.len(), |i| pos + i);
+        let line = src[pos..line_end].trim();
+        if let Some(name) = line.strip_prefix("setup ") {
+            let (body, next) = block(&src, pos);
+            setups.insert(name.trim_end_matches(" {").to_string(), body);
+            pos = next;
+            continue;
+        }
+        if let Some(name) = line.strip_prefix("@setup ") {
+            pending_setup = Some(name.to_string());
+        }
+        if let Some(name) = line.strip_prefix("test ") {
+            let (body, next) = block(&src, pos);
+            let is_error = src[next..].trim_start().starts_with("expect error");
+            let (expect, next) = block(&src, next);
+            let dir = tempfile::tempdir().unwrap();
+            let conn = open(&temp_path(&dir, "s.db"));
+            let mut sql = String::new();
+            if let Some(s) = pending_setup.take() {
+                sql.push_str(&setups[&s]);
+                sql.push('\n');
+            }
+            sql.push_str(&body);
+            let mut out = Vec::new();
+            let mut error = None;
+            for stmt in sql.split(";\n").map(str::trim).filter(|s| !s.is_empty()) {
+                let r = tq(&conn, stmt.trim_end_matches(';'));
+                if let Some(e) = r.strip_prefix("ERR: ") {
+                    error = Some(e.to_string());
+                    break;
+                }
+                if !r.is_empty() {
+                    out.push(r);
+                }
+            }
+            let expect: Vec<&str> = expect.lines().map(str::trim).collect();
+            if is_error {
+                let e = error.unwrap_or_default();
+                assert!(expect.iter().all(|x| e.contains(x)), "{name}: {e}");
+            } else {
+                assert_eq!(error, None, "{name}");
+                let got = out.join("\n");
+                let got: Vec<&str> = got.lines().collect();
+                assert_eq!(got, expect, "{name}");
+            }
+            ntests += 1;
+            pos = next;
+            continue;
+        }
+        pos = line_end + 1;
+    }
+    assert!(ntests >= 10);
+}
+
+#[test]
+fn fts5_two_connections() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = temp_path(&dir, "m.db");
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file(io, &path, Arc::new(SqliteDialect)).unwrap();
+    let a = db.connect(ConnectOpts::new()).unwrap();
+    let b = db.connect(ConnectOpts::new()).unwrap();
+    texec(&a, "CREATE VIRTUAL TABLE t USING fts5(x)");
+    texec(&a, "INSERT INTO t VALUES('alpha beta')");
+    texec(&a, "BEGIN");
+    texec(&a, "INSERT INTO t VALUES('alpha gamma')");
+    // A sees its pending rows; B sees only committed ones.
+    assert_eq!(tq(&a, "SELECT count(*) FROM t WHERE t MATCH 'alpha'"), "2");
+    assert_eq!(tq(&b, "SELECT count(*) FROM t WHERE t MATCH 'alpha'"), "1");
+    texec(&a, "COMMIT");
+    assert_eq!(tq(&b, "SELECT count(*) FROM t WHERE t MATCH 'alpha'"), "2");
+    // A config change made by one connection is seen by the other.
+    texec(&b, "INSERT INTO t(t, rank) VALUES('rank', 'bm25(2.0)')");
+    texec(&a, "INSERT INTO t VALUES('gamma delta')");
+    assert_eq!(
+        tq(&a, "SELECT k, v FROM t_config WHERE k = 'rank'"),
+        "rank|bm25(2.0)"
+    );
+    texec(&a, "BEGIN");
+    texec(&a, "INSERT INTO t VALUES('alpha alpha')");
+    texec(&a, "ROLLBACK");
+    assert_eq!(tq(&b, "SELECT count(*) FROM t WHERE t MATCH 'alpha'"), "2");
+    assert_eq!(tq(&a, "SELECT count(*) FROM t WHERE t MATCH 'alpha'"), "2");
+    assert_eq!(tq(&a, "INSERT INTO t(t) VALUES('integrity-check')"), "");
+    texec(&a, "BEGIN");
+    texec(&a, "INSERT INTO t VALUES('epsilon')");
+    texec(&a, "SAVEPOINT s1");
+    texec(&a, "INSERT INTO t VALUES('epsilon zeta')");
+    texec(&a, "ROLLBACK TO s1");
+    texec(&a, "COMMIT");
+    assert_eq!(
+        tq(&b, "SELECT count(*) FROM t WHERE t MATCH 'epsilon'"),
+        "1"
+    );
+    assert_eq!(tq(&b, "INSERT INTO t(t) VALUES('integrity-check')"), "");
+}
+
+#[test]
+#[ignore]
+fn fts5_bulk_timing() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open(&temp_path(&dir, "b.db"));
+    texec(&t, "CREATE VIRTUAL TABLE t USING fts5(a, b)");
+    let mut rng = Rng(7);
+    let start = std::time::Instant::now();
+    texec(&t, "BEGIN");
+    for i in 0..5000 {
+        let a = random_doc(&mut rng, 10);
+        let b = random_doc(&mut rng, 40);
+        texec(
+            &t,
+            &format!("INSERT INTO t(rowid, a, b) VALUES({}, '{a}', '{b}')", i + 1),
+        );
+    }
+    texec(&t, "COMMIT");
+    eprintln!("insert 5000: {:?}", start.elapsed());
+    let start = std::time::Instant::now();
+    for _ in 0..100 {
+        tq(
+            &t,
+            "SELECT rowid, bm25(t) FROM t WHERE t MATCH 'alpha AND beta' ORDER BY rank LIMIT 10",
+        );
+    }
+    eprintln!("100 queries: {:?}", start.elapsed());
 }

@@ -43,6 +43,7 @@ pub(crate) struct Fts5Config {
     pub content: Content,
     pub columnsize: bool,
     pub contentless_delete: bool,
+    #[allow(dead_code)]
     pub contentless_unindexed: bool,
     pub locale: bool,
     pub tokendata: bool,

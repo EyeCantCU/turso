@@ -5568,6 +5568,10 @@ pub fn op_savepoint(
                     }
                 }
             }
+            // As in SQLite, xSavepoint runs before the savepoint opens, so
+            // what a module writes there survives ROLLBACK TO.
+            let level = conn.named_savepoints.read().len();
+            vtab_savepoint_all(&conn, 0, level)?;
             conn.with_savepoint_schema_snapshot(
                 |main_schema_snapshot, temp_schema_snapshot, staged_schema_snapshot| {
                     let starts_transaction = conn.auto_commit.load(Ordering::SeqCst);
@@ -5667,8 +5671,6 @@ pub fn op_savepoint(
                         return Err(mirror_err);
                     }
                     conn.push_named_savepoint(frame);
-                    let level = conn.named_savepoints.read().len() - 1;
-                    vtab_savepoint_all(&conn, 0, level)?;
                     if starts_transaction {
                         turso_assert!(
                             !conn.tx_is_poisoned(),

@@ -863,6 +863,7 @@ fn tombstone_query(page: &[u8], npg: usize, rowid: u64) -> bool {
 pub(crate) struct Entry {
     pub term: Vec<u8>,
     pub rowid: i64,
+    #[allow(dead_code)]
     pub del: bool,
     pub npos: usize,
     pub poslist: Vec<u8>,
@@ -944,7 +945,7 @@ enum Source<'s> {
 impl<'s> Source<'s> {
     fn key(&self) -> Option<(&[u8], i64)> {
         match self {
-            Source::Seg(it) => (!it.eof()).then(|| (it.term.as_slice(), it.rowid)),
+            Source::Seg(it) => (!it.eof()).then_some((it.term.as_slice(), it.rowid)),
             Source::Hash(h) => h.cur.as_ref().map(|e| (e.term.as_slice(), e.rowid)),
         }
     }
@@ -1172,9 +1173,8 @@ impl SegWriter {
             } else {
                 done = true;
             }
-            let val;
-            if self.dlidx[i].prev_valid {
-                val = (rowid as u64).wrapping_sub(self.dlidx[i].prev as u64);
+            let val = if self.dlidx[i].prev_valid {
+                (rowid as u64).wrapping_sub(self.dlidx[i].prev as u64)
             } else {
                 let pgno = if i == 0 {
                     self.pgno
@@ -1184,8 +1184,8 @@ impl SegWriter {
                 let d = &mut self.dlidx[i];
                 put_varint(&mut d.buf, (!done) as u64);
                 put_varint(&mut d.buf, pgno as u64);
-                val = rowid as u64;
-            }
+                rowid as u64
+            };
             let d = &mut self.dlidx[i];
             put_varint(&mut d.buf, val);
             d.prev_valid = true;
@@ -1320,6 +1320,9 @@ fn poslist_prefix(a: &[u8], nmax: i64) -> usize {
 }
 
 // ------------------------------------------------------------------ index operations
+
+/// A term with its doclist: (rowid, position list) pairs.
+pub(crate) type TermDoclist = (Vec<u8>, Vec<(i64, Vec<u8>)>);
 
 /// The per-operation view of the index: a store plus the settings.
 pub(crate) struct Index<'a> {
@@ -1499,7 +1502,7 @@ impl<'a> Index<'a> {
                 if !secure {
                     w.append_term(&self.store, &term)?;
                 }
-                if !secure && pgsz >= w.buf.len() + w.pgidx.len() + doclist.len() + 1 {
+                if !secure && pgsz > w.buf.len() + w.pgidx.len() + doclist.len() {
                     w.buf.extend_from_slice(&doclist);
                     continue;
                 }
@@ -2026,7 +2029,7 @@ impl<'a> Index<'a> {
         s: &Structure,
         pending: Option<&Pending>,
         prefix: &[u8],
-    ) -> Result<Vec<(Vec<u8>, Vec<(i64, Vec<u8>)>)>> {
+    ) -> Result<Vec<TermDoclist>> {
         let mut sources = Vec::new();
         if let Some(p) = pending {
             let entries = p.hash.scan_prefix(prefix);
@@ -2049,7 +2052,7 @@ impl<'a> Index<'a> {
             sources,
             skip_empty: true,
         };
-        let mut out: Vec<(Vec<u8>, Vec<(i64, Vec<u8>)>)> = Vec::new();
+        let mut out: Vec<TermDoclist> = Vec::new();
         loop {
             // Stop each segment once it has moved past the prefix.
             for src in m.sources.iter_mut() {
@@ -2374,7 +2377,7 @@ impl<'a> Index<'a> {
             // Leaves between index entries must exist and hold no terms.
             for i in idx_prev_leaf + 1..idx_leaf {
                 let l = read_leaf(&self.store, segment_rowid(seg.segid, i))?;
-                if !l.is_termless() || (i >= dlidx_prev_leaf + 1 && l.first_rowid_off() != 0) {
+                if !l.is_termless() || (i > dlidx_prev_leaf && l.first_rowid_off() != 0) {
                     return Err(corrupt());
                 }
             }

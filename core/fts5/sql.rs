@@ -53,25 +53,6 @@ pub(crate) fn query_row(
     Ok(row)
 }
 
-/// Streams rows to `f` until it returns false.
-pub(crate) fn for_each_row(
-    conn: &Arc<Connection>,
-    sql: &str,
-    params: &[Value],
-    mut f: impl FnMut(&[Value]) -> Result<bool>,
-) -> Result<()> {
-    let mut stmt = prepare(conn, sql, params)?;
-    loop {
-        let row: Vec<Value> = match stmt.run_one_step_blocking(|| Ok(()), || Ok(()))? {
-            Some(row) => row.get_values().cloned().collect(),
-            None => return Ok(()),
-        };
-        if !f(&row)? {
-            return Ok(());
-        }
-    }
-}
-
 pub(crate) fn blob(data: &[u8]) -> Value {
     Value::from_slice(data).unwrap_or(Value::Null)
 }

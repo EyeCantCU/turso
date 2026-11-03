@@ -34,7 +34,7 @@ pub trait AuxApi {
         &mut self,
         text: &[u8],
         locale: Option<&[u8]>,
-        cb: &mut dyn FnMut(i32, &[u8], i32, i32) -> i32,
+        cb: &mut super::tokenize::TokenCallback,
     ) -> ApiResult<()>;
     fn phrase_count(&self) -> i32;
     fn phrase_size(&self, phrase: i32) -> i32;
@@ -109,13 +109,6 @@ pub(crate) fn call_builtin(
         _ => return None,
     };
     Some(r.map_err(to_result))
-}
-
-pub(crate) fn is_builtin(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "bm25" | "highlight" | "snippet" | "fts5_get_locale"
-    )
 }
 
 /// Iterates coalesced phrase instances in one column (CInstIter).
@@ -548,7 +541,7 @@ fn bm25(api: &mut dyn AuxApi, args: &[Value]) -> ApiResult<Value> {
     for (i, f) in freq.iter().enumerate() {
         score += data.idf[i] * ((f * (K1 + 1.0)) / (f + K1 * (1.0 - B + B * d / data.avgdl)));
     }
-    Ok(Value::from_f64(-1.0 * score))
+    Ok(Value::from_f64(-score))
 }
 
 fn get_locale(api: &mut dyn AuxApi, args: &[Value]) -> ApiResult<Value> {
