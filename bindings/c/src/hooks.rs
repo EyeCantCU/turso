@@ -60,6 +60,20 @@ impl HookState {
     }
 }
 
+/// For reset/finalize: a WAL hook error left by the last step becomes the
+/// result (and the handle's error), unless something else failed first.
+pub(crate) unsafe fn take_wal_hook_error(
+    stmt: *mut sqlite3_stmt,
+    result: ffi::c_int,
+) -> ffi::c_int {
+    let stmt = &mut *stmt;
+    let rc = std::mem::replace(&mut stmt.wal_hook_rc, SQLITE_OK);
+    if result != SQLITE_OK || rc == SQLITE_OK {
+        return result;
+    }
+    set_db_err_code(&mut stmt.db.inner.lock().unwrap(), rc)
+}
+
 unsafe fn db_conn(db: *mut sqlite3) -> Option<Arc<turso_core::Connection>> {
     if db.is_null() {
         return None;

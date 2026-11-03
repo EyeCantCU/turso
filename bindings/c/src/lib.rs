@@ -298,6 +298,9 @@ pub struct sqlite3_stmt {
     /// High-water mark of `search_count` already published to the global
     /// counter, so each step contributes only the delta.
     pub(crate) prev_search_count: i64,
+    /// Error a WAL hook returned after this statement committed; reported
+    /// by the next reset or finalize, as in SQLite.
+    pub(crate) wal_hook_rc: ffi::c_int,
 }
 
 #[cfg(feature = "csv")]
@@ -324,6 +327,7 @@ impl sqlite3_stmt {
             text_cache: vec![vec![]; n_cols],
             value_cache: (0..n_cols).map(|_| None).collect(),
             prev_search_count: 0,
+            wal_hook_rc: SQLITE_OK,
         }
     }
     #[inline]
@@ -1166,7 +1170,7 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> ffi::c_int
     // first, finalize any execution if it was unfinished
     // (for example, many drivers can consume just one row and finalize statement after that, while there still can be work to do)
     // (this is necessary because queries like INSERT INTO t VALUES (1), (2), (3) RETURNING id return values within a transaction)
-    let result = stmt_run_to_completion(stmt);
+    let result = hooks::take_wal_hook_error(stmt, stmt_run_to_completion(stmt));
 
     {
         let mut db_inner = stmt_ref.db.inner.lock().unwrap();
@@ -1223,7 +1227,10 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
             // with SQLITE_ERROR, as in SQLite.
             match db.hooks.take_wal_rc() {
                 SQLITE_OK => SQLITE_DONE,
-                _ => set_db_err_code(&mut db.inner.lock().unwrap(), SQLITE_ERROR),
+                rc => {
+                    stmt.wal_hook_rc = rc;
+                    set_db_err_code(&mut db.inner.lock().unwrap(), SQLITE_ERROR)
+                }
             }
         }
         Err(LimboError::Busy) => set_db_err_code(&mut db.inner.lock().unwrap(), SQLITE_BUSY),
@@ -1348,7 +1355,7 @@ pub unsafe extern "C" fn sqlite3_reset(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     // first, finalize any execution if it was unfinished
     // (for example, many drivers can consume just one row and finalize statement after that, while there still can be work to do)
     // (this is necessary because queries like INSERT INTO t VALUES (1), (2), (3) RETURNING id return values within a transaction)
-    let result = stmt_run_to_completion(stmt);
+    let result = hooks::take_wal_hook_error(stmt, stmt_run_to_completion(stmt));
     if let Err(err) = stmt.stmt.reset() {
         if result == SQLITE_OK {
             return handle_limbo_err(err, std::ptr::null_mut());

@@ -584,10 +584,25 @@ fn test_wal_hook() {
             frames.windows(2).all(|w| w[1] > w[0]),
             "no checkpoint expected: {frames:?}"
         );
-        // A failing hook fails the step, but the commit stands.
-        WAL_RC.store(10, std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(run(db, "INSERT INTO t VALUES(9)"), SQLITE_ERROR);
+        // A failing hook fails the step with SQLITE_ERROR; finalize then
+        // reports the hook's code. The commit stands.
+        WAL_RC.store(5, std::sync::atomic::Ordering::SeqCst);
+        let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+        assert_eq!(
+            sqlite3_prepare_v2(
+                db,
+                c"INSERT INTO t VALUES(9)".as_ptr(),
+                -1,
+                &mut stmt,
+                ptr::null_mut()
+            ),
+            SQLITE_OK
+        );
+        assert_eq!(sqlite3_step(stmt), SQLITE_ERROR);
         WAL_RC.store(0, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(sqlite3_finalize(stmt), 5);
+        assert_eq!(sqlite3_errcode(db), 5);
+        assert_eq!(errmsg(db), "database is locked");
         assert_eq!(query_i64(db, "SELECT count(*) FROM t WHERE x = 9"), 1);
         // sqlite3_wal_autocheckpoint and the WAL hook replace each other.
         assert_eq!(sqlite3_wal_autocheckpoint(db, 500), SQLITE_OK);
