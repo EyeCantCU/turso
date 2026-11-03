@@ -16103,6 +16103,13 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                     conn.dialect().as_ref(),
                 )?;
                 if ty == "trigger" {
+                    // A trigger of the temp database is a TEMP trigger; like
+                    // SQLite, its stored text does not say so.
+                    if inner.db == crate::TEMP_DB_ID {
+                        if let Some(trigger) = schema.trigger_mut(NamespaceId::ROOT, name) {
+                            Arc::make_mut(trigger).temporary = true;
+                        }
+                    }
                     if let Some(target_database_id) = inner.trigger_target_database_id {
                         schema.set_trigger_target_database_id(
                             NamespaceId::ROOT,
@@ -17678,7 +17685,7 @@ fn regenerate_trigger_sql(trigger: &crate::schema::Trigger) -> String {
         alias: None,
     };
     create_trigger_to_sql(
-        trigger.temporary,
+        false, // like SQLite, the stored text never says TEMP
         false, // IF NOT EXISTS is stripped from stored schema SQL
         &trigger_name,
         Some(trigger.time),

@@ -142,9 +142,9 @@ pub fn translate_create_trigger(
             alias: None,
         }
     };
+    // Like SQLite, the stored text has neither TEMP nor IF NOT EXISTS.
     let sql = stored_create_trigger_sql(
         input,
-        temporary,
         &trigger_name_in_sql,
         time,
         event,
@@ -155,8 +155,8 @@ pub fn translate_create_trigger(
     )
     .unwrap_or_else(|| {
         create_trigger_to_sql(
-            temporary,
-            if_not_exists,
+            false,
+            false,
             &trigger_name_in_sql,
             time,
             event,
@@ -342,12 +342,10 @@ pub fn translate_create_trigger(
 }
 
 /// The statement as written, as SQLite stores it, when it still describes
-/// this trigger. A TEMP trigger keeps `TEMP`: loading the temp schema relies
-/// on it.
+/// this trigger.
 #[allow(clippy::too_many_arguments)]
 fn stored_create_trigger_sql(
     input: &str,
-    temporary: bool,
     trigger_name: &QualifiedName,
     time: Option<ast::TriggerTime>,
     event: &ast::TriggerEvent,
@@ -372,11 +370,7 @@ fn stored_create_trigger_sql(
         crate::translate::schema_text::CreateKind::Trigger,
         &expected,
     )?;
-    Some(if temporary {
-        sql.replacen("CREATE TRIGGER", "CREATE TEMP TRIGGER", 1)
-    } else {
-        sql
-    })
+    Some(sql)
 }
 
 fn resolve_create_trigger_namespace(
