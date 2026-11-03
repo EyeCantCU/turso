@@ -136,6 +136,8 @@ extern "C" {
     fn sqlite3_vfs_find(name: *const c_char) -> *mut sqlite3_vfs;
     fn sqlite3_vfs_register(vfs: *mut sqlite3_vfs, make_default: c_int) -> c_int;
     fn sqlite3_vfs_unregister(vfs: *mut sqlite3_vfs) -> c_int;
+    #[cfg(not(feature = "sqlite3"))]
+    fn turso_enable_experimental();
 }
 
 const SQLITE_OK: c_int = 0;
@@ -552,6 +554,43 @@ fn memory_vfs_holds_the_whole_database() {
 
         assert_eq!(sqlite3_vfs_unregister(vfs), SQLITE_OK);
         mem(|m| m.retain(|k, _| !k.starts_with("/mem/memvfs-test.db")));
+    }
+}
+
+#[test]
+fn attach_uses_the_connection_vfs_or_the_uri_vfs() {
+    let _g = lock();
+    unsafe {
+        // ATTACH is behind turso's experimental switch.
+        #[cfg(not(feature = "sqlite3"))]
+        turso_enable_experimental();
+        let name = c"compat-memvfs-attach";
+        let vfs = mem_vfs(name);
+        assert_eq!(sqlite3_vfs_register(vfs, 0), SQLITE_OK);
+        let (rc, db) = open_v2(
+            "file:attach-main.db?vfs=compat-memvfs-attach",
+            OPEN_READWRITE | OPEN_CREATE | OPEN_URI,
+            None,
+        );
+        assert_eq!(rc, SQLITE_OK);
+        exec(db, "ATTACH 'attach-aux.db' AS aux");
+        exec(db, "CREATE TABLE aux.a(x); INSERT INTO aux.a VALUES (42)");
+        exec(
+            db,
+            "ATTACH 'file:attach-aux2.db?vfs=compat-memvfs-attach' AS aux2",
+        );
+        exec(
+            db,
+            "CREATE TABLE aux2.b(y); INSERT INTO aux2.b SELECT x + 1 FROM aux.a",
+        );
+        assert_eq!(rows(db, "SELECT y FROM aux2.b"), "43");
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+        assert!(!std::path::Path::new("attach-aux.db").exists());
+        assert!(mem(
+            |m| m.contains_key("/mem/attach-aux.db") && m.contains_key("/mem/attach-aux2.db")
+        ));
+        assert_eq!(sqlite3_vfs_unregister(vfs), SQLITE_OK);
+        mem(|m| m.retain(|k, _| !k.starts_with("/mem/attach-")));
     }
 }
 
