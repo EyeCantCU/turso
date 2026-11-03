@@ -233,6 +233,7 @@ mod stubs;
 
 mod errmsg;
 mod misc;
+mod reentrancy;
 
 mod tests {
     use super::*;

@@ -982,6 +982,10 @@ impl Connection {
     pub fn is_nested_stmt(&self) -> bool {
         self.nestedness.load(Ordering::SeqCst) > 0
     }
+    /// True while a top-level write statement is running on this connection.
+    pub fn has_active_write(&self) -> bool {
+        self.n_active_writes.load(Ordering::SeqCst) > 0
+    }
     /// starts nested program execution
     pub fn start_nested(&self) {
         self.nestedness.fetch_add(1, Ordering::SeqCst);
