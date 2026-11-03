@@ -246,6 +246,12 @@ fn translate_statement(
             | ast::Stmt::CreateSchema { .. }
             | ast::Stmt::DropSchema { .. }
     );
+    let is_write = is_write
+        && !matches!(
+            &stmt,
+            ast::Stmt::CreateTable { temporary, if_not_exists, tbl_name, .. }
+                if schema::create_table_is_noop(resolver, *temporary, *if_not_exists, tbl_name)
+        );
     let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
 
     if is_vacuum && connection.get_query_only() {
