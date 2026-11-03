@@ -123,6 +123,7 @@ fn legacy_op(c: &IndexConstraint) -> Option<ConstraintOp> {
         index_op::GT => ConstraintOp::Gt,
         index_op::GE => ConstraintOp::Ge,
         index_op::NE => ConstraintOp::Ne,
+        index_op::MATCH => ConstraintOp::Match,
         _ => return None,
     })
 }

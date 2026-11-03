@@ -1203,7 +1203,7 @@ fn native_module_creation_borrows_original_argument_buffers() {
             .unwrap();
             assert_eq!(table.columns.len(), 1);
             assert_eq!(calls.load(Ordering::SeqCst), 2);
-            table.destroy().unwrap();
+            table.destroy(&conn).unwrap();
         }
     }
 }
@@ -1298,7 +1298,7 @@ fn c_module_creation_converts_core_arguments_at_the_callback() {
                     };
                     assert_eq!(value, Value::from_i64(-7));
                     drop(cursor);
-                    table.destroy().unwrap();
+                    table.destroy(&conn).unwrap();
                 } else {
                     assert!(matches!(result, Err(LimboError::ExtensionError(_))));
                 }

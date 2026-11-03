@@ -132,6 +132,7 @@ fn emit_integrity_result_row(program: &mut ProgramBuilder, registers: &Registers
     program.preassign_label_to_next_insn(continue_label);
 }
 
+/// Reports what a virtual table's xIntegrity finds, as one result row.
 fn emit_row_missing_from_index_error(
     program: &mut ProgramBuilder,
     registers: &Registers,

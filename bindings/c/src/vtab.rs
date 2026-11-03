@@ -638,6 +638,7 @@ impl VirtualTable for CTable {
 
     fn integrity(
         &self,
+        _connection: &Arc<turso_core::Connection>,
         schema: &str,
         table: &str,
         quick: bool,

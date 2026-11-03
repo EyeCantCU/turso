@@ -3338,6 +3338,9 @@ static int TursoOpenCmd(ClientData cd, Tcl_Interp *interp,
     return TCL_OK;
 }
 
+/* SQLite's R*Tree geometry-callback test commands. */
+#include "turso_rtree_test.c"
+
 /* ------------------------------------------------------------------ */
 /* Extension initialisation                                             */
 /* ------------------------------------------------------------------ */
@@ -3358,6 +3361,8 @@ int Tursotcl_Init(Tcl_Interp *interp)
     Tcl_CreateObjCommand(interp, "sqlite3_exec", TursoExecCmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "sqlite3_connection_pointer",
                          TursoConnectionPointerCmd, NULL, NULL);
+    Sqlitetestrtree_Init(interp);
+    Sqlitetestrtreedoc_Init(interp);
 
     Tcl_CreateObjCommand(interp, "sqlite3_prepare",
                          TursoPrepareCmd, NULL, NULL);

@@ -309,7 +309,8 @@ pub fn translate_insert(
             crate::util::table_name_for_error(&tbl_name)
         ),
     };
-    if program.trigger.is_some() && table.virtual_table().is_some() {
+    // Triggers may write innocuous virtual tables (e.g. R*Tree), as in SQLite.
+    if program.trigger.is_some() && table.virtual_table().is_some_and(|vt| !vt.innocuous) {
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name.name.as_str());
     }
     validate(table_name.as_str(), resolver, &table, namespace, connection)?;
@@ -3526,20 +3527,166 @@ fn translate_virtual_table_insert(
     if virtual_table.readonly() && !allow_dbpage_write {
         crate::bail_constraint_error!("Table is read-only: {}", virtual_table.name);
     }
-    let (num_values, rows) = match &mut body {
-        InsertBody::Select(select, None) => match &mut select.body.select {
-            OneSelect::Values(values) => (values[0].len(), std::mem::take(values)),
-            _ => crate::bail_parse_error!("Virtual tables only support VALUES clause in INSERT"),
-        },
-        InsertBody::DefaultValues => (0, vec![vec![]]),
-        _ => crate::bail_parse_error!("Unsupported INSERT body for virtual tables"),
-    };
+    let is_values = matches!(
+        &body,
+        InsertBody::Select(select, None)
+            if select.body.compounds.is_empty()
+                && matches!(select.body.select, OneSelect::Values(_))
+    );
     let table = Table::Virtual(virtual_table.clone());
     let cursor_id = program.alloc_cursor_id(CursorType::VirtualTable(virtual_table));
     program.emit_insn(Insn::VOpen { cursor_id });
     if !allow_dbpage_write {
         program.emit_insn(Insn::VBegin { cursor_id });
     }
+    let conflict_action = on_conflict.as_ref().map(|c| c.bit_value()).unwrap_or(0) as u16;
+    let halt_label = program.allocate_label();
+
+    if !is_values && !matches!(body, InsertBody::DefaultValues) {
+        let InsertBody::Select(select, None) = body else {
+            crate::bail_parse_error!("Unsupported INSERT body for virtual tables");
+        };
+        // INSERT ... SELECT: like SQLite, the rows go through a temporary
+        // table first, so the SELECT may read the table being written.
+        let yield_reg = program.alloc_register();
+        let jump_on_definition = program.allocate_label();
+        let start_offset = program.allocate_label();
+        program.emit_insn(Insn::InitCoroutine {
+            yield_reg,
+            jump_on_definition,
+            start_offset,
+        });
+        program.preassign_label_to_next_insn(start_offset);
+        let query_destination = QueryDestination::CoroutineYield {
+            yield_reg,
+            coroutine_implementation_start: halt_label,
+        };
+        let num_values = program.nested(|program| {
+            translate_select(select, resolver, program, query_destination, connection)
+        })?;
+        program.emit_insn(Insn::EndCoroutine { yield_reg });
+        program.preassign_label_to_next_insn(jump_on_definition);
+
+        let columns_for_temp = (0..num_values)
+            .map(|i| {
+                Column::new(
+                    Some(format!("__vtab_insert_{i}")),
+                    "BLOB".to_string(),
+                    None,
+                    None,
+                    schema::Type::Blob,
+                    None,
+                    ColDef::default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let temp_table = Arc::new(BTreeTable::new(
+            0,
+            "vtab_insert_buffer".to_string(),
+            crate::alloc::vec![],
+            columns_for_temp.into_iter().collect(),
+            schema::BTreeCharacteristics::HAS_ROWID,
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            None,
+        ));
+        let temp_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(temp_table));
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id: temp_cursor_id,
+            is_table: true,
+        });
+        let fill_loop = program.allocate_label();
+        let fill_done = program.allocate_label();
+        program.preassign_label_to_next_insn(fill_loop);
+        program.emit_insn(Insn::Yield {
+            yield_reg,
+            end_offset: fill_done,
+            subtype_clear_start_reg: 0,
+            subtype_clear_count: 0,
+        });
+        let record_reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(program.reg_result_cols_start.unwrap_or(yield_reg + 1)),
+            count: to_u32(num_values),
+            dest_reg: to_u32(record_reg),
+            index_name: None,
+            affinity_str: None,
+        });
+        let temp_rowid_reg = program.alloc_register();
+        program.emit_insn(Insn::NewRowid {
+            cursor: temp_cursor_id,
+            rowid_reg: temp_rowid_reg,
+            prev_largest_reg: 0,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: temp_cursor_id,
+            key_reg: temp_rowid_reg,
+            record_reg,
+            flag: InsertFlags::new()
+                .require_seek()
+                .is_ephemeral_table_insert(),
+            table_name: String::new(),
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: fill_loop,
+        });
+        program.preassign_label_to_next_insn(fill_done);
+
+        // argv[0] = NULL (insert), argv[1] = rowid, argv[2..] = columns.
+        let registers_start = program.alloc_register();
+        program.emit_insn(Insn::Null {
+            dest: registers_start,
+            dest_end: None,
+        });
+        let insertion = build_insertion(program, &table, &columns, num_values)?;
+        let loop_start_label = program.allocate_label();
+        let loop_end_label = program.allocate_label();
+        translate_rows_multiple(
+            program,
+            &insertion,
+            yield_reg,
+            resolver,
+            &Some(TempTableCtx {
+                cursor_id: temp_cursor_id,
+                loop_start_label,
+                loop_end_label,
+            }),
+            false,
+        )?;
+        program.emit_insn(Insn::VUpdate {
+            cursor_id,
+            arg_count: insertion.col_mappings.len() + 2,
+            start_reg: registers_start,
+            conflict_action,
+        });
+        program.emit_insn(Insn::Next {
+            cursor_id: temp_cursor_id,
+            pc_if_next: loop_start_label,
+            fullscan: false,
+            is_index: false,
+        });
+        program.preassign_label_to_next_insn(loop_end_label);
+        program.emit_insn(Insn::Close { cursor_id });
+        program.preassign_label_to_next_insn(halt_label);
+        return Ok(());
+    }
+
+    let (num_values, rows) = match &mut body {
+        InsertBody::Select(select, None) => match &mut select.body.select {
+            OneSelect::Values(values) => (values[0].len(), std::mem::take(values)),
+            _ => crate::bail_parse_error!("Virtual tables only support VALUES clause in INSERT"),
+        },
+        // A virtual table has no column defaults: every column is NULL.
+        InsertBody::DefaultValues => {
+            let n = table.columns().iter().filter(|c| !c.hidden()).count();
+            (
+                n,
+                vec![vec![Box::new(ast::Expr::Literal(ast::Literal::Null)); n]],
+            )
+        }
+        _ => crate::bail_parse_error!("Unsupported INSERT body for virtual tables"),
+    };
     /* *
      * Inserts for virtual tables are done in a single step.
      * argv[0] = (NULL for insert)
@@ -3555,8 +3702,6 @@ fn translate_virtual_table_insert(
      * */
     let insertion = build_insertion(program, &table, &columns, num_values)?;
 
-    let conflict_action = on_conflict.as_ref().map(|c| c.bit_value()).unwrap_or(0) as u16;
-
     // One xUpdate per VALUES row.
     for value in &rows {
         translate_rows_single(program, value, &insertion, resolver, false)?;
@@ -3570,7 +3715,6 @@ fn translate_virtual_table_insert(
 
     program.emit_insn(Insn::Close { cursor_id });
 
-    let halt_label = program.allocate_label();
     program.preassign_label_to_next_insn(halt_label);
 
     Ok(())

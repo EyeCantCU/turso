@@ -77,6 +77,7 @@ mod pragma;
 mod progress;
 mod pseudo;
 mod regexp;
+mod rtree;
 #[cfg(feature = "series")]
 mod series;
 mod stack;
@@ -164,6 +165,7 @@ pub use io::{
 };
 pub use namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
 pub use numeric::{nonnan::NonNan, Numeric};
+pub use rtree::{RtreeMatchCall, RtreeMatchFunction, RtreeQueryInfo};
 pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
 pub use storage::{
     buffer_pool::BufferPool,

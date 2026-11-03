@@ -958,6 +958,8 @@ pub enum DmlSafetyReason {
     /// so writes could invalidate the live iterator.
     IndexMethodNotMaterialized,
     FkCascade,
+    /// A virtual table must not be written while its cursor is scanning it.
+    VirtualTable,
 }
 
 /// Safety decisions made while planning UPDATE/DELETE.

@@ -12,6 +12,7 @@ use turso_core::{CheckpointMode, ConnectOpts, DatabaseOpts, LimboError, Value};
 use turso_ext::ScalarFunction;
 use turso_ext::Value as ExtValue;
 
+mod rtree;
 mod vtab;
 
 /// Global flag: when set, all subsequently opened databases enable experimental features.
@@ -3747,10 +3748,19 @@ fn limbo_err_code(err: &LimboError) -> i32 {
     }
 }
 
+/// The message sqlite3_errmsg reports for `err`. Like SQLite, corruption
+/// is reported with the standard text, without turso's details.
+fn limbo_err_msg(err: &LimboError) -> String {
+    match err {
+        LimboError::Corrupt(_) => "database disk image is malformed".to_string(),
+        _ => format!("{err}"),
+    }
+}
+
 fn handle_limbo_err(err: LimboError, container: *mut *mut ffi::c_char) -> i32 {
     let code = limbo_err_code(&err);
     if !container.is_null() {
-        let err_msg = format!("{err}");
+        let err_msg = limbo_err_msg(&err);
         unsafe { *container = CString::new(err_msg).unwrap().into_raw() };
     }
     code
@@ -3758,7 +3768,7 @@ fn handle_limbo_err(err: LimboError, container: *mut *mut ffi::c_char) -> i32 {
 
 /// Store a LimboError on the database handle, returning the SQLite error code.
 unsafe fn set_db_err(db: &mut sqlite3Inner, err: LimboError) -> i32 {
-    set_db_err_msg(db, limbo_err_code(&err), &format!("{err}"))
+    set_db_err_msg(db, limbo_err_code(&err), &limbo_err_msg(&err))
 }
 
 unsafe fn set_db_err_msg(db: &mut sqlite3Inner, code: i32, err_msg: &str) -> i32 {

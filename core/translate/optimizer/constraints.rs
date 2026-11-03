@@ -119,8 +119,15 @@ pub struct Constraint {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ConstraintOperator {
     AstNativeOperator(ast::Operator),
-    Like { not: bool },
-    In { not: bool, estimated_values: f64 },
+    Like {
+        not: bool,
+    },
+    /// `x MATCH y`, offered to virtual tables.
+    Match,
+    In {
+        not: bool,
+        estimated_values: f64,
+    },
 }
 
 impl ConstraintOperator {
