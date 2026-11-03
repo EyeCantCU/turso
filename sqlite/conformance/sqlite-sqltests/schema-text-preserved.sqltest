@@ -1,0 +1,80 @@
+@database :memory:
+
+# SQLite stores a CREATE statement in sqlite_schema as written: it only drops
+# TEMP, IF NOT EXISTS, a schema qualifier on the name and what precedes CREATE,
+# and an ALTER TABLE edits just the tokens it changes. Turso used to store text
+# regenerated from the parsed statement, so .dump and schema diffs differed.
+
+@cross-check-integrity
+test create-statements-keep-their-text {
+    CREATE TABLE   main.t1 (  a INTEGER PRIMARY KEY, /* the key */  b TEXT NOT NULL DEFAULT 'x', CHECK (length(b) < 10)  ) ;
+    create temp table if not exists tt(x);
+    CREATE TABLE IF NOT EXISTS [b r](x) /* trailing */;
+    create unique index if not exists main.i1 on t1 ( b ) where b>'a' /*c*/;
+    CREATE INDEX i2 ON t1(b) ;
+    create view if not exists v1(c) as select b from t1   ;
+    create trigger if not exists tr1 after insert on main.t1 begin select new.a; end;
+    SELECT name, sql || '|' FROM sqlite_schema ORDER BY name;
+    SELECT name, sql || '|' FROM sqlite_temp_schema;
+}
+expect {
+    b r|CREATE TABLE [b r](x)|
+    i1|CREATE UNIQUE INDEX i1 on t1 ( b ) where b>'a' /*c*/|
+    i2|CREATE INDEX i2 ON t1(b) |
+    t1|CREATE TABLE t1 (  a INTEGER PRIMARY KEY, /* the key */  b TEXT NOT NULL DEFAULT 'x', CHECK (length(b) < 10)  )|
+    tr1|CREATE TRIGGER tr1 after insert on main.t1 begin select new.a; end|
+    v1|CREATE VIEW v1(c) as select b from t1|
+    tt|CREATE TABLE tt(x)|
+}
+
+setup rename-schema {
+    CREATE TABLE p(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id), v INT CHECK (v >= 0));
+    CREATE INDEX c_pid ON c(pid) WHERE pid IS NOT NULL;
+    CREATE VIEW pv AS SELECT p.id, p.name AS nm, c.v FROM p JOIN c ON c.pid = p.id;
+    CREATE TRIGGER t_upd AFTER UPDATE OF name ON p WHEN new.name IS NOT NULL BEGIN UPDATE c SET v = v + 1 WHERE pid = new.id; END;
+}
+
+@setup rename-schema
+@cross-check-integrity
+test rename-table-edits-only-the-name {
+    ALTER TABLE p RENAME TO Parent;
+    SELECT name, sql FROM sqlite_schema ORDER BY name;
+}
+expect {
+    Parent|CREATE TABLE "Parent"(id INTEGER PRIMARY KEY, name TEXT)
+    c|CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES "Parent"(id), v INT CHECK (v >= 0))
+    c_pid|CREATE INDEX c_pid ON c(pid) WHERE pid IS NOT NULL
+    pv|CREATE VIEW pv AS SELECT "Parent".id, "Parent".name AS nm, c.v FROM "Parent" JOIN c ON c.pid = "Parent".id
+    t_upd|CREATE TRIGGER t_upd AFTER UPDATE OF name ON "Parent" WHEN new.name IS NOT NULL BEGIN UPDATE c SET v = v + 1 WHERE pid = new.id; END
+}
+
+@setup rename-schema
+@cross-check-integrity
+test rename-column-edits-only-the-name {
+    ALTER TABLE p RENAME COLUMN name TO Title;
+    ALTER TABLE c RENAME COLUMN pid TO "Parent Id";
+    SELECT name, sql FROM sqlite_schema ORDER BY name;
+}
+expect {
+    c|CREATE TABLE c(id INTEGER PRIMARY KEY, "Parent Id" INTEGER REFERENCES p(id), v INT CHECK (v >= 0))
+    c_pid|CREATE INDEX c_pid ON c("Parent Id") WHERE "Parent Id" IS NOT NULL
+    p|CREATE TABLE p(id INTEGER PRIMARY KEY, Title TEXT)
+    pv|CREATE VIEW pv AS SELECT p.id, p.Title AS nm, c.v FROM p JOIN c ON c."Parent Id" = p.id
+    t_upd|CREATE TRIGGER t_upd AFTER UPDATE OF Title ON p WHEN new.Title IS NOT NULL BEGIN UPDATE c SET v = v + 1 WHERE "Parent Id" = new.id; END
+}
+
+@cross-check-integrity
+test add-and-drop-column-edit-the-text {
+    CREATE TABLE t2 ( a , b, CHECK (a > 0) , UNIQUE(a) ) ;
+    ALTER TABLE t2 ADD COLUMN "Z z" TEXT /* c */ ;
+    ALTER TABLE t2 ADD w  INTEGER DEFAULT 5;
+    CREATE TABLE t3(a, b /* bee */, c /* cee */ );
+    ALTER TABLE t3 DROP COLUMN b;
+    ALTER TABLE t3 DROP COLUMN c;
+    SELECT name, sql FROM sqlite_schema WHERE type = 'table' ORDER BY name;
+}
+expect {
+    t2|CREATE TABLE t2 ( a , b, "Z z" TEXT /* c */, w  INTEGER DEFAULT 5, CHECK (a > 0) , UNIQUE(a) )
+    t3|CREATE TABLE t3(a)
+}

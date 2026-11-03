@@ -102,6 +102,7 @@ pub fn translate_create_trigger(
     program: &mut ProgramBuilder,
     commands: &[ast::TriggerCmd],
     when_clause: Option<&ast::Expr>,
+    input: &str,
 ) -> Result<()> {
     let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
     if is_reserved_object_name(
@@ -141,9 +142,9 @@ pub fn translate_create_trigger(
             alias: None,
         }
     };
-    let sql = create_trigger_to_sql(
+    let sql = stored_create_trigger_sql(
+        input,
         temporary,
-        if_not_exists,
         &trigger_name_in_sql,
         time,
         event,
@@ -151,7 +152,20 @@ pub fn translate_create_trigger(
         for_each_row,
         when_clause,
         commands,
-    );
+    )
+    .unwrap_or_else(|| {
+        create_trigger_to_sql(
+            temporary,
+            if_not_exists,
+            &trigger_name_in_sql,
+            time,
+            event,
+            &tbl_name_in_sql,
+            for_each_row,
+            when_clause,
+            commands,
+        )
+    });
     // Like SQLite, both names are stored as written in the statement.
     let mangled_trigger_name = resolver.mangle_name(namespace, trigger_name.name.as_str());
     let mangled_table_name = resolver.mangle_name(target_table_namespace, tbl_name.name.as_str());
@@ -302,6 +316,44 @@ pub fn translate_create_trigger(
     });
 
     Ok(())
+}
+
+/// The statement as written, as SQLite stores it, when it still describes
+/// this trigger. A TEMP trigger keeps `TEMP`: loading the temp schema relies
+/// on it.
+#[allow(clippy::too_many_arguments)]
+fn stored_create_trigger_sql(
+    input: &str,
+    temporary: bool,
+    trigger_name: &QualifiedName,
+    time: Option<ast::TriggerTime>,
+    event: &ast::TriggerEvent,
+    tbl_name: &QualifiedName,
+    for_each_row: bool,
+    when_clause: Option<&ast::Expr>,
+    commands: &[ast::TriggerCmd],
+) -> Option<String> {
+    let expected = ast::Stmt::CreateTrigger {
+        temporary: false,
+        if_not_exists: false,
+        trigger_name: QualifiedName::single(trigger_name.name.clone()),
+        time,
+        event: event.clone(),
+        tbl_name: tbl_name.clone(),
+        for_each_row,
+        when_clause: when_clause.map(|e| Box::new(e.clone())),
+        commands: commands.to_vec(),
+    };
+    let sql = crate::translate::schema_text::verified_create_sql(
+        input,
+        crate::translate::schema_text::CreateKind::Trigger,
+        &expected,
+    )?;
+    Some(if temporary {
+        sql.replacen("CREATE TRIGGER", "CREATE TEMP TRIGGER", 1)
+    } else {
+        sql
+    })
 }
 
 fn resolve_create_trigger_namespace(

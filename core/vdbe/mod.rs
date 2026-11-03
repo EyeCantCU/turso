@@ -1102,6 +1102,9 @@ pub struct ProgramState {
     pub(crate) index_method_finalize_subprogram_keys: Option<Vec<usize>>,
     pub(crate) index_method_finalize_subprogram: usize,
     pub(crate) index_methods_finalized: bool,
+    /// sqlite_schema text that ALTER TABLE wrote for tables, by row name, for
+    /// the instruction that updates the in-memory schema.
+    pub(crate) altered_table_sql: Vec<(String, String)>,
     cursor_seqs: Vec<i64>,
     registers: Box<[Register]>,
     /// Trace state: register snapshot for diffing.
@@ -1292,6 +1295,7 @@ impl ProgramState {
             index_method_finalize_subprogram_keys: None,
             index_method_finalize_subprogram: 0,
             index_methods_finalized: false,
+            altered_table_sql: Vec::new(),
             cursor_seqs,
             registers,
             pre_op_registers: None,
@@ -1451,6 +1455,7 @@ impl ProgramState {
         self.index_method_finalize_subprogram_keys = None;
         self.index_method_finalize_subprogram = 0;
         self.index_methods_finalized = false;
+        self.altered_table_sql.clear();
         for r in self.registers.iter_mut() {
             match r {
                 Register::Value(v) => *v = Value::Null,

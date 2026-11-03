@@ -2582,6 +2582,7 @@ pub fn insn_to_row(
                 namespace: _,
                 table,
                 column_index,
+                sql: _,
             } => (
                 "DropColumn",
                 0,

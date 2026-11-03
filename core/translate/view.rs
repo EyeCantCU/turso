@@ -362,6 +362,7 @@ pub fn translate_create_view(
     if_not_exists: bool,
     connection: &Arc<crate::Connection>,
     program: &mut ProgramBuilder,
+    input: &str,
 ) -> Result<()> {
     // TEMP views always live in the temp schema. The parser rejects
     // CREATE TEMP VIEW with a database name other than "temp".
@@ -428,12 +429,22 @@ pub fn translate_create_view(
         bind_sequence_names_in_select(&mut select_stmt, resolver)?;
     }
     let stored_view_name = resolver.mangle_name(namespace, &normalized_view_name);
-    let sql = create_view_to_str(
-        "VIEW",
-        &resolver.name_in_sql(namespace, &view_name.name).as_ident(),
-        columns,
-        &select_stmt,
-    );
+    let name_in_sql = resolver.name_in_sql(namespace, &view_name.name);
+    // Store the statement as written, as SQLite does, when it still
+    // describes this view.
+    let expected = ast::Stmt::CreateView {
+        temporary: false,
+        if_not_exists: false,
+        view_name: ast::QualifiedName::single(name_in_sql.clone()),
+        columns: columns.to_vec(),
+        select: select_stmt.clone(),
+    };
+    let sql = crate::translate::schema_text::verified_create_sql(
+        input,
+        crate::translate::schema_text::CreateKind::View,
+        &expected,
+    )
+    .unwrap_or_else(|| create_view_to_str("VIEW", &name_in_sql.as_ident(), columns, &select_stmt));
 
     // Open cursor to sqlite_schema table
     let table = resolver

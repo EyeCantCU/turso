@@ -67,7 +67,7 @@ test alter-table-rename-fk-child {
     SELECT sql FROM sqlite_schema WHERE name = 'child';
 }
 expect {
-    CREATE TABLE child (cid INTEGER PRIMARY KEY, parent_id INTEGER, FOREIGN KEY (parent_id) REFERENCES parent (id))
+    CREATE TABLE child (cid INTEGER PRIMARY KEY, parent_id INTEGER, FOREIGN KEY (parent_id) REFERENCES parent(id))
 }
 
 # Foreign key parent column rename - critical test
@@ -82,7 +82,7 @@ test alter-table-rename-fk-parent {
 }
 expect {
     CREATE TABLE orders (ord_id INTEGER PRIMARY KEY, date TEXT)
-    CREATE TABLE items (item_id INTEGER PRIMARY KEY, oid INTEGER, FOREIGN KEY (oid) REFERENCES orders (ord_id))
+    CREATE TABLE items (item_id INTEGER PRIMARY KEY, oid INTEGER, FOREIGN KEY (oid) REFERENCES orders(ord_id))
 }
 
 # Composite foreign key parent rename
@@ -97,7 +97,7 @@ test alter-table-rename-composite-fk-parent {
 }
 expect {
     CREATE TABLE products (cat TEXT, sku TEXT, PRIMARY KEY (cat, sku))
-    CREATE TABLE inventory (id INTEGER PRIMARY KEY, cat TEXT, code TEXT, FOREIGN KEY (cat, code) REFERENCES products (cat, sku))
+    CREATE TABLE inventory (id INTEGER PRIMARY KEY, cat TEXT, code TEXT, FOREIGN KEY (cat, code) REFERENCES products(cat, sku))
 }
 
 # Multiple foreign keys to same parent
@@ -111,8 +111,10 @@ test alter-table-rename-multiple-fks {
 
     SELECT sql FROM sqlite_schema WHERE name = 'messages';
 }
-expect {
-    CREATE TABLE messages (mid INTEGER PRIMARY KEY, sender INTEGER, receiver INTEGER, FOREIGN KEY (sender) REFERENCES users (user_id), FOREIGN KEY (receiver) REFERENCES users (user_id))
+expect raw {
+CREATE TABLE messages (mid INTEGER PRIMARY KEY, sender INTEGER, receiver INTEGER,
+                            FOREIGN KEY (sender) REFERENCES users(user_id),
+                            FOREIGN KEY (receiver) REFERENCES users(user_id))
 }
 
 # Self-referencing foreign key
@@ -124,8 +126,9 @@ test alter-table-rename-self-ref-fk {
 
     SELECT sql FROM sqlite_schema WHERE name = 'employees';
 }
-expect {
-    CREATE TABLE employees (employee_id INTEGER PRIMARY KEY, manager_id INTEGER, FOREIGN KEY (manager_id) REFERENCES employees (employee_id))
+expect raw {
+CREATE TABLE employees (employee_id INTEGER PRIMARY KEY, manager_id INTEGER,
+                            FOREIGN KEY (manager_id) REFERENCES employees(employee_id))
 }
 
 # Chain of FK renames - parent is both PK and referenced
@@ -141,8 +144,8 @@ test alter-table-rename-fk-chain {
     SELECT sql FROM sqlite_schema WHERE name = 't3';
 }
 expect {
-    CREATE TABLE t2 (b_new INTEGER PRIMARY KEY, a_ref INTEGER, FOREIGN KEY (a_ref) REFERENCES t1 (a_new))
-    CREATE TABLE t3 (c INTEGER PRIMARY KEY, b_ref INTEGER, FOREIGN KEY (b_ref) REFERENCES t2 (b_new))
+    CREATE TABLE t2 (b_new INTEGER PRIMARY KEY, a_ref INTEGER, FOREIGN KEY (a_ref) REFERENCES t1(a_new))
+    CREATE TABLE t3 (c INTEGER PRIMARY KEY, b_ref INTEGER, FOREIGN KEY (b_ref) REFERENCES t2(b_new))
 }
 
 # FK with ON DELETE/UPDATE actions
@@ -155,8 +158,9 @@ test alter-table-rename-fk-actions {
 
     SELECT sql FROM sqlite_schema WHERE name = 'child';
 }
-expect {
-    CREATE TABLE child (cid INTEGER PRIMARY KEY, pid INTEGER, FOREIGN KEY (pid) REFERENCES parent (parent_id) ON DELETE CASCADE ON UPDATE RESTRICT)
+expect raw {
+CREATE TABLE child (cid INTEGER PRIMARY KEY, pid INTEGER,
+                        FOREIGN KEY (pid) REFERENCES parent(parent_id) ON DELETE CASCADE ON UPDATE RESTRICT)
 }
 
 # FK with DEFERRABLE
@@ -169,8 +173,9 @@ test alter-table-rename-fk-deferrable {
 
     SELECT sql FROM sqlite_schema WHERE name = 'child';
 }
-expect {
-    CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER, FOREIGN KEY (pid) REFERENCES parent (parent_id) DEFERRABLE INITIALLY DEFERRED)
+expect raw {
+CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER,
+                        FOREIGN KEY (pid) REFERENCES parent(parent_id) DEFERRABLE INITIALLY DEFERRED)
 }
 
 # Rename with quoted identifiers in FK
@@ -183,8 +188,9 @@ test alter-table-rename-fk-quoted {
 
     SELECT sql FROM sqlite_schema WHERE name = 'child';
 }
-expect {
-    CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER, FOREIGN KEY (pid) REFERENCES "parent table" ("new id"))
+expect raw {
+CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER,
+                        FOREIGN KEY (pid) REFERENCES "parent table"("new id"))
 }
 
 # Verify FK constraint still works after rename
@@ -236,8 +242,15 @@ test alter-table-rename-complex-constraints {
 
     SELECT sql FROM sqlite_schema WHERE name = 't';
 }
-expect {
-    CREATE TABLE t (x INTEGER, y TEXT, c REAL, PRIMARY KEY (x, y), UNIQUE (y, c), FOREIGN KEY (x) REFERENCES t (x))
+expect raw {
+CREATE TABLE t (
+        x INTEGER,
+        y TEXT,
+        c REAL,
+        PRIMARY KEY (x, y),
+        UNIQUE (y, c),
+        FOREIGN KEY (x) REFERENCES t(x)
+    )
 }
 
 # Rename column that appears in both PK and FK
@@ -254,8 +267,13 @@ test alter-table-rename-pk-and-fk {
 
     SELECT sql FROM sqlite_schema WHERE name = 'child';
 }
-expect {
-    CREATE TABLE child (id INTEGER PRIMARY KEY, parent_ref INTEGER, FOREIGN KEY (id) REFERENCES parent (pid), FOREIGN KEY (parent_ref) REFERENCES parent (pid))
+expect raw {
+CREATE TABLE child (
+        id INTEGER PRIMARY KEY,
+        parent_ref INTEGER,
+        FOREIGN KEY (id) REFERENCES parent(pid),
+        FOREIGN KEY (parent_ref) REFERENCES parent(pid)
+        )
 }
 
 test rename-self-1 {
@@ -265,7 +283,7 @@ test rename-self-1 {
     INSERT INTO s1 VALUES (1,NULL);
     INSERT INTO s1 VALUES (2,1);
     ALTER TABLE s1 RENAME TO s1_new;
-    SELECT name, tbl_name, sql LIKE '%REFERENCES s1_new%' FROM sqlite_schema WHERE type='table' AND name='s1_new';
+    SELECT name, tbl_name, sql LIKE '%REFERENCES "s1_new"%' FROM sqlite_schema WHERE type='table' AND name='s1_new';
 }
 expect {
     s1_new|s1_new|1
@@ -283,8 +301,10 @@ test rename-self-2-composite {
     
     SELECT sql FROM sqlite_schema WHERE type='table' AND name='sc_new';
 }
-expect {
-    CREATE TABLE sc_new (id INTEGER, vr INTEGER, parent_id INTEGER, parent_vr INTEGER, PRIMARY KEY (id, vr), FOREIGN KEY (parent_id, parent_vr) REFERENCES sc_new (id, vr))
+expect raw {
+CREATE TABLE "sc_new"(id INTEGER, vr INTEGER, parent_id INTEGER, parent_vr INTEGER,
+        PRIMARY KEY(id,vr),
+        FOREIGN KEY(parent_id, parent_vr) REFERENCES "sc_new"(id,vr))
 }
 
 test rename-parent-1 {
@@ -314,7 +334,7 @@ test rename-parent-2-inline {
     SELECT sql FROM sqlite_schema WHERE type='table' AND name='c2';
 }
 expect {
-    CREATE TABLE c2 (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p2_new (id))
+    CREATE TABLE c2(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES "p2_new"(id))
 }
 
 test rename-parent-3-composite {
@@ -328,8 +348,9 @@ test rename-parent-3-composite {
     ALTER TABLE p3 RENAME TO p3_new;
     SELECT sql  FROM sqlite_schema WHERE type='table' AND name='c3';
 }
-expect {
-    CREATE TABLE c3 (x INTEGER PRIMARY KEY, fa INTEGER, fb INTEGER, FOREIGN KEY (fa, fb) REFERENCES p3_new (a, b))
+expect raw {
+CREATE TABLE c3(x INTEGER PRIMARY KEY, fa INTEGER, fb INTEGER,
+        FOREIGN KEY(fa,fb) REFERENCES "p3_new"(a,b))
 }
 
 # Adding a stored generated column via ALTER TABLE should error
@@ -464,7 +485,7 @@ test alter-table-add-column-with-fk-updates-schema {
     SELECT sql FROM sqlite_schema WHERE name = 's';
 }
 expect {
-    CREATE TABLE s (a, b, FOREIGN KEY (b) REFERENCES t(a))
+    CREATE TABLE s(a, b REFERENCES t(a))
 }
 
 test alter-table-add-self-ref-fk-updates-schema {
@@ -473,7 +494,7 @@ test alter-table-add-self-ref-fk-updates-schema {
     SELECT sql FROM sqlite_schema WHERE name = 's';
 }
 expect {
-    CREATE TABLE s (a, b, FOREIGN KEY (b) REFERENCES s(a))
+    CREATE TABLE s(a, b REFERENCES s(a))
 }
 
 # NOT NULL column without default on EMPTY table should succeed (SQLite behavior)
@@ -1041,7 +1062,7 @@ test alter-column-renames-column-with-unique-also-declared-at-table-level {
     PRAGMA integrity_check;
 }
 expect {
-    table|t|CREATE TABLE t (a2 text UNIQUE, b text, UNIQUE (a2))
+    table|t|CREATE TABLE t (a2 text unique, b text, unique (a2))
     index|sqlite_autoindex_t_1|
     1
     ok

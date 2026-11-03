@@ -3497,6 +3497,7 @@ impl Schema {
             let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
                 name: view_name.clone(),
                 declared_name: view_name.clone(),
+                sql: None,
                 root_page: main_root,
                 columns: cols,
                 primary_key_columns: vec![],
@@ -3826,6 +3827,7 @@ impl Schema {
                     self.add_virtual_table(NamespaceId::ROOT, vtab)?;
                 } else {
                     let mut table = dialect.parse_table_sql(sql, root_page)?;
+                    table.sql = Some(sql.to_string());
                     let (namespace, table_name) = self.demangle_name(&table.name);
                     if !namespace.is_root() {
                         table.name = table_name.to_string();
@@ -4492,6 +4494,7 @@ impl TryClone for BTreeTable {
             root_page: self.root_page,
             name: self.name.clone(),
             declared_name: self.declared_name.clone(),
+            sql: self.sql.clone(),
             primary_key_columns: self.primary_key_columns.try_clone()?,
             primary_key_is_inline: self.primary_key_is_inline,
             columns: self.columns.try_clone()?,
@@ -5132,6 +5135,8 @@ pub struct BTreeTable {
     pub root_page: i64,
     pub name: String,
     pub declared_name: String,
+    /// The text of the table's sqlite_schema row, when loaded from one.
+    pub sql: Option<String>,
     pub primary_key_columns: Vec<(String, SortOrder)>,
     pub primary_key_is_inline: bool,
     columns: Vec<Column>,
@@ -5211,6 +5216,7 @@ impl BTreeTable {
         Self {
             root_page,
             declared_name: name.clone(),
+            sql: None,
             name,
             primary_key_columns,
             primary_key_is_inline,
@@ -5449,6 +5455,19 @@ impl BTreeTable {
         supports_namespaces: bool,
     ) -> Result<BTreeTable> {
         create_table(tbl_name.name.as_str(), body, root_page, supports_namespaces)
+    }
+
+    /// The stored text of the table, when it still describes the table as
+    /// it is in memory.
+    pub fn stored_sql(&self) -> Option<&str> {
+        let sql = self.sql.as_deref()?;
+        self.has_same_definition(sql).then_some(sql)
+    }
+
+    /// Whether `sql` creates a table with this table's definition.
+    pub fn has_same_definition(&self, sql: &str) -> bool {
+        BTreeTable::from_sql(sql, self.root_page)
+            .is_ok_and(|table| table.to_sql_as(&self.name) == self.to_sql())
     }
 
     /// Reconstruct the SQL for the table.
@@ -7088,6 +7107,7 @@ pub fn create_table(
         root_page,
         name: table_name,
         declared_name: tbl_name.to_owned(),
+        sql: None,
         has_rowid,
         primary_key_columns,
         primary_key_is_inline,
@@ -7914,6 +7934,7 @@ pub fn sqlite_schema_table() -> Result<BTreeTable> {
         root_page: 1,
         name: "sqlite_schema".to_string(),
         declared_name: "sqlite_schema".to_string(),
+        sql: None,
         has_rowid: true,
         is_strict: false,
         has_autoincrement: false,
@@ -9418,6 +9439,7 @@ mod tests {
             root_page: 0,
             name: "t1".to_string(),
             declared_name: "t1".to_string(),
+            sql: None,
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
