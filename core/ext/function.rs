@@ -107,7 +107,7 @@ impl ExtFunc {
                 crate::native_ext::step_aggregate(&mut registers[acc_reg], function.as_ref(), &args)
             }
             Self::Aggregate { .. } => {
-                let aggregate = self.c_aggregate(&mut registers[acc_reg]).clone();
+                let aggregate = self.c_aggregate(&mut registers[acc_reg]).call_info();
                 let args: Vec<_> = registers[start_reg..start_reg + aggregate.argc]
                     .iter()
                     .map(|arg| arg.get_value().to_ffi())
@@ -126,9 +126,7 @@ impl ExtFunc {
                     )
                 };
                 if let Err(err) = finish_call(result, aggregate.value_destructor, args) {
-                    if let Some(destructor) = aggregate.aggregate_destructor {
-                        unsafe { destructor(aggregate.state as usize) };
-                    }
+                    // Dropping the state runs the aggregate destructor.
                     registers[acc_reg].set_null();
                     return Err(err.into());
                 }
@@ -144,17 +142,72 @@ impl ExtFunc {
                 crate::native_ext::finalize_aggregate(accumulator, function.as_ref())
             }
             Self::Aggregate { .. } => {
-                let aggregate = self.c_aggregate(accumulator).clone();
-                accumulator.set_null();
+                let aggregate = self.c_aggregate(accumulator).call_info();
                 let result = unsafe { (aggregate.finalize_fn)(aggregate.context, aggregate.state) };
                 let value = finish_call(result, aggregate.value_destructor, Vec::new());
-                if let Some(destructor) = aggregate.aggregate_destructor {
-                    unsafe { destructor(aggregate.state as usize) };
-                }
+                // Dropping the state runs the aggregate destructor.
+                accumulator.set_null();
                 value.map(IOResult::Done).map_err(Into::into)
             }
             _ => unreachable!("scalar function called in aggregate context"),
         }
+    }
+
+    /// Runs xInverse for a row leaving the window frame.
+    pub(crate) fn inverse_aggregate(
+        &self,
+        registers: &mut [Register],
+        acc_reg: usize,
+        start_reg: usize,
+    ) -> IOResultOr<()> {
+        let Self::Aggregate {
+            window: Some(window),
+            ..
+        } = self
+        else {
+            unreachable!("xInverse requires a window-capable aggregate");
+        };
+        let aggregate = self.c_aggregate(&mut registers[acc_reg]).call_info();
+        let args: Vec<_> = registers[start_reg..start_reg + aggregate.argc]
+            .iter()
+            .map(|arg| arg.get_value().to_ffi())
+            .collect();
+        let argv = if args.is_empty() {
+            std::ptr::null()
+        } else {
+            args.as_ptr()
+        };
+        let result = unsafe {
+            (window.inverse)(
+                aggregate.context,
+                aggregate.state,
+                aggregate.argc as i32,
+                argv,
+            )
+        };
+        if let Err(err) = finish_call(result, aggregate.value_destructor, args) {
+            registers[acc_reg].set_null();
+            return Err(err.into());
+        }
+        Ok(IOResult::Done(()))
+    }
+
+    /// Runs xValue: the current result, leaving the state intact.
+    pub(crate) fn value_aggregate(&self, accumulator: &mut Register) -> IOResultOr<Value> {
+        let Self::Aggregate {
+            window: Some(window),
+            ..
+        } = self
+        else {
+            unreachable!("xValue requires a window-capable aggregate");
+        };
+        let aggregate = self.c_aggregate(accumulator).call_info();
+        let result = unsafe { (window.value)(aggregate.context, aggregate.state) };
+        let value = finish_call(result, aggregate.value_destructor, Vec::new());
+        if value.is_err() {
+            accumulator.set_null();
+        }
+        value.map(IOResult::Done).map_err(Into::into)
     }
 
     fn c_aggregate<'a>(&self, accumulator: &'a mut Register) -> &'a ExternalAggState {

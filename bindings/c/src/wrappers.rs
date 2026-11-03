@@ -17,6 +17,7 @@ type Destructor = unsafe extern "C" fn(*mut ffi::c_void);
 // Legacy entry points: forward to the _v2 variants.
 // ---------------------------------------------------------------------------
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_create_function(
     db: *mut sqlite3,
@@ -31,6 +32,7 @@ pub unsafe extern "C" fn sqlite3_create_function(
     sqlite3_create_function_v2(db, name, n_args, enc, context, func, step, final_, None)
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_create_collation(
     db: *mut sqlite3,
@@ -42,6 +44,7 @@ pub unsafe extern "C" fn sqlite3_create_collation(
     sqlite3_create_collation_v2(db, name, enc, context, cmp, None)
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_prepare(
     db: *mut sqlite3,
@@ -137,6 +140,7 @@ unsafe fn utf16_to_string(text: *const ffi::c_char, len: u64, enc: ffi::c_int) -
 
 /// UTF-8, UTF-16LE/BE and native UTF-16 are accepted (the latter three are
 /// transcoded). On failure the destructor still runs, as in SQLite.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_bind_text64(
     stmt: *mut sqlite3_stmt,
@@ -182,6 +186,7 @@ pub unsafe extern "C" fn sqlite3_bind_text64(
     rc
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_bind_blob64(
     stmt: *mut sqlite3_stmt,
@@ -203,6 +208,7 @@ pub unsafe extern "C" fn sqlite3_bind_blob64(
 
 /// Same encodings as `sqlite3_bind_text64`. The context copies the text, so
 /// the destructor is run before returning.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_result_text64(
     context: *mut ffi::c_void,
@@ -252,11 +258,13 @@ pub unsafe extern "C" fn sqlite3_result_text64(
 // ---------------------------------------------------------------------------
 
 /// Like SQLite: n <= 0 frees the block and returns NULL.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_realloc(ptr: *mut ffi::c_void, n: ffi::c_int) -> *mut ffi::c_void {
     sqlite3_realloc64(ptr, if n < 0 { 0 } else { n as u64 })
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_realloc64(ptr: *mut ffi::c_void, n: u64) -> *mut ffi::c_void {
     if n == 0 {
@@ -271,6 +279,7 @@ pub unsafe extern "C" fn sqlite3_realloc64(ptr: *mut ffi::c_void, n: u64) -> *mu
 
 /// Always reports 0 bytes freed: turso keeps no per-connection page cache that
 /// can be shrunk on request.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_db_release_memory(db: *mut sqlite3) -> ffi::c_int {
     if db.is_null() {
@@ -304,6 +313,7 @@ pub static sqlite3_version: [u8; SQLITE_VERSION_LEN] = version_bytes();
 
 /// "YYYY-MM-DD HH:MM:SS <64 hex>" like SQLite's, but naming the Turso git
 /// commit this library was built from (set by build.rs).
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_sourceid() -> *const ffi::c_char {
     concat!(env!("TURSO_SOURCE_ID"), "\0").as_ptr().cast()
@@ -463,11 +473,13 @@ const SQLITE_KEYWORDS: [&str; 147] = [
     "PRIMARY",
 ];
 
+#[capi_guard]
 #[no_mangle]
 pub extern "C" fn sqlite3_keyword_count() -> ffi::c_int {
     SQLITE_KEYWORDS.len() as ffi::c_int
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_keyword_name(
     i: ffi::c_int,
@@ -488,6 +500,7 @@ pub unsafe extern "C" fn sqlite3_keyword_name(
 
 /// `sqlite3_keyword_check` is a sibling that consumers use alongside the
 /// above; case-insensitive membership test.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_keyword_check(
     word: *const ffi::c_char,
@@ -507,6 +520,7 @@ pub unsafe extern "C" fn sqlite3_keyword_check(
 // ---------------------------------------------------------------------------
 
 /// Copies any sqlite3_value (function argument or column value) as the result.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_result_value(context: *mut ffi::c_void, value: *mut ffi::c_void) {
     if context.is_null() {
@@ -521,6 +535,7 @@ pub unsafe extern "C" fn sqlite3_result_value(context: *mut ffi::c_void, value: 
     ctx.result = *Box::from_raw(copy as *mut ExtValue);
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_result_zeroblob(context: *mut ffi::c_void, n: ffi::c_int) {
     if context.is_null() {
@@ -535,6 +550,7 @@ pub unsafe extern "C" fn sqlite3_result_zeroblob(context: *mut ffi::c_void, n: f
 }
 
 /// SQLITE_TOOBIG (and a too-big error result) above the length limit.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_result_zeroblob64(
     context: *mut ffi::c_void,
@@ -554,6 +570,7 @@ pub unsafe extern "C" fn sqlite3_result_zeroblob64(
 /// Applies NUMERIC affinity to a TEXT value in place, as SQLite does: a
 /// complete numeric literal becomes INTEGER or FLOAT; anything else keeps
 /// its type.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_numeric_type(value: *mut ffi::c_void) -> ffi::c_int {
     let t = sqlite3_value_type(value);
@@ -589,6 +606,7 @@ pub unsafe extern "C" fn sqlite3_value_numeric_type(value: *mut ffi::c_void) -> 
 // ---------------------------------------------------------------------------
 
 /// Name of the table column behind a result column; NULL for expressions.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_origin_name(
     stmt: *mut sqlite3_stmt,
@@ -620,6 +638,7 @@ pub unsafe extern "C" fn sqlite3_column_origin_name(
 }
 
 /// 0 for an ordinary statement, 1 for EXPLAIN, 2 for EXPLAIN QUERY PLAN.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_stmt_isexplain(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     if stmt.is_null() {
@@ -635,6 +654,7 @@ pub unsafe extern "C" fn sqlite3_stmt_isexplain(stmt: *mut sqlite3_stmt) -> ffi:
 /// Converts a statement between normal, EXPLAIN and EXPLAIN QUERY PLAN mode.
 /// Like SQLite: SQLITE_ERROR for a bad mode, SQLITE_BUSY once stepping has
 /// begun (reset first).
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_stmt_explain(
     stmt: *mut sqlite3_stmt,
@@ -670,12 +690,14 @@ pub unsafe extern "C" fn sqlite3_stmt_explain(
 
 /// Turso does not track the byte offset of errors; -1 means "not available",
 /// which SQLite also returns when the last error had no offset.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_error_offset(_db: *mut sqlite3) -> ffi::c_int {
     -1
 }
 
 /// Turso does not record the OS errno of failed I/O; 0 means "none".
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_system_errno(_db: *mut sqlite3) -> ffi::c_int {
     0
@@ -689,6 +711,7 @@ static SHARED_CACHE_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// behavior; connections still see each other's committed data through the
 /// file as usual. Failing would break callers (e.g. Python 3.10/3.11's
 /// sqlite3.enable_shared_cache) that use it purely as an optimization.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_enable_shared_cache(enable: ffi::c_int) -> ffi::c_int {
     SHARED_CACHE_REQUESTED.store(enable != 0, Ordering::Relaxed);

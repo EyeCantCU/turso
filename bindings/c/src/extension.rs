@@ -46,6 +46,7 @@ pub(crate) fn forget_connection(db: *mut sqlite3) {
     set_load_extension_enabled(db, false);
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_auto_extension(
     x_entry_point: Option<unsafe extern "C" fn()>,
@@ -67,6 +68,7 @@ pub unsafe extern "C" fn sqlite3_auto_extension(
 }
 
 /// Returns 1 if the entry point was registered, else 0.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_cancel_auto_extension(
     x_entry_point: Option<unsafe extern "C" fn()>,
@@ -86,6 +88,7 @@ pub unsafe extern "C" fn sqlite3_cancel_auto_extension(
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_reset_auto_extension() {
     if let Ok(mut list) = AUTO_EXTENSIONS.lock() {
@@ -131,6 +134,7 @@ pub(crate) unsafe fn run_auto_extensions(db: *mut sqlite3) -> ffi::c_int {
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_enable_load_extension(
     db: *mut sqlite3,
@@ -186,6 +190,7 @@ unsafe fn dl_error() -> String {
 }
 
 #[cfg(not(unix))]
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_load_extension(
     db: *mut sqlite3,
@@ -204,6 +209,7 @@ pub unsafe extern "C" fn sqlite3_load_extension(
 }
 
 #[cfg(unix)]
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_load_extension(
     db: *mut sqlite3,

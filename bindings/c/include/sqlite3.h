@@ -193,9 +193,9 @@ int sqlite3_stmt_status(sqlite3_stmt *stmt, int op, int resetFlg);
 
 sqlite3_stmt *sqlite3_next_stmt(sqlite3 *db, sqlite3_stmt *stmt);
 
-int sqlite3_serialize(sqlite3 *_db, const char *_schema, void **_out, int *_out_bytes, unsigned int _flags);
+unsigned char *sqlite3_serialize(sqlite3 *db, const char *zSchema, sqlite3_int64 *piSize, unsigned int mFlags);
 
-int sqlite3_deserialize(sqlite3 *_db, const char *_schema, const void *_in_, int _in_bytes, unsigned int _flags);
+int sqlite3_deserialize(sqlite3 *db, const char *zSchema, unsigned char *pData, sqlite3_int64 szDb, sqlite3_int64 szBuf, unsigned int mFlags);
 
 int sqlite3_get_autocommit(sqlite3 *_db);
 
@@ -232,11 +232,11 @@ int sqlite3_extended_result_codes(sqlite3 *db, int onoff);
 
 sqlite3 *sqlite3_db_handle(sqlite3_stmt *_stmt);
 
-void sqlite3_sleep(int _ms);
+int sqlite3_sleep(int _ms);
 
 int sqlite3_limit(sqlite3 *_db, int _id, int _new_value);
 
-void *sqlite3_malloc64(uint64_t n);
+void *sqlite3_malloc64(uint64_t _n);
 
 void sqlite3_free(void *_ptr);
 
@@ -493,6 +493,19 @@ int sqlite3_stmt_explain(sqlite3_stmt *stmt, int eMode);
 int sqlite3_error_offset(sqlite3 *db);
 int sqlite3_enable_shared_cache(int enable);
 /* ---- end src/wrappers.rs ---- */
+/* ---- Chainguard compat (stubs group): UTF-16 API ---- */
+#define SQLITE_SERIALIZE_NOCOPY 0x001
+#define SQLITE_DESERIALIZE_FREEONCLOSE 1
+#define SQLITE_DESERIALIZE_RESIZEABLE  2
+#define SQLITE_DESERIALIZE_READONLY    4
+int sqlite3_prepare16_v2(sqlite3 *db, const void *zSql, int nByte, sqlite3_stmt **ppStmt, const void **pzTail);
+const void *sqlite3_errmsg16(sqlite3 *db);
+int sqlite3_bind_text16(sqlite3_stmt *stmt, int idx, const void *data, int nByte, void (*destructor)(void*));
+const void *sqlite3_column_text16(sqlite3_stmt *stmt, int idx);
+int sqlite3_column_bytes16(sqlite3_stmt *stmt, int idx);
+const void *sqlite3_column_name16(sqlite3_stmt *stmt, int idx);
+const void *sqlite3_column_decltype16(sqlite3_stmt *stmt, int idx);
+const void *sqlite3_column_table_name16(sqlite3_stmt *stmt, int idx);
 
 /*
 ** Enable all Turso experimental features for subsequently opened databases.

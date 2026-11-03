@@ -370,6 +370,44 @@ impl Connection {
         }
     }
 
+    /// Registers an external aggregate that also has xValue/xInverse, so it
+    /// can be used as a window function (`sqlite3_create_window_function`).
+    ///
+    /// # Safety
+    /// The callbacks must be valid for the lifetime of the registration.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn _register_window_function(
+        &self,
+        name: &str,
+        args: i32,
+        context: usize,
+        func: (InitAggFunction, StepFunction, FinalizeFunction),
+        window: crate::function::ExternalWindowCallbacks,
+        context_destructor: Option<ContextDestructor>,
+        aggregate_destructor: Option<ContextDestructor>,
+        value_destructor: Option<ValueDestructor>,
+    ) -> crate::Result<()> {
+        let name = crate::util::normalize_ident(name);
+        let function = ExternalFunc::new_aggregate(
+            name.clone(),
+            args,
+            context,
+            func,
+            context_destructor,
+            aggregate_destructor,
+            value_destructor,
+        )?
+        .with_window_callbacks(window);
+        unsafe {
+            (*self.syms.data_ptr())
+                .functions
+                .insert(name, Arc::new(function));
+        }
+        self.prepare_context_generation
+            .fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
     /// Free the connection's extension libary context after registering an extension manually.
     /// # Safety
     /// Only to be used if you have previously called Connection::build_turso_ext

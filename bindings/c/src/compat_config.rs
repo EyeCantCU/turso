@@ -89,6 +89,7 @@ pub unsafe extern "C" fn sqlite3_config(_op: ffi::c_int) -> ffi::c_int {
 ///
 /// As in SQLite, configuration is refused with SQLITE_MISUSE once the library
 /// has been initialized (turso initializes on first sqlite3_open*).
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn turso_sqlite3_config_apply(
     op: ffi::c_int,
@@ -142,6 +143,7 @@ pub unsafe extern "C" fn turso_sqlite3_config_apply(
 /// SQLite itself returns 0 for ops it does not act on. The variadic
 /// arguments are never read, which is valid for a callee on every ABI, so a
 /// plain fixed-signature function suffices here.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_test_control(_op: ffi::c_int) -> ffi::c_int {
     0
@@ -156,6 +158,7 @@ const SQLITE_DBSTATUS_MAX: ffi::c_int = 12;
 
 /// Turso does not track SQLite's allocator counters, so every global status
 /// parameter reads as zero.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_status64(
     op: ffi::c_int,
@@ -171,6 +174,7 @@ pub unsafe extern "C" fn sqlite3_status64(
     SQLITE_OK
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_status(
     op: ffi::c_int,
@@ -188,6 +192,7 @@ pub unsafe extern "C" fn sqlite3_status(
 
 /// Per-connection status counters (lookaside, cache, schema memory, ...) are
 /// not tracked; valid ops read as zero.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_db_status(
     db: *mut sqlite3,
@@ -216,6 +221,7 @@ pub unsafe extern "C" fn sqlite3_db_status(
 /// object, so NULL is the honest answer. Botan's `is_threadsafe()` is
 /// `sqlite3_db_mutex(db) != NULL`; with NULL its TLS session manager adds its
 /// own lock around the database, which is the safe outcome.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_db_mutex(_db: *mut sqlite3) -> *mut ffi::c_void {
     std::ptr::null_mut()
@@ -224,6 +230,7 @@ pub unsafe extern "C" fn sqlite3_db_mutex(_db: *mut sqlite3) -> *mut ffi::c_void
 /// Shared-cache unlock notification. Turso has no shared-cache table locks, so
 /// a connection can never be blocked by another one; SQLite specifies that
 /// the callback is then invoked immediately, and returns SQLITE_OK.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_unlock_notify(
     db: *mut sqlite3,
@@ -330,6 +337,7 @@ fn pragma_int(db: &sqlite3, pragma: &str) -> Option<i64> {
 /// `sqlite3_file*`/`sqlite3_vfs*` pointers, which do not exist here) returns
 /// SQLITE_NOTFOUND, which is what SQLite returns for opcodes the VFS does not
 /// understand.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_file_control(
     db: *mut sqlite3,
@@ -651,6 +659,7 @@ unsafe fn vfs_name_of(p: usize) -> Option<&'static [u8]> {
 /// The built-in descriptor lets applications that wrap the default VFS read
 /// its parameters, but its xOpen fails with SQLITE_CANTOPEN: turso's I/O layer
 /// does not go through sqlite3_file.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_vfs_find(z_vfs_name: *const ffi::c_char) -> *mut sqlite3_vfs {
     let builtin = std::ptr::addr_of!(DEFAULT_VFS.0) as *mut sqlite3_vfs;
@@ -689,6 +698,7 @@ fn is_builtin_vfs_name(n: &[u8]) -> bool {
 /// Records the VFS so that sqlite3_vfs_find() sees it. Turso's storage layer
 /// cannot call into a C `sqlite3_vfs`, so callbacks are never invoked; see
 /// [`check_open_vfs`] for what a connection opened "through" it does.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_vfs_register(
     p_vfs: *mut sqlite3_vfs,
@@ -709,6 +719,7 @@ pub unsafe extern "C" fn sqlite3_vfs_register(
     SQLITE_OK
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_vfs_unregister(p_vfs: *mut sqlite3_vfs) -> ffi::c_int {
     if p_vfs.is_null() {
