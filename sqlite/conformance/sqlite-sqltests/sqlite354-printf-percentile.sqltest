@@ -1,0 +1,215 @@
+@database :memory:
+
+# SQLite 3.51-3.54 printf()/format() changes (%j/%J, 3.53 float decoding,
+# empty result is '') and the percentile family built in with
+# SQLITE_ENABLE_PERCENTILE. Expected output is from SQLite 3.54.1.
+
+test printf-json-J {
+    SELECT printf('%J', 'a"b' || char(10) || '\');
+}
+expect {
+    "a\"b\n\\"
+}
+
+test printf-json-j {
+    SELECT printf('%j|', 'a"b');
+}
+expect {
+    a\"b|
+}
+
+test printf-json-null {
+    SELECT printf('%J|%j|', NULL, NULL);
+}
+expect {
+    null||
+}
+
+test printf-json-width {
+    SELECT printf('%5J|%-5J|', 'ab', 'ab');
+}
+expect {
+     "ab"|"ab" |
+}
+
+test printf-json-precision {
+    SELECT printf('%.2J', 'abcd');
+}
+expect {
+    "ab"
+}
+
+test printf-json-altform2 {
+    SELECT printf('%!.1J|%!5J|', 'éa', 'é');
+}
+expect {
+    "é"|  "é"|
+}
+
+test printf-json-controls {
+    SELECT printf('%J', char(1, 9, 12, 31));
+}
+expect {
+    "\u0001\t\f\u001f"
+}
+
+test printf-json-number {
+    SELECT printf('%J %J', 12, 1.5);
+}
+expect {
+    "12" "1.5"
+}
+
+test printf-fp-roundtrip-17 {
+    SELECT printf('%!.17g|%!.17g|%!.17g|%!.17g', 49.47, 0.1, 1.0/3, 1e23);
+}
+expect {
+    49.47|0.1|0.33333333333333332|1.0e+23
+}
+
+test printf-fp-altform2-20-digits {
+    SELECT printf('%!.20e|%!.30f', 0.1, 0.1);
+}
+expect {
+    1.000000000000000056e-01|0.1000000000000000056
+}
+
+test printf-fp-hash-neg-zero {
+    SELECT printf('%#.2f|%#.0f|%.2f|%+#.2f', -0.001, -0.3, -0.001, -0.001);
+}
+expect {
+    0.00|0.|-0.00|-0.00
+}
+
+test printf-fp-nan-zeropad {
+    SELECT printf('%010f|%f', 0.0/0.0, 0.0/0.0) IS NULL;
+}
+expect {
+    0
+}
+
+test printf-fp-inf {
+    SELECT printf('%f|%+f|% f|%7.1f|', 1e999, 1e999, 1e999, -1e999);
+}
+expect {
+    Inf|+Inf| Inf|   -Inf|
+}
+
+test printf-fp-large {
+    SELECT substr(printf('%f', 1e308), 1, 20), substr(printf('%,.0f', 1e308), 1, 23);
+}
+expect {
+    10000000000000000000|100,000,000,000,000,000
+}
+
+test printf-empty-result {
+    SELECT printf('') IS NULL, printf('%y', 1) IS NULL, printf('a%y', 1);
+}
+expect {
+    0|0|a
+}
+
+test printf-internal-conversions {
+    SELECT printf('a%Tb', 1), printf('a%Sb', 1), printf('%hd', 5) IS NULL;
+}
+expect {
+    a|a|0
+}
+
+test printf-char-nul {
+    SELECT hex(printf('%c', '')), hex(printf('%3c|', NULL));
+}
+expect {
+    00|2020007C
+}
+
+test printf-char-utf8-width {
+    SELECT printf('%5c|%-3.2c|', 'é', 'é');
+}
+expect {
+        é|éé |
+}
+
+test percentile-median {
+    SELECT median(x), typeof(median(x)) FROM (SELECT 1 x UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT NULL);
+}
+expect {
+    3.0|real
+}
+
+test percentile-family {
+    SELECT percentile(x, 25), percentile_cont(x, 0.25), percentile_disc(x, 0.25) FROM (SELECT 1 x UNION ALL SELECT 2.5 UNION ALL SELECT 3 UNION ALL SELECT 4);
+}
+expect {
+    2.125|2.125|1.0
+}
+
+test percentile-text-fraction {
+    SELECT percentile(x, '50') FROM (SELECT 1 x UNION ALL SELECT 2);
+}
+expect {
+    1.5
+}
+
+test percentile-empty {
+    SELECT median(x), percentile(x, 10) FROM (SELECT NULL x);
+}
+expect {
+    |
+}
+
+test percentile-fraction-range {
+    SELECT percentile(x, 101) FROM (SELECT 1 x);
+}
+expect error {
+    the fraction argument to percentile() is not between 0.0 and 100.0
+}
+
+test percentile-cont-fraction-range {
+    SELECT percentile_cont(x, 2) FROM (SELECT 1 x);
+}
+expect error {
+    the fraction argument to percentile_cont() is not between 0.0 and 1.0
+}
+
+test percentile-fraction-not-constant {
+    SELECT percentile(x, x) FROM (SELECT 1 x UNION ALL SELECT 2);
+}
+expect error {
+    the fraction argument to percentile() is not the same for all input rows
+}
+
+test percentile-input-not-numeric {
+    SELECT median(x) FROM (SELECT '5' x);
+}
+expect error {
+    input to median() is not numeric
+}
+
+test percentile-inf-input {
+    SELECT median(x) FROM (SELECT 1e999 x);
+}
+expect error {
+    Inf input to median()
+}
+
+test percentile-window-running {
+    SELECT group_concat(m, ',') FROM (SELECT median(x) OVER (ORDER BY x) m FROM (SELECT 1 x UNION ALL SELECT 2 UNION ALL SELECT 4 UNION ALL SELECT 8));
+}
+expect {
+    1.0,1.5,2.0,3.0
+}
+
+test percentile-window-sliding {
+    SELECT group_concat(m, ',') FROM (SELECT percentile_disc(x, 0.5) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) m FROM (SELECT 1 x UNION ALL SELECT 2 UNION ALL SELECT 4 UNION ALL SELECT 8));
+}
+expect {
+    1.0,2.0,4.0,4.0
+}
+
+test percentile-window-partition {
+    SELECT group_concat(m, ',') FROM (SELECT percentile(x, 50) OVER (PARTITION BY x % 2) m FROM (SELECT 1 x UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 ORDER BY x));
+}
+expect {
+    3.0,3.0,2.0,2.0
+}

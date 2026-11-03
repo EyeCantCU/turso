@@ -7370,6 +7370,12 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
             payload.push(Value::from_i64(0));
             payload.push(Value::from_i64(0));
         }
+        AggFunc::Median
+        | AggFunc::Percentile
+        | AggFunc::PercentileContCall
+        | AggFunc::PercentileDiscCall => {
+            crate::functions::percentile::init(payload)?;
+        }
         AggFunc::PercentileCont | AggFunc::PercentileDisc => {
             payload.try_reserve_exact(3)?;
             // [0] = collation bits, [1] = count, [2] = fraction, [3..] = buffered values.
@@ -7745,6 +7751,12 @@ fn update_agg_payload(
                 payload[1] = Value::from_i64((count + 1) as i64);
                 payload.try_push(arg.try_clone()?)?;
             }
+        }
+        AggFunc::Median
+        | AggFunc::Percentile
+        | AggFunc::PercentileContCall
+        | AggFunc::PercentileDiscCall => {
+            crate::functions::percentile::step(func, arg, maybe_arg2, payload)?;
         }
         AggFunc::PercentileCont | AggFunc::PercentileDisc => {
             payload[0] = Value::from_i64(collation.to_bits() as i64);
@@ -8177,6 +8189,10 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
                 ordered_set_mode(&payload[2..2 + count], collation)
             }
         }
+        AggFunc::Median
+        | AggFunc::Percentile
+        | AggFunc::PercentileContCall
+        | AggFunc::PercentileDiscCall => crate::functions::percentile::finalize(func, payload),
         AggFunc::PercentileCont | AggFunc::PercentileDisc => {
             // payload: [0]=collation bits, [1]=count, [2]=fraction, [3..]=buffered values.
             // The fraction was range-checked in translate (pre-loop), so it is
@@ -8917,6 +8933,13 @@ pub fn op_agg_inverse(
         ))
         .into());
     };
+    if crate::functions::percentile::is_percentile(func) {
+        if let AggContext::Builtin(payload) = agg {
+            crate::functions::percentile::inverse(&arg, payload);
+        }
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
     let payload = agg.payload_mut();
     inverse_agg_payload(func, arg, payload)?;
 
@@ -9183,6 +9206,12 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
         AggFunc::External(_) => {
             unreachable!("planner rejects moving-start frames over external aggregates");
         }
+        AggFunc::Median
+        | AggFunc::Percentile
+        | AggFunc::PercentileContCall
+        | AggFunc::PercentileDiscCall => {
+            unreachable!("percentile inverse is handled in op_agg_inverse");
+        }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupObject
         | AggFunc::JsonbGroupObject
@@ -9429,7 +9458,11 @@ fn op_agg_step_slow(state: &mut ProgramState, data: &AggStepData) -> InsnResult 
                 AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
                     Some(state.registers[*delimiter].get_value().try_clone()?)
                 }
-                AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+                AggFunc::PercentileCont
+                | AggFunc::PercentileDisc
+                | AggFunc::Percentile
+                | AggFunc::PercentileContCall
+                | AggFunc::PercentileDiscCall => {
                     Some(state.registers[*delimiter].get_value().try_clone()?)
                 }
                 _ => None,
@@ -21458,6 +21491,8 @@ mod tests {
             AggFunc::Mode,
             AggFunc::PercentileCont,
             AggFunc::PercentileDisc,
+            AggFunc::Median,
+            AggFunc::Percentile,
             #[cfg(feature = "json")]
             AggFunc::JsonGroupObject,
             #[cfg(feature = "json")]

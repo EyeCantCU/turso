@@ -286,6 +286,22 @@ pub(crate) fn resolve_builtin_function_name(
             }
             Ok(Some(Func::Agg(AggFunc::Sum)))
         }
+        "median" => {
+            if arg_count != 1 {
+                crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+            }
+            Ok(Some(Func::Agg(AggFunc::Median)))
+        }
+        "percentile" | "percentile_cont" | "percentile_disc" => {
+            if arg_count != 2 {
+                crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+            }
+            Ok(Some(Func::Agg(match name {
+                "percentile" => AggFunc::Percentile,
+                "percentile_cont" => AggFunc::PercentileContCall,
+                _ => AggFunc::PercentileDiscCall,
+            })))
+        }
         "total" => {
             if arg_count != 1 {
                 crate::bail_parse_error!("wrong number of arguments to function {}()", name)
