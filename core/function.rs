@@ -8,6 +8,7 @@ use turso_ext::{
 };
 
 use crate::translate::collate::{CollationSeq, TextCollation};
+use crate::types::TextRef;
 use crate::LimboError;
 
 pub type ContextCollationFunction = unsafe extern "C" fn(
@@ -36,6 +37,8 @@ pub struct ExternalCollation {
     pub context: usize,
     pub callback: ContextCollationFunction,
     pub context_destructor: Option<ContextDestructor>,
+    /// SQLITE_UTF8, SQLITE_UTF16LE or SQLITE_UTF16BE: the encoding the callback receives.
+    pub encoding: u8,
 }
 
 impl ExternalCollation {
@@ -45,16 +48,35 @@ impl ExternalCollation {
         callback: ContextCollationFunction,
         context_destructor: Option<ContextDestructor>,
     ) -> Arc<Self> {
+        Self::new_with_encoding(name, context, callback, context_destructor, 1)
+    }
+
+    /// `encoding` is SQLITE_UTF8 (1), SQLITE_UTF16LE (2) or SQLITE_UTF16BE (3).
+    pub fn new_with_encoding(
+        name: String,
+        context: usize,
+        callback: ContextCollationFunction,
+        context_destructor: Option<ContextDestructor>,
+        encoding: u8,
+    ) -> Arc<Self> {
         TextCollation::new_custom(|collation| Self {
             collation,
             name,
             context,
             callback,
             context_destructor,
+            encoding,
         })
     }
 
-    pub fn compare(&self, left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+    /// Calls the callback with both texts in its encoding.
+    pub fn compare(&self, left: TextRef, right: TextRef) -> std::cmp::Ordering {
+        let enc = crate::text_bytes::DbEncoding::from_u8(self.encoding);
+        let (left, right) = (left.encoded(enc), right.encoded(enc));
+        self.compare_bytes(&left, &right)
+    }
+
+    fn compare_bytes(&self, left: &[u8], right: &[u8]) -> std::cmp::Ordering {
         let result = unsafe {
             (self.callback)(
                 self.context,

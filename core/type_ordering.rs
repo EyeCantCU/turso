@@ -84,7 +84,7 @@ impl<'a> ArraySortKey<'a> {
         let elements = match value {
             ValueRef::Null => return Self::Null,
             ValueRef::Blob(blob) => array_values_from_blob(blob).ok(),
-            ValueRef::Text(text) => parse_text(text.as_str()),
+            ValueRef::Text(text) => parse_text(&text.to_str_lossy()),
             ValueRef::Numeric(_) => None,
         };
         match elements {

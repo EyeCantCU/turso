@@ -4,7 +4,6 @@
 use crate::alloc::TursoIteratorExt;
 use crate::sync::Arc;
 use crate::turso_soft_unreachable;
-use chrono::Datelike;
 use turso_macros::{match_ignore_ascii_case, turso_debug_assert};
 use turso_parser::ast::PragmaName;
 use turso_parser::ast::{self, Expr, Literal};
@@ -408,8 +407,25 @@ fn update_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::Encoding => {
-            let year = chrono::Local::now().year();
-            bail_parse_error!("It's {year}. UTF-8 won.");
+            let requested = match &value {
+                Expr::Name(name) => name.as_str().to_string(),
+                Expr::Literal(Literal::Keyword(kw)) => kw.clone(),
+                other => parse_string(other)?,
+            };
+            let requested = requested.trim_matches(|c| c == '"' || c == '\'' || c == '`');
+            let Some(enc) = crate::text_bytes::DbEncoding::parse(requested) else {
+                bail_parse_error!("unsupported encoding: {requested}");
+            };
+            // Only a database that has not been written yet changes encoding;
+            // SQLite silently ignores the request afterwards.
+            if pager.set_initial_text_encoding(enc.to_header())? {
+                connection
+                    .db
+                    .text_encoding
+                    .store(enc as u8, crate::sync::atomic::Ordering::Release);
+                connection.bump_prepare_context_generation();
+            }
+            Ok(TransactionMode::None)
         }
         PragmaName::JournalMode => {
             // For JournalMode, when setting a value, we use the opcode
@@ -946,7 +962,9 @@ fn query_pragma(
             let encoding = pager
                 .io
                 .block(|| pager.with_header(|header| header.text_encoding))
-                .unwrap_or_default()
+                .unwrap_or_default();
+            let encoding = crate::text_bytes::DbEncoding::from_header(encoding)
+                .to_header()
                 .to_string();
             program.emit_string8(encoding, register);
             program.emit_result_row(register, 1);

@@ -3113,6 +3113,28 @@ impl Pager {
     }
 
     /// Set the page size of an empty database for all of its pagers. Does nothing once page 1 exists.
+    /// Sets the text encoding of a database that has not been written yet.
+    /// Returns false (and does nothing) once it has, as SQLite ignores the
+    /// change then.
+    pub fn set_initial_text_encoding(
+        &self,
+        enc: crate::storage::sqlite3_ondisk::TextEncoding,
+    ) -> Result<bool> {
+        let _lock = self.shared.init_lock.lock();
+        if self.db_initialized() {
+            return Ok(false);
+        }
+        let Some(page) = self.shared.init_page_1.load_full() else {
+            return Ok(false);
+        };
+        let IOResult::Done(mut header) = self.with_header(|header| *header)? else {
+            panic!("DB should not be initialized and should not do any IO");
+        };
+        header.text_encoding = enc;
+        page.get_contents().write_database_header(&header);
+        Ok(true)
+    }
+
     pub fn set_initial_page_size(&self, size: PageSize) -> Result<()> {
         let _lock = self.shared.init_lock.lock();
         if self.db_initialized() {

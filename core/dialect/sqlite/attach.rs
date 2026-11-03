@@ -334,6 +334,11 @@ impl Connection {
         db: &Database,
         pager: &Pager,
     ) -> Result<()> {
+        if db.text_encoding() != self.db.text_encoding() {
+            return Err(LimboError::InvalidArgument(
+                "attached databases must use the same text encoding as main database".into(),
+            ));
+        }
         // Reject incompatible journal modes for initialized attached databases:
         // we cannot silently convert the header (the user may have attached read-only).
         if self.mvcc_enabled() != db.mvcc_enabled() {
@@ -527,6 +532,13 @@ impl Connection {
                         &pager,
                         init.reserved_space,
                     )?;
+                    // A fresh attached database takes the main database's encoding.
+                    let enc = self.db.text_encoding();
+                    if pager.set_initial_text_encoding(enc.to_header())? {
+                        init.db
+                            .text_encoding
+                            .store(enc as u8, crate::sync::atomic::Ordering::Release);
+                    }
 
                     if self.mvcc_enabled() && !init.db.mvcc_enabled() {
                         Self::set_mvcc_journal_mode_fresh_db(&pager)?;

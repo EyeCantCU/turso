@@ -72,7 +72,7 @@ use crate::storage::wal::READMARK_NOT_USED;
 use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::Arc;
 use crate::sync::RwLock;
-use crate::types::{SerialType, SerialTypeKind, TextRef, TextSubtype, ValueRef};
+use crate::types::{SerialType, SerialTypeKind, TextRef, ValueRef};
 use crate::{bail_corrupt_error, CompletionError, File, IOContext, Result, WalFileShared};
 use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
@@ -1132,7 +1132,7 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                 ))
             })?;
             Ok((
-                ValueRef::Text(TextRef::from_bytes(data, TextSubtype::Text)),
+                ValueRef::Text(TextRef::from_record_bytes(data)),
                 content_size,
             ))
         }
@@ -1258,7 +1258,7 @@ pub fn read_value_serial_type<'a>(
                     ))
                 })?;
                 Ok((
-                    ValueRef::Text(TextRef::from_bytes(data, TextSubtype::Text)),
+                    ValueRef::Text(TextRef::from_record_bytes(data)),
                     content_size,
                 ))
             }

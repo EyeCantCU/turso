@@ -723,6 +723,8 @@ pub struct Database<
 
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
+    /// Text encoding of the records (text_bytes::DbEncoding as u8).
+    pub(crate) text_encoding: AtomicU8,
     page_codec_id: Option<PageCodecId>,
 }
 
@@ -798,6 +800,12 @@ impl<A: alloc::ConcurrentAllocator, F: alloc::ConcurrentAllocator> Drop for Data
 }
 
 impl Database {
+    /// The text encoding records are stored in.
+    #[inline]
+    pub(crate) fn text_encoding(&self) -> crate::text_bytes::DbEncoding {
+        crate::text_bytes::DbEncoding::from_u8(self.text_encoding.load(Ordering::Acquire))
+    }
+
     /// Returns true if this database is backed by MemoryIO.
     pub fn is_in_memory_db(&self) -> bool {
         is_memory_like(&self.path)
@@ -869,6 +877,7 @@ impl Database {
             opts,
             buffer_pool: BufferPool::begin_init(io, arena_size),
             n_connections: AtomicUsize::new(0),
+            text_encoding: AtomicU8::new(crate::text_bytes::DbEncoding::Utf8 as u8),
             incarnation: {
                 // Deliberately std, not crate::sync: this static outlives a
                 // shuttle test execution, and a shuttle-tracked atomic that
@@ -1723,6 +1732,7 @@ impl Database {
                     let schema = Schema::try_make_mut(guard)?;
 
                     let dialect = conn.dialect();
+                    let _encoding = crate::text_bytes::EncodingGuard::set(conn.db.text_encoding());
                     let result = schema.make_from_btree(
                         &mut state.make_from_btree_state,
                         None,
@@ -2085,12 +2095,10 @@ impl Database {
                     let header: HeaderRefMut = return_if_io!(HeaderRefMut::from_pager(pager));
                     let header_mut = header.borrow_mut();
 
-                    if !header_mut.text_encoding.is_utf8() {
-                        return Err(LimboError::UnsupportedEncoding(
-                            header_mut.text_encoding.to_string(),
-                        )
-                        .into());
-                    }
+                    self.text_encoding.store(
+                        crate::text_bytes::DbEncoding::from_header(header_mut.text_encoding) as u8,
+                        Ordering::Release,
+                    );
 
                     let (read_version, write_version) =
                         { (header_mut.read_version, header_mut.write_version) };
@@ -2174,20 +2182,17 @@ impl Database {
                         ))
                         .into());
                     }
-                    if !matches!(
-                        header_mut.text_encoding,
-                        TextEncoding::Unset | TextEncoding::Utf8
-                    ) {
-                        return Err(LimboError::Corrupt(format!(
-                            "Only utf8 text_encoding is supported by tursodb: got={}",
-                            header_mut.text_encoding
-                        ))
-                        .into());
-                    }
 
                     // Determine if we should open in MVCC mode based on the database header version
                     // MVCC is controlled only by the database header (set via PRAGMA journal_mode)
                     let open_mv_store = matches!(read_version, Version::Mvcc);
+                    if open_mv_store && !self.text_encoding().is_utf8() {
+                        return Err(LimboError::UnsupportedEncoding(format!(
+                            "{} (MVCC databases must be UTF-8)",
+                            header_mut.text_encoding
+                        ))
+                        .into());
+                    }
                     if open_mv_store && page_codec.is_some() {
                         return Err(LimboError::InvalidArgument(
                             "external page codecs are not supported with MVCC databases"

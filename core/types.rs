@@ -97,6 +97,10 @@ pub enum TextRepr {
     Lossy,
     /// Invalid UTF-8 borrowed without a lossy view (`TextRef` only).
     Raw,
+    /// UTF-16LE bytes borrowed from a record of a UTF-16 database (`TextRef` only).
+    Utf16Le,
+    /// UTF-16BE bytes borrowed from a record of a UTF-16 database (`TextRef` only).
+    Utf16Be,
 }
 
 /// A TEXT value. SQLite TEXT is a byte string that is normally, but not
@@ -388,7 +392,7 @@ pub struct TextRef<'a> {
 impl Debug for TextRef<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut s = f.debug_struct("TextRef");
-        s.field("value", &self.as_str());
+        s.field("value", &self.to_str_lossy());
         if self.repr != TextRepr::Utf8 {
             s.field("bytes", &self.as_bytes());
         }
@@ -423,20 +427,78 @@ impl<'a> TextRef<'a> {
         }
     }
 
+    /// TEXT bytes from a record, in the record encoding of this thread
+    /// (see text_bytes::db_encoding).
+    #[inline(always)]
+    pub fn from_record_bytes(bytes: &'a [u8]) -> Self {
+        match crate::text_bytes::db_encoding() {
+            crate::text_bytes::DbEncoding::Utf8 => Self::from_bytes(bytes, TextSubtype::Text),
+            enc => Self::utf16(bytes, enc),
+        }
+    }
+
+    #[cold]
+    fn utf16(bytes: &'a [u8], enc: crate::text_bytes::DbEncoding) -> Self {
+        Self {
+            bytes,
+            raw_len: 0,
+            subtype: TextSubtype::Text,
+            repr: if enc == crate::text_bytes::DbEncoding::Utf16Be {
+                TextRepr::Utf16Be
+            } else {
+                TextRepr::Utf16Le
+            },
+        }
+    }
+
+    /// Whether the bytes are UTF-16 from a record (see `as_bytes`).
+    #[inline]
+    pub fn is_utf16(&self) -> bool {
+        matches!(self.repr, TextRepr::Utf16Le | TextRepr::Utf16Be)
+    }
+
+    /// The UTF-8 bytes of the value, transcoding UTF-16 record bytes.
+    #[inline]
+    pub fn utf8_bytes(&self) -> Cow<'a, [u8]> {
+        match self.repr {
+            TextRepr::Utf16Le => Cow::Owned(crate::text_bytes::utf16_to_utf8(self.bytes, false)),
+            TextRepr::Utf16Be => Cow::Owned(crate::text_bytes::utf16_to_utf8(self.bytes, true)),
+            _ => Cow::Borrowed(self.as_bytes()),
+        }
+    }
+
+    /// The bytes in record encoding `enc`.
+    pub(crate) fn encoded(&self, enc: crate::text_bytes::DbEncoding) -> Cow<'a, [u8]> {
+        use crate::text_bytes::DbEncoding;
+        match (self.repr, enc) {
+            (TextRepr::Utf16Le, DbEncoding::Utf16Le) | (TextRepr::Utf16Be, DbEncoding::Utf16Be) => {
+                Cow::Borrowed(self.bytes)
+            }
+            (_, DbEncoding::Utf8) if !self.is_utf16() => Cow::Borrowed(self.as_bytes()),
+            _ => Cow::Owned(crate::text_bytes::encode_for(enc, &self.utf8_bytes())),
+        }
+    }
+
     /// The UTF-8 view. For invalid UTF-8 borrowed from a page this is the
-    /// longest valid prefix; use `as_bytes()` where exactness matters.
+    /// longest valid prefix, and for UTF-16 record bytes it is empty: use
+    /// `to_str_lossy()` or `utf8_bytes()` for those.
     #[inline]
     pub fn as_str(&self) -> &'a str {
         let bytes = match self.repr {
             TextRepr::Utf8 => self.bytes,
             TextRepr::Lossy => &self.bytes[self.raw_len as usize..],
             TextRepr::Raw => valid_prefix(self.bytes),
+            TextRepr::Utf16Le | TextRepr::Utf16Be => {
+                turso_debug_assert!(false, "as_str() on UTF-16 record text");
+                &[]
+            }
         };
         // SAFETY: Utf8 bytes, lossy views and valid prefixes are valid UTF-8.
         unsafe { std::str::from_utf8_unchecked(bytes) }
     }
 
-    /// The exact bytes of the value.
+    /// The exact bytes of the value: UTF-8 (possibly invalid), or for UTF-16
+    /// record text the stored UTF-16 bytes.
     #[inline]
     pub fn as_bytes(&self) -> &'a [u8] {
         match self.repr {
@@ -454,6 +516,9 @@ impl<'a> TextRef<'a> {
     pub fn to_str_lossy(&self) -> Cow<'a, str> {
         match self.repr {
             TextRepr::Raw => Cow::Owned(crate::text_bytes::lossy_string(self.bytes)),
+            TextRepr::Utf16Le | TextRepr::Utf16Be => {
+                Cow::Owned(crate::text_bytes::lossy_string(&self.utf8_bytes()))
+            }
             _ => Cow::Borrowed(self.as_str()),
         }
     }
@@ -474,6 +539,9 @@ impl<'a> TextRef<'a> {
                 repr: TextRepr::Lossy,
             },
             TextRepr::Raw => Text::from_invalid_utf8(self.bytes),
+            TextRepr::Utf16Le | TextRepr::Utf16Be => {
+                Text::from_bytes(self.utf8_bytes().into_owned())
+            }
         };
         text.subtype = self.subtype;
         text
@@ -657,10 +725,21 @@ impl<T: AnyText> Extendable<T> for Text {
         self.raw_len = raw_len;
         self.repr = repr;
         self.subtype = other.subtype();
-        if repr == TextRepr::Raw {
-            mark_unlikely();
-            let raw = std::mem::take(self.buf.to_mut());
-            self.set_invalid_utf8(&raw);
+        match repr {
+            TextRepr::Raw => {
+                mark_unlikely();
+                let raw = std::mem::take(self.buf.to_mut());
+                self.set_invalid_utf8(&raw);
+            }
+            TextRepr::Utf16Le | TextRepr::Utf16Be => {
+                mark_unlikely();
+                let raw = std::mem::take(self.buf.to_mut());
+                let utf8 = crate::text_bytes::utf16_to_utf8(&raw, repr == TextRepr::Utf16Be);
+                let subtype = self.subtype;
+                *self = Text::from_bytes(utf8);
+                self.subtype = subtype;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -705,6 +784,43 @@ impl AnyText for Text {
     fn subtype(&self) -> TextSubtype {
         self.subtype
     }
+}
+
+/// BINARY order of two texts, as SQLite compares them: memcmp() of the
+/// stored form, which in a UTF-16 database is the UTF-16 encoding.
+#[inline]
+pub fn binary_cmp_text(a: TextRef, b: TextRef) -> Ordering {
+    if !a.is_utf16() && !b.is_utf16() {
+        let ord = a.as_bytes().cmp(b.as_bytes());
+        if ord.is_eq() {
+            return ord;
+        }
+        let enc = crate::text_bytes::db_encoding();
+        if enc.is_utf8() {
+            return ord;
+        }
+        return crate::text_bytes::binary_cmp_utf8_in(enc, a.as_bytes(), b.as_bytes());
+    }
+    binary_cmp_utf16(a, b)
+}
+
+#[cold]
+fn binary_cmp_utf16(a: TextRef, b: TextRef) -> Ordering {
+    use crate::text_bytes::DbEncoding;
+    let enc = match (a.repr, b.repr) {
+        (TextRepr::Utf16Be, _) | (_, TextRepr::Utf16Be) => DbEncoding::Utf16Be,
+        _ => DbEncoding::Utf16Le,
+    };
+    a.encoded(enc).cmp(&b.encoded(enc))
+}
+
+/// Whether two texts are equal (as BINARY compares them).
+#[inline]
+pub fn text_eq(a: TextRef, b: TextRef) -> bool {
+    if a.is_utf16() == b.is_utf16() && a.repr == b.repr || !a.is_utf16() && !b.is_utf16() {
+        return a.as_bytes() == b.as_bytes();
+    }
+    a.utf8_bytes() == b.utf8_bytes()
 }
 
 #[cold]
@@ -947,8 +1063,11 @@ impl Debug for ValueRef<'_> {
             }
             ValueRef::Text(text_ref) => {
                 // truncate string to at most 256 chars
-                let text = text_ref.as_str();
-                let max_len = text.len().min(256);
+                let text = text_ref.to_str_lossy();
+                let mut max_len = text.len().min(256);
+                while !text.is_char_boundary(max_len) {
+                    max_len -= 1;
+                }
                 f.debug_struct("Text")
                     .field("data", &&text[0..max_len])
                     // Indicates to the developer debugging that the data is truncated for printing
@@ -1157,7 +1276,8 @@ impl Value {
         match self {
             Value::Null => None,
             Value::Text(t) => Some((Cow::Borrowed(t.as_bytes()), t.is_utf8())),
-            Value::Blob(b) => Some((Cow::Borrowed(b.as_slice()), false)),
+            // A blob read as text is in the database encoding.
+            Value::Blob(b) => Some((crate::text_bytes::db_decoded(b), false)),
             other => Some((Cow::Owned(other.to_string().into_bytes()), true)),
         }
     }
@@ -2261,9 +2381,57 @@ mod immutable_record {
         /// capacity is insufficient. Per-row callers recycle the destination
         /// register's previous record buffer, making steady-state record
         /// construction allocation-free.
-        #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::RecordBuild)]
         #[inline]
         pub fn build<'a>(
+            values: impl IntoIterator<Item = impl AsValueRef + 'a> + Clone,
+            buf: RecordBuf,
+        ) -> Result<Self> {
+            let enc = crate::text_bytes::db_encoding();
+            if !enc.is_utf8() {
+                return Self::build_encoded(values, buf, enc);
+            }
+            Self::build_raw(values, buf)
+        }
+
+        /// [Self::build] for a UTF-16 database: TEXT is stored in its encoding.
+        #[cold]
+        fn build_encoded<'a>(
+            values: impl IntoIterator<Item = impl AsValueRef + 'a> + Clone,
+            buf: RecordBuf,
+            enc: crate::text_bytes::DbEncoding,
+        ) -> Result<Self> {
+            let items: std::vec::Vec<_> = values.into_iter().collect();
+            let encoded: std::vec::Vec<Option<Cow<'_, [u8]>>> = items
+                .iter()
+                .map(|v| match v.as_value_ref() {
+                    ValueRef::Text(t) => Some(t.encoded(enc)),
+                    _ => None,
+                })
+                .collect();
+            let repr = if enc == crate::text_bytes::DbEncoding::Utf16Be {
+                TextRepr::Utf16Be
+            } else {
+                TextRepr::Utf16Le
+            };
+            let refs: std::vec::Vec<ValueRef<'_>> = items
+                .iter()
+                .zip(&encoded)
+                .map(|(v, e)| match (v.as_value_ref(), e) {
+                    (ValueRef::Text(t), Some(bytes)) => ValueRef::Text(TextRef {
+                        bytes,
+                        raw_len: 0,
+                        subtype: t.subtype,
+                        repr,
+                    }),
+                    (other, _) => other,
+                })
+                .collect();
+            Self::build_raw(refs.iter().copied(), buf)
+        }
+
+        #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::RecordBuild)]
+        #[inline]
+        fn build_raw<'a>(
             values: impl IntoIterator<Item = impl AsValueRef + 'a> + Clone,
             buf: RecordBuf,
         ) -> Result<Self> {
@@ -2806,7 +2974,7 @@ impl Display for ValueRef<'_> {
                 let fval: f64 = (*fl).into();
                 write!(f, "{fval:?}")
             }
-            Self::Text(s) => write!(f, "{}", s.as_str()),
+            Self::Text(s) => write!(f, "{}", s.to_str_lossy()),
             Self::Blob(b) => write!(f, "{}", String::from_utf8_lossy(b)),
         }
     }
@@ -2817,9 +2985,7 @@ impl<'a> PartialEq<ValueRef<'a>> for ValueRef<'a> {
         match (self, other) {
             (Self::Null, Self::Null) => true,
             (Self::Numeric(a), Self::Numeric(b)) => a == b,
-            (Self::Text(text_left), Self::Text(text_right)) => {
-                text_left.as_bytes() == text_right.as_bytes()
-            }
+            (Self::Text(text_left), Self::Text(text_right)) => text_eq(*text_left, *text_right),
             (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left.eq(blob_right),
             _ => false,
         }
@@ -2855,7 +3021,7 @@ impl<'a> Ord for ValueRef<'a> {
             (_, Self::Numeric(_)) => std::cmp::Ordering::Greater,
 
             (Self::Text(text_left), Self::Text(text_right)) => {
-                text_left.as_bytes().cmp(text_right.as_bytes())
+                binary_cmp_text(*text_left, *text_right)
             }
             (Self::Text(_), Self::Blob(_)) => std::cmp::Ordering::Less,
             (Self::Blob(_), Self::Text(_)) => std::cmp::Ordering::Greater,
@@ -3386,7 +3552,12 @@ where
 
     match final_comparison {
         std::cmp::Ordering::Equal => {
-            let len_cmp = lhs_text.as_bytes().len().cmp(&rhs_text.as_bytes().len());
+            // Lengths of UTF-16 record bytes and UTF-8 text are not comparable.
+            let len_cmp = if lhs_text.is_utf16() == rhs_text.is_utf16() {
+                lhs_text.as_bytes().len().cmp(&rhs_text.as_bytes().len())
+            } else {
+                std::cmp::Ordering::Equal
+            };
             if len_cmp != std::cmp::Ordering::Equal {
                 let adjusted = match index_info.key_info[0].sort_order {
                     SortOrder::Asc => len_cmp,

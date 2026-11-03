@@ -162,7 +162,9 @@ fn hash_value<H: Hasher>(hasher: &mut H, value: &ValueRef) {
         }
         ValueRef::Text(s) => {
             3u8.hash(hasher);
-            s.as_str().hash(hasher);
+            // Same as str's Hash, on the UTF-8 form whatever the storage.
+            hasher.write(&s.utf8_bytes());
+            hasher.write_u8(0xff);
         }
         ValueRef::Blob(b) => {
             4u8.hash(hasher);

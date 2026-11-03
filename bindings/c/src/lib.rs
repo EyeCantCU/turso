@@ -3052,7 +3052,7 @@ pub unsafe extern "C" fn sqlite3_strnicmp(
 pub unsafe extern "C" fn sqlite3_create_collation_v2(
     db: *mut sqlite3,
     name: *const ffi::c_char,
-    _enc: ffi::c_int,
+    enc: ffi::c_int,
     context: *mut ffi::c_void,
     cmp: Option<unsafe extern "C" fn() -> ffi::c_int>,
     destroy: Option<unsafe extern "C" fn()>,
@@ -3060,6 +3060,9 @@ pub unsafe extern "C" fn sqlite3_create_collation_v2(
     if db.is_null() || name.is_null() {
         return SQLITE_MISUSE;
     }
+    let Some(enc) = textbytes::collation_encoding(enc) else {
+        return SQLITE_MISUSE;
+    };
     let name = match CStr::from_ptr(name).to_str() {
         Ok(s) => s.to_owned(),
         Err(_) => return SQLITE_MISUSE,
@@ -3076,11 +3079,12 @@ pub unsafe extern "C" fn sqlite3_create_collation_v2(
             std::mem::transmute::<unsafe extern "C" fn(), unsafe extern "C" fn(*mut ffi::c_void)>(f)
         }),
     });
-    inner.conn.register_external_collation(
+    inner.conn.register_external_collation_with_encoding(
         name,
         Box::into_raw(bridge) as usize,
         collation_bridge_compare,
         Some(collation_bridge_destroy),
+        enc,
     );
     SQLITE_OK
 }

@@ -315,6 +315,7 @@ const unsigned char *sqlite3_value_text(void *value);
 const void *sqlite3_value_blob(void *value);
 
 int sqlite3_value_bytes(void *value);
+int sqlite3_value_encoding(void *value);
 
 void *sqlite3_value_dup(void *value);
 

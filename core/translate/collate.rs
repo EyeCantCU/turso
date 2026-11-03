@@ -277,7 +277,9 @@ impl TextCollation {
     }
 
     fn hash_text(self, text: TextRef, hasher: &mut impl Hasher) {
-        let bytes = text.as_bytes();
+        // Hash the UTF-8 form, so equal texts hash alike whatever they are stored as.
+        let bytes = text.utf8_bytes();
+        let bytes = &bytes[..];
         match self {
             Self::Binary => hasher.write(bytes),
             Self::NoCase => {
@@ -313,17 +315,16 @@ impl TextCollation {
     #[inline(always)]
     fn compare_text(self, lhs: TextRef, rhs: TextRef) -> Ordering {
         match self {
-            Self::Binary => binary_cmp(lhs.as_bytes(), rhs.as_bytes()),
-            Self::NoCase => nocase_cmp(lhs.as_bytes(), rhs.as_bytes()),
-            Self::Rtrim => rtrim_cmp(lhs.as_bytes(), rhs.as_bytes()),
+            Self::Binary => crate::types::binary_cmp_text(lhs, rhs),
+            // NOCASE and RTRIM work on UTF-8 in every database, as in SQLite.
+            Self::NoCase => nocase_cmp(&lhs.utf8_bytes(), &rhs.utf8_bytes()),
+            Self::Rtrim => rtrim_cmp(&lhs.utf8_bytes(), &rhs.utf8_bytes()),
             Self::Locale(id) => LocaleCollationRegistry::global().compare(
                 id,
                 &lhs.to_str_lossy(),
                 &rhs.to_str_lossy(),
             ),
-            Self::Custom(number) => {
-                custom_collation(number).compare(lhs.as_bytes(), rhs.as_bytes())
-            }
+            Self::Custom(number) => custom_collation(number).compare(lhs, rhs),
         }
     }
 }
@@ -337,11 +338,6 @@ fn custom_collation(number: u32) -> Arc<ExternalCollation> {
         .get(&number)
         .and_then(Weak::upgrade)
         .expect("a plan or program keeps its custom collations alive")
-}
-
-#[inline(always)]
-fn binary_cmp(lhs: &[u8], rhs: &[u8]) -> Ordering {
-    lhs.cmp(rhs)
 }
 
 #[inline(always)]

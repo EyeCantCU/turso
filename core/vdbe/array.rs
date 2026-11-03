@@ -222,7 +222,7 @@ fn write_value_ref_pg(result: &mut String, val: &crate::ValueRef<'_>) {
             }
         }
         crate::ValueRef::Text(t) => {
-            write_pg_text_element(result, t.as_str());
+            write_pg_text_element(result, &t.to_str_lossy());
         }
         crate::ValueRef::Blob(b) => {
             result.push_str("\"X'");
@@ -534,7 +534,7 @@ pub(crate) fn exec_array_to_string(
                             continue;
                         }
                     }
-                    crate::ValueRef::Text(t) => t.as_str().to_string(),
+                    crate::ValueRef::Text(t) => t.to_str_lossy().into_owned(),
                     other => format!("{other}"),
                 };
                 if !first {

@@ -53,7 +53,7 @@ impl Numeric {
         match value {
             ValueRef::Null => None,
             ValueRef::Numeric(v) => Some(v),
-            ValueRef::Text(text) => Some(Numeric::from(text.as_str())),
+            ValueRef::Text(text) => Some(Numeric::from(&*text.to_str_lossy())),
             ValueRef::Blob(blob) => {
                 let text = String::from_utf8_lossy(blob);
                 Some(Numeric::from(&text))
