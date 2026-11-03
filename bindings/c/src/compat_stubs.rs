@@ -167,6 +167,7 @@ pub(crate) unsafe extern "C" fn agg_destroy_state(ctx_addr: usize) {
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_aggregate_context(
     context: *mut ffi::c_void,

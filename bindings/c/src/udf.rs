@@ -296,6 +296,7 @@ unsafe fn name_bytes<'a>(name: *const ffi::c_char) -> &'a [u8] {
     CStr::from_ptr(name).to_bytes()
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_create_function_v2(
     db: *mut sqlite3,
@@ -326,6 +327,7 @@ pub unsafe extern "C" fn sqlite3_create_function_v2(
     )
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_create_window_function(
     db: *mut sqlite3,
@@ -357,6 +359,7 @@ pub unsafe extern "C" fn sqlite3_create_window_function(
     )
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_create_function16(
     db: *mut sqlite3,

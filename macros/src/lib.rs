@@ -82,6 +82,7 @@
 
 extern crate proc_macro;
 mod atomic_enum;
+mod capi_guard;
 mod codspeed;
 mod ext;
 mod test;
@@ -1697,4 +1698,11 @@ fn get_caller_file(input: &TokenStream) -> String {
 
 fn prefix_message(file_path: &str, msg: &LitStr) -> LitStr {
     LitStr::new(&format!("[{}] {}", file_path, msg.value()), msg.span())
+}
+
+/// Turn a panic in an exported C function into an error return; see
+/// `bindings/c/src/guard.rs`. Place it above `#[no_mangle]`.
+#[proc_macro_attribute]
+pub fn capi_guard(attr: TokenStream, input: TokenStream) -> TokenStream {
+    capi_guard::capi_guard(attr, input)
 }
