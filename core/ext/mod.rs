@@ -465,6 +465,21 @@ impl Connection {
         Ok(())
     }
 
+    /// Finds a connected virtual table by id: one this connection created,
+    /// an eponymous one, or one loaded from the schema.
+    pub(crate) fn vtab_by_id(&self, id: u64) -> Option<Arc<VirtualTable>> {
+        if let Some(vtab) = self.syms.read().vtab_by_id(id) {
+            return Some(vtab);
+        }
+        self.schema
+            .read()
+            .all_tables()
+            .find_map(|table| match table.as_ref() {
+                Table::Virtual(vtab) if vtab.id() == id => Some(vtab.clone()),
+                _ => None,
+            })
+    }
+
     /// Removes a module registered with [`Self::register_vtab_module_local`].
     pub fn unregister_vtab_module_local(&self, name: &str) {
         let mut syms = self.syms.write();

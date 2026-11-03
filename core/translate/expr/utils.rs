@@ -47,6 +47,17 @@ pub fn as_binary_components(
             }
             Ok(Some((lhs.as_ref(), (*operator).into(), rhs.as_ref())))
         }
+        ast::Expr::Like {
+            lhs,
+            not: false,
+            op: ast::LikeOperator::Match,
+            rhs,
+            ..
+        } => Ok(Some((
+            lhs.as_ref(),
+            ConstraintOperator::Match,
+            rhs.as_ref(),
+        ))),
         ast::Expr::Like { lhs, not, rhs, .. } => Ok(Some((
             lhs.as_ref(),
             ConstraintOperator::Like { not: *not },
