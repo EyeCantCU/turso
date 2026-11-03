@@ -1216,6 +1216,9 @@ pub struct ProgramState {
     fk_immediate_violations_during_stmt: AtomicIsize,
     fk_immediate_violation: Option<LimboError>,
     uses_subjournal: bool,
+    /// Level of the statement savepoint announced to virtual tables, so it
+    /// is released or rolled back with the statement.
+    pub(crate) vtab_stmt_level: Option<usize>,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
     /// Write activity on the main database when this statement became an
@@ -1328,6 +1331,7 @@ impl ProgramState {
             hash_tables: HashMap::default(),
             ephemeral_temp_files: HashMap::default(),
             uses_subjournal: false,
+            vtab_stmt_level: None,
             is_active_write: false,
             tx_read_only_at_start: false,
             write_baseline: WriteBaseline::None,
@@ -1502,6 +1506,7 @@ impl ProgramState {
             self.ephemeral_temp_files.clear();
         }
         self.uses_subjournal = false;
+        self.vtab_stmt_level = None;
         self.is_active_write = false;
         self.tx_read_only_at_start = false;
         self.write_baseline = WriteBaseline::None;
@@ -1811,7 +1816,7 @@ impl ProgramState {
     /// while FK bookkeeping still needs cleanup.
     pub fn end_statement(
         &mut self,
-        connection: &Connection,
+        connection: &Arc<Connection>,
         pager: &Arc<Pager>,
         end_statement: EndStatement,
     ) -> Result<()> {
@@ -1954,6 +1959,17 @@ impl ProgramState {
         }
         for p in &attached_pagers {
             p.stop_use_subjournal();
+        }
+        // Virtual tables in the transaction follow the statement savepoint.
+        if let Some(level) = self.vtab_stmt_level.take() {
+            let op = match end_statement {
+                EndStatement::ReleaseSavepoint => 1,
+                EndStatement::RollbackSavepoint => 2,
+            };
+            let hooked = execute::vtab_savepoint_all(connection, op, level);
+            if result.is_ok() {
+                hooked?;
+            }
         }
         result
     }

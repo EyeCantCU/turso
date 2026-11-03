@@ -809,6 +809,7 @@ pub fn find_best_access_method_for_join_order(
         ),
         Table::Virtual(vtab) => find_best_access_method_for_vtab(
             vtab,
+            vtab_order_by(rhs_table.internal_id, planning_context.maybe_order_target),
             &rhs_constraints.constraints,
             join_order,
             input_cardinality,
@@ -1153,8 +1154,43 @@ fn has_two_local_constraint_terms(
     false
 }
 
+/// The ORDER BY terms SQLite offers to xBestIndex: only when every term is
+/// a column (or the rowid, as column `u32::MAX`) of this table.
+fn vtab_order_by(
+    table_id: TableInternalId,
+    maybe_order_target: Option<&super::order::OrderTarget>,
+) -> Vec<turso_ext::OrderByInfo> {
+    use super::order::{ColumnTarget, EliminatesSortBy, OrderTargetPurpose};
+    let Some(target) = maybe_order_target else {
+        return Vec::new();
+    };
+    if !matches!(
+        target.purpose,
+        OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order)
+    ) {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(target.columns.len());
+    for c in &target.columns {
+        if c.table_id != table_id {
+            return Vec::new();
+        }
+        let column_index = match c.target {
+            ColumnTarget::Column(i) => i as u32,
+            ColumnTarget::RowId => u32::MAX,
+            ColumnTarget::Expr(_) => return Vec::new(),
+        };
+        out.push(turso_ext::OrderByInfo {
+            column_index,
+            desc: c.order == ast::SortOrder::Desc,
+        });
+    }
+    out
+}
+
 fn find_best_access_method_for_vtab(
     vtab: &VirtualTable,
+    order_by: Vec<turso_ext::OrderByInfo>,
     constraints: &[Constraint],
     join_order: &[JoinOrderMember],
     input_cardinality: f64,
@@ -1163,9 +1199,8 @@ fn find_best_access_method_for_vtab(
 ) -> Result<Option<AccessMethod>> {
     let vtab_constraints = convert_to_vtab_constraint(constraints, join_order)?;
 
-    // TODO: get proper order_by information to pass to the vtab.
-    // maybe encode more info on t_ctx? we need: [col_idx , is_descending]
-    let best_index_result = vtab.best_index(&vtab_constraints, &[]);
+    // The ORDER BY is offered, but a consumed order does not yet remove the sort.
+    let best_index_result = vtab.best_index(&vtab_constraints, &order_by);
 
     match best_index_result {
         Ok(index_info) => {

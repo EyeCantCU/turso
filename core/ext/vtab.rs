@@ -1,4 +1,6 @@
-use crate::native_ext::{ConnectInfo, ExtensionState, ModuleFactory, NativeCursor, NativeTable};
+use crate::native_ext::{
+    ConnectInfo, ExtensionState, ModuleFactory, NativeCursor, NativeTable, TableHook,
+};
 use crate::sync::Arc;
 use crate::types::IOResultOr;
 use crate::vtab::{ExtVirtualTable, ExtVirtualTableCursor, VirtualTableType};
@@ -101,60 +103,29 @@ impl ExtensionTable {
 
     pub(crate) fn update(
         &self,
+        conn: &Arc<Connection>,
         args: &[Value],
         state: &mut ExtensionState,
         on_conflict: u8,
     ) -> IOResultOr<Option<i64>> {
         match self {
             Self::C(table) => table.update(args).map(IOResult::Done).map_err(Into::into),
-            Self::Native(table) => table.update(state, args, on_conflict),
+            Self::Native(table) => table.update(conn, state, args, on_conflict),
         }
     }
 
-    /// Savepoint hooks (`xSavepoint`, `xRelease`, `xRollbackTo`); `op` is 0, 1 or 2.
-    pub(crate) fn savepoint_op(&self, op: u8, level: usize) -> Result<()> {
+    /// Runs a transaction, rename or destroy hook.
+    pub(crate) fn hook(&self, conn: &Arc<Connection>, hook: TableHook<'_>) -> Result<()> {
         match self {
-            Self::C(_) => Ok(()),
-            Self::Native(table) => match op {
-                0 => table.savepoint(level),
-                1 => table.release(level),
-                _ => table.rollback_to(level),
+            Self::C(table) => match hook {
+                TableHook::Begin => table.begin(),
+                TableHook::Commit => table.commit(),
+                TableHook::Rollback => table.rollback(),
+                TableHook::Rename(name) => table.rename(name),
+                TableHook::Destroy => table.destroy(),
+                _ => Ok(()),
             },
-        }
-    }
-
-    pub(crate) fn begin(&self) -> Result<()> {
-        match self {
-            Self::C(table) => table.begin(),
-            Self::Native(table) => table.begin(),
-        }
-    }
-
-    pub(crate) fn commit(&self) -> Result<()> {
-        match self {
-            Self::C(table) => table.commit(),
-            Self::Native(table) => table.commit(),
-        }
-    }
-
-    pub(crate) fn rollback(&self) -> Result<()> {
-        match self {
-            Self::C(table) => table.rollback(),
-            Self::Native(table) => table.rollback(),
-        }
-    }
-
-    pub(crate) fn rename(&self, name: &str) -> Result<()> {
-        match self {
-            Self::C(table) => table.rename(name),
-            Self::Native(table) => table.rename(name),
-        }
-    }
-
-    pub(crate) fn destroy(&self) -> Result<()> {
-        match self {
-            Self::C(table) => table.destroy(),
-            Self::Native(table) => table.destroy(),
+            Self::Native(table) => table.hook(conn, hook),
         }
     }
 }

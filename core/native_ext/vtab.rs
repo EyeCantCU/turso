@@ -7,13 +7,42 @@ use std::fmt::Debug;
 use turso_ext::ResultCode;
 
 /// Identifies the table a module instance is being created for.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct ConnectInfo<'a> {
     pub module_name: &'a str,
     pub schema_name: &'a str,
     pub table_name: &'a str,
     /// `true` for `CREATE VIRTUAL TABLE`, `false` when attaching to an existing table.
     pub create: bool,
+    /// The connection running `CREATE VIRTUAL TABLE`, when there is one.
+    pub connection: Option<&'a Arc<Connection>>,
+    /// Column names of another table in the schema being loaded, for
+    /// modules that derive their columns from one.
+    pub lookup_columns: Option<&'a dyn Fn(&str) -> Option<Vec<String>>>,
+}
+
+impl Debug for ConnectInfo<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectInfo")
+            .field("module_name", &self.module_name)
+            .field("schema_name", &self.schema_name)
+            .field("table_name", &self.table_name)
+            .field("create", &self.create)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A transaction, rename or destroy hook, as passed to [`VirtualTable::hook`].
+#[derive(Debug, Clone, Copy)]
+pub enum TableHook<'a> {
+    Begin,
+    Commit,
+    Rollback,
+    Savepoint(usize),
+    Release(usize),
+    RollbackTo(usize),
+    Rename(&'a str),
+    Destroy,
 }
 
 pub trait VirtualTableModule: Debug + Send + Sync {
@@ -90,6 +119,34 @@ pub trait VirtualTable: Debug + Send + Sync {
     fn destroy(&mut self) -> Result<()> {
         Ok(())
     }
+    /// Runs a hook for `conn`. Modules that need the calling connection
+    /// override this; the default dispatches to the methods above.
+    fn hook(&mut self, _conn: &Arc<Connection>, hook: TableHook<'_>) -> Result<()> {
+        match hook {
+            TableHook::Begin => self.begin(),
+            TableHook::Commit => self.commit(),
+            TableHook::Rollback => self.rollback(),
+            TableHook::Savepoint(level) => self.savepoint(level),
+            TableHook::Release(level) => self.release(level),
+            TableHook::RollbackTo(level) => self.rollback_to(level),
+            TableHook::Rename(name) => self.rename(name),
+            TableHook::Destroy => self.destroy(),
+        }
+    }
+    /// Whether the plan `idx_num` visits at most one row
+    /// (`SQLITE_INDEX_SCAN_UNIQUE`), so a write through it is a single write.
+    fn unique_scan(&self, _idx_num: i32) -> bool {
+        false
+    }
+    /// Like `create_update_on_conflict`, with the connection running the statement.
+    fn create_update_conn(
+        &mut self,
+        _conn: &Arc<Connection>,
+        args: Vec<Value>,
+        on_conflict: u8,
+    ) -> Result<Box<dyn TableUpdate>> {
+        self.create_update_on_conflict(args, on_conflict)
+    }
 }
 
 pub trait VirtualTableCursor: Send + Sync {
@@ -149,6 +206,7 @@ impl NativeTable {
 
     pub(crate) fn update(
         &self,
+        conn: &Arc<Connection>,
         state: &mut ExtensionState,
         args: &[Value],
         on_conflict: u8,
@@ -158,11 +216,11 @@ impl NativeTable {
                 .iter()
                 .map(Value::try_clone)
                 .collect::<Result<Vec<_>, _>>()?;
-            *state = ExtensionState::TableUpdate(
-                self.0
-                    .write()
-                    .create_update_on_conflict(args, on_conflict)?,
-            );
+            *state = ExtensionState::TableUpdate(self.0.write().create_update_conn(
+                conn,
+                args,
+                on_conflict,
+            )?);
         }
         let ExtensionState::TableUpdate(update) = state else {
             unreachable!("update instruction requires table update state");
@@ -174,40 +232,16 @@ impl NativeTable {
         result
     }
 
-    pub(crate) fn begin(&self) -> Result<()> {
-        self.0.write().begin()
-    }
-
-    pub(crate) fn commit(&self) -> Result<()> {
-        self.0.write().commit()
-    }
-
-    pub(crate) fn rollback(&self) -> Result<()> {
-        self.0.write().rollback()
-    }
-
-    pub(crate) fn rename(&self, name: &str) -> Result<()> {
-        self.0.write().rename(name)
+    pub(crate) fn hook(&self, conn: &Arc<Connection>, hook: TableHook<'_>) -> Result<()> {
+        self.0.write().hook(conn, hook)
     }
 
     pub(crate) fn commits_after_create(&self) -> bool {
         self.0.read().commits_after_create()
     }
 
-    pub(crate) fn savepoint(&self, level: usize) -> Result<()> {
-        self.0.write().savepoint(level)
-    }
-
-    pub(crate) fn release(&self, level: usize) -> Result<()> {
-        self.0.write().release(level)
-    }
-
-    pub(crate) fn rollback_to(&self, level: usize) -> Result<()> {
-        self.0.write().rollback_to(level)
-    }
-
-    pub(crate) fn destroy(&self) -> Result<()> {
-        self.0.write().destroy()
+    pub(crate) fn unique_scan(&self, idx_num: i32) -> bool {
+        self.0.read().unique_scan(idx_num)
     }
 }
 
@@ -219,20 +253,15 @@ trait TableInstance: Debug + Send + Sync {
         order_by: &[OrderByInfo],
     ) -> Result<IndexInfo, ResultCode>;
     fn readonly(&self) -> bool;
-    fn create_update_on_conflict(
+    fn create_update_conn(
         &mut self,
+        conn: &Arc<Connection>,
         args: Vec<Value>,
         on_conflict: u8,
     ) -> Result<Box<dyn TableUpdate>>;
     fn commits_after_create(&self) -> bool;
-    fn savepoint(&mut self, level: usize) -> Result<()>;
-    fn release(&mut self, level: usize) -> Result<()>;
-    fn rollback_to(&mut self, level: usize) -> Result<()>;
-    fn begin(&mut self) -> Result<()>;
-    fn commit(&mut self) -> Result<()>;
-    fn rollback(&mut self) -> Result<()>;
-    fn rename(&mut self, name: &str) -> Result<()>;
-    fn destroy(&mut self) -> Result<()>;
+    fn unique_scan(&self, idx_num: i32) -> bool;
+    fn hook(&mut self, conn: &Arc<Connection>, hook: TableHook<'_>) -> Result<()>;
 }
 
 impl<T: VirtualTable> TableInstance for T {
@@ -252,48 +281,25 @@ impl<T: VirtualTable> TableInstance for T {
         VirtualTable::readonly(self)
     }
 
-    fn create_update_on_conflict(
+    fn create_update_conn(
         &mut self,
+        conn: &Arc<Connection>,
         args: Vec<Value>,
         on_conflict: u8,
     ) -> Result<Box<dyn TableUpdate>> {
-        VirtualTable::create_update_on_conflict(self, args, on_conflict)
+        VirtualTable::create_update_conn(self, conn, args, on_conflict)
     }
 
     fn commits_after_create(&self) -> bool {
         VirtualTable::commits_after_create(self)
     }
 
-    fn savepoint(&mut self, level: usize) -> Result<()> {
-        VirtualTable::savepoint(self, level)
+    fn unique_scan(&self, idx_num: i32) -> bool {
+        VirtualTable::unique_scan(self, idx_num)
     }
 
-    fn release(&mut self, level: usize) -> Result<()> {
-        VirtualTable::release(self, level)
-    }
-
-    fn rollback_to(&mut self, level: usize) -> Result<()> {
-        VirtualTable::rollback_to(self, level)
-    }
-
-    fn begin(&mut self) -> Result<()> {
-        VirtualTable::begin(self)
-    }
-
-    fn commit(&mut self) -> Result<()> {
-        VirtualTable::commit(self)
-    }
-
-    fn rollback(&mut self) -> Result<()> {
-        VirtualTable::rollback(self)
-    }
-
-    fn rename(&mut self, name: &str) -> Result<()> {
-        VirtualTable::rename(self, name)
-    }
-
-    fn destroy(&mut self) -> Result<()> {
-        VirtualTable::destroy(self)
+    fn hook(&mut self, conn: &Arc<Connection>, hook: TableHook<'_>) -> Result<()> {
+        VirtualTable::hook(self, conn, hook)
     }
 }
 

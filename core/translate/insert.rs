@@ -3524,6 +3524,9 @@ fn translate_virtual_table_insert(
         InsertBody::DefaultValues => (0, vec![vec![]]),
         _ => crate::bail_parse_error!("Unsupported INSERT body for virtual tables"),
     };
+    // As in SQLite: one VALUES row is a single write, and a write may abort.
+    program.set_multi_write(rows.len() > 1);
+    program.set_may_abort(true);
     let table = Table::Virtual(virtual_table.clone());
     let cursor_id = program.alloc_cursor_id(CursorType::VirtualTable(virtual_table));
     program.emit_insn(Insn::VOpen { cursor_id });

@@ -7,7 +7,9 @@ pub use function::{
     Aggregate, AggregateFunction, FunctionArity, ScalarCall, ScalarFunction, ScalarReturn,
 };
 pub use turso_ext::{ConstraintInfo, ConstraintUsage, IndexInfo, OrderByInfo, VTabKind};
-pub use vtab::{ConnectInfo, TableUpdate, VirtualTable, VirtualTableCursor, VirtualTableModule};
+pub use vtab::{
+    ConnectInfo, TableHook, TableUpdate, VirtualTable, VirtualTableCursor, VirtualTableModule,
+};
 
 pub use function::AggregateState;
 pub(crate) use function::{
