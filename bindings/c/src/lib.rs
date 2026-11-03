@@ -67,6 +67,8 @@ fn default_db_opts() -> DatabaseOpts {
     opts
 }
 
+mod multiprocess;
+
 macro_rules! stub {
     () => {
         todo!("{} is not implemented", stringify!($fn));
@@ -531,13 +533,11 @@ pub unsafe extern "C" fn sqlite3_open(
             Err(_) => return SQLITE_CANTOPEN,
         },
     };
-    match turso_core::Database::open_file_with_flags(
+    match multiprocess::open_file_db(
         io.clone(),
         filename_str,
         turso_core::OpenFlags::default(),
         default_db_opts(),
-        None,
-        Arc::new(SqliteDialect),
     ) {
         Ok(db) => {
             let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -753,13 +753,11 @@ pub unsafe extern "C" fn sqlite3_open_v2(
             Ok(io) => Arc::new(io),
             Err(_) => return SQLITE_CANTOPEN,
         };
-        match turso_core::Database::open_file_with_flags(
+        match multiprocess::open_file_db(
             io.clone(),
             &effective_filename,
             file_open_flags,
             default_db_opts(),
-            None,
-            Arc::new(SqliteDialect),
         ) {
             Ok(db) => (io, db),
             Err(e) => {
