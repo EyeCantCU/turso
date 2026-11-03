@@ -875,6 +875,67 @@ pub(crate) fn best_index(constraints: &[ConstraintInfo]) -> IndexInfo {
     }
 }
 
+/// xBestIndex of geopoly.c: rowid=, then geopoly_overlap (2) or
+/// geopoly_within (3) through their function constraints, else a full scan.
+pub(crate) fn best_index_plan(req: &crate::native_ext::IndexRequest) -> crate::native_ext::IndexPlan {
+    use crate::native_ext::{index_op, IndexPlan, INDEX_SCAN_UNIQUE};
+    let mut plan = IndexPlan::new(req.constraints.len());
+    let mut rowid_term = None;
+    let mut func_term = None;
+    for (i, c) in req.constraints.iter().enumerate() {
+        if !c.usable {
+            continue;
+        }
+        if c.column < 0 && c.op == index_op::EQ {
+            rowid_term = Some(i);
+            break;
+        }
+        if c.column == 0 && c.op >= index_op::FUNCTION {
+            func_term = Some((i, i32::from(c.op - index_op::FUNCTION) + 2));
+        }
+    }
+    let set = |plan: &mut IndexPlan, num: i32, s: &str, cost: f64, rows: i64| {
+        plan.idx_num = num;
+        plan.idx_str = Some(s.to_string());
+        plan.idx_str_display = Some(s.to_string());
+        plan.estimated_cost = cost;
+        plan.estimated_rows = rows;
+    };
+    if let Some(i) = rowid_term {
+        set(&mut plan, 1, "rowid", 30.0, 1);
+        plan.usages[i] = ConstraintUsage {
+            argv_index: Some(1),
+            omit: true,
+        };
+        plan.idx_flags = INDEX_SCAN_UNIQUE;
+    } else if let Some((i, num)) = func_term {
+        set(&mut plan, num, "rtree", 300.0, 10);
+        plan.usages[i] = ConstraintUsage {
+            argv_index: Some(1),
+            omit: false,
+        };
+    } else {
+        set(&mut plan, 4, "fullscan", 3000000.0, 100000);
+    }
+    plan
+}
+
+/// xFindFunction of geopoly.c.
+pub(crate) fn find_function(name: &str) -> Option<(i32, Arc<ExternalFunc>)> {
+    let op = if name.eq_ignore_ascii_case("geopoly_overlap") {
+        150
+    } else if name.eq_ignore_ascii_case("geopoly_within") {
+        151
+    } else {
+        return None;
+    };
+    let func = functions()
+        .ok()?
+        .into_iter()
+        .find(|f| f.name.eq_ignore_ascii_case(name))?;
+    Some((op, Arc::new(func)))
+}
+
 /// The constraints of an overlap (2) or within (3) query for polygon `arg`.
 pub(crate) fn filter_constraints(idx_num: i32, arg: &Value) -> Result<Vec<Constraint>> {
     let b = bbox_coords(arg).map_err(|_| LimboError::SqlError("SQL logic error".into()))?;

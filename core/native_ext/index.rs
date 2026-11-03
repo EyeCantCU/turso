@@ -113,7 +113,8 @@ impl IndexPlan {
 }
 
 fn legacy_op(c: &IndexConstraint) -> Option<ConstraintOp> {
-    if c.column < 0 || c.is_in {
+    // An IN is offered as EQ, as SQLite does; the planner loops over its values.
+    if c.column < 0 {
         return None;
     }
     Some(match c.op {

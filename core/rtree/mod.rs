@@ -456,6 +456,32 @@ impl VirtualTable for RtreeTable {
         Ok(best_index(&self.t, constraints))
     }
 
+    fn best_index_plan(
+        &self,
+        req: &crate::native_ext::IndexRequest,
+    ) -> Result<Option<crate::native_ext::IndexPlan>> {
+        if self.t.kind == RtreeKind::Geopoly {
+            return Ok(Some(geopoly::best_index_plan(req)));
+        }
+        // rtreeBestIndex treats the rowid and column 0 alike.
+        let mut req = req.clone();
+        for c in &mut req.constraints {
+            c.column = c.column.max(0);
+        }
+        crate::native_ext::best_index_via_legacy(&req, |c, o| self.best_index(c, o))
+    }
+
+    fn find_function(
+        &self,
+        _n_arg: i32,
+        name: &str,
+    ) -> Option<(i32, Arc<crate::function::ExternalFunc>)> {
+        if self.t.kind != RtreeKind::Geopoly {
+            return None;
+        }
+        geopoly::find_function(name)
+    }
+
     fn readonly(&self) -> bool {
         false
     }
