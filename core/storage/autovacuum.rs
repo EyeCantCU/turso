@@ -197,6 +197,7 @@ struct VacuumJob {
     n_orig: u32,
     n_fin: u32,
     n_free: u32,
+    n_vac: u32,
     free: Vec<u32>,
     free_set: HashSet<u32>,
     /// Free pages at or below `n_fin`, largest first so `pop` gives the lowest.
@@ -549,7 +550,8 @@ impl Pager {
     /// Vacuums `n` free pages (all of them when `n` is `None`): relocates
     /// the pages in use above the final size into free pages below it,
     /// rebuilds the freelist from what is left and shrinks the database.
-    pub(crate) fn av_vacuum(&self, n: Option<u32>) -> IOResultOr<()> {
+    /// Returns the number of free pages given back.
+    pub(crate) fn av_vacuum(&self, n: Option<u32>) -> IOResultOr<u32> {
         let res = self.av_vacuum_inner(n);
         if res.is_err() {
             self.av_abort();
@@ -557,7 +559,7 @@ impl Pager {
         res
     }
 
-    fn av_vacuum_inner(&self, n: Option<u32>) -> IOResultOr<()> {
+    fn av_vacuum_inner(&self, n: Option<u32>) -> IOResultOr<u32> {
         loop {
             let phase = {
                 let st = self.av_state.read();
@@ -577,7 +579,7 @@ impl Pager {
                         h.freelist_pages.get()
                     )));
                     if n_free == 0 {
-                        return Ok(IOResult::Done(()));
+                        return Ok(IOResult::Done(0));
                     }
                     if n_free >= n_orig || geom.skip(n_orig) {
                         return Err(LimboError::Corrupt(format!(
@@ -595,6 +597,7 @@ impl Pager {
                         n_orig,
                         n_fin,
                         n_free,
+                        n_vac,
                         free: Vec::with_capacity(n_free as usize),
                         free_set: HashSet::new(),
                         targets: Vec::new(),
@@ -613,11 +616,12 @@ impl Pager {
                 Some(2) => return_if_io!(self.av_vacuum_relocate_step()),
                 Some(3) => return_if_io!(self.av_vacuum_rewrite_step()),
                 Some(_) => {
-                    let (n_fin, first_trunk, n_left) = {
+                    let (n_fin, first_trunk, n_left, n_vac) = {
                         let st = self.av_state.read();
                         let job = st.vacuum.as_ref().expect("vacuum");
                         let n_left: usize = job.trunks.iter().map(|(_, l)| l.len() + 1).sum();
-                        (job.n_fin, job.trunks.first().map_or(0, |t| t.0), n_left)
+                        let first = job.trunks.first().map_or(0, |t| t.0);
+                        (job.n_fin, first, n_left, job.n_vac)
                     };
                     return_if_io!(self.with_header_mut(|h| {
                         h.freelist_trunk_page = first_trunk.into();
@@ -628,7 +632,7 @@ impl Pager {
                     self.invalidate_all_cursors();
                     self.av_state.write().vacuum = None;
                     self.av_keep_clean();
-                    return Ok(IOResult::Done(()));
+                    return Ok(IOResult::Done(n_vac));
                 }
             }
         }
@@ -1074,6 +1078,13 @@ impl Pager {
 }
 
 impl Pager {
+    /// Whether page `id`, about to be created at the end of the file, existed
+    /// when the newest savepoint was opened (the file was truncated since).
+    pub(super) fn av_needs_preimage(&self, id: u32) -> bool {
+        self.subjournal.read().is_some()
+            && Self::savepoints_require_page(&self.savepoints.read(), id)
+    }
+
     pub(super) fn av_force_grow(&self) -> bool {
         self.av_state.read().force_grow
     }

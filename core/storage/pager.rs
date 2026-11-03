@@ -2232,6 +2232,25 @@ impl Pager {
     ///
     /// A buffer of length page_size + 4 bytes is allocated and the page id
     /// is written to the beginning of the buffer. The rest of the buffer is filled with the page contents.
+    /// subjRequiresPage: some savepoint saw `page_id` exist and has no
+    /// journal record for it yet. The records written since savepoint i are
+    /// tracked by the bitmaps of savepoints i.. (released ones are merged into
+    /// their parent). Database sizes only shrink under auto-vacuum, so outer
+    /// savepoints can need a page the newest one never saw.
+    fn savepoints_require_page(savepoints: &[Savepoint], page_id: u32) -> bool {
+        let mut covered = false;
+        for savepoint in savepoints.iter().rev() {
+            covered = covered || savepoint.has_dirty_page(page_id);
+            if covered {
+                return false;
+            }
+            if page_id <= savepoint.db_size.load(Ordering::Acquire) {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn subjournal_page_if_required(&self, page: &Page) -> Result<()> {
         if self.subjournal.read().is_none() {
             return Ok(());
@@ -2246,10 +2265,7 @@ impl Pager {
             // truncating back to the original db_size. This matches SQLite's subjRequiresPage()
             // which checks: p->nOrig >= pgno.
             let page_id_u32 = page.get().id() as u32;
-            if page_id_u32 > cur_savepoint.db_size.load(Ordering::Acquire) {
-                return Ok(());
-            }
-            if cur_savepoint.has_dirty_page(page_id_u32) {
+            if !Self::savepoints_require_page(&savepoints, page_id_u32) {
                 return Ok(());
             }
             cur_savepoint.write_offset.load(Ordering::SeqCst)
@@ -2347,6 +2363,8 @@ impl Pager {
         let savepoint = savepoints.pop().expect("savepoint must exist");
         if let Some(parent) = savepoints.last() {
             parent.set_write_offset(savepoint.write_offset());
+            // See release_named_savepoint: the records now belong to the parent.
+            *parent.page_bitmap.write() |= &*savepoint.page_bitmap.read();
         } else {
             let subjournal = self.subjournal.read();
             let Some(subjournal) = subjournal.as_ref() else {
@@ -2415,6 +2433,16 @@ impl Pager {
             .last()
             .map(|savepoint| savepoint.write_offset())
             .unwrap_or(0);
+
+        // The released savepoints' journal records now belong to the parent:
+        // each holds the page as it was when the parent was opened, unless the
+        // parent already journaled that page itself.
+        if target_idx > 0 {
+            let mut bitmap = savepoints[target_idx - 1].page_bitmap.write();
+            for savepoint in &savepoints[target_idx..] {
+                *bitmap |= &*savepoint.page_bitmap.read();
+            }
+        }
 
         savepoints.truncate(target_idx);
 
@@ -3344,8 +3372,16 @@ impl Pager {
             // Parent statement will handle the transaction commit.
             return Ok(IOResult::Done(()));
         }
+        #[cfg(feature = "autovacuum")]
+        if self.commit_info.read().state == CommitState::PrepareWal
+            && matches!(connection.get_tx_state(), TransactionState::Write { .. })
+        {
+            return_if_io!(self.av_commit());
+        }
         let Some(wal) = self.wal.as_ref() else {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
+            #[cfg(feature = "autovacuum")]
+            self.av_commit_end();
             self.clear_savepoints()?;
             return Ok(IOResult::Done(()));
         };
@@ -3356,13 +3392,6 @@ impl Pager {
             }
             self.commit_wal_end();
         };
-
-        #[cfg(feature = "autovacuum")]
-        if self.commit_info.read().state == CommitState::PrepareWal
-            && matches!(connection.get_tx_state(), TransactionState::Write { .. })
-        {
-            return_if_io!(self.av_commit());
-        }
 
         loop {
             let commit_state = self.commit_info.read().state;
@@ -6064,6 +6093,31 @@ impl Pager {
                         }
                         _ => None,
                     };
+                    // After an in-transaction truncation a "new" page may have existed when
+                    // the newest savepoint was opened; load it so its content is journaled.
+                    #[cfg(feature = "autovacuum")]
+                    let mut preimages = HashMap::new();
+                    #[cfg(feature = "autovacuum")]
+                    {
+                        let pending = skips_pending_byte_page
+                            .then_some(pending_byte_page_id)
+                            .flatten();
+                        for id in [ptrmap_page_id, pending, Some(new_db_size)]
+                            .into_iter()
+                            .flatten()
+                        {
+                            if self.av_needs_preimage(id) {
+                                let (page, c) = return_if_io!(self.read_page(id as i64));
+                                if !page.is_loaded() {
+                                    io_yield_one!(c.unwrap_or_else(Completion::new_yield));
+                                }
+                                preimages.insert(id, PinGuard::new(page));
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "autovacuum"))]
+                    let preimages: HashMap<u32, PinGuard> = HashMap::new();
+
                     #[cfg(feature = "autovacuum")]
                     if let Some((map, off)) = stale_ptrmap_slot {
                         let slot = &mut map.get_contents().as_ptr()[off..off + PTRMAP_ENTRY_SIZE];
@@ -6075,34 +6129,18 @@ impl Pager {
 
                     #[cfg(feature = "autovacuum")]
                     if let Some(ptrmap_page_id) = ptrmap_page_id {
-                        let page = allocate_new_page(ptrmap_page_id as i64, &self.buffer_pool);
-                        self.add_dirty(&page)?;
-                        let page_key = PageCacheKey::new(ptrmap_page_id as usize);
-                        self.page_cache.write().force_insert_page(page_key, page)?;
+                        self.install_new_page(ptrmap_page_id, preimages.get(&ptrmap_page_id))?;
                     }
 
                     if skips_pending_byte_page {
                         // HIPP special page is assumed to zeroed and should never be read or written to by the BTREE
                         let pending_page = pending_byte_page_id.expect("pending byte page");
-                        let richard_hipp_special_page =
-                            allocate_new_page(pending_page as i64, &self.buffer_pool);
-                        self.add_dirty(&richard_hipp_special_page)?;
-                        let page_key = PageCacheKey::new(richard_hipp_special_page.get().id());
-                        self.page_cache
-                            .write()
-                            .force_insert_page(page_key, richard_hipp_special_page)?;
+                        self.install_new_page(pending_page, preimages.get(&pending_page))?;
                     }
 
                     // FIXME: should reserve page cache entry before modifying the database
-                    let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
+                    let page = self.install_new_page(new_db_size, preimages.get(&new_db_size))?;
                     {
-                        // setup page and add to cache
-                        self.add_dirty(&page)?;
-
-                        let page_key = PageCacheKey::new(page.get().id() as usize);
-                        self.page_cache
-                            .write()
-                            .force_insert_page(page_key, page.clone())?;
                         header.database_size = new_db_size.into();
                         *state = AllocatePageState::Start;
                         return Ok(IOResult::Done(page));
@@ -6110,6 +6148,25 @@ impl Pager {
                 }
             }
         }
+    }
+
+    /// Creates page `id` at the end of the file, dirty and zeroed. `existing` is
+    /// the loaded old copy of the page, when its content must be journaled.
+    fn install_new_page(&self, id: u32, existing: Option<&PinGuard>) -> Result<PageRef> {
+        if let Some(existing) = existing {
+            let page = existing.to_page();
+            self.add_dirty(&page)?;
+            page.get().overflow_cells.clear();
+            page.get_contents().as_ptr().fill(0);
+            return Ok(page);
+        }
+        let page = allocate_new_page(id as i64, &self.buffer_pool);
+        self.add_dirty(&page)?;
+        let page_key = PageCacheKey::new(id as usize);
+        self.page_cache
+            .write()
+            .force_insert_page(page_key, page.clone())?;
+        Ok(page)
     }
 
     pub fn upsert_page_in_cache(
