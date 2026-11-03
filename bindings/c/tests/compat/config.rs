@@ -652,7 +652,7 @@ fn auto_extension_failure_fails_the_open() {
 
 /// Compiles the C test extension once; returns the paths of the two builds
 /// (with and without the default `sqlite3_extension_init` entry point).
-fn build_extension() -> &'static (std::path::PathBuf, std::path::PathBuf) {
+pub(super) fn build_extension() -> &'static (std::path::PathBuf, std::path::PathBuf) {
     use std::sync::OnceLock;
     static BUILT: OnceLock<(std::path::PathBuf, std::path::PathBuf)> = OnceLock::new();
     BUILT.get_or_init(|| {
