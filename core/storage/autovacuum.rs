@@ -18,7 +18,7 @@ pub(crate) const PTRMAP_BTREE: u8 = 5;
 
 /// Pointer-map geometry of one database (usable size and pending-byte page).
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Geom {
+pub struct Geom {
     pub usable: u32,
     pub pending: u32,
 }
@@ -812,7 +812,7 @@ impl Pager {
     fn av_freelist_take(&self, pgno: u32) -> IOResultOr<()> {
         loop {
             let (prev, trunk) = {
-                let mut st = self.av_state.write();
+                let st = self.av_state.write();
                 match st.take {
                     Some(t) => t,
                     None => {

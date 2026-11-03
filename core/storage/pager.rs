@@ -6047,6 +6047,7 @@ impl Pager {
 
                     // if new_db_size reaches the pending page, we need to allocate a new one
                     let pending_byte_page_id = self.pending_byte_page_id();
+                    #[cfg_attr(not(feature = "autovacuum"), allow(unused_mut))]
                     let mut skips_pending_byte_page = Some(new_db_size) == pending_byte_page_id;
                     if skips_pending_byte_page {
                         new_db_size += 1;

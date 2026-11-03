@@ -8239,6 +8239,7 @@ pub enum IntegrityCheckError {
     PendingBytePageUsed { page_id: i64 },
     #[error("Page {page_id}: pointer map referenced")]
     PointerMapReferenced { page_id: i64 },
+    #[cfg_attr(not(feature = "autovacuum"), allow(dead_code))]
     #[error("Bad ptr map entry key={page_id} expected=({expected_type},{expected_parent}) got=({got_type},{got_parent})")]
     BadPtrmapEntry {
         page_id: i64,

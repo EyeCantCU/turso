@@ -16531,7 +16531,6 @@ pub fn op_read_cookie(
                 Cookie::PageSize => header.page_size.get().into(),
                 Cookie::FreePageCount => header.freelist_pages.get().into(),
                 Cookie::IncrementalVacuum => header.incremental_vacuum_enabled.get().into(),
-                cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
             },
         ) {
             Err(_) => 0.into(),
@@ -20772,6 +20771,7 @@ pub fn op_incr_vacuum(
 ) -> InsnResult {
     load_insn!(IncrVacuum { db, limit, dest }, insn);
     check_db_write_allowed(program, state, None)?;
+    #[cfg_attr(not(feature = "autovacuum"), allow(unused_mut))]
     let mut freed = 0;
     #[cfg(feature = "autovacuum")]
     if program.connection.mv_store_for_db(*db).is_none() {
