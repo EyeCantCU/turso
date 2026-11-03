@@ -628,8 +628,9 @@ impl Pager {
                         h.freelist_pages = (n_left as u32).into();
                         h.database_size = n_fin.into();
                     }));
-                    self.av_truncate(n_fin)?;
+                    // Cursors may still pin pages past the new end.
                     self.invalidate_all_cursors();
+                    self.av_truncate(n_fin)?;
                     self.av_state.write().vacuum = None;
                     self.av_keep_clean();
                     return Ok(IOResult::Done(n_vac));
