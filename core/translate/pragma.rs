@@ -1521,6 +1521,10 @@ fn query_pragma(
                             base_reg,
                             false,
                         );
+                    } else if let Some(vtab) =
+                        eponymous_for_pragma(resolver, table_namespace, &lookup_name)?
+                    {
+                        emit_columns_for_table_info(program, &vtab.columns, None, base_reg, false);
                     }
                     Ok(())
                 })?;
@@ -1586,6 +1590,10 @@ fn query_pragma(
                             base_reg,
                             true,
                         );
+                    } else if let Some(vtab) =
+                        eponymous_for_pragma(resolver, table_namespace, &lookup_name)?
+                    {
+                        emit_columns_for_table_info(program, &vtab.columns, None, base_reg, true);
                     }
                     Ok(())
                 })?;
@@ -2025,6 +2033,18 @@ fn column_pk_index(
     primary_key_columns
         .iter()
         .position(|(pk_name, _)| name.eq_ignore_ascii_case(pk_name))
+}
+
+/// An eponymous virtual table named by a main-schema table pragma.
+fn eponymous_for_pragma(
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+    name: &str,
+) -> Result<Option<Arc<crate::vtab::VirtualTable>>> {
+    if namespace.database_id != crate::MAIN_DB_ID || !namespace.id.is_root() {
+        return Ok(None);
+    }
+    resolver.catalog.symbol_table.eponymous_table(name)
 }
 
 /// Helper function to emit column information for PRAGMA table_info

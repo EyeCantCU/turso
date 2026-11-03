@@ -2174,6 +2174,25 @@ fn validate_drop_table(
     Ok(())
 }
 
+/// Eponymous virtual tables exist but cannot be dropped.
+fn reject_eponymous_drop(resolver: &Resolver, tbl_name: &ast::QualifiedName) -> Result<()> {
+    let in_main = tbl_name
+        .namespace
+        .as_ref()
+        .is_none_or(|n| n.as_str().eq_ignore_ascii_case("main"));
+    let name = tbl_name.name.as_str();
+    if in_main
+        && resolver
+            .catalog
+            .symbol_table
+            .eponymous_table(&normalize_ident(name))?
+            .is_some()
+    {
+        bail_parse_error!("table {} may not be dropped", name);
+    }
+    Ok(())
+}
+
 pub fn translate_drop_table(
     tbl_name: ast::QualifiedName,
     resolver: &mut Resolver,
@@ -2186,6 +2205,7 @@ pub fn translate_drop_table(
     program.extend(&opts);
 
     let Some(namespace) = resolver.find_existing_table(&tbl_name)? else {
+        reject_eponymous_drop(resolver, &tbl_name)?;
         if if_exists {
             return Ok(());
         }
@@ -2204,6 +2224,7 @@ pub fn translate_drop_table(
         if resolver.with_schema(database_id, |s| s.get_view(namespace.id, name).is_some()) {
             bail_parse_error!("use DROP VIEW to delete view {name}");
         }
+        reject_eponymous_drop(resolver, &tbl_name)?;
         if if_exists {
             return Ok(());
         }

@@ -5,6 +5,7 @@
 use std::ptr;
 
 mod lifecycle;
+mod dbstat;
 mod vtab;
 
 #[repr(C)]
