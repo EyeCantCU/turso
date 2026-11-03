@@ -51,8 +51,8 @@ fn prepare_sets_outputs_on_error() {
         assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
         let sql = c"SELEC nonsense";
         // Poison the outputs: they must be overwritten on failure.
-        let mut stmt = 0x1 as *mut sqlite3_stmt;
-        let mut tail = 0x1 as *const libc::c_char;
+        let mut stmt = ptr::dangling_mut::<sqlite3_stmt>();
+        let mut tail = ptr::dangling::<libc::c_char>();
         let rc = sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, &mut tail);
         assert_eq!(rc, SQLITE_ERROR);
         assert!(stmt.is_null());
@@ -61,7 +61,7 @@ fn prepare_sets_outputs_on_error() {
 
         // Empty and comment-only SQL: OK with a NULL statement.
         for s in [c"", c"  ", c"-- c"] {
-            stmt = 0x1 as *mut sqlite3_stmt;
+            stmt = ptr::dangling_mut::<sqlite3_stmt>();
             tail = ptr::null();
             assert_eq!(
                 sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut stmt, &mut tail),
@@ -72,7 +72,7 @@ fn prepare_sets_outputs_on_error() {
         }
 
         // v3 behaves the same.
-        stmt = 0x1 as *mut sqlite3_stmt;
+        stmt = ptr::dangling_mut::<sqlite3_stmt>();
         tail = ptr::null();
         let rc = sqlite3_prepare_v3(db, sql.as_ptr(), -1, 0, &mut stmt, &mut tail);
         assert_eq!(rc, SQLITE_ERROR);
@@ -80,7 +80,7 @@ fn prepare_sets_outputs_on_error() {
         assert!(!tail.is_null());
 
         // A NULL db still clears the outputs.
-        stmt = 0x1 as *mut sqlite3_stmt;
+        stmt = ptr::dangling_mut::<sqlite3_stmt>();
         let rc = sqlite3_prepare_v2(ptr::null_mut(), sql.as_ptr(), -1, &mut stmt, &mut tail);
         assert_eq!(rc, SQLITE_MISUSE);
         assert!(stmt.is_null());
