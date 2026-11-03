@@ -1472,12 +1472,15 @@ pub fn op_vcreate(
         vec![]
     };
     let conn = program.connection.clone();
+    // No lock is held while the module's constructor runs: it may run
+    // statements on this connection.
+    let module = conn.syms.read().vtab_module(&module_name).cloned();
     let table = crate::VirtualTable::table_for(
         Some(&table_name),
         &module_name,
         args,
-        &conn.syms.read(),
-        true,
+        module.as_ref(),
+        Some(&conn),
     )?;
     // A table that asks for it joins the transaction, as in SQLite (commit, no begin).
     if table.commits_after_create() {
@@ -1632,7 +1635,12 @@ pub fn op_vupdate(
             unreachable!("sqlite_dbpage writes require cli_only feature");
         }
     } else {
-        virtual_table.update(&argv, &mut state.extension_state, *conflict_action as u8)
+        virtual_table.update(
+            &program.connection,
+            &argv,
+            &mut state.extension_state,
+            *conflict_action as u8,
+        )
     };
     match result {
         Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
@@ -1655,6 +1663,8 @@ pub fn op_vupdate(
                 LimboError::Constraint(_)
                     | LimboError::ConstraintViolation(_)
                     | LimboError::ReadOnly
+                    | LimboError::SqlError(_)
+                    | LimboError::Corrupt(_)
             ) =>
         {
             mark_unlikely();
@@ -1727,7 +1737,7 @@ pub fn op_vdestroy(
             )
             .into());
         };
-        vtab.destroy()?;
+        vtab.destroy(&conn)?;
     }
 
     state.pc += 1;
@@ -1787,7 +1797,7 @@ pub fn op_vrename(
         )
         .into());
     };
-    vtab.rename(&name)?;
+    vtab.rename(&program.connection, &name)?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

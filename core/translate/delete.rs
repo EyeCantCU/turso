@@ -367,6 +367,14 @@ fn record_delete_optimizer_safety(plan: &mut DeletePlan) {
         .table_references
         .joined_tables()
         .first()
+        .is_some_and(|table| table.virtual_table().is_some())
+    {
+        plan.safety.require(DmlSafetyReason::VirtualTable);
+    }
+    if plan
+        .table_references
+        .joined_tables()
+        .first()
         .is_some_and(|table| matches!(table.op, Operation::MultiIndexScan(_)))
     {
         plan.safety.require(DmlSafetyReason::MultiIndexScan);

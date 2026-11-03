@@ -101,13 +101,14 @@ impl ExtensionTable {
 
     pub(crate) fn update(
         &self,
+        connection: &Arc<Connection>,
         args: &[Value],
         state: &mut ExtensionState,
         on_conflict: u8,
     ) -> IOResultOr<Option<i64>> {
         match self {
             Self::C(table) => table.update(args).map(IOResult::Done).map_err(Into::into),
-            Self::Native(table) => table.update(state, args, on_conflict),
+            Self::Native(table) => table.update(connection, state, args, on_conflict),
         }
     }
 
@@ -144,17 +145,17 @@ impl ExtensionTable {
         }
     }
 
-    pub(crate) fn rename(&self, name: &str) -> Result<()> {
+    pub(crate) fn rename(&self, connection: &Arc<Connection>, name: &str) -> Result<()> {
         match self {
             Self::C(table) => table.rename(name),
-            Self::Native(table) => table.rename(name),
+            Self::Native(table) => table.rename(connection, name),
         }
     }
 
-    pub(crate) fn destroy(&self) -> Result<()> {
+    pub(crate) fn destroy(&self, connection: &Arc<Connection>) -> Result<()> {
         match self {
             Self::C(table) => table.destroy(),
-            Self::Native(table) => table.destroy(),
+            Self::Native(table) => table.destroy(connection),
         }
     }
 }
