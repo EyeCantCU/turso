@@ -1,0 +1,90 @@
+# The "end of day|month|year" modifier and "weekday -N" (SQLite 3.54).
+# Expected output is from SQLite 3.54.1.
+
+@database :memory:
+
+test end-of-day-month-year {
+    SELECT datetime('2026-11-03 12:34:56', 'end of day'),
+           datetime('2026-11-03 12:34:56', 'end of month'),
+           datetime('2026-11-03 12:34:56', 'end of year');
+}
+expect {
+    2026-11-03 23:59:59|2026-11-30 23:59:59|2026-12-31 23:59:59
+}
+
+test end-of-month-lengths {
+    SELECT date('2026-02-10', 'end of month'),
+           date('2024-02-10', 'end of month'),
+           date('2026-12-15', 'end of month'),
+           date('2026-04-30', 'end of month');
+}
+expect {
+    2026-02-28|2024-02-29|2026-12-31|2026-04-30
+}
+
+test end-of-keeps-milliseconds {
+    SELECT strftime('%Y-%m-%d %H:%M:%f', '2026-11-03 12:00', 'end of day'),
+           julianday('2026-11-03', 'end of day') < julianday('2026-11-04'),
+           datetime('2026-11-03 12:00', 'end of day', '+1 second');
+}
+expect {
+    2026-11-03 23:59:59.999|1|2026-11-04 00:00:00
+}
+
+test end-of-case-and-timezone {
+    SELECT datetime('2026-11-03', 'END OF MONTH'),
+           datetime('2026-11-03 12:00+02:00', 'end of day'),
+           datetime('12:00', 'end of day'),
+           datetime('2026-11-03', 'start of month', 'end of month');
+}
+expect {
+    2026-11-30 23:59:59|2026-11-03 23:59:59|2000-01-01 23:59:59|2026-11-30 23:59:59
+}
+
+test end-of-unknown-unit-is-null {
+    SELECT datetime('2026-11-03', 'end of week') IS NULL,
+           datetime('2026-11-03', 'end of') IS NULL,
+           datetime('2026-11-03', 'end of  day') IS NULL;
+}
+expect {
+    1|1|1
+}
+
+test weekday-backwards {
+    SELECT date('2026-11-03', 'weekday -1'),
+           date('2026-11-03', 'weekday -2'),
+           date('2026-11-03', 'weekday -3'),
+           date('2026-11-03', 'weekday -6'),
+           date('2026-11-03', 'weekday -0');
+}
+expect {
+    2026-11-02|2026-11-03|2026-10-28|2026-10-31|2026-11-01
+}
+
+test weekday-forwards-unchanged {
+    SELECT date('2026-11-03', 'weekday 2'),
+           date('2026-11-03', 'weekday 6'),
+           date('2026-11-03', 'weekday +1'),
+           date('2026-11-03', 'weekday 2.0'),
+           date('2026-11-03', 'weekday -2.0');
+}
+expect {
+    2026-11-03|2026-11-07|2026-11-09|2026-11-03|2026-11-03
+}
+
+test weekday-out-of-range-is-null {
+    SELECT date('2026-11-03', 'weekday -7') IS NULL,
+           date('2026-11-03', 'weekday 7') IS NULL,
+           date('2026-11-03', 'weekday - 1') IS NULL,
+           date('2026-11-03', 'weekday -1.5') IS NULL;
+}
+expect {
+    1|1|1|1
+}
+
+test weekday-backwards-keeps-time {
+    SELECT datetime('2026-11-03 08:15:00', 'weekday -5');
+}
+expect {
+    2026-10-30 08:15:00
+}
