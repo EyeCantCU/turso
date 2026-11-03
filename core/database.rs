@@ -3677,6 +3677,15 @@ impl Database {
         self.owner_pid == std::process::id()
     }
 
+    /// Whether another process has this multiprocess-WAL database open.
+    pub(crate) fn multiprocess_peers_live(&self) -> bool {
+        #[cfg(host_shared_wal)]
+        if let Some(authority) = self.shared_wal_coordination.get() {
+            return !authority.is_last_process_mapping();
+        }
+        false
+    }
+
     pub fn experimental_multiprocess_wal_enabled(&self) -> bool {
         self.opts.enable_multiprocess_wal
     }

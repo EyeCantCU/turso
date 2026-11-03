@@ -3134,6 +3134,11 @@ impl Connection {
         self.db.experimental_mvcc_passive_checkpoint_enabled()
     }
 
+    /// Whether another process has this multiprocess-WAL database open.
+    pub fn multiprocess_peers_live(&self) -> bool {
+        self.db.multiprocess_peers_live()
+    }
+
     pub fn experimental_multiprocess_wal_enabled(&self) -> bool {
         self.db.experimental_multiprocess_wal_enabled()
     }

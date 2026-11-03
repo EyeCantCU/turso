@@ -93,10 +93,12 @@ pub fn translate_vacuum(
                         .to_string(),
                 ));
             }
-            if connection.experimental_multiprocess_wal_enabled() {
-                return Err(LimboError::ParseError(
-                    "VACUUM is incompatible with experimental multiprocess WAL".to_string(),
-                ));
+            // In-place VACUUM coordinates only with this process's readers,
+            // so it needs to be the database's only process.
+            if connection.experimental_multiprocess_wal_enabled()
+                && connection.multiprocess_peers_live()
+            {
+                return Err(LimboError::Busy);
             }
 
             // Schema-qualified VACUUM is not supported yet.
