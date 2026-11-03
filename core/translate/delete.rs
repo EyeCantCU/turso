@@ -43,7 +43,13 @@ fn validate_delete(
         s.get_table(namespace.id, tbl_name)
     }) {
         Some(table) => table,
-        None => return Err(crate::translate::catalog::dml_no_table_error(resolver, namespace, qualified_name)),
+        None => {
+            return Err(crate::translate::catalog::dml_no_table_error(
+                resolver,
+                namespace,
+                qualified_name,
+            ))
+        }
     };
     if program.trigger.is_some() && table.virtual_table().is_some() {
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name);

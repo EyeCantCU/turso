@@ -294,7 +294,11 @@ pub fn translate_insert(
         s.get_table(namespace.id, table_name.as_str())
     }) {
         Some(table) => table,
-        None => return Err(crate::translate::catalog::dml_no_table_error(resolver, namespace, &tbl_name)),
+        None => {
+            return Err(crate::translate::catalog::dml_no_table_error(
+                resolver, namespace, &tbl_name,
+            ))
+        }
     };
     if program.trigger.is_some() && table.virtual_table().is_some() {
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name.name.as_str());
@@ -318,7 +322,9 @@ pub fn translate_insert(
     }
 
     let Some(btree_table) = table.btree() else {
-        return Err(crate::translate::catalog::dml_no_table_error(resolver, namespace, &tbl_name));
+        return Err(crate::translate::catalog::dml_no_table_error(
+            resolver, namespace, &tbl_name,
+        ));
     };
 
     let BoundInsertResult {

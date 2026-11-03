@@ -3201,7 +3201,9 @@ impl Schema {
                     if unique_set.columns.len() == 1 {
                         let col_name = &unique_set.columns.first().unwrap().name;
                         let Some((_, column)) = table.get_column(col_name) else {
-                            return Err(LimboError::ParseError(format!("no such column: {col_name}")));
+                            return Err(LimboError::ParseError(format!(
+                                "no such column: {col_name}"
+                            )));
                         };
                         if column.is_rowid_alias() {
                             // rowid alias, no index needed
@@ -3237,7 +3239,10 @@ impl Schema {
                         Vec::try_with_capacity_ext(unique_set.columns.len())?;
                     for unique_column in unique_set.columns.iter() {
                         let Some((pos_in_table, _)) = table.get_column(&unique_column.name) else {
-                            return Err(crate::LimboError::ParseError(format!("no such column: {}", unique_column.name)));
+                            return Err(crate::LimboError::ParseError(format!(
+                                "no such column: {}",
+                                unique_column.name
+                            )));
                         };
                         column_indices_and_sort_orders
                             .push_within_capacity((pos_in_table, unique_column.sort_order))
@@ -8161,7 +8166,9 @@ impl Index {
         let mut primary_keys = Vec::try_with_capacity_ext(column_count)?;
         for (i, (col_name, order)) in table.primary_key_columns.iter().enumerate() {
             let Some((pos_in_table, _)) = table.get_column(col_name) else {
-                return Err(crate::LimboError::ParseError(format!("no such column: {col_name}")));
+                return Err(crate::LimboError::ParseError(format!(
+                    "no such column: {col_name}"
+                )));
             };
             let (_, column) = table.get_column(col_name).unwrap();
             let explicit_collation = constraint_columns.get(i).and_then(|c| c.collation);
@@ -8276,7 +8283,7 @@ impl Index {
 
     /// Walk the where_clause Expr of a partial index and validate that it doesn't reference any other
     /// tables or use any disallowed constructs.
-    pub fn validate_where_expr(&self, table: &Table, _resolver: &Resolver) -> bool {
+    pub fn validate_where_expr(&self, table: &Table, resolver: &Resolver) -> bool {
         let Some(where_clause) = &self.where_clause else {
             return true;
         };
@@ -8292,7 +8299,10 @@ impl Index {
         let is_tbl = |ns: &str| normalize_ident(ns) == tbl_norm;
         let is_deterministic_fn = |name: &str, argc: usize| {
             let n = normalize_ident(name);
-            Func::resolve_function(&n, argc).is_ok_and(|f| f.is_some_and(|f| f.is_deterministic()))
+            // The resolver also knows application-defined functions.
+            resolver
+                .resolve_function(&n, argc)
+                .is_ok_and(|f| f.is_some_and(|f| f.is_deterministic()))
         };
 
         let mut ok = true;

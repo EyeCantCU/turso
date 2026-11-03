@@ -315,7 +315,11 @@ pub fn bind_and_rewrite_expr<'a>(
                             referenced_tables.mark_column_used(m.table_id, m.col_idx);
                             return Ok(WalkControl::Continue);
                         }
-                        crate::bail_parse_error!("no such column: {}.{}", tbl.as_str(), id.as_str());
+                        crate::bail_parse_error!(
+                            "no such column: {}.{}",
+                            tbl.as_str(),
+                            id.as_str()
+                        );
                     }
                     match qualified_match {
                         QualifiedNameMatch::Found(table_id, column) => {
