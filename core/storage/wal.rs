@@ -5703,7 +5703,8 @@ fn read_database_identity_from_file_path(
         .strip_suffix("-wal")
         .unwrap_or(wal_path)
         .to_string();
-    let file = match io.open_file(&db_path, crate::OpenFlags::None, false) {
+    // No lock: the open database holds OFD locks on its SQLite lock bytes.
+    let file = match io.open_file(&db_path, crate::OpenFlags::NoLock, false) {
         Ok(file) => file,
         Err(LimboError::CompletionError(CompletionError::IOError(
             std::io::ErrorKind::NotFound,
