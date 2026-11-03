@@ -847,6 +847,20 @@ fn shim_vfs_routes_file_io_to_the_default_vfs() {
         assert_eq!(sqlite3_close(db), SQLITE_OK);
         assert!(Counts::get(&SHIM.open) > opens, "xOpen through vfs=");
 
+        // nolock=1: no xLock/xUnlock calls at all.
+        let locks = Counts::get(&SHIM.lock);
+        let unlocks = Counts::get(&SHIM.unlock);
+        let (rc, db) = open_v2(
+            &format!("file:{p}?vfs=compat-shim&nolock=1"),
+            OPEN_READWRITE | OPEN_URI,
+            None,
+        );
+        assert_eq!(rc, SQLITE_OK);
+        assert_eq!(rows(db, "SELECT max(x) FROM t"), "3");
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+        assert_eq!(Counts::get(&SHIM.lock), locks, "xLock with nolock=1");
+        assert_eq!(Counts::get(&SHIM.unlock), unlocks, "xUnlock with nolock=1");
+
         // An unknown `vfs=` fails like SQLite.
         let (rc, db) = open_v2(
             &format!("file:{p}?vfs=nosuchvfs"),

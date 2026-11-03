@@ -496,7 +496,9 @@ proc sqlite3_config_sqllog {args} { return "" }
 proc sqlite3_config_alt_pcache {args} { return "" }
 proc register_devsim {args} { return "" }
 proc unregister_devsim {args} { return "" }
-proc sqlite3_open_v2 {filename flags {vfs ""}} { sqlite3_open $filename }
+if {[info commands sqlite3_open_v2] eq ""} {
+  proc sqlite3_open_v2 {filename flags {vfs ""}} { sqlite3_open $filename }
+}
 proc test_syscall {args} { return "" }
 proc clear_mutex_counters {args} { return "" }
 proc install_mutex_counters {args} { return "" }
@@ -563,11 +565,24 @@ proc sqlite3_create_function_v2 {args} { return "" }
 proc sqlite3_create_aggregate {args} { return "" }
 proc sqlite3_create_window_function {args} { return "" }
 proc sqlite3_create_collation_v2 {args} { return "" }
-proc sqlite3_multiplex_initialize {args} { return "" }
+# The "multiplex" and "devsym" VFSes of upstream's testfixture are
+# stood in for by pass-through [testvfs] instances, so that opens naming
+# them still work.
+proc sqlite3_multiplex_initialize {args} {
+  if {[info commands testvfs] ne "" && [info commands ::multiplex] eq ""} {
+    testvfs multiplex
+  }
+  return ""
+}
 proc sqlite3_multiplex_shutdown {args} { return "" }
 proc sqlite3_register_cksumvfs {args} { return "" }
 proc sqlite3_unregister_cksumvfs {args} { return "" }
-proc sqlite3_simulate_device {args} { return "" }
+proc sqlite3_simulate_device {args} {
+  if {[info commands testvfs] ne "" && [info commands ::devsym] eq ""} {
+    testvfs devsym
+  }
+  return ""
+}
 proc sqlite3_sleep {ms} { after $ms; return $ms }
 proc sqlite3_snapshot_get {args} { error "snapshots are not supported" }
 proc sqlite3_snapshot_get_blob {args} { error "snapshots are not supported" }

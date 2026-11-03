@@ -149,7 +149,6 @@ const SQLITE_OPEN_TEMP_DB: ffi::c_int = 0x200;
 const SQLITE_OPEN_WAL: ffi::c_int = 0x80000;
 
 const SQLITE_ACCESS_EXISTS: ffi::c_int = 0;
-const SQLITE_ACCESS_READWRITE: ffi::c_int = 1;
 
 const SQLITE_LOCK_NONE: ffi::c_int = 0;
 const SQLITE_LOCK_SHARED: ffi::c_int = 1;

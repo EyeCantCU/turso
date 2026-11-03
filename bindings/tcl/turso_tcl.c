@@ -2673,6 +2673,78 @@ static int TursoCApiOpenCmd(ClientData cd, Tcl_Interp *interp,
     return TCL_OK;
 }
 
+/* sqlite3_open_v2 FILENAME FLAGS VFS, as upstream test1.c: FLAGS is a list
+ * of SQLITE_OPEN_* names and an empty VFS means the default one. */
+static int TursoCApiOpenV2Cmd(ClientData cd, Tcl_Interp *interp,
+                              int objc, Tcl_Obj *const objv[])
+{
+    static const struct { const char *name; int flag; } aFlag[] = {
+        { "SQLITE_OPEN_READONLY",      0x00000001 },
+        { "SQLITE_OPEN_READWRITE",     0x00000002 },
+        { "SQLITE_OPEN_CREATE",        0x00000004 },
+        { "SQLITE_OPEN_DELETEONCLOSE", 0x00000008 },
+        { "SQLITE_OPEN_EXCLUSIVE",     0x00000010 },
+        { "SQLITE_OPEN_AUTOPROXY",     0x00000020 },
+        { "SQLITE_OPEN_URI",           0x00000040 },
+        { "SQLITE_OPEN_MEMORY",        0x00000080 },
+        { "SQLITE_OPEN_MAIN_DB",       0x00000100 },
+        { "SQLITE_OPEN_TEMP_DB",       0x00000200 },
+        { "SQLITE_OPEN_TRANSIENT_DB",  0x00000400 },
+        { "SQLITE_OPEN_MAIN_JOURNAL",  0x00000800 },
+        { "SQLITE_OPEN_TEMP_JOURNAL",  0x00001000 },
+        { "SQLITE_OPEN_SUBJOURNAL",    0x00002000 },
+        { "SQLITE_OPEN_SUPER_JOURNAL", 0x00004000 },
+        { "SQLITE_OPEN_NOMUTEX",       0x00008000 },
+        { "SQLITE_OPEN_FULLMUTEX",     0x00010000 },
+        { "SQLITE_OPEN_SHAREDCACHE",   0x00020000 },
+        { "SQLITE_OPEN_PRIVATECACHE",  0x00040000 },
+        { "SQLITE_OPEN_WAL",           0x00080000 },
+        { "SQLITE_OPEN_NOFOLLOW",      0x01000000 },
+        { "SQLITE_OPEN_EXRESCODE",     0x02000000 },
+        { 0, 0 }
+    };
+    static int open_seq = 0;
+    Tcl_Obj **apFlag;
+    Tcl_Size nFlag;
+    int flags = 0;
+    (void)cd;
+
+    if (objc != 4) {
+        Tcl_WrongNumArgs(interp, 1, objv, "FILENAME FLAGS VFS");
+        return TCL_ERROR;
+    }
+    if (Tcl_ListObjGetElements(interp, objv[2], &nFlag, &apFlag) != TCL_OK) {
+        return TCL_ERROR;
+    }
+    for (Tcl_Size i = 0; i < nFlag; i++) {
+        int idx;
+        if (Tcl_GetIndexFromObjStruct(interp, apFlag[i], aFlag, sizeof(aFlag[0]),
+                                      "flag", 0, &idx) != TCL_OK) {
+            return TCL_ERROR;
+        }
+        flags |= aFlag[idx].flag;
+    }
+    const char *vfs = Tcl_GetString(objv[3]);
+    if (vfs[0] == 0) vfs = NULL;
+
+    sqlite3 *db = NULL;
+    sqlite3_open_v2(Tcl_GetString(objv[1]), &db, flags, vfs);
+    if (!db) {
+        Tcl_ResetResult(interp);
+        return TCL_OK;
+    }
+    TursoDb *tdb = (TursoDb *)Tcl_Alloc(sizeof(TursoDb));
+    memset(tdb, 0, sizeof(TursoDb));
+    tdb->db     = db;
+    tdb->interp = interp;
+    char handle_name[24];
+    snprintf(handle_name, sizeof(handle_name), "dbptrv2_%d", ++open_seq);
+    Tcl_CreateObjCommand(interp, handle_name, TursoDbCmd,
+                         (ClientData)tdb, TursoDbFree);
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(handle_name, -1));
+    return TCL_OK;
+}
+
 /* sqlite3_close DB — closes the connection and returns the symbolic
  * result code; the handle command is deleted on success. */
 static int TursoCApiCloseCmd(ClientData cd, Tcl_Interp *interp,
@@ -3486,6 +3558,8 @@ int Tursotcl_Init(Tcl_Interp *interp)
                          TursoCApiOpenCmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "sqlite3_close",
                          TursoCApiCloseCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_open_v2",
+                         TursoCApiOpenV2Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "sqlite3_close_v2",
                          TursoCApiCloseV2Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "sqlite3_db_filename",
