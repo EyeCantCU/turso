@@ -1006,7 +1006,7 @@ pub unsafe extern "C" fn sqlite3_vtab_config(_db: *mut sqlite3, _op: c_int) -> c
 }
 
 extern "C" {
-    fn turso_sqlite3_vtab_config_va(db: *mut sqlite3, op: c_int, ...) -> c_int;
+    fn turso_sqlite3_vtab_config_va(db: *mut c_void, op: c_int, ...) -> c_int;
 }
 
 #[capi_guard]
