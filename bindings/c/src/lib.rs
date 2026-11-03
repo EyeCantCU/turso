@@ -242,6 +242,13 @@ impl sqlite3 {
     ) -> Self {
         #[cfg(feature = "csv")]
         register_csv_module(&conn);
+        // Built in, as with SQLITE_ENABLE_DBSTAT_VTAB.
+        let _ = conn.register_vtab_module_local(
+            turso_core::dbstat::DBSTAT_MODULE_NAME,
+            turso_core::dbstat::DbstatModule::new(&conn),
+            true,
+            true,
+        );
         let inner = sqlite3Inner {
             _io: io,
             _db: db,

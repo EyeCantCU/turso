@@ -3,6 +3,7 @@
 #![allow(unused_imports)]
 use std::ptr;
 
+mod dbstat;
 mod vtab;
 
 #[repr(C)]
