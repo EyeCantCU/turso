@@ -489,6 +489,167 @@ int sqlite3_preupdate_blobwrite(sqlite3 *db);
 int sqlite3_wal_autocheckpoint(sqlite3 *db, int N);
 
 /*
+** Session extension (SQLite's sqlite3session.h; always built in).
+*/
+#ifndef __SQLITESESSION_H_
+#define __SQLITESESSION_H_ 1
+
+typedef struct sqlite3_value sqlite3_value;
+typedef struct sqlite3_session sqlite3_session;
+typedef struct sqlite3_changeset_iter sqlite3_changeset_iter;
+typedef struct sqlite3_changegroup sqlite3_changegroup;
+typedef struct sqlite3_rebaser sqlite3_rebaser;
+
+#define SQLITE_SESSION_OBJCONFIG_SIZE  1
+#define SQLITE_SESSION_OBJCONFIG_ROWID 2
+#define SQLITE_CHANGESETSTART_INVERT        0x0002
+#define SQLITE_CHANGESETAPPLY_NOSAVEPOINT   0x0001
+#define SQLITE_CHANGESETAPPLY_INVERT        0x0002
+#define SQLITE_CHANGESETAPPLY_IGNORENOOP    0x0004
+#define SQLITE_CHANGESETAPPLY_FKNOACTION    0x0008
+#define SQLITE_CHANGESETAPPLY_NOUPDATELOOP  0x0010
+#define SQLITE_CHANGESET_DATA        1
+#define SQLITE_CHANGESET_NOTFOUND    2
+#define SQLITE_CHANGESET_CONFLICT    3
+#define SQLITE_CHANGESET_CONSTRAINT  4
+#define SQLITE_CHANGESET_FOREIGN_KEY 5
+#define SQLITE_CHANGESET_OMIT       0
+#define SQLITE_CHANGESET_REPLACE    1
+#define SQLITE_CHANGESET_ABORT      2
+#define SQLITE_SESSION_CONFIG_STRMSIZE 1
+#define SQLITE_CHANGEGROUP_CONFIG_PATCHSET 1
+
+int sqlite3session_create(sqlite3 *db, const char *zDb, sqlite3_session **ppSession);
+void sqlite3session_delete(sqlite3_session *pSession);
+int sqlite3session_object_config(sqlite3_session*, int op, void *pArg);
+int sqlite3session_enable(sqlite3_session *pSession, int bEnable);
+int sqlite3session_indirect(sqlite3_session *pSession, int bIndirect);
+int sqlite3session_attach(sqlite3_session *pSession, const char *zTab);
+void sqlite3session_table_filter(
+    sqlite3_session *pSession,
+    int(*xFilter)(void *pCtx, const char *zTab),
+    void *pCtx
+);
+int sqlite3session_changeset(sqlite3_session *pSession, int *pnChangeset, void **ppChangeset);
+sqlite3_int64 sqlite3session_changeset_size(sqlite3_session *pSession);
+int sqlite3session_diff(sqlite3_session *pSession, const char *zFromDb, const char *zTbl, char **pzErrMsg);
+int sqlite3session_patchset(sqlite3_session *pSession, int *pnPatchset, void **ppPatchset);
+int sqlite3session_isempty(sqlite3_session *pSession);
+sqlite3_int64 sqlite3session_memory_used(sqlite3_session *pSession);
+
+int sqlite3changeset_start(sqlite3_changeset_iter **pp, int nChangeset, void *pChangeset);
+int sqlite3changeset_start_v2(sqlite3_changeset_iter **pp, int nChangeset, void *pChangeset, int flags);
+int sqlite3changeset_next(sqlite3_changeset_iter *pIter);
+int sqlite3changeset_op(sqlite3_changeset_iter *pIter, const char **pzTab, int *pnCol, int *pOp, int *pbIndirect);
+int sqlite3changeset_pk(sqlite3_changeset_iter *pIter, unsigned char **pabPK, int *pnCol);
+int sqlite3changeset_old(sqlite3_changeset_iter *pIter, int iVal, sqlite3_value **ppValue);
+int sqlite3changeset_new(sqlite3_changeset_iter *pIter, int iVal, sqlite3_value **ppValue);
+int sqlite3changeset_conflict(sqlite3_changeset_iter *pIter, int iVal, sqlite3_value **ppValue);
+int sqlite3changeset_fk_conflicts(sqlite3_changeset_iter *pIter, int *pnOut);
+int sqlite3changeset_finalize(sqlite3_changeset_iter *pIter);
+int sqlite3changeset_invert(int nIn, const void *pIn, int *pnOut, void **ppOut);
+int sqlite3changeset_concat(int nA, void *pA, int nB, void *pB, int *pnOut, void **ppOut);
+
+int sqlite3changegroup_new(sqlite3_changegroup **pp);
+int sqlite3changegroup_schema(sqlite3_changegroup*, sqlite3*, const char *zDb);
+int sqlite3changegroup_add(sqlite3_changegroup*, int nData, void *pData);
+int sqlite3changegroup_add_change(sqlite3_changegroup*, sqlite3_changeset_iter*);
+int sqlite3changegroup_output(sqlite3_changegroup*, int *pnData, void **ppData);
+void sqlite3changegroup_delete(sqlite3_changegroup*);
+int sqlite3changegroup_config(sqlite3_changegroup*, int, void *pArg);
+int sqlite3changegroup_change_begin(sqlite3_changegroup*, int eOp, const char *zTab, int bIndirect, char **pzErr);
+int sqlite3changegroup_change_int64(sqlite3_changegroup*, int bNew, int iCol, sqlite3_int64 iVal);
+int sqlite3changegroup_change_null(sqlite3_changegroup*, int bNew, int iCol);
+int sqlite3changegroup_change_double(sqlite3_changegroup*, int bNew, int iCol, double fVal);
+int sqlite3changegroup_change_text(sqlite3_changegroup*, int bNew, int iCol, const char *pVal, int nVal);
+int sqlite3changegroup_change_blob(sqlite3_changegroup*, int bNew, int iCol, const void *pVal, int nVal);
+int sqlite3changegroup_change_finish(sqlite3_changegroup*, int bDiscard, char **pzErr);
+
+int sqlite3changeset_apply(
+    sqlite3 *db, int nChangeset, void *pChangeset,
+    int(*xFilter)(void *pCtx, const char *zTab),
+    int(*xConflict)(void *pCtx, int eConflict, sqlite3_changeset_iter *p),
+    void *pCtx
+);
+int sqlite3changeset_apply_v2(
+    sqlite3 *db, int nChangeset, void *pChangeset,
+    int(*xFilter)(void *pCtx, const char *zTab),
+    int(*xConflict)(void *pCtx, int eConflict, sqlite3_changeset_iter *p),
+    void *pCtx, void **ppRebase, int *pnRebase, int flags
+);
+int sqlite3changeset_apply_v3(
+    sqlite3 *db, int nChangeset, void *pChangeset,
+    int(*xFilter)(void *pCtx, sqlite3_changeset_iter *p),
+    int(*xConflict)(void *pCtx, int eConflict, sqlite3_changeset_iter *p),
+    void *pCtx, void **ppRebase, int *pnRebase, int flags
+);
+
+int sqlite3rebaser_create(sqlite3_rebaser **ppNew);
+int sqlite3rebaser_configure(sqlite3_rebaser*, int nRebase, const void *pRebase);
+int sqlite3rebaser_rebase(sqlite3_rebaser*, int nIn, const void *pIn, int *pnOut, void **ppOut);
+void sqlite3rebaser_delete(sqlite3_rebaser *p);
+
+int sqlite3changeset_apply_strm(
+    sqlite3 *db,
+    int (*xInput)(void *pIn, void *pData, int *pnData), void *pIn,
+    int(*xFilter)(void *pCtx, const char *zTab),
+    int(*xConflict)(void *pCtx, int eConflict, sqlite3_changeset_iter *p),
+    void *pCtx
+);
+int sqlite3changeset_apply_v2_strm(
+    sqlite3 *db,
+    int (*xInput)(void *pIn, void *pData, int *pnData), void *pIn,
+    int(*xFilter)(void *pCtx, const char *zTab),
+    int(*xConflict)(void *pCtx, int eConflict, sqlite3_changeset_iter *p),
+    void *pCtx, void **ppRebase, int *pnRebase, int flags
+);
+int sqlite3changeset_apply_v3_strm(
+    sqlite3 *db,
+    int (*xInput)(void *pIn, void *pData, int *pnData), void *pIn,
+    int(*xFilter)(void *pCtx, sqlite3_changeset_iter *p),
+    int(*xConflict)(void *pCtx, int eConflict, sqlite3_changeset_iter *p),
+    void *pCtx, void **ppRebase, int *pnRebase, int flags
+);
+int sqlite3changeset_concat_strm(
+    int (*xInputA)(void *pIn, void *pData, int *pnData), void *pInA,
+    int (*xInputB)(void *pIn, void *pData, int *pnData), void *pInB,
+    int (*xOutput)(void *pOut, const void *pData, int nData), void *pOut
+);
+int sqlite3changeset_invert_strm(
+    int (*xInput)(void *pIn, void *pData, int *pnData), void *pIn,
+    int (*xOutput)(void *pOut, const void *pData, int nData), void *pOut
+);
+int sqlite3changeset_start_strm(
+    sqlite3_changeset_iter **pp,
+    int (*xInput)(void *pIn, void *pData, int *pnData), void *pIn
+);
+int sqlite3changeset_start_v2_strm(
+    sqlite3_changeset_iter **pp,
+    int (*xInput)(void *pIn, void *pData, int *pnData), void *pIn,
+    int flags
+);
+int sqlite3session_changeset_strm(
+    sqlite3_session *pSession,
+    int (*xOutput)(void *pOut, const void *pData, int nData), void *pOut
+);
+int sqlite3session_patchset_strm(
+    sqlite3_session *pSession,
+    int (*xOutput)(void *pOut, const void *pData, int nData), void *pOut
+);
+int sqlite3changegroup_add_strm(sqlite3_changegroup*,
+    int (*xInput)(void *pIn, void *pData, int *pnData), void *pIn);
+int sqlite3changegroup_output_strm(sqlite3_changegroup*,
+    int (*xOutput)(void *pOut, const void *pData, int nData), void *pOut);
+int sqlite3rebaser_rebase_strm(
+    sqlite3_rebaser *pRebaser,
+    int (*xInput)(void *pIn, void *pData, int *pnData), void *pIn,
+    int (*xOutput)(void *pOut, const void *pData, int nData), void *pOut
+);
+int sqlite3session_config(int op, void *pArg);
+
+#endif  /* __SQLITESESSION_H_ */
+
+/*
 ** Enable all Turso experimental features for subsequently opened databases.
 */
 void turso_enable_experimental(void);
