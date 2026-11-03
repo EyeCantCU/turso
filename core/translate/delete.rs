@@ -51,7 +51,7 @@ fn validate_delete(
             ))
         }
     };
-    if program.trigger.is_some() && table.virtual_table().is_some() {
+    if program.trigger.is_some() && table.virtual_table().is_some_and(|vt| !vt.innocuous) {
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name);
     }
     if table.btree().is_some_and(|bt| !bt.has_rowid) {
@@ -366,6 +366,14 @@ fn estimate_num_instructions(plan: &DeletePlan) -> usize {
 
 /// Add post-optimizer reasons that force "collect rowids first, then delete".
 fn record_delete_optimizer_safety(plan: &mut DeletePlan) {
+    if plan
+        .table_references
+        .joined_tables()
+        .first()
+        .is_some_and(|table| table.virtual_table().is_some())
+    {
+        plan.safety.require(DmlSafetyReason::VirtualTable);
+    }
     if plan
         .table_references
         .joined_tables()

@@ -203,33 +203,58 @@ fn emit_row_loop_delete(
             });
         }
 
-        program.preassign_label_to_next_insn(rowset_loop_start);
+        if table_ref.table.virtual_table().is_some() {
+            // As SQLite does: xUpdate for each collected rowid, with no seek.
+            program.emit_insn(Insn::VOpen {
+                cursor_id: table_cursor_id,
+            });
+            program.emit_insn(Insn::VBegin {
+                cursor_id: table_cursor_id,
+            });
+            program.preassign_label_to_next_insn(rowset_loop_start);
+            program.emit_insn(Insn::RowSetRead {
+                rowset_reg,
+                pc_if_empty: rowset_loop_end,
+                dest_reg: rowid_reg,
+            });
+            program.emit_insn(Insn::VUpdate {
+                cursor_id: table_cursor_id,
+                arg_count: 2,
+                start_reg: rowid_reg,
+                conflict_action: 0,
+            });
+            program.emit_insn(Insn::Goto {
+                target_pc: rowset_loop_start,
+            });
+        } else {
+            program.preassign_label_to_next_insn(rowset_loop_start);
 
-        // Read next rowid from RowSet
-        // Note: rowset_loop_end will be resolved later when we assign it
-        program.emit_insn(Insn::RowSetRead {
-            rowset_reg,
-            pc_if_empty: rowset_loop_end,
-            dest_reg: rowid_reg,
-        });
+            // Read next rowid from RowSet
+            // Note: rowset_loop_end will be resolved later when we assign it
+            program.emit_insn(Insn::RowSetRead {
+                rowset_reg,
+                pc_if_empty: rowset_loop_end,
+                dest_reg: rowid_reg,
+            });
 
-        emit_delete_insns_when_triggers_present(
-            connection,
-            program,
-            &mut t_ctx,
-            &mut plan.table_references,
-            &mut plan.non_from_clause_subqueries,
-            &plan.result_columns,
-            rowid_reg,
-            table_cursor_id,
-            resolver,
-            returning_buffer.as_ref(),
-        )?;
+            emit_delete_insns_when_triggers_present(
+                connection,
+                program,
+                &mut t_ctx,
+                &mut plan.table_references,
+                &mut plan.non_from_clause_subqueries,
+                &plan.result_columns,
+                rowid_reg,
+                table_cursor_id,
+                resolver,
+                returning_buffer.as_ref(),
+            )?;
 
-        // Continue loop
-        program.emit_insn(Insn::Goto {
-            target_pc: rowset_loop_start,
-        });
+            // Continue loop
+            program.emit_insn(Insn::Goto {
+                target_pc: rowset_loop_start,
+            });
+        }
 
         // Assign the end label here, after all loop body code
         program.preassign_label_to_next_insn(rowset_loop_end);

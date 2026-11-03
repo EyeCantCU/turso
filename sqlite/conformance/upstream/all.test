@@ -482,6 +482,32 @@ set test_files {
   rowvalue9          fail
   rowvalueA            pass
   rowvaluevtab         fail
+  rtree1               fail
+  rtree2               pass
+  rtree3               pass
+  rtree4               pass
+  rtree5               pass
+  rtree6               fail
+  rtree7               pass
+  rtree8               fail
+  rtree9               pass
+  rtreeA               fail
+  rtreeB               pass
+  rtreeC               fail
+  rtreeD               fail
+  rtreeE               pass
+  rtreeF               pass
+  rtreeG               pass
+  rtreeH               pass
+  rtreeI               pass
+  rtreeJ               fail
+  rtreecheck           fail
+  rtreecirc            fail
+  rtreeconnect         pass
+  rtreedoc             fail
+  rtreedoc2            fail
+  rtreedoc3            pass
+  rtreefuzz001         fail
   savepoint            fail
   savepoint2           pass
   savepoint4           fail
@@ -677,6 +703,7 @@ set test_files {
   tkt3334              pass
   tkt3346              fail
   tkt3357              pass
+  tkt3363              pass
   tkt3419              pass
   tkt3424              pass
   tkt3442              fail

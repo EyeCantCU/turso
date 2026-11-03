@@ -1151,6 +1151,11 @@ pub(crate) fn vacuum_target_build_step(
 
                 let entry_ordinal = state.post_data_entries[idx];
                 let entry = &state.schema_entries[entry_ordinal];
+                // A virtual table's shadow tables were copied with the data.
+                state.target_conn.vtab_connect_only.store(
+                    entry.entry_type == SchemaEntryType::Table,
+                    crate::sync::atomic::Ordering::SeqCst,
+                );
                 let target_stmt = prepare_on_target(&state.target_conn, &entry.name, &entry.sql)?;
                 state.phase = VacuumTargetBuildPhase::StepPostData {
                     target_schema_stmt: Box::new(target_stmt),
@@ -1167,6 +1172,10 @@ pub(crate) fn vacuum_target_build_step(
                     unreachable!("CREATE statement unexpectedly returned a row");
                 }
                 crate::StepResult::Done => {
+                    state
+                        .target_conn
+                        .vtab_connect_only
+                        .store(false, crate::sync::atomic::Ordering::SeqCst);
                     state.phase = VacuumTargetBuildPhase::PreparePostData { idx: idx + 1 };
                     continue;
                 }

@@ -120,8 +120,15 @@ pub struct Constraint {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ConstraintOperator {
     AstNativeOperator(ast::Operator),
-    Like { not: bool },
-    In { not: bool, estimated_values: f64 },
+    Like {
+        not: bool,
+    },
+    /// `x MATCH y`, offered to virtual tables.
+    Match,
+    In {
+        not: bool,
+        estimated_values: f64,
+    },
 }
 
 impl ConstraintOperator {
@@ -2088,6 +2095,9 @@ pub fn is_equality_operator(op: ConstraintOperator) -> bool {
 }
 
 fn to_ext_constraint_op(op: &ConstraintOperator) -> Option<ConstraintOp> {
+    if matches!(op, ConstraintOperator::Match) {
+        return Some(ConstraintOp::Match);
+    }
     let ConstraintOperator::AstNativeOperator(op) = op else {
         return None;
     };

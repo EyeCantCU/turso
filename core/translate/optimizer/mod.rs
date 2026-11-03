@@ -809,6 +809,14 @@ fn transform_match_to_fts_match(
             .unwrap_or(false)
     };
 
+    // A virtual table can take MATCH as a constraint (xBestIndex), as R*Tree does.
+    let table_is_virtual = |table_id: TableInternalId| -> bool {
+        table_references
+            .joined_tables()
+            .iter()
+            .any(|t| t.internal_id == table_id && matches!(t.table, Table::Virtual(_)))
+    };
+
     let mut match_without_fts = false;
     for term in where_clause.iter_mut() {
         let _ = walk_expr_mut(&mut term.expr, &mut |e: &mut Expr| -> Result<WalkControl> {
@@ -820,6 +828,9 @@ fn transform_match_to_fts_match(
                     rhs,
                     escape: _,
                 } => {
+                    if get_table_id_from_expr(lhs).is_some_and(table_is_virtual) {
+                        return Ok(WalkControl::SkipChildren);
+                    }
                     // Check if the specific table referenced by this MATCH has an FTS index
                     let has_fts = get_table_id_from_expr(lhs).is_some_and(table_has_fts_index);
 
@@ -3796,7 +3807,14 @@ fn build_vtab_scan_op(
         {
             where_term.consumed = true;
         }
-        let (_, expr, _) = constraint.get_constraining_expr(where_clause, referenced_tables, None);
+        // MATCH is not a binary operator, so it has no comparison operator to report.
+        let expr = if matches!(constraint.operator, constraints::ConstraintOperator::Match) {
+            constraint.get_constraining_expr_ref(where_clause).clone()
+        } else {
+            constraint
+                .get_constraining_expr(where_clause, referenced_tables, None)
+                .1
+        };
         constraints[zero_based_argv_index] = Some(expr);
         arg_count += 1;
     }

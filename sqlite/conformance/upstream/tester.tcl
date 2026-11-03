@@ -391,7 +391,7 @@ proc ifcapable {expr code {else_keyword ""} {elsecode ""}} {
       "foreignkey" { set has_capability 1 }
       "check" { set has_capability 1 }
       "vtab" { set has_capability 1 }
-      "rtree" { set has_capability 0 }
+      "rtree" { set has_capability 1 }
       "fts3" { set has_capability 0 }
       "fts4" { set has_capability 0 }
       "fts5" { set has_capability 0 }
@@ -438,6 +438,10 @@ proc capable {expr} {
   return 1
 }
 
+# testfixture's expand_all_sql walks the open statements with
+# sqlite3_next_stmt and sqlite3_expanded_sql; nothing to check here.
+proc expand_all_sql {db} {}
+
 # Sanitizer detection (simplified - assume no sanitizers)
 proc clang_sanitize_address {} {
   return 0
@@ -447,7 +451,7 @@ proc clang_sanitize_address {} {
 # compile-time configuration. 1 means the feature exists. Almost every
 # entry is 1 even where Turso lacks the feature, so the file runs and its
 # tests fail on their own assertions instead of the file skipping itself.
-# The 0 entries are modules (fts, rtree, utf16 encoding, sessions) where
+# The 0 entries are modules (fts, utf16 encoding, sessions) where
 # every test in the file would stop the file at its first statement.
 array set sqlite_options {
   altertable 1 analyze 1 api_armor 1 atomicwrite 1 attach 1 auth 1
@@ -456,14 +460,14 @@ array set sqlite_options {
   complete 1 compound 1 conflict 1 crashtest 1 cte 1 datetime 1
   dbpage_vtab 1 dbstat_vtab 1 decltype 1 deprecated 1 deserialize 1
   direct_read 1 explain 1 floatingpoint 1 foreignkey 1 fts1 0 fts2 0
-  fts3 0 fts4 0 fts5 0 gencol 1 generated_always 1 geopoly 0 getmutex 1
+  fts3 0 fts4 0 fts5 0 gencol 1 generated_always 1 geopoly 1 getmutex 1
   icu 1 icu_collations 1 incrblob 1 incrvacuum 1 integrityck 1 json1 1
   like_opt 1 load_ext 1 lock_proxy_pragmas 1 long_double 1 lookaside 1
   malloc_usable_size 1 math 1 mem3 1 mem5 1 memdebug 0 memorymanage 1
   memsys3 1 memsys5 1 mergesort 1 mmap 1 mutex 1 mutex_noop 1
   normalize 1 offset_sql_func 1 oversize_cell_check 1 pager_pragmas 1
   pragma 1 prefer_proxy_locking 0 preupdate_hook 1 progress 1 reindex 1
-  rtree 0 rtree_int_only 0 schema_pragmas 1 schema_version 1
+  rtree 1 rtree_int_only 0 schema_pragmas 1 schema_version 1
   secure_delete 1 session 0 shared_cache 1 snapshot 1 stat4 1
   stmt_scanstatus 1 subquery 1 tclvar 1 tempdb 1 threadsafe 1
   threadsafe1 1 threadsafe2 1 trace 1 trigger 1 truncate_opt 1

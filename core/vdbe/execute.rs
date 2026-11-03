@@ -1481,12 +1481,16 @@ pub fn op_vcreate(
         vec![]
     };
     let conn = program.connection.clone();
+    // No lock is held while the module's constructor runs: it may run
+    // statements on this connection.
+    let module = conn.syms.read().vtab_module(&module_name).cloned();
+    let create = (!conn.vtab_connect_only.load(Ordering::SeqCst)).then_some(&conn);
     let table = crate::VirtualTable::table_for(
         Some(&table_name),
         &module_name,
         args,
-        &conn.syms.read(),
-        true,
+        module.as_ref(),
+        create,
     )?;
     // A table that asks for it joins the transaction, as in SQLite (commit, no begin).
     if table.commits_after_create() {
@@ -1641,7 +1645,12 @@ pub fn op_vupdate(
             unreachable!("sqlite_dbpage writes require cli_only feature");
         }
     } else {
-        virtual_table.update(&argv, &mut state.extension_state, *conflict_action as u8)
+        virtual_table.update(
+            &program.connection,
+            &argv,
+            &mut state.extension_state,
+            *conflict_action as u8,
+        )
     };
     match result {
         Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
@@ -1651,11 +1660,18 @@ pub fn op_vupdate(
             if matches!(argv[0], Value::Null) {
                 program.connection.update_last_rowid(new_rowid);
             }
+            // Each successful xUpdate counts as a change, as in SQLite.
+            state.record_statement_change();
             state.pc += 1;
         }
         Ok(IOResult::Done(None)) => {
             // no-op or successful update without rowid return
             state.record_rows_written(1);
+            state.record_statement_change();
+            state.pc += 1;
+        }
+        // The module skipped the row under OR IGNORE: not a change.
+        Err(e) if matches!(*e, LimboError::RaiseIgnore) => {
             state.pc += 1;
         }
         Err(e)
@@ -1664,6 +1680,8 @@ pub fn op_vupdate(
                 LimboError::Constraint(_)
                     | LimboError::ConstraintViolation(_)
                     | LimboError::ReadOnly
+                    | LimboError::SqlError(_)
+                    | LimboError::Corrupt(_)
             ) =>
         {
             mark_unlikely();
@@ -1736,7 +1754,7 @@ pub fn op_vdestroy(
             )
             .into());
         };
-        vtab.destroy()?;
+        vtab.destroy(&conn)?;
     }
 
     state.pc += 1;
@@ -1758,7 +1776,7 @@ pub fn op_vbegin(
     let mut states = program.connection.vtab_txn_states.write();
     if states.insert(vtab_id) {
         // Only begin a new transaction if one is not already active for this virtual table module
-        let vtab = program.connection.syms.read().vtab_by_id(vtab_id);
+        let vtab = program.connection.vtab_by_id(vtab_id);
         let Some(vtab) = vtab else {
             return Err(LimboError::InternalError(
                 "Could not find virtual table for VBegin".to_string(),
@@ -1789,14 +1807,14 @@ pub fn op_vrename(
     let cursor = cursor.as_virtual_mut();
     let vtab = cursor
         .vtab_id()
-        .and_then(|id| program.connection.syms.read().vtab_by_id(id));
+        .and_then(|id| program.connection.vtab_by_id(id));
     let Some(vtab) = vtab else {
         return Err(LimboError::InternalError(
             "Could not find virtual table for VRename".to_string(),
         )
         .into());
     };
-    vtab.rename(&name)?;
+    vtab.rename(&program.connection, &name)?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -3996,10 +4014,11 @@ pub(crate) fn vtab_commit_all(conn: &Connection) -> crate::Result<()> {
     if set.is_empty() {
         return Ok(());
     }
-    let syms = conn.syms.read();
-    for id in set.drain() {
+    let ids: Vec<u64> = set.drain().collect();
+    drop(set);
+    for id in ids {
         // A table can be dropped (or its module replaced) mid-transaction.
-        if let Some(vtab) = syms.vtab_by_id(id) {
+        if let Some(vtab) = conn.vtab_by_id(id) {
             vtab.commit()?;
         }
     }
@@ -4236,9 +4255,8 @@ fn vtab_savepoint_all(conn: &Connection, op: u8, level: usize) -> crate::Result<
     if ids.is_empty() {
         return Ok(());
     }
-    let syms = conn.syms.read();
     for id in ids {
-        if let Some(vtab) = syms.vtab_by_id(id) {
+        if let Some(vtab) = conn.vtab_by_id(id) {
             vtab.savepoint_op(op, level)?;
         }
     }
@@ -4251,10 +4269,11 @@ pub(crate) fn vtab_rollback_all(conn: &Connection) -> crate::Result<()> {
     if set.is_empty() {
         return Ok(());
     }
-    let syms = conn.syms.read();
-    for id in set.drain() {
+    let ids: Vec<u64> = set.drain().collect();
+    drop(set);
+    for id in ids {
         // A table can be dropped (or its module replaced) mid-transaction.
-        if let Some(vtab) = syms.vtab_by_id(id) {
+        if let Some(vtab) = conn.vtab_by_id(id) {
             vtab.rollback()?;
         }
     }

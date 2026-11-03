@@ -265,7 +265,7 @@ fn prepare_update_plan(
             ))
         }
     };
-    if program.trigger.is_some() && table.virtual_table().is_some() {
+    if program.trigger.is_some() && table.virtual_table().is_some_and(|vt| !vt.innocuous) {
         bail_parse_error!(
             "unsafe use of virtual table \"{}\"",
             body.tbl_name.name.as_str()

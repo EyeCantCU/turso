@@ -26,6 +26,7 @@ mod compat_stubs;
 mod hooks;
 mod session;
 
+mod rtree;
 pub mod vfs;
 pub mod vfs_unix;
 mod vtab;
@@ -3669,6 +3670,15 @@ fn limbo_err_code(err: &LimboError) -> i32 {
         LimboError::StatementsInProgress(_) => SQLITE_BUSY,
         LimboError::SchemaUpdated | LimboError::SchemaConflict => SQLITE_SCHEMA,
         _ => SQLITE_ERROR,
+    }
+}
+
+/// The message sqlite3_errmsg reports for `err`. Like SQLite, corruption
+/// is reported with the standard text, without turso's details.
+fn limbo_err_msg(err: &LimboError) -> String {
+    match err {
+        LimboError::Corrupt(_) => "database disk image is malformed".to_string(),
+        _ => format!("{err}"),
     }
 }
 
