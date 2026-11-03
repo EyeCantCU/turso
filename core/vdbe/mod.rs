@@ -3770,7 +3770,13 @@ impl Program {
                 }
             }
 
-            let can_autocommit_now = state.can_autocommit_now(&self.connection, self_counted);
+            // A read statement started before BEGIN must not end the explicit
+            // transaction when it is reset or finalized mid-run.
+            let reader_outlived_autocommit = unfinished_statement_reset_or_drop
+                && inside_explicit_transaction
+                && !unfinished_writer;
+            let can_autocommit_now = !reader_outlived_autocommit
+                && state.can_autocommit_now(&self.connection, self_counted);
             let is_mvcc = state.mv_store(&self.connection).is_some();
             let changed_shared_mvcc_auto_txn = !can_autocommit_now
                 && state.auto_txn_cleanup == TxnCleanup::RollbackTxn

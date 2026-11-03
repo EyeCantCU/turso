@@ -243,3 +243,51 @@ mod panics {
         }
     }
 }
+
+/// A read statement left mid-run before BEGIN must not end the explicit
+/// transaction when it is finalized (Qt does this).
+#[test]
+fn finalizing_unfinished_reader_keeps_explicit_transaction() {
+    unsafe {
+        let (rc, db) = open_v2(":memory:", 0x6);
+        assert_eq!(rc, SQLITE_OK);
+        let exec =
+            |sql: &CStr| sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut());
+        assert_eq!(
+            exec(c"CREATE TABLE m(x); INSERT INTO m VALUES (1),(2)"),
+            SQLITE_OK
+        );
+        let mut sel = ptr::null_mut();
+        assert_eq!(
+            sqlite3_prepare_v2(
+                db,
+                c"SELECT x FROM m".as_ptr(),
+                -1,
+                &mut sel,
+                ptr::null_mut()
+            ),
+            SQLITE_OK
+        );
+        assert_eq!(sqlite3_step(sel), SQLITE_ROW);
+        assert_eq!(exec(c"BEGIN"), SQLITE_OK);
+        assert_eq!(sqlite3_finalize(sel), SQLITE_OK);
+        assert_eq!(sqlite3_get_autocommit(db), 0);
+        assert_eq!(exec(c"DELETE FROM m"), SQLITE_OK);
+        assert_eq!(exec(c"ROLLBACK"), SQLITE_OK);
+        let mut cnt = ptr::null_mut();
+        assert_eq!(
+            sqlite3_prepare_v2(
+                db,
+                c"SELECT count(*) FROM m".as_ptr(),
+                -1,
+                &mut cnt,
+                ptr::null_mut()
+            ),
+            SQLITE_OK
+        );
+        assert_eq!(sqlite3_step(cnt), SQLITE_ROW);
+        assert_eq!(sqlite3_column_int(cnt, 0), 2);
+        sqlite3_finalize(cnt);
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}
