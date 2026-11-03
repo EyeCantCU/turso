@@ -4509,6 +4509,13 @@ impl Connection {
         self.bump_prepare_context_generation();
     }
 
+    pub fn has_external_collation(&self, name: &str) -> bool {
+        self.syms
+            .read()
+            .collations
+            .contains_key(&crate::util::normalize_ident(name))
+    }
+
     pub fn unregister_external_collation(&self, name: &str) {
         if self
             .syms
