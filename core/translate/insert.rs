@@ -3630,20 +3630,20 @@ fn translate_virtual_table_insert(
             dest_end: None,
         });
         let insertion = build_insertion(program, &table, &columns, num_values)?;
-        let temp_table_ctx = Some(TempTableCtx {
-            cursor_id: temp_cursor_id,
-            loop_start_label: program.allocate_label(),
-            loop_end_label: program.allocate_label(),
-        });
+        let loop_start_label = program.allocate_label();
+        let loop_end_label = program.allocate_label();
         translate_rows_multiple(
             program,
             &insertion,
             yield_reg,
             resolver,
-            &temp_table_ctx,
+            &Some(TempTableCtx {
+                cursor_id: temp_cursor_id,
+                loop_start_label,
+                loop_end_label,
+            }),
             false,
         )?;
-        let temp_table_ctx = temp_table_ctx.expect("set above");
         program.emit_insn(Insn::VUpdate {
             cursor_id,
             arg_count: insertion.col_mappings.len() + 2,
@@ -3652,11 +3652,11 @@ fn translate_virtual_table_insert(
         });
         program.emit_insn(Insn::Next {
             cursor_id: temp_cursor_id,
-            pc_if_next: temp_table_ctx.loop_start_label,
+            pc_if_next: loop_start_label,
             fullscan: false,
             is_index: false,
         });
-        program.preassign_label_to_next_insn(temp_table_ctx.loop_end_label);
+        program.preassign_label_to_next_insn(loop_end_label);
         program.emit_insn(Insn::Close { cursor_id });
         program.preassign_label_to_next_insn(halt_label);
         return Ok(());

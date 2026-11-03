@@ -701,7 +701,7 @@ pub(crate) fn int_equals_float(i: i64, r: f64) -> bool {
     if r.is_nan() {
         return false;
     }
-    if r < -9223372036854775808.0 || r >= 9223372036854775808.0 {
+    if !(-9223372036854775808.0..9223372036854775808.0).contains(&r) {
         return false;
     }
     let y = r as i64;

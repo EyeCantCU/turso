@@ -75,7 +75,7 @@ impl RtreeMatchFunction for CMatch {
             x_query: self.x_query,
             info: Box::new(unsafe { std::mem::zeroed() }),
             params: params.iter().map(as_double).collect(),
-            values: params.iter().map(Value::to_ffi).map(Box::new).collect(),
+            values: params.iter().map(Value::to_ffi).collect(),
             value_ptrs: Vec::new(),
             coords: [0.0; 10],
             queue: Vec::new(),
@@ -83,7 +83,7 @@ impl RtreeMatchFunction for CMatch {
         call.value_ptrs = call
             .values
             .iter_mut()
-            .map(|v| v.as_mut() as *mut ExtValue as *mut c_void)
+            .map(|v| v as *mut ExtValue as *mut c_void)
             .collect();
         let info = call.info.as_mut();
         info.pContext = self.context as *mut c_void;
@@ -109,7 +109,7 @@ struct CCall {
     x_query: Option<QueryFn>,
     info: Box<sqlite3_rtree_query_info>,
     params: Vec<f64>,
-    values: Vec<Box<ExtValue>>,
+    values: Vec<ExtValue>,
     value_ptrs: Vec<*mut c_void>,
     coords: [f64; 10],
     queue: Vec<c_uint>,
@@ -125,7 +125,7 @@ impl Drop for CCall {
             unsafe { del(self.info.pUser) };
         }
         for v in self.values.drain(..) {
-            unsafe { (*v).__free_internal_type() };
+            unsafe { v.__free_internal_type() };
         }
     }
 }

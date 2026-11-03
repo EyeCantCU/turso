@@ -906,8 +906,10 @@ pub(crate) fn update(
             }
             if !matches!(args[2], Value::Null) {
                 cell.rowid = value_int64(&args[2]);
-                if matches!(args[0], Value::Null) || value_int64(&args[0]) != cell.rowid {
-                    if w.rowid_exists(cell.rowid)? {
+                if (matches!(args[0], Value::Null) || value_int64(&args[0]) != cell.rowid)
+                    && w.rowid_exists(cell.rowid)?
+                {
+                    {
                         if on_conflict == ON_CONFLICT_REPLACE {
                             w.delete_rowid(cell.rowid)?;
                         } else {

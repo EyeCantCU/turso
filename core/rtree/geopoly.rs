@@ -187,8 +187,7 @@ fn parse_json(z: &[u8]) -> Option<GeoPoly> {
         break;
     }
     if s.skip_space() == b']'
-        && n_vertex >= 4
-        && n_vertex < 16777216
+        && (4..16777216).contains(&n_vertex)
         && a[0] == a[n_vertex * 2 - 2]
         && a[1] == a[n_vertex * 2 - 1]
     {
@@ -256,7 +255,7 @@ fn area(p: &GeoPoly) -> f64 {
     r
 }
 
-const GEOPOLY_PI: f64 = 3.1415926535897932385;
+const GEOPOLY_PI: f64 = std::f64::consts::PI;
 
 fn sine(r: f64) -> f64 {
     let mut r = r;

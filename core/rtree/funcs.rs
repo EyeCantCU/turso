@@ -108,7 +108,8 @@ scalar!(RtreeCheckFn, RtreeCheckCall, |conn, args| {
     } else {
         (text(args[0].get_value()), text(args[1].get_value()))
     };
-    check_table(conn, &db, &tab).map(|report| Value::build_text(report.unwrap_or("ok".into())))
+    check_table(conn, &db, &tab)
+        .map(|report| Value::build_text(report.unwrap_or_else(|| "ok".into())))
 });
 
 const RTREE_CHECK_MAX_ERROR: usize = 100;
