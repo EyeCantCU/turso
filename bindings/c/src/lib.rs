@@ -3732,6 +3732,7 @@ pub unsafe extern "C" fn sqlite3_table_column_metadata(
 fn limbo_err_code(err: &LimboError) -> i32 {
     match err {
         LimboError::Corrupt(..) => SQLITE_CORRUPT,
+        LimboError::CorruptVtab(..) => SQLITE_CORRUPT,
         LimboError::NotADB => SQLITE_NOTADB,
         // A Raise is a constraint error that carries its own conflict
         // resolution, and SQLite reports it as SQLITE_CONSTRAINT.

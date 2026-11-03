@@ -51,7 +51,9 @@ fn validate_delete(
     if program.trigger.is_some() && table.virtual_table().is_some() {
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name);
     }
-    if table.btree().is_some_and(|bt| !bt.has_rowid) {
+    // Engine helper SQL (FTS5 shadow tables) may delete from a WITHOUT ROWID
+    // table that has no secondary indexes.
+    if table.btree().is_some_and(|bt| !bt.has_rowid) && !connection.is_nested_stmt() {
         crate::bail_parse_error!("DELETE from WITHOUT ROWID tables is not supported");
     }
 

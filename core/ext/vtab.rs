@@ -101,22 +101,28 @@ impl ExtensionTable {
 
     pub(crate) fn update(
         &self,
+        connection: &Arc<Connection>,
         args: &[Value],
         state: &mut ExtensionState,
         on_conflict: u8,
     ) -> IOResultOr<Option<i64>> {
         match self {
             Self::C(table) => table.update(args).map(IOResult::Done).map_err(Into::into),
-            Self::Native(table) => table.update(state, args, on_conflict),
+            Self::Native(table) => table.update(connection, state, args, on_conflict),
         }
     }
 
     /// Savepoint hooks (`xSavepoint`, `xRelease`, `xRollbackTo`); `op` is 0, 1 or 2.
-    pub(crate) fn savepoint_op(&self, op: u8, level: usize) -> Result<()> {
+    pub(crate) fn savepoint_op(
+        &self,
+        connection: &Arc<Connection>,
+        op: u8,
+        level: usize,
+    ) -> Result<()> {
         match self {
             Self::C(_) => Ok(()),
             Self::Native(table) => match op {
-                0 => table.savepoint(level),
+                0 => table.savepoint(connection, level),
                 1 => table.release(level),
                 _ => table.rollback_to(level),
             },
@@ -137,6 +143,13 @@ impl ExtensionTable {
         }
     }
 
+    pub(crate) fn sync(&self, connection: &Arc<Connection>) -> Result<()> {
+        match self {
+            Self::C(_) => Ok(()),
+            Self::Native(table) => table.sync(connection),
+        }
+    }
+
     pub(crate) fn rollback(&self) -> Result<()> {
         match self {
             Self::C(table) => table.rollback(),
@@ -144,17 +157,17 @@ impl ExtensionTable {
         }
     }
 
-    pub(crate) fn rename(&self, name: &str) -> Result<()> {
+    pub(crate) fn rename(&self, connection: &Arc<Connection>, name: &str) -> Result<()> {
         match self {
             Self::C(table) => table.rename(name),
-            Self::Native(table) => table.rename(name),
+            Self::Native(table) => table.rename(connection, name),
         }
     }
 
-    pub(crate) fn destroy(&self) -> Result<()> {
+    pub(crate) fn destroy(&self, connection: &Arc<Connection>) -> Result<()> {
         match self {
             Self::C(table) => table.destroy(),
-            Self::Native(table) => table.destroy(),
+            Self::Native(table) => table.destroy(connection),
         }
     }
 }

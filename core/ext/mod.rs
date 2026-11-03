@@ -318,6 +318,8 @@ impl Database {
             #[cfg(all(feature = "fts", not(target_family = "wasm")))]
             syms.index_methods
                 .insert(FTS_INDEX_METHOD_NAME.to_string(), Arc::new(FtsIndexMethod));
+            #[cfg(feature = "fts5")]
+            crate::fts5::register(&mut syms);
         }
         let syms = self.builtin_syms.data_ptr();
         // Pass the mutex pointer and the appropriate handler
@@ -365,6 +367,20 @@ impl Database {
 }
 
 impl Connection {
+    /// The virtual table with id `id`: one this connection created, an
+    /// eponymous table, or one loaded from the schema.
+    pub(crate) fn vtab_by_id(&self, id: u64) -> Option<Arc<VirtualTable>> {
+        if let Some(vtab) = self.syms.read().vtab_by_id(id) {
+            return Some(vtab);
+        }
+        let schema = self.schema.read();
+        let found = schema.all_tables().find_map(|table| match table.as_ref() {
+            crate::schema::Table::Virtual(vtab) if vtab.id() == id => Some(vtab.clone()),
+            _ => None,
+        });
+        found
+    }
+
     /// Registers a virtual table module on this connection only, as
     /// `sqlite3_create_module` does. `creatable` modules back
     /// `CREATE VIRTUAL TABLE`; `eponymous` ones also get a table named after

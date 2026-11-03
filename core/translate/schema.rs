@@ -1180,7 +1180,8 @@ pub fn translate_create_table(
         }
     }
 
-    if !connection.experimental_without_rowid_enabled() {
+    // Engine helper SQL (e.g. FTS5 shadow tables) may create WITHOUT ROWID tables.
+    if !connection.experimental_without_rowid_enabled() && !connection.is_nested_stmt() {
         if let ast::CreateTableBody::ColumnsAndConstraints { options, .. } = &body {
             if options.contains_without_rowid() {
                 bail_parse_error!(

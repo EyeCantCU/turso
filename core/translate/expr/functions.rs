@@ -59,11 +59,11 @@ pub(super) fn translate_like_base(
         }
         #[cfg(all(feature = "fts", not(target_family = "wasm")))]
         ast::LikeOperator::Match => {
-            crate::bail_parse_error!("MATCH requires an FTS index query")
+            crate::bail_parse_error!("unable to use function MATCH in the requested context")
         }
         #[cfg(any(not(feature = "fts"), target_family = "wasm"))]
         ast::LikeOperator::Match => {
-            crate::bail_parse_error!("MATCH requires the 'fts' feature to be enabled")
+            crate::bail_parse_error!("unable to use function MATCH in the requested context")
         }
         ast::LikeOperator::Regexp => {
             if escape.is_some() {

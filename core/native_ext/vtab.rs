@@ -7,13 +7,26 @@ use std::fmt::Debug;
 use turso_ext::ResultCode;
 
 /// Identifies the table a module instance is being created for.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct ConnectInfo<'a> {
     pub module_name: &'a str,
     pub schema_name: &'a str,
     pub table_name: &'a str,
     /// `true` for `CREATE VIRTUAL TABLE`, `false` when attaching to an existing table.
     pub create: bool,
+    /// The connection running `CREATE VIRTUAL TABLE`, when there is one.
+    pub connection: Option<&'a Arc<Connection>>,
+}
+
+impl Debug for ConnectInfo<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectInfo")
+            .field("module_name", &self.module_name)
+            .field("schema_name", &self.schema_name)
+            .field("table_name", &self.table_name)
+            .field("create", &self.create)
+            .finish()
+    }
 }
 
 pub trait VirtualTableModule: Debug + Send + Sync {
@@ -60,6 +73,35 @@ pub trait VirtualTable: Debug + Send + Sync {
         _on_conflict: u8,
     ) -> Result<Box<dyn TableUpdate>> {
         self.create_update(args)
+    }
+    /// Like `create_update_on_conflict`, with the connection running the write.
+    fn create_update_with_connection(
+        &mut self,
+        _connection: &Arc<Connection>,
+        args: Vec<Value>,
+        on_conflict: u8,
+    ) -> Result<Box<dyn TableUpdate>> {
+        self.create_update_on_conflict(args, on_conflict)
+    }
+    /// Runs before `commit`, while the transaction is still open (xSync).
+    fn sync(&mut self, _connection: &Arc<Connection>) -> Result<()> {
+        Ok(())
+    }
+    /// Like `savepoint`, with the connection that opened it.
+    fn savepoint_with_connection(
+        &mut self,
+        _connection: &Arc<Connection>,
+        level: usize,
+    ) -> Result<()> {
+        self.savepoint(level)
+    }
+    /// Like `destroy`, with the connection running `DROP TABLE`.
+    fn destroy_with_connection(&mut self, _connection: &Arc<Connection>) -> Result<()> {
+        self.destroy()
+    }
+    /// Like `rename`, with the connection running `ALTER TABLE`.
+    fn rename_with_connection(&mut self, _connection: &Arc<Connection>, name: &str) -> Result<()> {
+        self.rename(name)
     }
     /// Whether `CREATE VIRTUAL TABLE` enlists the new table in the
     /// transaction, so `commit` (or `rollback`) runs without a `begin`.
@@ -149,6 +191,7 @@ impl NativeTable {
 
     pub(crate) fn update(
         &self,
+        connection: &Arc<Connection>,
         state: &mut ExtensionState,
         args: &[Value],
         on_conflict: u8,
@@ -158,11 +201,11 @@ impl NativeTable {
                 .iter()
                 .map(Value::try_clone)
                 .collect::<Result<Vec<_>, _>>()?;
-            *state = ExtensionState::TableUpdate(
-                self.0
-                    .write()
-                    .create_update_on_conflict(args, on_conflict)?,
-            );
+            *state = ExtensionState::TableUpdate(self.0.write().create_update_with_connection(
+                connection,
+                args,
+                on_conflict,
+            )?);
         }
         let ExtensionState::TableUpdate(update) = state else {
             unreachable!("update instruction requires table update state");
@@ -182,20 +225,24 @@ impl NativeTable {
         self.0.write().commit()
     }
 
+    pub(crate) fn sync(&self, connection: &Arc<Connection>) -> Result<()> {
+        self.0.write().sync(connection)
+    }
+
     pub(crate) fn rollback(&self) -> Result<()> {
         self.0.write().rollback()
     }
 
-    pub(crate) fn rename(&self, name: &str) -> Result<()> {
-        self.0.write().rename(name)
+    pub(crate) fn rename(&self, connection: &Arc<Connection>, name: &str) -> Result<()> {
+        self.0.write().rename_with_connection(connection, name)
     }
 
     pub(crate) fn commits_after_create(&self) -> bool {
         self.0.read().commits_after_create()
     }
 
-    pub(crate) fn savepoint(&self, level: usize) -> Result<()> {
-        self.0.write().savepoint(level)
+    pub(crate) fn savepoint(&self, connection: &Arc<Connection>, level: usize) -> Result<()> {
+        self.0.write().savepoint_with_connection(connection, level)
     }
 
     pub(crate) fn release(&self, level: usize) -> Result<()> {
@@ -206,8 +253,8 @@ impl NativeTable {
         self.0.write().rollback_to(level)
     }
 
-    pub(crate) fn destroy(&self) -> Result<()> {
-        self.0.write().destroy()
+    pub(crate) fn destroy(&self, connection: &Arc<Connection>) -> Result<()> {
+        self.0.write().destroy_with_connection(connection)
     }
 }
 
@@ -219,20 +266,26 @@ trait TableInstance: Debug + Send + Sync {
         order_by: &[OrderByInfo],
     ) -> Result<IndexInfo, ResultCode>;
     fn readonly(&self) -> bool;
-    fn create_update_on_conflict(
+    fn create_update_with_connection(
         &mut self,
+        connection: &Arc<Connection>,
         args: Vec<Value>,
         on_conflict: u8,
     ) -> Result<Box<dyn TableUpdate>>;
     fn commits_after_create(&self) -> bool;
-    fn savepoint(&mut self, level: usize) -> Result<()>;
+    fn sync(&mut self, connection: &Arc<Connection>) -> Result<()>;
+    fn savepoint_with_connection(
+        &mut self,
+        connection: &Arc<Connection>,
+        level: usize,
+    ) -> Result<()>;
     fn release(&mut self, level: usize) -> Result<()>;
     fn rollback_to(&mut self, level: usize) -> Result<()>;
     fn begin(&mut self) -> Result<()>;
     fn commit(&mut self) -> Result<()>;
     fn rollback(&mut self) -> Result<()>;
-    fn rename(&mut self, name: &str) -> Result<()>;
-    fn destroy(&mut self) -> Result<()>;
+    fn rename_with_connection(&mut self, connection: &Arc<Connection>, name: &str) -> Result<()>;
+    fn destroy_with_connection(&mut self, connection: &Arc<Connection>) -> Result<()>;
 }
 
 impl<T: VirtualTable> TableInstance for T {
@@ -252,20 +305,29 @@ impl<T: VirtualTable> TableInstance for T {
         VirtualTable::readonly(self)
     }
 
-    fn create_update_on_conflict(
+    fn create_update_with_connection(
         &mut self,
+        connection: &Arc<Connection>,
         args: Vec<Value>,
         on_conflict: u8,
     ) -> Result<Box<dyn TableUpdate>> {
-        VirtualTable::create_update_on_conflict(self, args, on_conflict)
+        VirtualTable::create_update_with_connection(self, connection, args, on_conflict)
     }
 
     fn commits_after_create(&self) -> bool {
         VirtualTable::commits_after_create(self)
     }
 
-    fn savepoint(&mut self, level: usize) -> Result<()> {
-        VirtualTable::savepoint(self, level)
+    fn sync(&mut self, connection: &Arc<Connection>) -> Result<()> {
+        VirtualTable::sync(self, connection)
+    }
+
+    fn savepoint_with_connection(
+        &mut self,
+        connection: &Arc<Connection>,
+        level: usize,
+    ) -> Result<()> {
+        VirtualTable::savepoint_with_connection(self, connection, level)
     }
 
     fn release(&mut self, level: usize) -> Result<()> {
@@ -288,12 +350,12 @@ impl<T: VirtualTable> TableInstance for T {
         VirtualTable::rollback(self)
     }
 
-    fn rename(&mut self, name: &str) -> Result<()> {
-        VirtualTable::rename(self, name)
+    fn rename_with_connection(&mut self, connection: &Arc<Connection>, name: &str) -> Result<()> {
+        VirtualTable::rename_with_connection(self, connection, name)
     }
 
-    fn destroy(&mut self) -> Result<()> {
-        VirtualTable::destroy(self)
+    fn destroy_with_connection(&mut self, connection: &Arc<Connection>) -> Result<()> {
+        VirtualTable::destroy_with_connection(self, connection)
     }
 }
 

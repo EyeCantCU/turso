@@ -805,6 +805,13 @@ fn transform_match_to_fts_match(
             .unwrap_or(false)
     };
 
+    let table_is_virtual = |table_id: TableInternalId| -> bool {
+        table_references
+            .joined_tables()
+            .iter()
+            .any(|t| t.internal_id == table_id && matches!(t.table, Table::Virtual(_)))
+    };
+
     let mut match_without_fts = false;
     for term in where_clause.iter_mut() {
         let _ = walk_expr_mut(&mut term.expr, &mut |e: &mut Expr| -> Result<WalkControl> {
@@ -816,6 +823,10 @@ fn transform_match_to_fts_match(
                     rhs,
                     escape: _,
                 } => {
+                    // A virtual table evaluates MATCH on its own columns.
+                    if get_table_id_from_expr(lhs).is_some_and(table_is_virtual) {
+                        return Ok(WalkControl::SkipChildren);
+                    }
                     // Check if the specific table referenced by this MATCH has an FTS index
                     let has_fts = get_table_id_from_expr(lhs).is_some_and(table_has_fts_index);
 

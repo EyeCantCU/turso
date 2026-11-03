@@ -120,8 +120,15 @@ pub struct Constraint {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ConstraintOperator {
     AstNativeOperator(ast::Operator),
-    Like { not: bool },
-    In { not: bool, estimated_values: f64 },
+    Like {
+        not: bool,
+    },
+    /// `col MATCH expr`, which only a virtual table can evaluate.
+    Match,
+    In {
+        not: bool,
+        estimated_values: f64,
+    },
 }
 
 impl ConstraintOperator {
@@ -181,9 +188,10 @@ impl Constraint {
                 affinity = Affinity::Blob;
             }
             (
+                // MATCH has no AST operator; only virtual tables consume it.
                 self.operator
                     .as_ast_operator()
-                    .expect("expected an ast operator because as_binary_components returned Some"),
+                    .unwrap_or(ast::Operator::Equals),
                 lhs.clone(),
                 affinity,
             )
@@ -192,9 +200,10 @@ impl Constraint {
                 affinity = Affinity::Blob;
             }
             (
+                // MATCH has no AST operator; only virtual tables consume it.
                 self.operator
                     .as_ast_operator()
-                    .expect("expected an ast operator because as_binary_components returned Some"),
+                    .unwrap_or(ast::Operator::Equals),
                 rhs.clone(),
                 affinity,
             )
@@ -964,6 +973,12 @@ pub fn constraints_from_where_clause(
                         });
                     }
                     _ => {}
+                };
+                // MATCH constrains only the column on its left.
+                let rhs = if matches!(operator, ConstraintOperator::Match) {
+                    &ast::Expr::Literal(ast::Literal::Null)
+                } else {
+                    rhs
                 };
                 match rhs {
                     ast::Expr::Column { table, column, .. } => {
@@ -2088,6 +2103,9 @@ pub fn is_equality_operator(op: ConstraintOperator) -> bool {
 }
 
 fn to_ext_constraint_op(op: &ConstraintOperator) -> Option<ConstraintOp> {
+    if matches!(op, ConstraintOperator::Match) {
+        return Some(ConstraintOp::Match);
+    }
     let ConstraintOperator::AstNativeOperator(op) = op else {
         return None;
     };

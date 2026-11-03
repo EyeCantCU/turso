@@ -532,6 +532,7 @@ fn emit_delete_insns<'a>(
         }
     };
     let btree_table = unsafe { &*table_reference }.btree();
+    let without_rowid = btree_table.as_ref().is_some_and(|t| !t.has_rowid);
     let namespace = unsafe { (*table_reference).namespace };
     let main_table_cursor_id = program.resolve_cursor_id(&CursorKey::table(internal_id));
     let iteration_index = unsafe { &*table_reference }.op.index();
@@ -560,10 +561,17 @@ fn emit_delete_insns<'a>(
         }
         // Get rowid for RETURNING
         let rowid_reg = program.alloc_register();
-        program.emit_insn(Insn::RowId {
-            cursor_id: main_table_cursor_id,
-            dest: rowid_reg,
-        });
+        if without_rowid {
+            program.emit_insn(Insn::Null {
+                dest: rowid_reg,
+                dest_end: None,
+            });
+        } else {
+            program.emit_insn(Insn::RowId {
+                cursor_id: main_table_cursor_id,
+                dest: rowid_reg,
+            });
+        }
         if unsafe { &*table_reference }.virtual_table().is_some() {
             // VUpdate requires a NULL second argument ("new rowid") for deletion
             let new_rowid_reg = program.alloc_register();

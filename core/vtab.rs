@@ -100,6 +100,7 @@ impl VirtualTable {
             schema_name: "main",
             table_name: name,
             create: false,
+            connection: None,
         };
         let (vtab_type, schema) = if module.is_some() {
             crate::ext::create_virtual_table(
@@ -132,23 +133,41 @@ impl VirtualTable {
         args: Vec<Value>,
         syms: &SymbolTable,
     ) -> crate::Result<Arc<VirtualTable>> {
-        Self::table_for(tbl_name, module_name, args, syms, false)
+        Self::table_for(tbl_name, module_name, args, syms, None)
     }
 
-    /// Like [`Self::table`]; `create` is true when run for `CREATE VIRTUAL TABLE`.
+    /// Like [`Self::table`]; `create` is the connection running `CREATE VIRTUAL TABLE`.
     pub(crate) fn table_for(
         tbl_name: Option<&str>,
         module_name: &str,
         args: Vec<Value>,
         syms: &SymbolTable,
-        create: bool,
+        create: Option<&Arc<Connection>>,
     ) -> crate::Result<Arc<VirtualTable>> {
-        let module = syms.vtab_module(module_name);
+        Self::table_for_module(
+            tbl_name,
+            module_name,
+            args,
+            syms.vtab_module(module_name),
+            create,
+        )
+    }
+
+    /// Like [`Self::table_for`], with the module already looked up, so no
+    /// symbol table lock is held while the module's constructor runs.
+    pub(crate) fn table_for_module(
+        tbl_name: Option<&str>,
+        module_name: &str,
+        args: Vec<Value>,
+        module: Option<&Arc<crate::ext::VTabImpl>>,
+        create: Option<&Arc<Connection>>,
+    ) -> crate::Result<Arc<VirtualTable>> {
         let info = crate::native_ext::ConnectInfo {
             module_name,
             schema_name: "main",
             table_name: tbl_name.unwrap_or(module_name),
-            create,
+            create: create.is_some(),
+            connection: create,
         };
         let (vtab_type, schema) =
             crate::ext::create_virtual_table(&info, module, args, VTabKind::VirtualTable)?;
@@ -176,6 +195,7 @@ impl VirtualTable {
             schema_name: "main",
             table_name: tbl_name,
             create: false,
+            connection: None,
         };
         let (vtab_type, schema) =
             crate::ext::create_virtual_table(&info, Some(module), args, VTabKind::VirtualTable)?;
@@ -200,6 +220,7 @@ impl VirtualTable {
             schema_name: "main",
             table_name: name,
             create: false,
+            connection: None,
         };
         let (vtab_type, schema) = module.implementation.create(&info, Vec::new())?;
         Ok(Arc::new(VirtualTable {
@@ -256,21 +277,22 @@ impl VirtualTable {
 
     pub(crate) fn update(
         &self,
+        conn: &Arc<Connection>,
         args: &[Value],
         state: &mut crate::native_ext::ExtensionState,
         on_conflict: u8,
     ) -> IOResultOr<Option<i64>> {
         match &self.vtab_type {
             VirtualTableType::Pragma(_) => Err(LimboError::ReadOnly.into()),
-            VirtualTableType::External(table) => table.update(args, state, on_conflict),
+            VirtualTableType::External(table) => table.update(conn, args, state, on_conflict),
             VirtualTableType::Internal(_) => Err(LimboError::ReadOnly.into()),
         }
     }
 
-    pub(crate) fn destroy(&self) -> crate::Result<()> {
+    pub(crate) fn destroy(&self, conn: &Arc<Connection>) -> crate::Result<()> {
         match &self.vtab_type {
             VirtualTableType::Pragma(_) => Ok(()),
-            VirtualTableType::External(table) => table.destroy(),
+            VirtualTableType::External(table) => table.destroy(conn),
             VirtualTableType::Internal(_) => Ok(()),
         }
     }
@@ -323,20 +345,33 @@ impl VirtualTable {
         }
     }
 
-    /// Runs a savepoint hook (0 = savepoint, 1 = release, 2 = rollback to).
-    pub(crate) fn savepoint_op(&self, op: u8, level: usize) -> crate::Result<()> {
+    /// Runs xSync before the commit.
+    pub(crate) fn sync(&self, conn: &Arc<Connection>) -> crate::Result<()> {
         match &self.vtab_type {
-            VirtualTableType::External(table) => table.savepoint_op(op, level),
+            VirtualTableType::External(table) => table.sync(conn),
             _ => Ok(()),
         }
     }
 
-    pub(crate) fn rename(&self, new_name: &str) -> crate::Result<()> {
+    /// Runs a savepoint hook (0 = savepoint, 1 = release, 2 = rollback to).
+    pub(crate) fn savepoint_op(
+        &self,
+        conn: &Arc<Connection>,
+        op: u8,
+        level: usize,
+    ) -> crate::Result<()> {
+        match &self.vtab_type {
+            VirtualTableType::External(table) => table.savepoint_op(conn, op, level),
+            _ => Ok(()),
+        }
+    }
+
+    pub(crate) fn rename(&self, conn: &Arc<Connection>, new_name: &str) -> crate::Result<()> {
         match &self.vtab_type {
             VirtualTableType::Pragma(_) => Err(LimboError::ExtensionError(
                 "Pragma virtual tables do not support renaming".to_string(),
             )),
-            VirtualTableType::External(table) => table.rename(new_name),
+            VirtualTableType::External(table) => table.rename(conn, new_name),
             VirtualTableType::Internal(_) => Err(LimboError::ExtensionError(
                 "Internal virtual tables currently do not support renaming".to_string(),
             )),
