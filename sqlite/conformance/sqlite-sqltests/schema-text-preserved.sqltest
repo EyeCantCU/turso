@@ -78,3 +78,149 @@ expect {
     t2|CREATE TABLE t2 ( a , b, "Z z" TEXT /* c */, w  INTEGER DEFAULT 5, CHECK (a > 0) , UNIQUE(a) )
     t3|CREATE TABLE t3(a)
 }
+
+# Every ALTER TABLE form edits the stored text in place, as SQLite 3.54 does
+# (renameEditSql, sqlite_add_constraint, sqlite_drop_constraint). The
+# expected text is what sqlite3 3.54.1 stores.
+
+@cross-check-integrity
+test set-not-null-appends-to-the-column {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT  NOT NULL , c /* cc */ INT, d DEFAULT 5);
+    ALTER TABLE t ALTER COLUMN c SET NOT NULL;
+    ALTER TABLE t ALTER d SET  NOT NULL ON CONFLICT IGNORE  -- trailing
+    ;
+    SELECT sql || '|' FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT  NOT NULL , c /* cc */ INT NOT NULL, d DEFAULT 5 NOT NULL ON CONFLICT IGNORE)|
+}
+
+@cross-check-integrity
+test set-not-null-replaces-existing-not-null {
+    CREATE TABLE t(p, q NOT NULL, r CONSTRAINT r_nn NOT NULL ON CONFLICT ROLLBACK);
+    ALTER TABLE t ALTER q SET NOT NULL ON CONFLICT REPLACE;
+    ALTER TABLE t ALTER r SET NOT NULL;
+    ALTER TABLE t ALTER p SET NOT NULL;
+    SELECT sql || '|' FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    CREATE TABLE t(p NOT NULL, q NOT NULL ON CONFLICT REPLACE, r NOT NULL)|
+}
+
+@cross-check-integrity
+test set-not-null-after-references {
+    CREATE TABLE p(a INTEGER PRIMARY KEY);
+    CREATE TABLE t(x, z REFERENCES p(a));
+    ALTER TABLE t ALTER z SET NOT NULL;
+    SELECT sql || '|' FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    CREATE TABLE t(x, z REFERENCES p(a) NOT NULL)|
+}
+
+@cross-check-integrity
+test drop-not-null-removes-the-text {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE NOT NULL DEFAULT 'q' CHECK(b <> ''), c INT NOT NULL ON CONFLICT FAIL CHECK(c > 0), d);
+    ALTER TABLE t ALTER b DROP NOT NULL;
+    ALTER TABLE t ALTER c DROP NOT NULL;
+    ALTER TABLE t ALTER d DROP NOT NULL;
+    SELECT sql || '|' FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE DEFAULT 'q' CHECK(b <> ''), c INT CHECK(c > 0), d)|
+}
+
+@cross-check-integrity
+test add-check-appends-after-the-last-element {
+    CREATE TABLE t ( a , b, UNIQUE(a) ) ;
+    ALTER TABLE t ADD CONSTRAINT "ck 2" CHECK( b < 100 ) /* keep */ ;
+    ALTER TABLE t ADD CHECK (length(a) < 10);
+    ALTER TABLE t ADD CONSTRAINT c3 CHECK (a IS NOT NULL) ON CONFLICT ABORT;
+    SELECT sql || '|' FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    CREATE TABLE t ( a , b, UNIQUE(a) , CONSTRAINT "ck 2" CHECK( b < 100 ) /* keep */, CHECK (length(a) < 10), CONSTRAINT c3 CHECK (a IS NOT NULL) ON CONFLICT ABORT)|
+}
+
+@cross-check-integrity
+test drop-constraint-cuts-the-named-constraint {
+    CREATE TABLE p(a INTEGER PRIMARY KEY);
+    CREATE TABLE t(x CONSTRAINT nn NOT NULL, y CONSTRAINT df DEFAULT 3, z CONSTRAINT cz CHECK (z > 0), CONSTRAINT fk FOREIGN KEY (y) REFERENCES p(a) ON DELETE CASCADE, CONSTRAINT tc CHECK (x <> y), CONSTRAINT pk PRIMARY KEY (x));
+    ALTER TABLE t DROP CONSTRAINT nn;
+    ALTER TABLE t DROP CONSTRAINT DF;
+    ALTER TABLE t DROP CONSTRAINT "cz";
+    ALTER TABLE t DROP CONSTRAINT fk;
+    ALTER TABLE t DROP CONSTRAINT tc;
+    SELECT sql || '|' FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    CREATE TABLE t(x, y DEFAULT 3, z, CONSTRAINT pk PRIMARY KEY (x))|
+}
+
+@cross-check-integrity
+test constraint-edits-on-a-temp-table {
+    CREATE TEMP TABLE te(a, b NOT NULL);
+    ALTER TABLE te ALTER a SET NOT NULL;
+    ALTER TABLE te ADD CHECK(b > 0);
+    ALTER TABLE temp.te ALTER b DROP NOT NULL;
+    SELECT sql || '|' FROM sqlite_temp_schema WHERE name = 'te';
+}
+expect {
+    CREATE TABLE te(a NOT NULL, b, CHECK(b > 0))|
+}
+
+@cross-check-integrity
+test rename-and-column-edits-with-keyword-names {
+    CREATE TABLE "group"(key INTEGER PRIMARY KEY, "action" TEXT, [values] INT, `offset` REAL);
+    CREATE INDEX gi ON "group"(action, [values] DESC);
+    CREATE VIEW gv AS SELECT key, action FROM "group" WHERE "values" > 0;
+    CREATE TRIGGER gt AFTER UPDATE OF action ON "group" BEGIN UPDATE "group" SET [values] = new.key WHERE key = old.key; END;
+    ALTER TABLE "group" RENAME COLUMN action TO act;
+    ALTER TABLE "group" RENAME COLUMN "values" TO "Vals";
+    ALTER TABLE "group" RENAME COLUMN key TO "match";
+    ALTER TABLE "group" RENAME TO "order";
+    ALTER TABLE "order" ADD COLUMN "default" TEXT DEFAULT 'x' ;
+    ALTER TABLE "order" DROP COLUMN "offset";
+    SELECT name, sql || '|' FROM sqlite_schema ORDER BY name;
+}
+expect {
+    gi|CREATE INDEX gi ON "order"(act, "Vals" DESC)|
+    gt|CREATE TRIGGER gt AFTER UPDATE OF act ON "order" BEGIN UPDATE "order" SET "Vals" = new."match" WHERE "match" = old."match"; END|
+    gv|CREATE VIEW gv AS SELECT "match", act FROM "order" WHERE "Vals" > 0|
+    order|CREATE TABLE "order"("match" INTEGER PRIMARY KEY, "act" TEXT, "Vals" INT, "default" TEXT DEFAULT 'x')|
+}
+
+@cross-check-integrity
+test temp-trigger-text-has-no-temp {
+    CREATE TABLE r(a, b, c);
+    CREATE TEMP TRIGGER tt AFTER INSERT ON r BEGIN SELECT new.a; END;
+    create temp trigger if not exists tt2 before delete on main.r begin select old.b; end;
+    ALTER TABLE r RENAME COLUMN a TO aa;
+    ALTER TABLE r RENAME TO r2;
+    SELECT name, tbl_name, sql || '|' FROM sqlite_temp_schema ORDER BY name;
+}
+expect {
+    tt|r2|CREATE TRIGGER tt AFTER INSERT ON "r2" BEGIN SELECT new.aa; END|
+    tt2|r2|CREATE TRIGGER tt2 before delete on main."r2" begin select old.b; end|
+}
+
+@cross-check-integrity
+test drop-index-and-table-clear-sqlite-stat1 {
+    CREATE TABLE T1(a, b);
+    CREATE INDEX I1 ON t1(a);
+    CREATE INDEX I2 ON t1(b);
+    CREATE TABLE t2(x);
+    CREATE INDEX i3 ON t2(x);
+    INSERT INTO t1 VALUES (1, 2), (3, 4);
+    INSERT INTO t2 VALUES (1);
+    ANALYZE;
+    DROP INDEX i1;
+    SELECT tbl, idx FROM sqlite_stat1 ORDER BY 1, 2;
+    DROP TABLE t1;
+    SELECT tbl, idx FROM sqlite_stat1 ORDER BY 1, 2;
+}
+expect {
+    T1|I2
+    t2|i3
+    t2|i3
+}

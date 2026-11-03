@@ -5476,8 +5476,16 @@ impl BTreeTable {
 
     /// Whether `sql` creates a table with this table's definition.
     pub fn has_same_definition(&self, sql: &str) -> bool {
+        // How a CHECK expression was spelled is not part of the definition.
+        let canonical = |table: &BTreeTable| {
+            let mut table = table.clone();
+            for check in &mut table.check_constraints {
+                check.source = None;
+            }
+            table.to_sql_as(&self.name)
+        };
         BTreeTable::from_sql(sql, self.root_page)
-            .is_ok_and(|table| table.to_sql_as(&self.name) == self.to_sql())
+            .is_ok_and(|table| canonical(&table) == canonical(self))
     }
 
     /// Reconstruct the SQL for the table.

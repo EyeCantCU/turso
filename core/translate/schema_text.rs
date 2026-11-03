@@ -161,7 +161,11 @@ fn name_tokens(sql: &str) -> Option<Vec<NameTok>> {
         }
         match token.token_type {
             TokenType::TK_LBRACKET => bracket = Some(start),
-            TokenType::TK_ID | TokenType::TK_STRING => {
+            // A keyword used as a name is written bare and printed quoted.
+            t if t == TokenType::TK_ID
+                || t == TokenType::TK_STRING
+                || is_word(&sql.as_bytes()[start..end]) =>
+            {
                 let text = &sql[start..end];
                 let quoted = matches!(text.as_bytes()[0], b'"' | b'\'' | b'`');
                 let value = if quoted {
@@ -181,6 +185,12 @@ fn name_tokens(sql: &str) -> Option<Vec<NameTok>> {
         }
     }
     (end == sql.len()).then_some(out)
+}
+
+fn is_word(text: &[u8]) -> bool {
+    text.first()
+        .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+        && text.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
 }
 
 /// Rewrites `old_sql`, the stored text of a schema object, so that it says
@@ -347,6 +357,368 @@ fn skip_name(toks: &[Tok], i: usize) -> Option<usize> {
     Some(i + close + 1)
 }
 
+/// A token of a schema text, with `[...]` merged into one identifier as
+/// SQLite's tokenizer reads it. Whitespace and comments are `TK_NONE`.
+#[derive(Clone, Copy)]
+struct SqlTok {
+    ty: TokenType,
+    start: usize,
+    end: usize,
+}
+
+fn sql_tokens(sql: &str) -> Option<Vec<SqlTok>> {
+    let mut out = Vec::new();
+    let mut bracket: Option<usize> = None;
+    let mut end = 0;
+    for token in Lexer::new(sql.as_bytes()) {
+        let token = token.ok()?;
+        let start = end;
+        end += token.value.len();
+        if let Some(open) = bracket {
+            if token.token_type == TokenType::TK_RBRACKET {
+                out.push(SqlTok {
+                    ty: TokenType::TK_ID,
+                    start: open,
+                    end,
+                });
+                bracket = None;
+            }
+            continue;
+        }
+        if token.token_type == TokenType::TK_LBRACKET {
+            bracket = Some(start);
+            continue;
+        }
+        out.push(SqlTok {
+            ty: token.token_type,
+            start,
+            end,
+        });
+    }
+    (end == sql.len() && bracket.is_none()).then_some(out)
+}
+
+/// A port of the tokenizer helpers of SQLite's alter.c, over byte offsets
+/// into `sql`. Past the end it returns `TK_ILLEGAL` of length 0, as
+/// `sqlite3GetToken` does for the terminating NUL.
+struct ConsText<'a> {
+    sql: &'a str,
+    toks: Vec<SqlTok>,
+}
+
+impl<'a> ConsText<'a> {
+    fn new(sql: &'a str) -> Option<Self> {
+        Some(Self {
+            sql,
+            toks: sql_tokens(sql)?,
+        })
+    }
+
+    /// `sqlite3GetToken`: the token at `off` and its length.
+    fn token(&self, off: usize) -> (TokenType, usize) {
+        match self.toks.binary_search_by_key(&off, |t| t.start) {
+            Ok(i) => (self.toks[i].ty, self.toks[i].end - off),
+            Err(_) => (TokenType::TK_ILLEGAL, 0),
+        }
+    }
+
+    fn is_space(&self, off: usize) -> bool {
+        self.token(off).0 == TokenType::TK_NONE
+    }
+
+    /// `getWhitespace`.
+    fn whitespace(&self, mut off: usize) -> usize {
+        let start = off;
+        while self.is_space(off) {
+            off += self.token(off).1;
+        }
+        off - start
+    }
+
+    /// `getConstraintToken`: the next non-space token, a parenthesized
+    /// group counting as one `TK_LP`.
+    fn constraint_token(&self, start: usize) -> (TokenType, usize) {
+        let mut off = start;
+        let mut t;
+        loop {
+            let (ty, n) = self.token(off);
+            off += n;
+            t = ty;
+            if ty != TokenType::TK_NONE || n == 0 {
+                break;
+            }
+        }
+        if t == TokenType::TK_LP {
+            let mut nest = 1;
+            while nest > 0 {
+                let (ty, n) = self.token(off);
+                off += n;
+                match ty {
+                    TokenType::TK_LP => nest += 1,
+                    TokenType::TK_RP => {
+                        t = TokenType::TK_LP;
+                        nest -= 1;
+                    }
+                    TokenType::TK_ILLEGAL => {
+                        t = TokenType::TK_ILLEGAL;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (t, off - start)
+    }
+
+    /// `getConstraint`: bytes from `start` to the end of the constraint whose
+    /// first token was `first`.
+    fn constraint(&self, start: usize, mut first: Option<TokenType>) -> usize {
+        let mut off = start;
+        if first == Some(TokenType::TK_FOREIGN) {
+            off += self.constraint(off, None);
+            let (t, n) = self.constraint_token(off);
+            off += n;
+            first = Some(t);
+        }
+        if first == Some(TokenType::TK_REFERENCES) {
+            off += self.constraint_token(off).1;
+        }
+        loop {
+            let (t, n) = self.constraint_token(off);
+            if matches!(
+                t,
+                TokenType::TK_CONSTRAINT
+                    | TokenType::TK_PRIMARY
+                    | TokenType::TK_NOT
+                    | TokenType::TK_UNIQUE
+                    | TokenType::TK_CHECK
+                    | TokenType::TK_DEFAULT
+                    | TokenType::TK_COLLATE
+                    | TokenType::TK_REFERENCES
+                    | TokenType::TK_FOREIGN
+                    | TokenType::TK_RP
+                    | TokenType::TK_COMMA
+                    | TokenType::TK_ILLEGAL
+                    | TokenType::TK_AS
+                    | TokenType::TK_GENERATED
+            ) {
+                break;
+            }
+            off += n;
+        }
+        off - start
+    }
+
+    /// `skipCreateTable`: the offset just past the first `(`.
+    fn skip_create_table(&self) -> Option<usize> {
+        let mut off = 0;
+        loop {
+            let (t, n) = self.token(off);
+            off += n;
+            match t {
+                TokenType::TK_LP => return Some(off),
+                TokenType::TK_ILLEGAL => return None,
+                _ => {}
+            }
+        }
+    }
+
+    /// Whether the possibly quoted name at `off..off+n` is `name`.
+    fn name_is(&self, t: TokenType, off: usize, n: usize, name: &str) -> bool {
+        t != TokenType::TK_ILLEGAL
+            && crate::util::dequote(self.sql[off..off + n].trim()).eq_ignore_ascii_case(name)
+    }
+}
+
+/// What [drop_constraint] removes.
+pub(crate) enum DropTarget<'a> {
+    /// The NOT NULL of the column with this index.
+    NotNull(usize),
+    /// The constraint with this (unquoted) name.
+    Named(&'a str),
+}
+
+/// Why [drop_constraint] failed, with SQLite's message.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DropError {
+    NoSuchConstraint,
+    MayNotBeDropped,
+    /// The text could not be read; the caller falls back.
+    Unreadable,
+}
+
+/// SQLite's `sqlite_drop_constraint()`: `sql` without the constraint. A
+/// DROP NOT NULL of a column without NOT NULL text returns `sql` unchanged.
+pub(crate) fn drop_constraint(sql: &str, target: DropTarget) -> Result<String, DropError> {
+    let c = ConsText::new(sql).ok_or(DropError::Unreadable)?;
+    let mut off = c.skip_create_table().ok_or(DropError::Unreadable)?;
+    let (cons, not_null) = match target {
+        DropTarget::NotNull(i) => (None, Some(i)),
+        DropTarget::Named(n) => (Some(n), None),
+    };
+    let mut start = 0;
+    let mut end: isize = 0;
+    let mut ii = 0;
+    while end == 0 {
+        loop {
+            start = off;
+            let (t, n) = c.constraint_token(off);
+            off += n;
+            if t == TokenType::TK_CONSTRAINT && (cons.is_some() || not_null == Some(ii)) {
+                off += c.whitespace(off);
+                let (nt, n) = c.constraint_token(off);
+                let same = cons.is_some_and(|name| c.name_is(nt, off, n, name));
+                off += n;
+                let (mut t, n) = c.constraint_token(off);
+                if matches!(
+                    t,
+                    TokenType::TK_CONSTRAINT
+                        | TokenType::TK_DEFAULT
+                        | TokenType::TK_COLLATE
+                        | TokenType::TK_COMMA
+                        | TokenType::TK_RP
+                        | TokenType::TK_GENERATED
+                        | TokenType::TK_AS
+                ) {
+                    t = TokenType::TK_CHECK;
+                } else {
+                    off += n;
+                    off += c.constraint(off, Some(t));
+                }
+                if same || (not_null.is_some() && t == TokenType::TK_NOT) {
+                    if !matches!(
+                        t,
+                        TokenType::TK_NOT
+                            | TokenType::TK_CHECK
+                            | TokenType::TK_REFERENCES
+                            | TokenType::TK_FOREIGN
+                    ) {
+                        return Err(DropError::MayNotBeDropped);
+                    }
+                    end = off as isize;
+                    break;
+                }
+            } else if t == TokenType::TK_NOT && not_null == Some(ii) {
+                end = (off + c.constraint(off, None)) as isize;
+                break;
+            } else if t == TokenType::TK_RP || t == TokenType::TK_ILLEGAL {
+                end = -1;
+                break;
+            } else if t == TokenType::TK_COMMA {
+                break;
+            }
+        }
+        ii += 1;
+    }
+    if end <= 0 {
+        return match cons {
+            Some(_) => Err(DropError::NoSuchConstraint),
+            None => Ok(sql.to_string()),
+        };
+    }
+    let mut end = end as usize;
+    end += c.whitespace(end);
+    let mut space = " ";
+    if matches!(c.token(end).0, TokenType::TK_RP | TokenType::TK_COMMA) {
+        space = "";
+        if start > 0 && sql.as_bytes()[start - 1] == b',' {
+            start -= 1;
+        }
+    }
+    Ok(format!("{}{space}{}", &sql[..start], &sql[end..]))
+}
+
+/// SQLite's `sqlite_find_constraint()`: whether `sql` names a constraint
+/// `name` anywhere after its first `(`.
+pub(crate) fn has_named_constraint(sql: &str, name: &str) -> Option<bool> {
+    let c = ConsText::new(sql)?;
+    let mut off = c.skip_create_table()?;
+    loop {
+        let (t, n) = c.constraint_token(off);
+        off += n;
+        match t {
+            TokenType::TK_CONSTRAINT => {
+                off += c.whitespace(off);
+                let (nt, n) = c.constraint_token(off);
+                if c.name_is(nt, off, n, name) {
+                    return Some(true);
+                }
+            }
+            TokenType::TK_ILLEGAL => return Some(false),
+            _ => {}
+        }
+    }
+}
+
+/// SQLite's `sqlite_add_constraint()`: `sql` with `cons` appended to the
+/// definition of column `col`, or after the last table element for `None`.
+pub(crate) fn add_constraint(sql: &str, cons: &str, col: Option<usize>) -> Option<String> {
+    let c = ConsText::new(sql)?;
+    let mut off = c.skip_create_table()?;
+    let mut t = TokenType::TK_NONE;
+    let mut ii = 0;
+    while col.map_or(t != TokenType::TK_RP, |col| ii <= col) {
+        off += c.constraint_token(off).1;
+        loop {
+            let (ty, n) = c.constraint_token(off);
+            t = ty;
+            if matches!(ty, TokenType::TK_COMMA | TokenType::TK_RP) {
+                break;
+            }
+            if ty == TokenType::TK_ILLEGAL {
+                return None;
+            }
+            off += n;
+        }
+        ii += 1;
+    }
+    off += c.whitespace(off);
+    let comma = if col.is_none() { "," } else { "" };
+    Some(format!("{}{comma} {cons}{}", &sql[..off], &sql[off..]))
+}
+
+/// SQLite's `alterRtrimConstraint`: `text` without trailing whitespace and
+/// `--` comments.
+fn rtrim_constraint(text: &str) -> Option<&str> {
+    let end = sql_tokens(text)?
+        .iter()
+        .rev()
+        .find(|t| t.ty != TokenType::TK_NONE || text[t.start..].starts_with("/*"))
+        .map(|t| t.end)
+        .unwrap_or(0);
+    Some(&text[..end])
+}
+
+/// The constraint text of an `ALTER TABLE` statement as SQLite takes it: from
+/// the first token of type `first` after the token types `after`, to the end
+/// of the statement without a trailing `;`, whitespace or `--` comment.
+pub(crate) fn alter_constraint_text<'a>(
+    input: &'a str,
+    after: &[TokenType],
+    first: &[TokenType],
+) -> Option<&'a str> {
+    let toks: Vec<SqlTok> = sql_tokens(input)?
+        .into_iter()
+        .filter(|t| t.ty != TokenType::TK_NONE)
+        .collect();
+    let at = toks.windows(after.len() + 1).position(|w| {
+        w[..after.len()]
+            .iter()
+            .zip(after)
+            .all(|(t, ty)| t.ty == *ty)
+            && first.contains(&w[after.len()].ty)
+    })?;
+    let start = toks[at + after.len()].start;
+    // Up to the `;` that ends the statement, if any.
+    let semi = toks
+        .iter()
+        .rev()
+        .take_while(|t| t.ty == TokenType::TK_SEMI)
+        .last()
+        .map_or(input.len(), |t| t.start);
+    rtrim_constraint(input.get(start..semi)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,6 +828,43 @@ mod tests {
         assert_eq!(
             table_sql_without_column("CREATE TABLE t(a, b DEFAULT (1+2), c)", 0).as_deref(),
             Some("CREATE TABLE t(b DEFAULT (1+2), c)")
+        );
+    }
+
+    #[test]
+    fn constraint_edits_match_sqlite() {
+        let t =
+            "CREATE TABLE t(x CONSTRAINT nn NOT NULL, y DEFAULT 3, CONSTRAINT pk PRIMARY KEY (x))";
+        assert_eq!(
+            drop_constraint(t, DropTarget::Named("NN")).as_deref(),
+            Ok("CREATE TABLE t(x, y DEFAULT 3, CONSTRAINT pk PRIMARY KEY (x))")
+        );
+        assert_eq!(
+            drop_constraint(t, DropTarget::Named("pk")),
+            Err(DropError::MayNotBeDropped)
+        );
+        assert_eq!(
+            drop_constraint(t, DropTarget::Named("zz")),
+            Err(DropError::NoSuchConstraint)
+        );
+        assert_eq!(drop_constraint(t, DropTarget::NotNull(1)).as_deref(), Ok(t));
+        assert_eq!(
+            add_constraint("CREATE TABLE t(a, b)", "NOT NULL", Some(0)).as_deref(),
+            Some("CREATE TABLE t(a NOT NULL, b)")
+        );
+        assert_eq!(
+            add_constraint("CREATE TABLE t(a, b)", "CHECK (a > b)", None).as_deref(),
+            Some("CREATE TABLE t(a, b, CHECK (a > b))")
+        );
+        assert_eq!(has_named_constraint(t, "pk"), Some(true));
+        assert_eq!(has_named_constraint(t, "y"), Some(false));
+        assert_eq!(
+            alter_constraint_text(
+                "ALTER TABLE t ALTER c SET NOT NULL /*x*/ -- y\n;",
+                &[TokenType::TK_SET],
+                &[TokenType::TK_NOT]
+            ),
+            Some("NOT NULL /*x*/")
         );
     }
 
