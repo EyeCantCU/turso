@@ -358,7 +358,9 @@ impl sqlite3_stmt {
         }
         // Drop cached ExtValues for the previous row
         for v in &mut self.value_cache {
-            *v = None;
+            if let Some(v) = v.take() {
+                forget_value_buffer(&v);
+            }
         }
     }
 }
@@ -2416,13 +2418,79 @@ pub unsafe extern "C" fn sqlite3_value_type(value: *mut ffi::c_void) -> ffi::c_i
     }
 }
 
+/// Text and blob conversions that need a NUL-terminated side buffer (blob
+/// as text, number as text), keyed by the value's address. An entry is reused
+/// only while its bytes still match the value, so a recycled address cannot
+/// return stale data.
+static VALUE_BUFFERS: std::sync::Mutex<std::collections::BTreeMap<usize, Box<[u8]>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+const VALUE_BUFFERS_MAX: usize = 4096;
+
+fn forget_value_buffer(value: *const ExtValue) {
+    if let Ok(mut m) = VALUE_BUFFERS.lock() {
+        m.remove(&(value as usize));
+    }
+}
+
+/// Bytes of the value's text conversion (NUL-terminated at `len`), as
+/// sqlite3_value_text returns them. None for NULL.
+unsafe fn value_text_bytes(value: *mut ffi::c_void) -> Option<(*const u8, usize)> {
+    if value.is_null() {
+        return None;
+    }
+    let v = &*(value as *const ExtValue);
+    let rendered: Vec<u8> = match v.value_type() {
+        turso_ext::ValueType::Text => {
+            // Boxed text always carries a NUL after its last byte.
+            let t = v.to_text()?;
+            return Some((t.as_ptr(), t.len()));
+        }
+        turso_ext::ValueType::Blob => v.blob_ref().unwrap_or(&[]).to_vec(),
+        turso_ext::ValueType::Integer => v.to_integer()?.to_string().into_bytes(),
+        turso_ext::ValueType::Float => Value::Numeric(turso_core::Numeric::Float(
+            turso_core::NonNan::new(v.to_float()?)?,
+        ))
+        .to_string()
+        .into_bytes(),
+        _ => return None,
+    };
+    let len = rendered.len();
+    let mut map = VALUE_BUFFERS.lock().ok()?;
+    if map.len() >= VALUE_BUFFERS_MAX {
+        map.clear();
+    }
+    let entry = map.entry(value as usize).or_default();
+    if entry.len() != len + 1 || entry[..len] != rendered[..] || entry[len] != 0 {
+        let mut buf = rendered;
+        buf.push(0);
+        *entry = buf.into_boxed_slice();
+    }
+    Some((entry.as_ptr(), len))
+}
+
+/// Converts a value to a core `Value` for CAST-style numeric conversion.
+unsafe fn value_as_core(v: &ExtValue) -> Option<Value> {
+    match v.value_type() {
+        turso_ext::ValueType::Text => Some(Value::build_text(v.to_text()?.to_owned())),
+        turso_ext::ValueType::Blob => Value::from_slice(v.blob_ref()?).ok(),
+        _ => None,
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_int64(value: *mut ffi::c_void) -> i64 {
     if value.is_null() {
         return 0;
     }
     let v = &*(value as *const ExtValue);
-    v.to_integer().unwrap_or(0)
+    match v.value_type() {
+        turso_ext::ValueType::Integer => v.to_integer().unwrap_or(0),
+        turso_ext::ValueType::Float => v.to_float().unwrap_or(0.0) as i64,
+        _ => match value_as_core(v).map(|c| c.exec_cast("INTEGER")) {
+            Some(Ok(Value::Numeric(turso_core::Numeric::Integer(i)))) => i,
+            _ => 0,
+        },
+    }
 }
 
 #[no_mangle]
@@ -2436,30 +2504,40 @@ pub unsafe extern "C" fn sqlite3_value_double(value: *mut ffi::c_void) -> f64 {
         return 0.0;
     }
     let v = &*(value as *const ExtValue);
-    v.to_float().unwrap_or(0.0)
+    match v.value_type() {
+        turso_ext::ValueType::Integer | turso_ext::ValueType::Float => v.to_float().unwrap_or(0.0),
+        _ => match value_as_core(v).map(|c| c.exec_cast("REAL")) {
+            Some(Ok(Value::Numeric(turso_core::Numeric::Float(f)))) => f64::from(f),
+            Some(Ok(Value::Numeric(turso_core::Numeric::Integer(i)))) => i as f64,
+            _ => 0.0,
+        },
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_text(value: *mut ffi::c_void) -> *const ffi::c_uchar {
-    if value.is_null() {
-        return std::ptr::null();
-    }
-    let v = &*(value as *const ExtValue);
-    match v.to_text() {
-        Some(s) => s.as_ptr() as *const ffi::c_uchar,
+    match value_text_bytes(value) {
+        Some((p, _)) => p,
         None => std::ptr::null(),
     }
 }
 
+/// Like SQLite, a zero-length value reads as a NULL pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_value_blob(value: *mut ffi::c_void) -> *const ffi::c_void {
     if value.is_null() {
         return std::ptr::null();
     }
     let v = &*(value as *const ExtValue);
-    match v.blob_ref() {
-        Some(b) => b.as_ptr() as *const ffi::c_void,
-        None => std::ptr::null(),
+    if v.value_type() == turso_ext::ValueType::Blob {
+        return match v.blob_ref() {
+            Some(b) if !b.is_empty() => b.as_ptr() as *const ffi::c_void,
+            _ => std::ptr::null(),
+        };
+    }
+    match value_text_bytes(value) {
+        Some((p, n)) if n > 0 => p as *const ffi::c_void,
+        _ => std::ptr::null(),
     }
 }
 
@@ -2469,11 +2547,10 @@ pub unsafe extern "C" fn sqlite3_value_bytes(value: *mut ffi::c_void) -> ffi::c_
         return 0;
     }
     let v = &*(value as *const ExtValue);
-    match v.value_type() {
-        turso_ext::ValueType::Text => v.to_text().map(|s| s.len()).unwrap_or(0) as ffi::c_int,
-        turso_ext::ValueType::Blob => v.blob_ref().map(|b| b.len()).unwrap_or(0) as ffi::c_int,
-        _ => 0,
+    if v.value_type() == turso_ext::ValueType::Blob {
+        return v.blob_ref().map_or(0, |b| b.len()) as ffi::c_int;
     }
+    value_text_bytes(value).map_or(0, |(_, n)| n) as ffi::c_int
 }
 
 /// Deep-copies an `sqlite3_value`.  Returns a heap-allocated copy that must
@@ -2507,6 +2584,7 @@ pub unsafe extern "C" fn sqlite3_value_free(value: *mut ffi::c_void) {
     if value.is_null() {
         return;
     }
+    forget_value_buffer(value as *const ExtValue);
     let _ = Box::from_raw(value as *mut ExtValue);
 }
 
