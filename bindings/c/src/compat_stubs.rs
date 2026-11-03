@@ -56,6 +56,7 @@ unsafe fn agg_invoke(
         p_app: reg.p_app as *mut ffi::c_void,
         db: reg.db as *mut sqlite3,
     };
+    let _scope = crate::value_conv::UdfScope::enter();
     let key = &mut sctx as *mut SqliteContext as usize;
     AGG_STACK.with(|s| s.borrow_mut().push((key, state as usize)));
     f(&mut sctx);

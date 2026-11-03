@@ -104,6 +104,7 @@ unsafe extern "C" fn scalar_bridge(
         p_app: reg.p_app as *mut ffi::c_void,
         db: reg.db as *mut sqlite3,
     };
+    let _scope = crate::value_conv::UdfScope::enter();
     x_func(
         &mut ctx as *mut SqliteContext as *mut ffi::c_void,
         argc,

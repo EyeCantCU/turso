@@ -3673,15 +3673,6 @@ fn limbo_err_code(err: &LimboError) -> i32 {
     }
 }
 
-/// The message sqlite3_errmsg reports for `err`. Like SQLite, corruption
-/// is reported with the standard text, without turso's details.
-fn limbo_err_msg(err: &LimboError) -> String {
-    match err {
-        LimboError::Corrupt(_) => "database disk image is malformed".to_string(),
-        _ => format!("{err}"),
-    }
-}
-
 fn handle_limbo_err(err: LimboError, container: *mut *mut ffi::c_char) -> i32 {
     let code = limbo_err_code(&err);
     if !container.is_null() {

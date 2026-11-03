@@ -127,6 +127,8 @@ pub fn message(err: &LimboError, sql: Option<&str>) -> String {
         | LimboError::InvalidTime(_) => rewrite(&err.to_string()),
         // Application-defined functions report their own text.
         LimboError::ExtensionError(msg) => msg.clone(),
+        // Like SQLite, corruption has one standard text.
+        LimboError::Corrupt(_) => "database disk image is malformed".to_string(),
         LimboError::LexerError(e) => parser_message(e, sql),
         // Core appends the result code the shell would print.
         LimboError::Constraint(msg) => strip_code_suffix(msg).to_string(),
