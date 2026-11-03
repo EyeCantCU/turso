@@ -5195,6 +5195,7 @@ pub fn op_transaction_inner(
                         if statement_writes_db
                             && in_explicit_txn
                             && state.vtab_stmt_level.is_none()
+                            && !program.vtab_single_write
                             && !program.connection.is_nested_stmt()
                         {
                             let level = program.connection.named_savepoints.read().len();

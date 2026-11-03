@@ -2155,6 +2155,8 @@ pub struct PreparedProgram {
     /// Whether the statement may write more than one row; see
     /// `crate::vdbe::builder::ProgramBuilder::is_multi_write`.
     pub is_multi_write: bool,
+    /// See `ProgramBuilder::set_vtab_single_write`.
+    pub vtab_single_write: bool,
     /// If this Program is a trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
     /// Whether this program is a subprogram (trigger or FK action) that runs within a parent statement.

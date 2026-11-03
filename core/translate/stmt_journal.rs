@@ -235,8 +235,9 @@ pub(crate) fn set_insert_stmt_journal_flags(
     program.set_may_abort(may_abort);
 }
 
-/// UPDATE or DELETE of a virtual table: like SQLite, a write may always
-/// abort, and is a multi-write unless the plan visits one row.
+/// UPDATE or DELETE of a virtual table: like SQLite, it is a single write
+/// (no statement savepoint for the table) when the plan visits one row.
+/// The journal flags keep their conservative defaults.
 fn set_vtab_write_flags(program: &mut ProgramBuilder, table: &crate::translate::plan::JoinedTable) {
     use crate::translate::plan::{Operation, Scan};
     let unique = match (&table.table, &table.op) {
@@ -246,8 +247,7 @@ fn set_vtab_write_flags(program: &mut ProgramBuilder, table: &crate::translate::
         ) => vtab.unique_scan(*idx_num),
         _ => false,
     };
-    program.set_multi_write(!unique);
-    program.set_may_abort(true);
+    program.set_vtab_single_write(unique);
 }
 
 /// Set multi_write / may_abort for UPDATE statements.
