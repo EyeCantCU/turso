@@ -422,10 +422,6 @@ pub fn translate_insert(
             s.any_resolved_fks_referencing(namespace.id, table_name.as_str())
         }));
     if !btree_table.has_rowid {
-        if has_fks {
-            crate::bail_parse_error!("foreign keys on WITHOUT ROWID tables are not supported");
-        }
-
         if cdc_table.is_some() {
             crate::bail_parse_error!("CDC on WITHOUT ROWID tables is not supported");
         }

@@ -4268,6 +4268,40 @@ impl Schema {
                             })
                 })
                 .cloned();
+            // The PRIMARY KEY of a WITHOUT ROWID parent is the table b-tree itself.
+            let found = match found {
+                Some(found) => Some(found),
+                None if !parent_tbl.has_rowid => {
+                    let pk_cols = parent_tbl.without_rowid_pk_columns()?;
+                    let matches = pk_cols.len() == parent_cols.len()
+                        && pk_cols
+                            .iter()
+                            .zip(parent_cols.iter())
+                            .zip(parent_collations.iter())
+                            .all(|((ic, pc), collation)| {
+                                ic.name.eq_ignore_ascii_case(pc) && ic.collation == *collation
+                            });
+                    if matches {
+                        Some(Arc::new(Index {
+                            name: format!("{}_primary_key", parent_tbl.name),
+                            table_name: parent_tbl.name.clone(),
+                            root_page: parent_tbl.root_page,
+                            n_key_col: pk_cols.len(),
+                            columns: pk_cols,
+                            unique: true,
+                            ephemeral: false,
+                            has_rowid: false,
+                            where_clause: None,
+                            index_method: None,
+                            on_conflict: None,
+                            constraint_name: None,
+                        }))
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            };
             if require_unique && found.is_none() {
                 return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
             }
@@ -5432,6 +5466,18 @@ impl BTreeTable {
             .collect();
         cols.sort_by_key(|(physical, _)| *physical);
         cols.iter().map(|(_, c)| c.affinity().aff_mask()).collect()
+    }
+
+    /// The `sqlite_autoindex_<table>_<N>` name SQLite gives the primary key of a
+    /// WITHOUT ROWID table; N counts the automatic indexes declared before it.
+    pub fn without_rowid_pk_index_name(&self) -> String {
+        let singles = self.unique_sets.iter().filter(|u| u.columns.len() == 1);
+        let compounds = self.unique_sets.iter().filter(|u| u.columns.len() > 1);
+        let number = singles
+            .chain(compounds)
+            .position(|u| u.is_primary_key)
+            .map_or(1, |i| i + 1);
+        format!("sqlite_autoindex_{}_{number}", self.name)
     }
 
     pub fn has_stored_generated_columns(&self) -> bool {
@@ -6645,6 +6691,13 @@ pub fn create_table(
                             }
                         };
                         let sort_order = column.order.unwrap_or(SortOrder::Asc);
+                        // SQLite ignores a column repeated in the key.
+                        if primary_key_columns
+                            .iter()
+                            .any(|(n, _): &(String, SortOrder)| n.eq_ignore_ascii_case(&col_name))
+                        {
+                            continue;
+                        }
                         pk_unique_set_columns.try_push(UniqueSetColumn {
                             name: col_name.clone(),
                             sort_order,

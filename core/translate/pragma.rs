@@ -1944,8 +1944,13 @@ fn find_index_by_name(
     }
     let Some(table) = index_name
         .strip_prefix(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
-        .and_then(|rest| rest.strip_suffix("_1"))
-        .and_then(|table_name| schema.get_btree_table(namespace, table_name))
+        .and_then(|rest| rest.rsplit_once('_'))
+        .and_then(|(table_name, _)| schema.get_btree_table(namespace, table_name))
+        .filter(|t| {
+            !t.has_rowid
+                && t.without_rowid_pk_index_name()
+                    .eq_ignore_ascii_case(index_name)
+        })
     else {
         return Ok(None);
     };
@@ -1959,10 +1964,7 @@ fn without_rowid_primary_key_index(table: &BTreeTable) -> Result<Option<Index>> 
     let primary_key = table.unique_sets.iter().find(|us| us.is_primary_key);
     let index = Index::automatic_from_primary_key(
         table,
-        (
-            format!("{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{}_1", table.name),
-            table.root_page,
-        ),
+        (table.without_rowid_pk_index_name(), table.root_page),
         table.primary_key_columns.len(),
         primary_key.and_then(|us| us.conflict_clause),
         primary_key.map_or(&[], |us| us.columns.as_slice()),

@@ -268,16 +268,6 @@ fn prepare_update_plan(
             body.tbl_name.name.as_str()
         );
     }
-    if let Some(bt) = table.btree().filter(|bt| !bt.has_rowid) {
-        if connection.foreign_keys_enabled()
-            && resolver.with_schema(database_id, |s| {
-                s.has_child_fks(namespace.id, &bt.name)
-                    || s.any_resolved_fks_referencing(namespace.id, &bt.name)
-            })
-        {
-            bail_parse_error!("foreign keys on WITHOUT ROWID tables are not supported");
-        }
-    }
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     validate_update(
