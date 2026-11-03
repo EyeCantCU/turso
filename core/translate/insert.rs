@@ -89,6 +89,14 @@ fn validate(
     {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
+    if crate::translate::planner::is_protected_shadow_table(
+        resolver,
+        conn,
+        namespace.database_id,
+        table_name,
+    ) {
+        crate::bail_parse_error!("table {} may not be modified", table_name);
+    }
     // Check if this table has any incompatible dependent views
     // Check if this is a materialized view. Must look up the schema of the
     // table's own database: a table in an attached database can share a name
@@ -290,9 +298,11 @@ pub fn translate_insert(
     let namespace = resolver.resolve_queried_table(&tbl_name)?;
     let database_id = namespace.database_id;
     let table_name = &tbl_name.name;
-    let table = match resolver.with_schema(database_id, |s| {
-        s.get_table(namespace.id, table_name.as_str())
-    }) {
+    let table = match crate::translate::planner::table_or_eponymous(
+        resolver,
+        namespace,
+        table_name.as_str(),
+    )? {
         Some(table) => table,
         None => crate::bail_parse_error!(
             "no such table: {}",

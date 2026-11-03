@@ -156,7 +156,12 @@ impl InternalVirtualTable for JsonVirtualTable {
         };
 
         Ok(turso_ext::IndexInfo {
-            idx_num: -1,
+            // SQLite's plan numbers: 1 = JSON only, 3 = JSON and ROOT.
+            idx_num: match argc {
+                1 => 1,
+                2 => 3,
+                _ => 0,
+            },
             idx_str: None,
             order_by_consumed: false,
             estimated_cost: cost,

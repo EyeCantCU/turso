@@ -809,6 +809,14 @@ pub fn translate_alter_table(
         table_name,
         resolver.catalog.dialect.supports_namespaces(),
     )?;
+    if crate::translate::planner::is_protected_shadow_table(
+        resolver,
+        connection,
+        database_id,
+        table_name,
+    ) {
+        crate::bail_parse_error!("table {} may not be altered", table_name);
+    }
     reject_alter_of_view(&alter_table, table_name, resolver, namespace)?;
 
     let table_indexes = resolver.with_schema(database_id, |s| {

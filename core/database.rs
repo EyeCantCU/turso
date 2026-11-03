@@ -2770,6 +2770,7 @@ impl Database {
                 crate::incremental::vdbe_maintenance::MaintenanceProgramCache::new(),
             metrics: RwLock::new(ConnectionMetrics::new()),
             nestedness: AtomicI32::new(0),
+            defensive: crate::sync::atomic::AtomicBool::new(false),
             compiling_triggers: RwLock::new(Vec::new()),
             executing_triggers: RwLock::new(Vec::new()),
             encryption_key: RwLock::new(encryption_key),

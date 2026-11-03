@@ -1452,6 +1452,7 @@ pub fn op_vcreate(
             module_name,
             table_name,
             args_reg,
+            db,
         },
         insn
     );
@@ -1472,9 +1473,13 @@ pub fn op_vcreate(
         vec![]
     };
     let conn = program.connection.clone();
-    let table = crate::VirtualTable::table_for(
+    let schema_name = conn
+        .namespace_name(*db)
+        .unwrap_or_else(|| "main".to_string());
+    let table = crate::VirtualTable::table_in(
         Some(&table_name),
         &module_name,
+        &schema_name,
         args,
         &conn.syms.read(),
         true,
@@ -1486,6 +1491,25 @@ pub fn op_vcreate(
     {
         conn.syms.write().vtabs.insert(table_name, table);
     }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_vcheck(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(VCheck { data }, insn);
+    let message = data
+        .table
+        .integrity(&data.schema, &data.table.name, data.quick)?;
+    let value = match message {
+        Some(text) => Value::build_text(text),
+        None => Value::Null,
+    };
+    state.registers[data.dest].set_value(value);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -1579,13 +1603,18 @@ pub fn op_vcolumn(
             cursor_id,
             column,
             dest,
+            nochange,
         },
         insn
     );
     let value = {
         let cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_virtual_mut();
-        return_if_io!(state, cursor.column(*column))
+        if *nochange {
+            return_if_io!(state, cursor.column_nochange(*column))
+        } else {
+            return_if_io!(state, cursor.column(*column))
+        }
     };
     state.registers[*dest].set_value(value);
     state.pc += 1;

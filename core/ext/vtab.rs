@@ -205,6 +205,13 @@ impl ExtensionCursor {
         }
     }
 
+    pub(crate) fn column_nochange(&mut self, column: usize) -> IOResultOr<Value> {
+        match self {
+            Self::Native(cursor) => cursor.cursor.column_nochange(column),
+            Self::C(_) => self.column(column),
+        }
+    }
+
     pub(crate) fn filter(
         &mut self,
         idx_num: i32,

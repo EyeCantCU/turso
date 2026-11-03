@@ -10,6 +10,48 @@ use std::ptr::NonNull;
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind, VTabModuleImpl};
 use turso_parser::{ast, parser::Parser};
 
+std::thread_local! {
+    /// Statements executing on this thread (SQLite's `nVdbeExec`).
+    static EXECUTING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts a statement as executing while it steps.
+pub(crate) struct ExecutingGuard;
+
+impl ExecutingGuard {
+    pub(crate) fn new() -> Self {
+        EXECUTING.with(|n| n.set(n.get() + 1));
+        Self
+    }
+}
+
+impl Drop for ExecutingGuard {
+    fn drop(&mut self) {
+        EXECUTING.with(|n| n.set(n.get().saturating_sub(1)));
+    }
+}
+
+/// `sqlite3ReadOnlyShadowTables`: defensive mode, outside any running
+/// statement (virtual table methods run inside one and may write them).
+pub(crate) fn readonly_shadow_tables(conn: &Connection) -> bool {
+    conn.is_defensive() && EXECUTING.with(|n| n.get()) == 0
+}
+
+/// `sqlite3ShadowTableName`: `name` is `<vtab>_<suffix>` and the virtual
+/// table's module claims `suffix` through xShadowName.
+pub(crate) fn is_shadow_table_name(schema: &crate::schema::Schema, name: &str) -> bool {
+    let Some(i) = name.rfind('_') else {
+        return false;
+    };
+    match schema.get_table(crate::namespace::NamespaceId::ROOT, &name[..i]) {
+        Some(table) => match table.as_ref() {
+            crate::schema::Table::Virtual(vtab) => vtab.is_shadow_name(&name[i + 1..]),
+            _ => false,
+        },
+        None => false,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum VirtualTableType {
     Pragma(PragmaVirtualTable),
@@ -143,10 +185,22 @@ impl VirtualTable {
         syms: &SymbolTable,
         create: bool,
     ) -> crate::Result<Arc<VirtualTable>> {
+        Self::table_in(tbl_name, module_name, "main", args, syms, create)
+    }
+
+    /// Like [`Self::table_for`], for a table in schema `schema_name`.
+    pub(crate) fn table_in(
+        tbl_name: Option<&str>,
+        module_name: &str,
+        schema_name: &str,
+        args: Vec<Value>,
+        syms: &SymbolTable,
+        create: bool,
+    ) -> crate::Result<Arc<VirtualTable>> {
         let module = syms.vtab_module(module_name);
         let info = crate::native_ext::ConnectInfo {
             module_name,
-            schema_name: "main",
+            schema_name,
             table_name: tbl_name.unwrap_or(module_name),
             create,
         };
@@ -303,6 +357,37 @@ impl VirtualTable {
         }
     }
 
+    /// xIntegrity: an error description, or None when the table is fine.
+    pub(crate) fn integrity(
+        &self,
+        schema: &str,
+        table: &str,
+        quick: bool,
+    ) -> crate::Result<Option<String>> {
+        match &self.vtab_type {
+            VirtualTableType::External(crate::ext::ExtensionTable::Native(t)) => {
+                t.integrity(schema, table, quick)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Whether PRAGMA integrity_check calls this table's xIntegrity.
+    pub(crate) fn has_integrity(&self) -> bool {
+        matches!(&self.vtab_type,
+            VirtualTableType::External(crate::ext::ExtensionTable::Native(t)) if t.has_integrity())
+    }
+
+    /// xShadowName of the table's module.
+    pub(crate) fn is_shadow_name(&self, suffix: &str) -> bool {
+        match &self.vtab_type {
+            VirtualTableType::External(crate::ext::ExtensionTable::Native(t)) => {
+                t.is_shadow_name(suffix)
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn find_function_op(&self, n_arg: i32, name: &str) -> Option<i32> {
         self.find_function(n_arg, name).map(|(op, _)| op)
     }
@@ -442,6 +527,16 @@ impl VirtualTableCursor {
             VirtualTableCursorInner::Internal(cursor) => cursor.read().column(column),
         };
         result.map(IOResult::Done).map_err(Into::into)
+    }
+
+    /// `column` for an UPDATE that passes the column through unchanged.
+    pub(crate) fn column_nochange(&mut self, column: usize) -> IOResultOr<Value> {
+        match &mut self.inner {
+            VirtualTableCursorInner::External(cursor) if !self.null_flag => {
+                cursor.column_nochange(column)
+            }
+            _ => self.column(column),
+        }
     }
 
     pub(crate) fn filter(

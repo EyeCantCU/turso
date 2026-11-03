@@ -522,6 +522,8 @@ pub struct Connection {
     /// The state is integer as we may want to spawn deep nested programs (e.g. Root -[run]-> S1 -[run]-> S2 -[run]-> ...)
     /// and we need to track current nestedness depth in order to properly understand when we will reach the root back again
     pub(super) nestedness: AtomicI32,
+    /// SQLITE_DBCONFIG_DEFENSIVE: virtual table shadow tables are read-only.
+    pub(super) defensive: crate::sync::atomic::AtomicBool,
     /// Stack of currently compiling triggers to prevent recursive trigger subprogram compilation
     pub(super) compiling_triggers: RwLock<Vec<Arc<Trigger>>>,
     /// Stack of currently executing triggers to prevent recursive trigger execution
@@ -954,6 +956,15 @@ impl Connection {
     #[cfg(feature = "simulator")]
     pub(crate) fn subquery_unnesting_mode(&self) -> SubqueryUnnestingMode {
         self.subquery_unnesting_mode.get()
+    }
+
+    /// SQLITE_DBCONFIG_DEFENSIVE.
+    pub fn set_defensive(&self, on: bool) {
+        self.defensive.store(on, Ordering::SeqCst);
+    }
+
+    pub fn is_defensive(&self) -> bool {
+        self.defensive.load(Ordering::SeqCst)
     }
 
     /// check if connection executes nested program (so it must not do any "finalization" work as parent program will handle it)

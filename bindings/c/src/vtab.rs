@@ -202,7 +202,16 @@ std::thread_local! {
     static DECLARE: RefCell<Vec<(usize, Option<String>)>> = const { RefCell::new(Vec::new()) };
     /// ON CONFLICT mode of the xUpdate call in progress.
     static ON_CONFLICT: Cell<c_int> = const { Cell::new(SQLITE_ABORT) };
+    /// The context of the nochange xColumn call in progress.
+    static NOCHANGE_CTX: Cell<usize> = const { Cell::new(0) };
+    /// Per table: columns of the current row left unset in a nochange read.
+    static NOCHANGE_COLS: RefCell<Vec<(usize, Vec<usize>)>> = const { RefCell::new(Vec::new()) };
+    /// xUpdate arguments that are unchanged columns.
+    static NOCHANGE_VALUES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
+
+/// Marks a nochange xColumn result the table did not set.
+const NOCHANGE_UNSET: &str = "\u{1}nochange";
 
 /// One `sqlite3_create_module_v2` registration. The client data destructor
 /// runs once the module and every table connected through it are gone.
@@ -627,6 +636,56 @@ impl VirtualTable for CTable {
         Some((rc, Arc::new(func)))
     }
 
+    fn integrity(
+        &self,
+        schema: &str,
+        table: &str,
+        quick: bool,
+    ) -> turso_core::Result<Option<String>> {
+        if self.inner.version() < 4 {
+            return Ok(None);
+        }
+        let Some(f) = self.inner.methods().xIntegrity else {
+            return Ok(None);
+        };
+        let schema = CString::new(schema).unwrap_or_default();
+        let table = CString::new(table).unwrap_or_default();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe {
+            f(
+                self.vtab,
+                schema.as_ptr(),
+                table.as_ptr(),
+                quick as c_int,
+                &mut err,
+            )
+        };
+        let msg = (!err.is_null()).then(|| unsafe {
+            let s = CStr::from_ptr(err).to_string_lossy().into_owned();
+            sqlite3_free(err as *mut c_void);
+            s
+        });
+        if rc != SQLITE_OK {
+            return Err(rc_error(rc, None));
+        }
+        Ok(msg)
+    }
+
+    fn has_integrity(&self) -> bool {
+        self.inner.version() >= 4 && self.inner.methods().xIntegrity.is_some()
+    }
+
+    fn is_shadow_name(&self, suffix: &str) -> bool {
+        if self.inner.version() < 3 {
+            return false;
+        }
+        let Some(f) = self.inner.methods().xShadowName else {
+            return false;
+        };
+        let suffix = CString::new(suffix).unwrap_or_default();
+        unsafe { f(suffix.as_ptr()) != 0 }
+    }
+
     fn readonly(&self) -> bool {
         self.inner.methods().xUpdate.is_none()
     }
@@ -780,6 +839,16 @@ impl TableUpdate for CUpdate {
         let mut args = ExtArgs::new(args);
         let mut ptrs = args.ptrs();
         let mut rowid: i64 = 0;
+        // UPDATE: columns the table left unset in a nochange read.
+        let unchanged: Vec<usize> = if ptrs.len() > 2 && !matches!(self.args[0], Value::Null) {
+            take_unchanged(self.vtab as usize)
+                .into_iter()
+                .filter_map(|col| ptrs.get(col + 2).map(|p| *p as usize))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        NOCHANGE_VALUES.with(|v| v.borrow_mut().extend(&unchanged));
         let prev = ON_CONFLICT.with(|c| c.replace(self.on_conflict));
         let rc = unsafe {
             x_update(
@@ -790,6 +859,7 @@ impl TableUpdate for CUpdate {
             )
         };
         ON_CONFLICT.with(|c| c.set(prev));
+        NOCHANGE_VALUES.with(|v| v.borrow_mut().retain(|p| !unchanged.contains(p)));
         check(self.vtab, rc)?;
         let is_insert = self.args.len() > 1 && matches!(self.args[0], Value::Null);
         Ok(IOResult::Done(is_insert.then_some(rowid)))
@@ -915,22 +985,64 @@ impl VirtualTableCursor for CCursor {
     }
 
     fn column(&mut self, column: usize) -> turso_core::types::IOResultOr<Value> {
+        self.read_column(column, false)
+    }
+
+    fn column_nochange(&mut self, column: usize) -> turso_core::types::IOResultOr<Value> {
+        self.read_column(column, true)
+    }
+
+    fn rowid(&self) -> i64 {
+        let Some(f) = self.inner.methods().xRowid else {
+            return 0;
+        };
+        let mut rowid: i64 = 0;
+        if unsafe { f(self.cur, &mut rowid) } != SQLITE_OK {
+            unsafe { vtab_error(self.vtab(), SQLITE_ERROR) };
+        }
+        rowid
+    }
+}
+
+impl CCursor {
+    fn read_column(
+        &mut self,
+        column: usize,
+        nochange: bool,
+    ) -> turso_core::types::IOResultOr<Value> {
         let Some(f) = self.inner.methods().xColumn else {
             return Ok(IOResult::Done(Value::Null));
         };
         let mut ctx = SqliteContext {
-            result: ExtValue::null(),
+            // In a nochange read, a result left unset means "unchanged".
+            result: if nochange {
+                ExtValue::error_with_message(NOCHANGE_UNSET.to_string())
+            } else {
+                ExtValue::null()
+            },
             p_app: std::ptr::null_mut(),
             db: self.inner.db as *mut sqlite3,
         };
-        let rc = unsafe {
-            f(
-                self.cur,
-                &mut ctx as *mut SqliteContext as *mut c_void,
-                column as c_int,
-            )
-        };
+        let ctx_ptr = &mut ctx as *mut SqliteContext as *mut c_void;
+        let prev = nochange.then(|| NOCHANGE_CTX.with(|c| c.replace(ctx_ptr as usize)));
+        let rc = unsafe { f(self.cur, ctx_ptr, column as c_int) };
+        if let Some(prev) = prev {
+            NOCHANGE_CTX.with(|c| c.set(prev));
+        }
         let result = std::mem::replace(&mut ctx.result, ExtValue::null());
+        if nochange {
+            let unset = result
+                .to_error_details()
+                .is_some_and(|(_, m)| m.as_deref() == Some(NOCHANGE_UNSET));
+            set_unchanged(self.vtab() as usize, column, unset);
+            if unset {
+                unsafe { result.__free_internal_type() };
+                if rc != SQLITE_OK {
+                    return Err(Box::new(unsafe { vtab_error(self.vtab(), rc) }));
+                }
+                return Ok(IOResult::Done(Value::Null));
+            }
+        }
         if result.value_type() == turso_ext::ValueType::Error {
             let msg = result
                 .to_error_details()
@@ -944,17 +1056,6 @@ impl VirtualTableCursor for CCursor {
             return Err(Box::new(unsafe { vtab_error(self.vtab(), rc) }));
         }
         Ok(IOResult::Done(Value::from_ffi(result)?))
-    }
-
-    fn rowid(&self) -> i64 {
-        let Some(f) = self.inner.methods().xRowid else {
-            return 0;
-        };
-        let mut rowid: i64 = 0;
-        if unsafe { f(self.cur, &mut rowid) } != SQLITE_OK {
-            unsafe { vtab_error(self.vtab(), SQLITE_ERROR) };
-        }
-        rowid
     }
 }
 
@@ -1090,10 +1191,45 @@ pub unsafe extern "C" fn sqlite3_vtab_on_conflict(_db: *mut sqlite3) -> c_int {
     ON_CONFLICT.with(|c| c.get())
 }
 
-/// Unchanged UPDATE columns are always fetched, so this is never true.
+/// True inside xColumn when UPDATE passes the column through unchanged.
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_vtab_nochange(_ctx: *mut c_void) -> c_int {
-    0
+pub unsafe extern "C" fn sqlite3_vtab_nochange(ctx: *mut c_void) -> c_int {
+    (!ctx.is_null() && NOCHANGE_CTX.with(|c| c.get()) == ctx as usize) as c_int
+}
+
+/// True for an xUpdate argument the table left unset in a nochange read.
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_value_nochange(value: *mut c_void) -> c_int {
+    (!value.is_null() && NOCHANGE_VALUES.with(|v| v.borrow().contains(&(value as usize)))) as c_int
+}
+
+/// Records whether `column` of the table's current row was left unset.
+fn set_unchanged(vtab: usize, column: usize, unset: bool) {
+    NOCHANGE_COLS.with(|m| {
+        let mut m = m.borrow_mut();
+        let pos = m.iter().position(|(v, _)| *v == vtab);
+        let cols = match pos {
+            Some(i) => &mut m[i].1,
+            None => {
+                m.push((vtab, Vec::new()));
+                &mut m.last_mut().unwrap().1
+            }
+        };
+        cols.retain(|c| *c != column);
+        if unset {
+            cols.push(column);
+        }
+    });
+}
+
+fn take_unchanged(vtab: usize) -> Vec<usize> {
+    NOCHANGE_COLS.with(|m| {
+        let mut m = m.borrow_mut();
+        match m.iter().position(|(v, _)| *v == vtab) {
+            Some(i) => m.swap_remove(i).1,
+            None => Vec::new(),
+        }
+    })
 }
 
 unsafe fn index_box<'a>(p: *mut sqlite3_index_info, i: c_int) -> Option<&'a mut IndexInfoBox> {
@@ -1218,4 +1354,18 @@ pub unsafe extern "C" fn sqlite3_vtab_in_first(val: *mut c_void, out: *mut *mut 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_vtab_in_next(val: *mut c_void, out: *mut *mut c_void) -> c_int {
     in_list_value(val, out, true)
+}
+
+/// SQLITE_DBCONFIG_DEFENSIVE: shadow tables become read-only to ordinary SQL.
+pub(crate) unsafe fn db_config_defensive(db: *mut sqlite3, value: c_int, out: *mut c_int) -> c_int {
+    let Some(conn) = db_conn(db) else {
+        return SQLITE_MISUSE;
+    };
+    if value >= 0 {
+        conn.set_defensive(value > 0);
+    }
+    if !out.is_null() {
+        *out = conn.is_defensive() as c_int;
+    }
+    SQLITE_OK
 }

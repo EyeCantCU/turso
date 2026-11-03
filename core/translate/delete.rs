@@ -39,9 +39,16 @@ fn validate_delete(
     {
         crate::bail_parse_error!("table {tbl_name} may not be modified");
     }
-    let table = match resolver.with_schema(namespace.database_id, |s| {
-        s.get_table(namespace.id, tbl_name)
-    }) {
+    if crate::translate::planner::is_protected_shadow_table(
+        resolver,
+        connection,
+        namespace.database_id,
+        tbl_name,
+    ) {
+        crate::bail_parse_error!("table {tbl_name} may not be modified");
+    }
+    let table = match crate::translate::planner::table_or_eponymous(resolver, namespace, tbl_name)?
+    {
         Some(table) => table,
         None => crate::bail_parse_error!(
             "no such table: {}",

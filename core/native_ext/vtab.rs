@@ -58,6 +58,19 @@ pub trait VirtualTable: Debug + Send + Sync {
     fn find_function(&self, _n_arg: i32, _name: &str) -> Option<(i32, Arc<ExternalFunc>)> {
         None
     }
+    /// xIntegrity for PRAGMA integrity_check (`quick` for quick_check): an
+    /// error description, or None when the table is fine.
+    fn integrity(&self, _schema: &str, _table: &str, _quick: bool) -> Result<Option<String>> {
+        Ok(None)
+    }
+    /// Whether the table has an xIntegrity for PRAGMA integrity_check to call.
+    fn has_integrity(&self) -> bool {
+        false
+    }
+    /// xShadowName: `<table>_<suffix>` is a shadow table of this module.
+    fn is_shadow_name(&self, _suffix: &str) -> bool {
+        false
+    }
     fn readonly(&self) -> bool {
         true
     }
@@ -119,6 +132,11 @@ pub trait VirtualTableCursor: Send + Sync {
     }
     fn next(&mut self) -> IOResultOr<bool>;
     fn column(&mut self, column: usize) -> IOResultOr<Value>;
+    /// `column` for an UPDATE that passes the column through unchanged
+    /// (`sqlite3_vtab_nochange` is true).
+    fn column_nochange(&mut self, column: usize) -> IOResultOr<Value> {
+        self.column(column)
+    }
     fn rowid(&self) -> i64;
 }
 
@@ -161,6 +179,23 @@ impl NativeTable {
 
     pub(crate) fn find_function(&self, n_arg: i32, name: &str) -> Option<(i32, Arc<ExternalFunc>)> {
         self.0.read().find_function(n_arg, name)
+    }
+
+    pub(crate) fn integrity(
+        &self,
+        schema: &str,
+        table: &str,
+        quick: bool,
+    ) -> Result<Option<String>> {
+        self.0.read().integrity(schema, table, quick)
+    }
+
+    pub(crate) fn is_shadow_name(&self, suffix: &str) -> bool {
+        self.0.read().is_shadow_name(suffix)
+    }
+
+    pub(crate) fn has_integrity(&self) -> bool {
+        self.0.read().has_integrity()
     }
 
     pub(crate) fn open(&self, connection: Arc<Connection>, vtab_id: u64) -> Result<NativeCursor> {
@@ -238,6 +273,9 @@ trait TableInstance: Debug + Send + Sync {
     fn open(&self, connection: Arc<Connection>) -> Result<Box<dyn VirtualTableCursor>>;
     fn best_index_plan(&self, req: &IndexRequest) -> Result<Option<IndexPlan>>;
     fn find_function(&self, n_arg: i32, name: &str) -> Option<(i32, Arc<ExternalFunc>)>;
+    fn integrity(&self, schema: &str, table: &str, quick: bool) -> Result<Option<String>>;
+    fn has_integrity(&self) -> bool;
+    fn is_shadow_name(&self, suffix: &str) -> bool;
     fn readonly(&self) -> bool;
     fn create_update_on_conflict(
         &mut self,
@@ -266,6 +304,18 @@ impl<T: VirtualTable> TableInstance for T {
 
     fn find_function(&self, n_arg: i32, name: &str) -> Option<(i32, Arc<ExternalFunc>)> {
         VirtualTable::find_function(self, n_arg, name)
+    }
+
+    fn integrity(&self, schema: &str, table: &str, quick: bool) -> Result<Option<String>> {
+        VirtualTable::integrity(self, schema, table, quick)
+    }
+
+    fn has_integrity(&self) -> bool {
+        VirtualTable::has_integrity(self)
+    }
+
+    fn is_shadow_name(&self, suffix: &str) -> bool {
+        VirtualTable::is_shadow_name(self, suffix)
     }
 
     fn readonly(&self) -> bool {

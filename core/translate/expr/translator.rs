@@ -2807,6 +2807,7 @@ fn translate_column_expr(
                 cursor_id,
                 column: *column,
                 dest: target_register,
+                nochange: false,
             });
             Ok(target_register)
         }

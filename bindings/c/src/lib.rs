@@ -1685,24 +1685,17 @@ pub unsafe extern "C" fn turso_db_config_int(
     if db.is_null() {
         return SQLITE_MISUSE;
     }
-    let _ = (value, p_out);
     match op {
-        // Refused rather than accepted-and-ignored, so a caller that checks
-        // the return cannot be misled into believing it toggled anything.
-        // The protections DEFENSIVE stands for are unconditionally on in
-        // turso_core today:
+        // Only shadow-table protection has a per-connection gate
+        // (core/vtab.rs, readonly_shadow_tables). The other DEFENSIVE
+        // protections are always on in turso_core:
         //   - sqlite_schema DML is rejected with no writable_schema unlock
         //     (core/schema.rs, allow_user_dml)
         //   - PRAGMA schema_version=N is a deliberate no-op
         //     (core/translate/pragma.rs, SchemaVersion write arm)
         //   - PRAGMA journal_mode=OFF is unsupported and silently kept as-is
         //     (core/storage/journal_mode.rs, JournalMode::supported)
-        //   - there are no SQLite-style shadow tables
-        // Callers that need file-corruption protection therefore already
-        // have it; PHP's ext/sqlite3 ignores this return value. Switching to
-        // accept + enforce is safe only if every feature above gains a
-        // per-connection defensive gate in core first.
-        SQLITE_DBCONFIG_DEFENSIVE => SQLITE_ERROR,
+        SQLITE_DBCONFIG_DEFENSIVE => unsafe { vtab::db_config_defensive(db, value, p_out) },
         _ => SQLITE_ERROR,
     }
 }

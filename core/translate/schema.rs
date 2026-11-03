@@ -1206,6 +1206,13 @@ pub fn translate_create_table(
         );
     }
 
+    crate::translate::planner::check_shadow_object_name(
+        resolver,
+        connection,
+        database_id,
+        tbl_name.name.as_str(),
+    )?;
+
     // Check for name conflicts with existing schema objects
     if let Some(object_type) = resolver.with_schema(database_id, |s| {
         s.get_object_type(namespace.id, &normalized_tbl_name)
@@ -2014,9 +2021,12 @@ pub fn translate_create_virtual_table(
     if !vtab_module.module_kind.eq(&VTabKind::VirtualTable) {
         bail_parse_error!("module {} is not a virtual table", module_name_str);
     };
+    // `CREATE VIRTUAL TABLE temp.x` (or an attached schema) creates it there.
+    let database_id = resolver.resolve_namespace_for_create(tbl_name)?.database_id;
+    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    program.begin_write_on_database(database_id, schema_cookie)?;
     if resolver
-        .schema()
-        .get_table(NamespaceId::ROOT, &table_name)
+        .with_schema(database_id, |s| s.get_table(NamespaceId::ROOT, &table_name))
         .is_some()
     {
         if *if_not_exists {
@@ -2058,6 +2068,7 @@ pub fn translate_create_virtual_table(
         module_name: module_name_reg,
         table_name: table_name_reg,
         args_reg,
+        db: database_id,
     });
     let table = resolver
         .schema()
@@ -2067,13 +2078,13 @@ pub fn translate_create_virtual_table(
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1i64.into(),
-        db: crate::MAIN_DB_ID,
+        db: database_id,
     });
 
     let cdc_table = prepare_cdc_if_necessary(
         program,
         resolver.schema(),
-        crate::MAIN_DB_ID,
+        database_id,
         Some(SQLITE_TABLEID),
     )?;
     let sql = create_vtable_body_to_str(&vtab, vtab_module.clone());
@@ -2090,16 +2101,16 @@ pub fn translate_create_virtual_table(
     )?;
 
     program.emit_insn(Insn::SetCookie {
-        db: crate::MAIN_DB_ID,
+        db: database_id,
         cookie: Cookie::SchemaVersion,
-        value: resolver.schema().schema_version as i32 + 1,
+        value: schema_cookie as i32 + 1,
         p5: 0,
     });
     let escaped_table_name = escape_sql_string_literal(&table_name);
     let parse_schema_where_clause =
         format!("tbl_name = '{escaped_table_name}' AND type != 'trigger'");
     program.emit_insn(Insn::ParseSchema {
-        db: sqlite_schema_cursor_id,
+        db: database_id,
         where_clause: Some(parse_schema_where_clause),
         trigger_target_database_id: None,
     });
@@ -2448,6 +2459,14 @@ pub fn translate_drop_table(
     //  3. Destroy the table structure
     match table.as_ref() {
         Table::BTree(table) => {
+            if crate::translate::planner::is_protected_shadow_table(
+                resolver,
+                connection,
+                database_id,
+                &table.name,
+            ) {
+                bail_parse_error!("table {} may not be dropped", table.name);
+            }
             program.emit_insn(Insn::Destroy {
                 db: database_id,
                 root: table.root_page,
