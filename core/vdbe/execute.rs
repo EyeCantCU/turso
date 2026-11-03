@@ -1026,7 +1026,7 @@ macro_rules! comparison_opcode {
             ) = (&state.registers[*lhs], &state.registers[*rhs])
             {
                 if texts_compare_as_bytes(lhs_value, rhs_value, *flags, *collation) {
-                    state.pc = if comparison_matches_order($op, l.as_str().cmp(r.as_str())) {
+                    state.pc = if comparison_matches_order($op, l.as_bytes().cmp(r.as_bytes())) {
                         target_pc
                     } else {
                         state.pc + 1
@@ -7740,16 +7740,16 @@ fn update_agg_payload(
                 let Value::Text(rendered) = rendered else {
                     unreachable!("GroupConcat rendering target is Text");
                 };
-                *first_separator_len = i64::try_from(rendered.as_str().len())
+                *first_separator_len = i64::try_from(rendered.as_bytes().len())
                     .map_err(|_| LimboError::IntegerOverflow)?;
             } else {
                 let before_separator = match acc {
-                    Value::Text(text) => text.as_str().len(),
+                    Value::Text(text) => text.as_bytes().len(),
                     _ => unreachable!("GroupConcat accumulator is Text after initialization"),
                 };
                 acc.exec_group_concat(delimiter)?;
                 let after_separator = match acc {
-                    Value::Text(text) => text.as_str().len(),
+                    Value::Text(text) => text.as_bytes().len(),
                     _ => unreachable!("GroupConcat accumulator is Text after its first value"),
                 };
                 let separator_len = after_separator
@@ -9244,7 +9244,7 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             let Value::Text(rendered) = rendered else {
                 unreachable!("GroupConcat rendering target is Text");
             };
-            let value_len = rendered.as_str().len();
+            let value_len = rendered.as_bytes().len();
 
             *count -= 1;
             let separator_len = if !separator_lengths.is_empty() && *count > 0 {
@@ -9266,12 +9266,7 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             let Value::Text(text) = acc else {
                 return Ok(());
             };
-            let accumulated_len = text.as_str().len();
-            if remove_len < accumulated_len && !text.as_str().is_char_boundary(remove_len) {
-                return Err(LimboError::InternalError(format!(
-                    "GroupConcat xInverse removes {remove_len} bytes from {accumulated_len}"
-                )));
-            }
+            let accumulated_len = text.as_bytes().len();
             if *count == 0 {
                 // No values remain, so the empty string cannot be told apart
                 // from "nothing accumulated" unless the accumulator is Null.
@@ -9280,9 +9275,9 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             } else if remove_len >= accumulated_len {
                 // Empty values can still remain; keep the accumulator as Text
                 // so the next step appends a separator before its value.
-                text.value.to_mut().clear();
+                text.remove_prefix(usize::MAX);
             } else {
-                text.value.to_mut().drain(..remove_len);
+                text.remove_prefix(remove_len);
             }
         }
         AggFunc::Min
@@ -11147,10 +11142,12 @@ pub fn op_function(
                     .into());
                 };
 
+                // A filename that is not UTF-8 keeps its bytes (see io::os_path).
+                let filename = crate::io::os_path::encode(filename_str.as_bytes());
                 return_if_io!(
                     state,
                     program.connection.attach_database(
-                        filename_str.as_str(),
+                        &filename,
                         dbname_str.as_str(),
                         state.active_op_state.attach(),
                     )
@@ -11417,7 +11414,7 @@ pub fn op_function(
                         }
                     },
                     Value::Text(t) => {
-                        let v = &t.value;
+                        let v = t.as_str();
                         match v.to_ascii_lowercase().as_str() {
                             "true" | "t" | "yes" | "on" | "1" => Value::from_i64(1),
                             "false" | "f" | "no" | "off" | "0" => Value::from_i64(0),
@@ -11454,7 +11451,7 @@ pub fn op_function(
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
                     Value::Text(t) => {
-                        let v = &t.value;
+                        let v = t.as_str();
                         v.parse::<std::net::IpAddr>().map_err(|_| {
                             LimboError::Constraint(format!("invalid input for type inet: \"{v}\""))
                         })?;

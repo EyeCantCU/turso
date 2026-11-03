@@ -1131,9 +1131,8 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                     content_size
                 ))
             })?;
-            let val = read_text(data)?;
             Ok((
-                ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
+                ValueRef::Text(TextRef::from_bytes(data, TextSubtype::Text)),
                 content_size,
             ))
         }
@@ -1258,9 +1257,8 @@ pub fn read_value_serial_type<'a>(
                         content_size
                     ))
                 })?;
-                let val = read_text(data)?;
                 Ok((
-                    ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
+                    ValueRef::Text(TextRef::from_bytes(data, TextSubtype::Text)),
                     content_size,
                 ))
             }
@@ -2496,19 +2494,18 @@ mod tests {
     }
 
     #[test]
-    fn test_text_decoders_reject_invalid_utf8() {
+    fn test_text_decoders_keep_invalid_utf8() {
         for result in [
             read_value(&[0xff], SerialType::text(1)),
             read_value_serial_type(&[0xff], 15),
         ] {
-            assert!(
-                matches!(
-                    result,
-                    Err(LimboError::Corrupt(ref message))
-                        if message == "TEXT value contains invalid UTF-8"
-                ),
-                "unexpected result: {result:?}"
-            );
+            let (ValueRef::Text(text), 1) = result.unwrap() else {
+                panic!("expected a one-byte text");
+            };
+            assert_eq!(text.as_bytes(), [0xff]);
+            assert!(!text.is_utf8());
+            assert_eq!(text.to_text().as_bytes(), [0xff]);
+            assert_eq!(text.to_text().as_str(), "\u{FFFD}");
         }
     }
 

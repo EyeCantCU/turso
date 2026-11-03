@@ -54,7 +54,7 @@ fn raw_bytes(v: &ExtValue) -> Option<Vec<u8>> {
     match v.value_type() {
         T::Integer => Some(v.to_integer()?.to_string().into_bytes()),
         T::Float => Some(turso_core::format_float(v.to_float()?).into_bytes()),
-        T::Text => v.to_text().map(|s| s.as_bytes().to_vec()),
+        T::Text => v.to_text_bytes().map(|s| s.to_vec()),
         T::Blob => Some(v.blob_ref().map(<[u8]>::to_vec).unwrap_or_default()),
         T::Null | T::Error => None,
     }

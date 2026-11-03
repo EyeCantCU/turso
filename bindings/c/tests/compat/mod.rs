@@ -237,6 +237,7 @@ mod errmsg;
 mod misc;
 mod reentrancy;
 mod session;
+mod textbytes;
 mod vfs;
 
 mod tests {

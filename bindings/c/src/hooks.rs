@@ -265,7 +265,7 @@ fn to_ext_value(v: &Value) -> ExtValue {
     match v {
         Value::Numeric(turso_core::Numeric::Integer(n)) => ExtValue::from_integer(*n),
         Value::Numeric(turso_core::Numeric::Float(f)) => ExtValue::from_float(f64::from(*f)),
-        Value::Text(t) => ExtValue::from_text(t.value.to_string()),
+        Value::Text(t) => ExtValue::from_text_bytes(t.as_bytes().to_vec()),
         Value::Blob(b) => ExtValue::from_blob(b.clone()),
         _ => ExtValue::null(),
     }

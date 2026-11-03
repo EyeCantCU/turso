@@ -1241,7 +1241,8 @@ pub fn decode_percent(uri: &str) -> String {
             None => break,
         }
     }
-    String::from_utf8_lossy(&decoded).to_string()
+    // Decoded bytes that are not UTF-8 stay exact (see io::os_path).
+    crate::io::os_path::encode(&decoded).into_owned()
 }
 
 pub fn trim_ascii_whitespace(s: &str) -> &str {

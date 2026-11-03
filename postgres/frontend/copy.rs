@@ -73,7 +73,7 @@ impl CopyTextEncoder {
                     output.extend_from_slice(pgwire_text::format_f64(f64::from(*value)).as_bytes());
                 }
                 Value::Text(text) => {
-                    let text = text.value.as_ref();
+                    let text = text.as_str();
                     escape_copy_text(text.as_bytes(), output);
                     if matches!(ty, CopyTextType::TimestampTz)
                         && !text.contains('+')

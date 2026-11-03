@@ -26,7 +26,9 @@ impl IO for GenericIO {
             file.create(flags.contains(OpenFlags::Create));
         }
 
-        let file = file.open(path).map_err(|e| io_error(e, "open"))?;
+        let file = file
+            .open(super::os_path::to_path(path))
+            .map_err(|e| io_error(e, "open"))?;
         Ok(Arc::new(GenericFile {
             file: RwLock::new(file),
         }))
@@ -35,7 +37,8 @@ impl IO for GenericIO {
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn remove_file(&self, path: &str) -> Result<()> {
         trace!("remove_file(path = {})", path);
-        std::fs::remove_file(path).map_err(|e| io_error(e, "remove_file"))?;
+        std::fs::remove_file(super::os_path::to_path(path))
+            .map_err(|e| io_error(e, "remove_file"))?;
         Ok(())
     }
 

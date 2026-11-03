@@ -741,7 +741,7 @@ fn encode_value(
             .encode_field(&f64::from(*f))
             .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
         Value::Text(t) => {
-            let text = t.value.as_ref();
+            let text = t.as_str();
             // For TIMESTAMPTZ columns, ensure timezone info is present so clients
             // parse the value correctly (as UTC, not local time).
             // TIMESTAMP (without TZ) should NOT have timezone suffix.

@@ -586,7 +586,7 @@ pub unsafe extern "C" fn sqlite3_value_numeric_type(value: *mut ffi::c_void) -> 
         return t;
     }
     let v = &mut *(value as *mut ExtValue);
-    let Some(s) = v.to_text() else {
+    let Some(s) = v.to_text().filter(|_| v.is_text_utf8()) else {
         return t;
     };
     let s = s.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r'));

@@ -31,6 +31,8 @@ pub mod vfs;
 pub mod vfs_unix;
 mod vtab;
 
+mod textbytes;
+
 /// Global flag: when set, all subsequently opened databases enable experimental features.
 static EXPERIMENTAL_ENABLED: AtomicBool = AtomicBool::new(false);
 static SQLITE_VERSION_C_STRING: OnceLock<CString> = OnceLock::new();
@@ -595,10 +597,9 @@ pub unsafe extern "C" fn sqlite3_open(
         );
     }
     let filename_cstr = CStr::from_ptr(filename);
-    let filename_str = match filename_cstr.to_str() {
-        Ok(s) => s,
-        Err(_) => return compat_lifecycle::open_failed(db_out, SQLITE_CANTOPEN),
-    };
+    // Any byte string is a valid Unix path.
+    let filename_enc = turso_core::io::os_path::encode(filename_cstr.to_bytes());
+    let filename_str: &str = &filename_enc;
     let io: Arc<dyn turso_core::IO> = match filename_str {
         ":memory:" => Arc::new(turso_core::MemoryIO::new()),
         _ => match turso_core::PlatformIO::new() {
@@ -644,10 +645,11 @@ pub const SQLITE_OPEN_PRIVATECACHE: ffi::c_int = 0x00040000;
 pub const SQLITE_OPEN_NOFOLLOW: ffi::c_int = 0x01000000;
 
 /// Percent-decode a URI component (e.g., `%20` -> ` `, `%2F` -> `/`).
-/// Returns None if a percent sequence is malformed or the result is not valid UTF-8.
-fn percent_decode(input: &str) -> Option<String> {
+/// Returns None if a percent sequence is malformed. Bytes that are not UTF-8
+/// are kept (see turso_core::io::os_path).
+fn percent_decode(input: &[u8]) -> Option<String> {
     let mut bytes = Vec::with_capacity(input.len());
-    let mut iter = input.as_bytes().iter();
+    let mut iter = input.iter();
     while let Some(&b) = iter.next() {
         if b == b'%' {
             let hi = *iter.next()?;
@@ -659,7 +661,7 @@ fn percent_decode(input: &str) -> Option<String> {
             bytes.push(b);
         }
     }
-    String::from_utf8(bytes).ok()
+    Some(turso_core::io::os_path::encode(&bytes).into_owned())
 }
 
 /// Parse a URI filename (when SQLITE_OPEN_URI is set).
@@ -672,30 +674,31 @@ fn percent_decode(input: &str) -> Option<String> {
 ///   file:path               -> real file at path
 ///   file:///path             -> real file at /path (authority form)
 ///   file://localhost/path    -> real file at /path
-fn parse_uri_filename(uri: &str) -> Result<(String, bool, bool), ()> {
+fn parse_uri_filename(uri: &[u8]) -> Result<(String, bool, bool), ()> {
+    let find = |s: &[u8], c: u8| s.iter().position(|&b| b == c);
     // Must start with "file:"
     let after_file = &uri[5..];
 
     // Extract path and query parts
-    let (raw_path, query) = match after_file.find('?') {
+    let (raw_path, query) = match find(after_file, b'?') {
         Some(pos) => (&after_file[..pos], Some(&after_file[pos + 1..])),
         None => (after_file, None),
     };
 
     // Strip fragment if present (after #)
-    let raw_path = match raw_path.find('#') {
+    let raw_path = match find(raw_path, b'#') {
         Some(pos) => &raw_path[..pos],
         None => raw_path,
     };
 
     // Handle authority: file:///path or file://localhost/path
-    let path = if let Some(after_slashes) = raw_path.strip_prefix("//") {
+    let path = if let Some(after_slashes) = raw_path.strip_prefix(b"//") {
         // file:///path -> authority is empty, path starts at third /
         // file://localhost/path -> authority is "localhost"
-        match after_slashes.find('/') {
+        match find(after_slashes, b'/') {
             Some(pos) => {
                 let authority = &after_slashes[..pos];
-                if !authority.is_empty() && authority != "localhost" {
+                if !authority.is_empty() && authority != b"localhost" {
                     return Err(()); // non-local authority not supported
                 }
                 percent_decode(&after_slashes[pos..]).ok_or(())?
@@ -712,6 +715,7 @@ fn parse_uri_filename(uri: &str) -> Result<(String, bool, bool), ()> {
     let mut is_memory = path == ":memory:";
     let mut cache_shared = false;
     if let Some(query) = query {
+        let query = String::from_utf8_lossy(query);
         for param in query.split('&') {
             let (key, value) = match param.find('=') {
                 Some(pos) => (&param[..pos], &param[pos + 1..]),
@@ -767,10 +771,9 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         flags
     };
     let filename_cstr = CStr::from_ptr(filename);
-    let filename_str = match filename_cstr.to_str() {
-        Ok(s) => s,
-        Err(_) => return compat_lifecycle::open_failed(db_out, SQLITE_CANTOPEN),
-    };
+    // Any byte string is a valid Unix path.
+    let filename_enc = turso_core::io::os_path::encode(filename_cstr.to_bytes());
+    let filename_str: &str = &filename_enc;
     let flags = match compat_lifecycle::effective_flags(flags, filename_str) {
         Ok(f) => f,
         Err(msg) => return compat_lifecycle::open_failed_with(db_out, SQLITE_PERM, &msg),
@@ -778,8 +781,8 @@ pub unsafe extern "C" fn sqlite3_open_v2(
 
     // Determine the effective filename and whether to use in-memory IO
     let (effective_filename, use_memory, cache_shared) =
-        if (flags & SQLITE_OPEN_URI) != 0 && filename_str.starts_with("file:") {
-            match parse_uri_filename(filename_str) {
+        if (flags & SQLITE_OPEN_URI) != 0 && filename_cstr.to_bytes().starts_with(b"file:") {
+            match parse_uri_filename(filename_cstr.to_bytes()) {
                 Ok(result) => result,
                 Err(()) => return compat_lifecycle::open_failed(db_out, SQLITE_CANTOPEN),
             }
@@ -824,7 +827,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
     // not writable: SQLite falls back to read-only access in that case
     // instead of failing to open.
     let file_is_readonly = !use_memory
-        && std::fs::metadata(&effective_filename)
+        && std::fs::metadata(turso_core::io::os_path::to_path(&effective_filename))
             .map(|m| m.permissions().readonly())
             .unwrap_or(false);
     let file_open_flags = if (flags & SQLITE_OPEN_READONLY) != 0 || file_is_readonly {
@@ -884,7 +887,8 @@ pub unsafe extern "C" fn sqlite3_open_v2(
             let stored_filename = if use_memory || temp_path.is_some() {
                 CString::new("".to_string()).unwrap()
             } else {
-                CString::new(effective_filename).unwrap()
+                let bytes = turso_core::io::os_path::decode(&effective_filename).into_owned();
+                CString::new(bytes).unwrap()
             };
             let handle = sqlite3::new(io, db, conn, stored_filename);
             handle.inner.lock().unwrap().temp_path = temp_path;
@@ -1725,7 +1729,8 @@ pub unsafe extern "C" fn turso_printf_va(
     }
     // SAFETY: fmt checked non-null; caller guarantees a NUL-terminated string.
     let fmt_str = unsafe { CStr::from_ptr(fmt) };
-    let fmt_str = String::from_utf8_lossy(fmt_str.to_bytes()).into_owned();
+    // Strings are escaped so that bytes that are not UTF-8 come out unchanged.
+    let (fmt_str, mut escaped) = textbytes::escape(fmt_str.to_bytes());
 
     let mut args = Vec::new();
     for slot in turso_core::printf_c_arg_plan(&fmt_str) {
@@ -1751,8 +1756,9 @@ pub unsafe extern "C" fn turso_printf_va(
                     let value = if s.is_null() {
                         turso_core::Value::Null
                     } else {
-                        let text = String::from_utf8_lossy(CStr::from_ptr(s).to_bytes());
-                        turso_core::Value::build_text(text.into_owned())
+                        let (text, esc) = textbytes::escape(CStr::from_ptr(s).to_bytes());
+                        escaped |= esc;
+                        turso_core::Value::build_text(text)
                     };
                     if slot == PrintfCArg::OwnedText {
                         // %z: the caller yields the pointer.
@@ -1782,8 +1788,9 @@ pub unsafe extern "C" fn turso_printf_va(
     let rendered = match turso_core::exec_printf_values(&fmt_value, &arg_refs) {
         // The SQL function returns NULL for an empty format or an unknown
         // specifier before any output; the C API returns "" there.
-        Ok(turso_core::Value::Text(t)) => t.as_str().to_string(),
-        Ok(_) => String::new(),
+        Ok(turso_core::Value::Text(t)) if escaped => textbytes::unescape(t.as_str()),
+        Ok(turso_core::Value::Text(t)) => t.as_str().as_bytes().to_vec(),
+        Ok(_) => Vec::new(),
         Err(_) => return std::ptr::null_mut(),
     };
     let n = rendered.len();
@@ -2209,47 +2216,23 @@ pub unsafe extern "C" fn sqlite3_bind_text(
         .map(|f| f as *const ffi::c_void)
         .unwrap_or(static_ptr);
 
-    let str_value = if len < 0 {
-        match CStr::from_ptr(text).to_str() {
-            Ok(s) => s.to_owned(),
-            Err(_) => return SQLITE_ERROR,
-        }
+    // TEXT is stored byte for byte, as in SQLite: no UTF-8 validation.
+    let bytes = if len < 0 {
+        CStr::from_ptr(text).to_bytes()
     } else {
-        let slice = std::slice::from_raw_parts(text.cast::<u8>(), len as usize);
-        match std::str::from_utf8(slice) {
-            Ok(s) => s.to_owned(),
-            Err(_) => return SQLITE_ERROR,
-        }
+        std::slice::from_raw_parts(text.cast::<u8>(), len as usize)
     };
-
-    if str_value.len() > misc::length_limit(&stmt_ref.db) {
+    if bytes.len() > misc::length_limit(&stmt_ref.db) {
         return misc::bind_too_big(stmt_ref, text.cast(), destructor);
     }
+    let val = Value::Text(turso_core::types::Text::from_bytes(bytes.to_vec()));
+    let result = stmt_ref.stmt.bind_at(index, val);
+    let rc = sqlite3_bind_result(stmt_ref, result);
+    if rc != SQLITE_OK {
+        return rc;
+    }
 
-    if ptr_val == transient_ptr {
-        let val = Value::from_text(str_value);
-        let result = stmt_ref.stmt.bind_at(index, val);
-        let rc = sqlite3_bind_result(stmt_ref, result);
-        if rc != SQLITE_OK {
-            return rc;
-        }
-    } else if ptr_val == static_ptr {
-        let slice = std::slice::from_raw_parts(text.cast::<u8>(), str_value.len());
-        let val = Value::from_text(std::str::from_utf8(slice).unwrap());
-        let result = stmt_ref.stmt.bind_at(index, val);
-        let rc = sqlite3_bind_result(stmt_ref, result);
-        if rc != SQLITE_OK {
-            return rc;
-        }
-    } else {
-        let slice = std::slice::from_raw_parts(text.cast::<u8>(), str_value.len());
-        let val = Value::from_text(std::str::from_utf8(slice).unwrap());
-        let result = stmt_ref.stmt.bind_at(index, val);
-        let rc = sqlite3_bind_result(stmt_ref, result);
-        if rc != SQLITE_OK {
-            return rc;
-        }
-
+    if ptr_val != transient_ptr && ptr_val != static_ptr {
         stmt_ref
             .destructors
             .push((idx as usize, destructor, text as *mut ffi::c_void));
@@ -2523,7 +2506,7 @@ unsafe fn column_text_cache(stmt: *mut sqlite3_stmt, idx: ffi::c_int) -> Option<
         let buf = &mut stmt.text_cache[i];
         match value {
             Value::Null => return None,
-            Value::Text(t) => buf.extend(t.as_str().as_bytes()),
+            Value::Text(t) => buf.extend(t.as_bytes()),
             Value::Blob(b) => buf.extend(b.iter()),
             numeric => buf.extend(numeric.to_string().as_bytes()),
         }
@@ -2593,10 +2576,10 @@ pub unsafe extern "C" fn sqlite3_value_dup(value: *mut ffi::c_void) -> *mut ffi:
     let copy = match v.value_type() {
         turso_ext::ValueType::Integer => ExtValue::from_integer(v.to_integer().unwrap_or(0)),
         turso_ext::ValueType::Float => ExtValue::from_float(v.to_float().unwrap_or(0.0)),
-        turso_ext::ValueType::Text => {
-            let s = v.to_text().unwrap_or("");
-            ExtValue::from_text(s.to_owned())
-        }
+        turso_ext::ValueType::Text => match v.to_text() {
+            Some(s) if v.is_text_utf8() => ExtValue::from_text(s.to_owned()),
+            _ => ExtValue::from_text_bytes(v.to_text_bytes().unwrap_or_default().to_vec()),
+        },
         turso_ext::ValueType::Blob => {
             let b = v.to_blob().unwrap_or_default();
             ExtValue::from_blob(b.to_vec())
@@ -2652,7 +2635,10 @@ pub unsafe extern "C" fn sqlite3_column_value(
         Ok(turso_core::Value::Numeric(turso_core::Numeric::Float(f))) => {
             ExtValue::from_float(f64::from(*f))
         }
-        Ok(turso_core::Value::Text(t)) => ExtValue::from_text(t.value.to_string()),
+        Ok(turso_core::Value::Text(t)) if t.is_utf8() => {
+            ExtValue::from_text(t.as_str().to_string())
+        }
+        Ok(turso_core::Value::Text(t)) => ExtValue::from_text_bytes(t.as_bytes().to_vec()),
         Ok(turso_core::Value::Blob(b)) => ExtValue::from_blob(b.clone()),
         _ => ExtValue::null(),
     };
@@ -2897,16 +2883,15 @@ pub unsafe extern "C" fn sqlite3_result_text(
     }
     if !context.is_null() {
         let ctx = &mut *(context as *mut SqliteContext);
-        let s = if len < 0 {
-            CStr::from_ptr(text).to_string_lossy().into_owned()
+        let bytes = if len < 0 {
+            CStr::from_ptr(text).to_bytes()
         } else {
-            let bytes = std::slice::from_raw_parts(text.cast::<u8>(), len as usize);
-            String::from_utf8_lossy(bytes).into_owned()
+            std::slice::from_raw_parts(text.cast::<u8>(), len as usize)
         };
-        if !ctx.db.is_null() && s.len() > misc::length_limit(&*ctx.db) {
+        if !ctx.db.is_null() && bytes.len() > misc::length_limit(&*ctx.db) {
             misc::result_error_code_impl(context, SQLITE_TOOBIG);
         } else {
-            ctx.result = ExtValue::from_text(s);
+            ctx.result = ExtValue::from_text_bytes(bytes.to_vec());
         }
     }
     // Turso never keeps the caller's buffer, so release it now unless it is SQLITE_TRANSIENT (-1).

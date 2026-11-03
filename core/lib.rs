@@ -86,6 +86,7 @@ mod series;
 mod stack;
 mod statement;
 mod stats;
+mod text_bytes;
 #[allow(dead_code)]
 #[cfg(feature = "time")]
 mod time;

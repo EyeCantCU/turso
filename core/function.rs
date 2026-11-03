@@ -54,7 +54,7 @@ impl ExternalCollation {
         })
     }
 
-    pub fn compare(&self, left: &str, right: &str) -> std::cmp::Ordering {
+    pub fn compare(&self, left: &[u8], right: &[u8]) -> std::cmp::Ordering {
         let result = unsafe {
             (self.callback)(
                 self.context,

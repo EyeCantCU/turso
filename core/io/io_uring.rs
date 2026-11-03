@@ -467,7 +467,9 @@ impl IO for UringIO {
             file.create(flags.contains(OpenFlags::Create));
         }
 
-        let file = file.open(path).map_err(|e| io_error(e, "open"))?;
+        let file = file
+            .open(super::os_path::to_path(path))
+            .map_err(|e| io_error(e, "open"))?;
         let uring_file = Arc::new(UringFile {
             ring: self.ring.clone(),
             state: self.state.clone(),
@@ -483,7 +485,8 @@ impl IO for UringIO {
     }
 
     fn remove_file(&self, path: &str) -> Result<()> {
-        std::fs::remove_file(path).map_err(|e| io_error(e, "remove_file"))?;
+        std::fs::remove_file(super::os_path::to_path(path))
+            .map_err(|e| io_error(e, "remove_file"))?;
         Ok(())
     }
 

@@ -4400,8 +4400,7 @@ fn read_serial_type(header: &mut &[u8]) -> Result<u64> {
 #[inline(never)]
 fn start_text_register(dest: &mut Register, text_data: &[u8]) -> Result<()> {
     use crate::types::Text;
-    let text_str = crate::storage::sqlite3_ondisk::read_text(text_data)?;
-    dest.set_text(Text::new(text_str.to_string()))
+    dest.set_text(Text::from_bytes(text_data.to_vec()))
 }
 
 /// Puts a BLOB value in a register that does not hold a blob yet.
@@ -4703,48 +4702,42 @@ mod tests {
         assert_eq!(register_text(&destination), "short");
     }
 
+    fn register_bytes(destination: &Register) -> &[u8] {
+        match destination {
+            Register::Value(Value::Text(text)) => text.as_bytes(),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn text_decode_rejects_invalid_utf8_and_leaves_the_register_usable() {
+    fn text_decode_keeps_invalid_utf8_bytes() {
         let mut destination = Register::Value(Value::Null);
         let long: Vec<u8> = (0..80usize).map(|i| b'a' + (i % 26) as u8).collect();
         decode_one_text(&one_text_record(&long), &mut destination).unwrap();
 
-        let short_invalid = [0xff, 0xfe];
-        let long_invalid = [0xff; 20];
+        let short_invalid = [b'x', 0xff, 0xfe];
+        let long_invalid = [0xfa; 100];
         for invalid in [&short_invalid[..], &long_invalid[..]] {
-            let result = decode_one_text(&one_text_record(invalid), &mut destination);
-            assert!(
-                matches!(
-                    result,
-                    Err(LimboError::Corrupt(ref message))
-                        if message == "TEXT value contains invalid UTF-8"
-                ),
-                "unexpected result: {result:?}"
-            );
-            let _ = register_text(&destination);
+            decode_one_text(&one_text_record(invalid), &mut destination).unwrap();
+            assert_eq!(register_bytes(&destination), invalid);
         }
+        assert_eq!(register_text(&destination), "\u{FFFD}".repeat(100));
         decode_one_text(&one_text_record(b"ok"), &mut destination).unwrap();
         assert_eq!(register_text(&destination), "ok");
+        assert_eq!(register_bytes(&destination), b"ok");
     }
 
     #[test]
-    fn nth_into_register_rejects_invalid_utf8_text() {
+    fn nth_into_register_keeps_invalid_utf8_text() {
         let payload = [2, 15, 0xff];
         let mut iterator = crate::types::ValueIterator::new(&payload).unwrap();
         let mut destination = Register::Value(Value::Null);
 
-        let result = iterator
+        iterator
             .nth_into_register(0, &mut destination)
-            .expect("record contains one value");
-
-        assert!(
-            matches!(
-                result,
-                Err(LimboError::Corrupt(ref message))
-                    if message == "TEXT value contains invalid UTF-8"
-            ),
-            "unexpected result: {result:?}"
-        );
+            .expect("record contains one value")
+            .unwrap();
+        assert_eq!(register_bytes(&destination), [0xff]);
     }
 
     #[test]

@@ -997,7 +997,7 @@ impl Database {
                 "experimental multiprocess WAL is not supported by the active IO backend for '{path}'"
             )));
         }
-        if !Self::path_allows_shared_wal_coordination(Path::new(path))? {
+        if !Self::path_allows_shared_wal_coordination(&crate::io::os_path::to_path(path))? {
             return Err(LimboError::InvalidArgument(format!(
                 "experimental multiprocess WAL is not supported on the filesystem backing '{path}'"
             )));
@@ -1058,7 +1058,7 @@ impl Database {
         if opts.enable_multiprocess_wal
             || is_memory_like(path)
             || !io.supports_shared_wal_coordination()
-            || !Self::path_allows_shared_wal_coordination(Path::new(path))?
+            || !Self::path_allows_shared_wal_coordination(&crate::io::os_path::to_path(path))?
         {
             return Ok(());
         }
@@ -2098,7 +2098,7 @@ impl Database {
                     let pager =
                         return_if_io!(self._init_nonblock(init, encryption_key, page_codec));
                     let log_exists =
-                        journal_mode::logical_log_exists(std::path::Path::new(&self.path));
+                        journal_mode::logical_log_exists(crate::io::os_path::to_path(&self.path));
                     let is_readonly = self.open_flags.contains(OpenFlags::ReadOnly);
                     turso_assert!(pager.wal.is_none(), "Pager should have no WAL yet");
                     *st = HeaderValidationState::Validate {
@@ -2486,8 +2486,8 @@ impl Database {
             String::new()
         } else {
             // For file databases, try show the full absolute path if that doesn't fail
-            match std::fs::canonicalize(&self.path) {
-                Ok(abs_path) => abs_path.to_string_lossy().to_string(),
+            match std::fs::canonicalize(crate::io::os_path::to_path(&self.path)) {
+                Ok(abs_path) => crate::io::os_path::from_path(&abs_path).into_owned(),
                 Err(_) => self.path.to_string(),
             }
         }
@@ -2541,7 +2541,8 @@ impl Database {
         self.shared_wal
             .write()
             .replace_after_external_restore(new_shared_wal.into_inner());
-        if self.mvcc_enabled() || journal_mode::logical_log_exists(std::path::Path::new(&self.path))
+        if self.mvcc_enabled()
+            || journal_mode::logical_log_exists(crate::io::os_path::to_path(&self.path))
         {
             let mv_store = journal_mode::open_mv_store(
                 self.io.clone(),
@@ -3181,7 +3182,7 @@ impl Database {
                 self.path
             )));
         }
-        if !Self::path_allows_shared_wal_coordination(Path::new(&self.path))? {
+        if !Self::path_allows_shared_wal_coordination(&crate::io::os_path::to_path(&self.path))? {
             return Err(LimboError::InvalidArgument(format!(
                 "experimental multiprocess WAL is not supported on the filesystem backing '{}'",
                 self.path

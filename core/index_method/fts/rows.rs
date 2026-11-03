@@ -73,7 +73,7 @@ pub(super) fn row_fields(record: &ImmutableRecord) -> Result<(String, i64, Vec<u
     let path = record
         .get_value_opt(0)
         .and_then(|value| match value {
-            crate::types::ValueRef::Text(text) => Some(text.value.to_string()),
+            crate::types::ValueRef::Text(text) => Some(text.as_str().to_string()),
             _ => None,
         })
         .ok_or_else(|| LimboError::Corrupt("FTS row path is not text".into()))?;
@@ -99,7 +99,7 @@ fn row_path(record: &ImmutableRecord) -> Result<String> {
     record
         .get_value_opt(0)
         .and_then(|value| match value {
-            crate::types::ValueRef::Text(text) => Some(text.value.to_string()),
+            crate::types::ValueRef::Text(text) => Some(text.as_str().to_string()),
             _ => None,
         })
         .ok_or_else(|| LimboError::Corrupt("FTS row path is not text".into()))
