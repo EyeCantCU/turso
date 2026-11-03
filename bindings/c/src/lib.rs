@@ -27,6 +27,8 @@ mod compat_stubs;
 mod hooks;
 mod session;
 
+pub mod vfs;
+pub mod vfs_unix;
 mod vtab;
 
 /// Global flag: when set, all subsequently opened databases enable experimental features.
@@ -573,7 +575,10 @@ pub unsafe extern "C" fn sqlite3_open(
         return SQLITE_MISUSE;
     }
     // sqlite3_config(SQLITE_CONFIG_URI, 1): sqlite3_open() accepts "file:" URIs.
-    if compat_config::uri_default() && CStr::from_ptr(filename).to_bytes().starts_with(b"file:") {
+    // A default VFS registered by the application also needs open_v2.
+    if (compat_config::uri_default() && CStr::from_ptr(filename).to_bytes().starts_with(b"file:"))
+        || vfs::default_is_app_vfs()
+    {
         return sqlite3_open_v2(
             filename,
             db_out,
@@ -783,6 +788,16 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         } else {
             (filename_str.to_string(), false, false)
         };
+    if let Some(rc) = vfs::open_v2_via_vfs(
+        filename_str,
+        &effective_filename,
+        use_memory,
+        flags,
+        z_vfs,
+        db_out,
+    ) {
+        return rc;
+    }
     // Without CREATE a missing file is CANTOPEN; SQLite never creates it.
     if !use_memory
         && !filename_str.is_empty()
@@ -904,6 +919,7 @@ pub unsafe extern "C" fn sqlite3_close(db: *mut sqlite3) -> ffi::c_int {
             return SQLITE_BUSY;
         }
     }
+    vfs::close_connection_early(db);
     compat_config::forget_connection(db);
     compat_stubs::utf16_release_db(db);
     misc::on_close(db);
@@ -927,6 +943,7 @@ pub unsafe extern "C" fn sqlite3_close_v2(db: *mut sqlite3) -> ffi::c_int {
             inner.e_open_state = SQLITE_STATE_ZOMBIE;
         }
     }
+    vfs::close_connection_early(db);
     compat_config::forget_connection(db);
     compat_stubs::utf16_release_db(db);
     misc::on_close(db);

@@ -236,6 +236,7 @@ mod errmsg;
 mod misc;
 mod reentrancy;
 mod session;
+mod vfs;
 
 mod tests {
     use super::*;

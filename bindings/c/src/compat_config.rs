@@ -263,6 +263,7 @@ const SQLITE_FCNTL_HAS_MOVED: ffi::c_int = 20;
 const SQLITE_FCNTL_DATA_VERSION: ffi::c_int = 35;
 const SQLITE_FCNTL_RESERVE_BYTES: ffi::c_int = 38;
 const SQLITE_FCNTL_RESET_CACHE: ffi::c_int = 42;
+const SQLITE_FCNTL_VFS_POINTER: ffi::c_int = 27;
 
 /// Values set through SQLITE_FCNTL_PERSIST_WAL / POWERSAFE_OVERWRITE, keyed by
 /// connection address. They are remembered so that a later query returns what
@@ -354,6 +355,14 @@ pub unsafe extern "C" fn sqlite3_file_control(
             _ => return SQLITE_ERROR,
         }
     }
+    // Through an application VFS, SQLite hands the opcode to the file.
+    if let Some(rc) = super::vfs::file_control(db, op, p_arg) {
+        return rc;
+    }
+    if op == SQLITE_FCNTL_VFS_POINTER && !p_arg.is_null() {
+        *(p_arg as *mut *mut sqlite3_vfs) = super::vfs_unix::unix_vfs();
+        return SQLITE_OK;
+    }
     // A plain in-memory database has no file to control.
     {
         let inner = (*db).inner.lock().unwrap();
@@ -432,209 +441,7 @@ fn temp_database_path_in_dir() -> String {
 // VFS registry
 // ---------------------------------------------------------------------------
 
-type VfsFn = Option<unsafe extern "C" fn()>;
-
-/// Layout of `struct sqlite3_vfs` (iVersion 3).
-#[repr(C)]
-pub struct sqlite3_vfs {
-    i_version: ffi::c_int,
-    sz_os_file: ffi::c_int,
-    mx_pathname: ffi::c_int,
-    p_next: *mut sqlite3_vfs,
-    z_name: *const ffi::c_char,
-    p_app_data: *mut ffi::c_void,
-    x_open: Option<
-        unsafe extern "C" fn(
-            *mut sqlite3_vfs,
-            *const ffi::c_char,
-            *mut ffi::c_void,
-            ffi::c_int,
-            *mut ffi::c_int,
-        ) -> ffi::c_int,
-    >,
-    x_delete: Option<
-        unsafe extern "C" fn(*mut sqlite3_vfs, *const ffi::c_char, ffi::c_int) -> ffi::c_int,
-    >,
-    x_access: Option<
-        unsafe extern "C" fn(
-            *mut sqlite3_vfs,
-            *const ffi::c_char,
-            ffi::c_int,
-            *mut ffi::c_int,
-        ) -> ffi::c_int,
-    >,
-    x_full_pathname: Option<
-        unsafe extern "C" fn(
-            *mut sqlite3_vfs,
-            *const ffi::c_char,
-            ffi::c_int,
-            *mut ffi::c_char,
-        ) -> ffi::c_int,
-    >,
-    x_dl_open:
-        Option<unsafe extern "C" fn(*mut sqlite3_vfs, *const ffi::c_char) -> *mut ffi::c_void>,
-    x_dl_error: Option<unsafe extern "C" fn(*mut sqlite3_vfs, ffi::c_int, *mut ffi::c_char)>,
-    x_dl_sym: Option<
-        unsafe extern "C" fn(*mut sqlite3_vfs, *mut ffi::c_void, *const ffi::c_char) -> VfsFn,
-    >,
-    x_dl_close: Option<unsafe extern "C" fn(*mut sqlite3_vfs, *mut ffi::c_void)>,
-    x_randomness:
-        Option<unsafe extern "C" fn(*mut sqlite3_vfs, ffi::c_int, *mut ffi::c_char) -> ffi::c_int>,
-    x_sleep: Option<unsafe extern "C" fn(*mut sqlite3_vfs, ffi::c_int) -> ffi::c_int>,
-    x_current_time: Option<unsafe extern "C" fn(*mut sqlite3_vfs, *mut f64) -> ffi::c_int>,
-    x_get_last_error:
-        Option<unsafe extern "C" fn(*mut sqlite3_vfs, ffi::c_int, *mut ffi::c_char) -> ffi::c_int>,
-    x_current_time_int64: Option<unsafe extern "C" fn(*mut sqlite3_vfs, *mut i64) -> ffi::c_int>,
-    x_set_system_call:
-        Option<unsafe extern "C" fn(*mut sqlite3_vfs, *const ffi::c_char, VfsFn) -> ffi::c_int>,
-    x_get_system_call: Option<unsafe extern "C" fn(*mut sqlite3_vfs, *const ffi::c_char) -> VfsFn>,
-    x_next_system_call:
-        Option<unsafe extern "C" fn(*mut sqlite3_vfs, *const ffi::c_char) -> *const ffi::c_char>,
-}
-
-// The default VFS description is immutable except for p_next, which is never
-// written, so sharing it between threads is fine.
-struct SyncVfs(sqlite3_vfs);
-unsafe impl Sync for SyncVfs {}
-
-unsafe extern "C" fn vfs_open(
-    _: *mut sqlite3_vfs,
-    _: *const ffi::c_char,
-    _: *mut ffi::c_void,
-    _: ffi::c_int,
-    _: *mut ffi::c_int,
-) -> ffi::c_int {
-    // Turso does its own file I/O and cannot produce a sqlite3_file.
-    SQLITE_CANTOPEN
-}
-unsafe extern "C" fn vfs_delete(
-    _: *mut sqlite3_vfs,
-    name: *const ffi::c_char,
-    _: ffi::c_int,
-) -> ffi::c_int {
-    if libc::unlink(name) == 0 {
-        SQLITE_OK
-    } else {
-        SQLITE_IOERR | (23 << 8) // SQLITE_IOERR_DELETE
-    }
-}
-unsafe extern "C" fn vfs_access(
-    _: *mut sqlite3_vfs,
-    name: *const ffi::c_char,
-    flags: ffi::c_int,
-    out: *mut ffi::c_int,
-) -> ffi::c_int {
-    let mode = match flags {
-        1 => libc::R_OK | libc::W_OK, // SQLITE_ACCESS_READWRITE
-        2 => libc::R_OK,              // SQLITE_ACCESS_READ
-        _ => libc::F_OK,              // SQLITE_ACCESS_EXISTS
-    };
-    *out = (libc::access(name, mode) == 0) as ffi::c_int;
-    SQLITE_OK
-}
-unsafe extern "C" fn vfs_full_pathname(
-    _: *mut sqlite3_vfs,
-    name: *const ffi::c_char,
-    n_out: ffi::c_int,
-    out: *mut ffi::c_char,
-) -> ffi::c_int {
-    let rel = CStr::from_ptr(name).to_string_lossy().into_owned();
-    let full = if rel.starts_with('/') {
-        std::path::PathBuf::from(rel)
-    } else {
-        match std::env::current_dir() {
-            Ok(d) => d.join(rel),
-            Err(_) => return SQLITE_CANTOPEN,
-        }
-    };
-    let s = full.to_string_lossy();
-    if s.len() + 1 > n_out.max(0) as usize {
-        return SQLITE_CANTOPEN;
-    }
-    std::ptr::copy_nonoverlapping(s.as_ptr(), out as *mut u8, s.len());
-    *out.add(s.len()) = 0;
-    SQLITE_OK
-}
-unsafe extern "C" fn vfs_randomness(
-    _: *mut sqlite3_vfs,
-    n: ffi::c_int,
-    out: *mut ffi::c_char,
-) -> ffi::c_int {
-    let n = n.max(0) as usize;
-    let got = libc::getrandom(out as *mut ffi::c_void, n, 0);
-    if got < 0 {
-        0
-    } else {
-        got as ffi::c_int
-    }
-}
-unsafe extern "C" fn vfs_sleep(_: *mut sqlite3_vfs, us: ffi::c_int) -> ffi::c_int {
-    std::thread::sleep(std::time::Duration::from_micros(us.max(0) as u64));
-    us
-}
-unsafe extern "C" fn vfs_current_time_int64(_: *mut sqlite3_vfs, out: *mut i64) -> ffi::c_int {
-    // Julian day number in milliseconds; 2440587.5 is the Unix epoch.
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    *out = 210_866_760_000_000i64 + ms;
-    SQLITE_OK
-}
-unsafe extern "C" fn vfs_current_time(v: *mut sqlite3_vfs, out: *mut f64) -> ffi::c_int {
-    let mut t = 0i64;
-    vfs_current_time_int64(v, &mut t);
-    *out = t as f64 / 86400000.0;
-    SQLITE_OK
-}
-unsafe extern "C" fn vfs_get_last_error(
-    _: *mut sqlite3_vfs,
-    _: ffi::c_int,
-    _: *mut ffi::c_char,
-) -> ffi::c_int {
-    0
-}
-unsafe extern "C" fn vfs_set_system_call(
-    _: *mut sqlite3_vfs,
-    _: *const ffi::c_char,
-    _: VfsFn,
-) -> ffi::c_int {
-    SQLITE_NOTFOUND
-}
-unsafe extern "C" fn vfs_get_system_call(_: *mut sqlite3_vfs, _: *const ffi::c_char) -> VfsFn {
-    None
-}
-unsafe extern "C" fn vfs_next_system_call(
-    _: *mut sqlite3_vfs,
-    _: *const ffi::c_char,
-) -> *const ffi::c_char {
-    std::ptr::null()
-}
-
-static DEFAULT_VFS: SyncVfs = SyncVfs(sqlite3_vfs {
-    i_version: 3,
-    sz_os_file: 8, // sizeof(sqlite3_file): just the pMethods pointer
-    mx_pathname: 512,
-    p_next: std::ptr::null_mut(),
-    z_name: c"unix".as_ptr(),
-    p_app_data: std::ptr::null_mut(),
-    x_open: Some(vfs_open),
-    x_delete: Some(vfs_delete),
-    x_access: Some(vfs_access),
-    x_full_pathname: Some(vfs_full_pathname),
-    x_dl_open: None,
-    x_dl_error: None,
-    x_dl_sym: None,
-    x_dl_close: None,
-    x_randomness: Some(vfs_randomness),
-    x_sleep: Some(vfs_sleep),
-    x_current_time: Some(vfs_current_time),
-    x_get_last_error: Some(vfs_get_last_error),
-    x_current_time_int64: Some(vfs_current_time_int64),
-    x_set_system_call: Some(vfs_set_system_call),
-    x_get_system_call: Some(vfs_get_system_call),
-    x_next_system_call: Some(vfs_next_system_call),
-});
+pub use super::vfs::sqlite3_vfs;
 
 /// Registered application VFSes, in registration order. Stored as
 /// addresses; the caller owns the structs and unregisters them before freeing,
@@ -653,16 +460,12 @@ unsafe fn vfs_name_of(p: usize) -> Option<&'static [u8]> {
 }
 
 /// Looks up `zVfsName` ("unix", the default, and its "unix-*" aliases map to
-/// the built-in descriptor; otherwise the registry is searched). NULL selects
-/// the default VFS: the one registered with makeDflt, else "unix".
-///
-/// The built-in descriptor lets applications that wrap the default VFS read
-/// its parameters, but its xOpen fails with SQLITE_CANTOPEN: turso's I/O layer
-/// does not go through sqlite3_file.
+/// the built-in VFS; otherwise the registry is searched). NULL selects the
+/// default VFS: the one registered with makeDflt, else "unix".
 #[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_vfs_find(z_vfs_name: *const ffi::c_char) -> *mut sqlite3_vfs {
-    let builtin = std::ptr::addr_of!(DEFAULT_VFS.0) as *mut sqlite3_vfs;
+    let builtin = super::vfs_unix::unix_vfs();
     let reg = match VFS_REGISTRY.lock() {
         Ok(g) => g,
         Err(_) => return std::ptr::null_mut(),
@@ -695,9 +498,9 @@ fn is_builtin_vfs_name(n: &[u8]) -> bool {
     )
 }
 
-/// Records the VFS so that sqlite3_vfs_find() sees it. Turso's storage layer
-/// cannot call into a C `sqlite3_vfs`, so callbacks are never invoked; see
-/// [`check_open_vfs`] for what a connection opened "through" it does.
+/// Registers an application VFS. Connections opened through it (zVfs,
+/// `vfs=` URI parameter, or makeDflt) do their file I/O through its methods;
+/// ATTACH finds it by name through turso_core's IO registry.
 #[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_vfs_register(
@@ -716,6 +519,11 @@ pub unsafe extern "C" fn sqlite3_vfs_register(
     if make_dflt != 0 {
         VFS_DEFAULT.store(p_vfs as usize, Ordering::Relaxed);
     }
+    if p_vfs != super::vfs_unix::unix_vfs() {
+        if let Ok(name) = CStr::from_ptr((*p_vfs).z_name).to_str() {
+            let _ = turso_core::register_io(name, super::vfs::VfsIo::for_vfs(p_vfs));
+        }
+    }
     SQLITE_OK
 }
 
@@ -726,41 +534,42 @@ pub unsafe extern "C" fn sqlite3_vfs_unregister(p_vfs: *mut sqlite3_vfs) -> ffi:
         return SQLITE_OK;
     }
     if let Ok(mut reg) = VFS_REGISTRY.lock() {
+        let was_registered = reg.contains(&(p_vfs as usize));
         reg.retain(|&p| p != p_vfs as usize);
         let _ =
             VFS_DEFAULT.compare_exchange(p_vfs as usize, 0, Ordering::Relaxed, Ordering::Relaxed);
+        if was_registered && !(*p_vfs).z_name.is_null() {
+            if let Ok(name) = CStr::from_ptr((*p_vfs).z_name).to_str() {
+                // Another registered VFS of the same name takes over.
+                match reg
+                    .iter()
+                    .rev()
+                    .find(|&&p| vfs_name_of(p) == Some(name.as_bytes()))
+                {
+                    Some(&p) => {
+                        let _ = turso_core::register_io(
+                            name,
+                            super::vfs::VfsIo::for_vfs(p as *mut sqlite3_vfs),
+                        );
+                    }
+                    None => {
+                        turso_core::unregister_io(name);
+                    }
+                }
+            }
+        }
     }
     SQLITE_OK
 }
 
-/// Gate for the `zVfs` argument of sqlite3_open_v2.
-///   - NULL/"" or a built-in name ("unix", "unix-excl", ...): proceed.
-///   - a name nobody registered: SQLITE_ERROR, as SQLite ("no such vfs").
-///   - a registered application VFS: turso opens the path with its own I/O and
-///     never calls the VFS. That is faithful only for pass-through VFSes, so it
-///     is allowed for read-only opens (the data cannot be damaged and, for
-///     example, proj's pass-through VFS over proj.db works) and refused with
-///     SQLITE_CANTOPEN for writable opens, where a VFS that transforms data
-///     (encryption, compression, remote storage) would be silently bypassed.
-pub(crate) unsafe fn check_open_vfs(z_vfs: *const ffi::c_char, flags: ffi::c_int) -> ffi::c_int {
-    if z_vfs.is_null() {
-        return SQLITE_OK;
-    }
-    let name = CStr::from_ptr(z_vfs).to_bytes();
-    if name.is_empty() || is_builtin_vfs_name(name) {
-        return SQLITE_OK;
-    }
-    let registered = match VFS_REGISTRY.lock() {
-        Ok(reg) => reg.iter().any(|&p| vfs_name_of(p) == Some(name)),
-        Err(_) => false,
-    };
-    if !registered {
-        return SQLITE_ERROR;
-    }
-    if flags & 0x1 != 0 {
+/// Gate for the `zVfs` argument of sqlite3_open_v2: NULL, "", a built-in
+/// name or a registered VFS proceed; any other name is SQLITE_ERROR ("no such
+/// vfs"), as in SQLite. Routing happens in [`super::vfs::open_v2_via_vfs`].
+pub(crate) unsafe fn check_open_vfs(z_vfs: *const ffi::c_char, _flags: ffi::c_int) -> ffi::c_int {
+    if z_vfs.is_null() || *z_vfs == 0 || !sqlite3_vfs_find(z_vfs).is_null() {
         SQLITE_OK
     } else {
-        SQLITE_CANTOPEN
+        SQLITE_ERROR
     }
 }
 
