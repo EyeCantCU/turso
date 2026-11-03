@@ -392,6 +392,8 @@ impl Drop for ExplicitCheckpointGuard {
 /// statements know they need to be reprepared.
 pub struct Connection {
     pub(crate) db: Arc<Database>,
+    #[cfg(feature = "fts3")]
+    pub(crate) fts3: crate::fts3::ConnState,
     pub(super) context: Option<Arc<dyn Any + Send + Sync>>,
     pub(super) hooks: Option<Arc<dyn ConnectionHooks>>,
     pub(crate) pager: ArcSwap<Pager>,
