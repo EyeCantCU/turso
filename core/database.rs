@@ -1407,6 +1407,7 @@ impl Database {
         // so, we bypass registry for all in memory dbs (i.e. db paths which starts with ":memory:")
         if matches!(state.phase, OpenDbAsyncPhase::Init) && !is_memory_like(path) {
             // An instance inherited across fork; dropped only after the lock.
+            #[allow(clippy::collection_is_never_read)]
             let mut _inherited: Option<Arc<Database>> = None;
             // Briefly lock the registry to check/reserve — never hold across I/O yields.
             let mut registry = DATABASE_MANAGER.lock();
