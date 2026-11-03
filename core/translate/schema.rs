@@ -2041,12 +2041,7 @@ pub fn translate_create_virtual_table(
     let table_name = tbl_name.name.as_str().to_string();
     let module_name_str = module_name.as_str().to_string();
     let args_vec = args.clone();
-    let Some(vtab_module) = resolver
-        .catalog
-        .symbol_table
-        .vtab_modules
-        .get(&module_name_str)
-    else {
+    let Some(vtab_module) = resolver.catalog.symbol_table.vtab_module(&module_name_str) else {
         bail_parse_error!("no such module: {}", module_name_str);
     };
     if !vtab_module.module_kind.eq(&VTabKind::VirtualTable) {

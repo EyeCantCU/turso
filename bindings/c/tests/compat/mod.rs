@@ -4,6 +4,7 @@
 use std::ptr;
 
 mod lifecycle;
+mod vtab;
 
 #[repr(C)]
 struct sqlite3 {

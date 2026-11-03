@@ -603,6 +603,129 @@ int sqlite3_preupdate_blobwrite(sqlite3 *db);
 int sqlite3_wal_autocheckpoint(sqlite3 *db, int N);
 
 /*
+** ===== vtab group: virtual table C API =====
+** Layouts match SQLite's sqlite3.h. As elsewhere in this header,
+** sqlite3_context* and sqlite3_value* are spelled void*. xFindFunction,
+** xShadowName and xIntegrity may be supplied but are never called.
+*/
+typedef struct sqlite3_vtab sqlite3_vtab;
+typedef struct sqlite3_index_info sqlite3_index_info;
+typedef struct sqlite3_vtab_cursor sqlite3_vtab_cursor;
+typedef struct sqlite3_module sqlite3_module;
+
+struct sqlite3_module {
+  int iVersion;
+  int (*xCreate)(sqlite3*, void *pAux, int argc, const char *const *argv,
+                 sqlite3_vtab **ppVTab, char **pzErr);
+  int (*xConnect)(sqlite3*, void *pAux, int argc, const char *const *argv,
+                  sqlite3_vtab **ppVTab, char **pzErr);
+  int (*xBestIndex)(sqlite3_vtab *pVTab, sqlite3_index_info*);
+  int (*xDisconnect)(sqlite3_vtab *pVTab);
+  int (*xDestroy)(sqlite3_vtab *pVTab);
+  int (*xOpen)(sqlite3_vtab *pVTab, sqlite3_vtab_cursor **ppCursor);
+  int (*xClose)(sqlite3_vtab_cursor*);
+  int (*xFilter)(sqlite3_vtab_cursor*, int idxNum, const char *idxStr,
+                 int argc, void **argv);
+  int (*xNext)(sqlite3_vtab_cursor*);
+  int (*xEof)(sqlite3_vtab_cursor*);
+  int (*xColumn)(sqlite3_vtab_cursor*, void *ctx, int);
+  int (*xRowid)(sqlite3_vtab_cursor*, sqlite3_int64 *pRowid);
+  int (*xUpdate)(sqlite3_vtab *, int, void **, sqlite3_int64 *);
+  int (*xBegin)(sqlite3_vtab *pVTab);
+  int (*xSync)(sqlite3_vtab *pVTab);
+  int (*xCommit)(sqlite3_vtab *pVTab);
+  int (*xRollback)(sqlite3_vtab *pVTab);
+  int (*xFindFunction)(sqlite3_vtab *pVtab, int nArg, const char *zName,
+                       void (**pxFunc)(void*, int, void**), void **ppArg);
+  int (*xRename)(sqlite3_vtab *pVtab, const char *zNew);
+  int (*xSavepoint)(sqlite3_vtab *pVTab, int);
+  int (*xRelease)(sqlite3_vtab *pVTab, int);
+  int (*xRollbackTo)(sqlite3_vtab *pVTab, int);
+  int (*xShadowName)(const char*);
+  int (*xIntegrity)(sqlite3_vtab *pVTab, const char *zSchema,
+                    const char *zTabName, int mFlags, char **pzErr);
+};
+
+struct sqlite3_index_info {
+  int nConstraint;
+  struct sqlite3_index_constraint {
+     int iColumn;
+     unsigned char op;
+     unsigned char usable;
+     int iTermOffset;
+  } *aConstraint;
+  int nOrderBy;
+  struct sqlite3_index_orderby {
+     int iColumn;
+     unsigned char desc;
+  } *aOrderBy;
+  struct sqlite3_index_constraint_usage {
+    int argvIndex;
+    unsigned char omit;
+  } *aConstraintUsage;
+  int idxNum;
+  char *idxStr;
+  int needToFreeIdxStr;
+  int orderByConsumed;
+  double estimatedCost;
+  sqlite3_int64 estimatedRows;
+  int idxFlags;
+  uint64_t colUsed;
+};
+
+#define SQLITE_INDEX_SCAN_UNIQUE      0x00000001
+#define SQLITE_INDEX_SCAN_HEX         0x00000002
+#define SQLITE_INDEX_CONSTRAINT_EQ          2
+#define SQLITE_INDEX_CONSTRAINT_GT          4
+#define SQLITE_INDEX_CONSTRAINT_LE          8
+#define SQLITE_INDEX_CONSTRAINT_LT         16
+#define SQLITE_INDEX_CONSTRAINT_GE         32
+#define SQLITE_INDEX_CONSTRAINT_MATCH      64
+#define SQLITE_INDEX_CONSTRAINT_LIKE       65
+#define SQLITE_INDEX_CONSTRAINT_GLOB       66
+#define SQLITE_INDEX_CONSTRAINT_REGEXP     67
+#define SQLITE_INDEX_CONSTRAINT_NE         68
+#define SQLITE_INDEX_CONSTRAINT_ISNOT      69
+#define SQLITE_INDEX_CONSTRAINT_ISNOTNULL  70
+#define SQLITE_INDEX_CONSTRAINT_ISNULL     71
+#define SQLITE_INDEX_CONSTRAINT_IS         72
+#define SQLITE_INDEX_CONSTRAINT_LIMIT      73
+#define SQLITE_INDEX_CONSTRAINT_OFFSET     74
+#define SQLITE_INDEX_CONSTRAINT_FUNCTION  150
+
+struct sqlite3_vtab {
+  const sqlite3_module *pModule;
+  int nRef;
+  char *zErrMsg;
+};
+
+struct sqlite3_vtab_cursor {
+  sqlite3_vtab *pVtab;
+};
+
+#define SQLITE_VTAB_CONSTRAINT_SUPPORT 1
+#define SQLITE_VTAB_INNOCUOUS          2
+#define SQLITE_VTAB_DIRECTONLY         3
+#define SQLITE_VTAB_USES_ALL_SCHEMAS   4
+
+int sqlite3_create_module(sqlite3 *db, const char *zName,
+                          const sqlite3_module *p, void *pClientData);
+int sqlite3_create_module_v2(sqlite3 *db, const char *zName,
+                             const sqlite3_module *p, void *pClientData,
+                             void (*xDestroy)(void*));
+int sqlite3_declare_vtab(sqlite3 *db, const char *zSQL);
+int sqlite3_vtab_config(sqlite3 *db, int op, ...);
+int sqlite3_vtab_on_conflict(sqlite3 *db);
+int sqlite3_vtab_nochange(void *ctx);
+const char *sqlite3_vtab_collation(sqlite3_index_info *pIdxInfo, int iCons);
+int sqlite3_vtab_distinct(sqlite3_index_info *pIdxInfo);
+int sqlite3_vtab_in(sqlite3_index_info *pIdxInfo, int iCons, int bHandle);
+int sqlite3_vtab_in_first(void *pVal, void **ppOut);
+int sqlite3_vtab_in_next(void *pVal, void **ppOut);
+int sqlite3_vtab_rhs_value(sqlite3_index_info *pIdxInfo, int iCons, void **ppVal);
+/* ===== end vtab group ===== */
+
+/*
 ** Enable all Turso experimental features for subsequently opened databases.
 */
 void turso_enable_experimental(void);

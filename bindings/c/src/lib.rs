@@ -25,6 +25,8 @@ mod compat_stubs;
 
 mod hooks;
 
+mod vtab;
+
 /// Global flag: when set, all subsequently opened databases enable experimental features.
 static EXPERIMENTAL_ENABLED: AtomicBool = AtomicBool::new(false);
 static SQLITE_VERSION_C_STRING: OnceLock<CString> = OnceLock::new();

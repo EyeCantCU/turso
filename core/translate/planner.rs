@@ -2165,9 +2165,17 @@ fn parse_table(
     // Resolve table using connection's with_schema method
     let namespace = resolver.resolve_queried_table(qualified_name)?;
     let database_id = namespace.database_id;
-    let table = resolver.with_schema(database_id, |schema| {
+    let mut table = resolver.with_schema(database_id, |schema| {
         schema.get_table(namespace.id, table_name.as_str())
     });
+    // Eponymous virtual tables live in the main schema only.
+    if table.is_none() && database_id == crate::MAIN_DB_ID && namespace.id.is_root() {
+        table = resolver
+            .catalog
+            .symbol_table
+            .eponymous_table(table_name.as_str())?
+            .map(|vtab| Arc::new(Table::Virtual(vtab)));
+    }
 
     if let Some(table) = table {
         let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));

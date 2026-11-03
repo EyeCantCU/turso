@@ -71,6 +71,7 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
     let vmodule = VTabImpl {
         module_kind: kind,
         implementation: ModuleImplementation::C(module),
+        eponymous: None,
     };
 
     unsafe {
@@ -101,6 +102,54 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
 pub struct VTabImpl {
     pub module_kind: VTabKind,
     pub(crate) implementation: ModuleImplementation,
+    /// Set for modules with an eponymous table, which is connected on first use.
+    pub(crate) eponymous: Option<Arc<EponymousSlot>>,
+}
+
+pub(crate) struct EponymousSlot {
+    name: String,
+    table: Mutex<Option<Arc<VirtualTable>>>,
+}
+
+impl SymbolTable {
+    /// Looks up a module by name, case-insensitively.
+    pub(crate) fn vtab_module(&self, name: &str) -> Option<&Arc<VTabImpl>> {
+        self.vtab_modules
+            .get(name)
+            .or_else(|| self.vtab_modules.get(&crate::util::normalize_ident(name)))
+    }
+
+    /// The eponymous virtual table `name`, connecting it on first use.
+    pub(crate) fn eponymous_table(&self, name: &str) -> crate::Result<Option<Arc<VirtualTable>>> {
+        let Some(module) = self.vtab_module(name) else {
+            return Ok(None);
+        };
+        let Some(slot) = &module.eponymous else {
+            return Ok(None);
+        };
+        let mut table = slot.table.lock();
+        if let Some(table) = table.as_ref() {
+            return Ok(Some(table.clone()));
+        }
+        let vtab = VirtualTable::eponymous(&slot.name, module)?;
+        *table = Some(vtab.clone());
+        Ok(Some(vtab))
+    }
+
+    /// Finds a connected virtual table (created or eponymous) by its id.
+    pub(crate) fn vtab_by_id(&self, id: u64) -> Option<Arc<VirtualTable>> {
+        self.vtabs
+            .values()
+            .find(|vtab| vtab.id() == id)
+            .cloned()
+            .or_else(|| {
+                self.vtab_modules.values().find_map(|module| {
+                    let slot = module.eponymous.as_ref()?;
+                    let table = slot.table.lock();
+                    table.as_ref().filter(|t| t.id() == id).cloned()
+                })
+            })
+    }
 }
 
 pub(crate) unsafe fn register_scalar_function(
@@ -316,6 +365,115 @@ impl Database {
 }
 
 impl Connection {
+    /// Registers a virtual table module on this connection only, as
+    /// `sqlite3_create_module` does. `creatable` modules back
+    /// `CREATE VIRTUAL TABLE`; `eponymous` ones also get a table named after
+    /// the module. Stored tables that use the module are connected.
+    pub fn register_vtab_module_local<M>(
+        self: &Arc<Connection>,
+        name: &str,
+        module: M,
+        creatable: bool,
+        eponymous: bool,
+    ) -> crate::Result<()>
+    where
+        M: crate::native_ext::VirtualTableModule + 'static,
+    {
+        let module = VTabImpl {
+            module_kind: if creatable {
+                VTabKind::VirtualTable
+            } else {
+                VTabKind::TableValuedFunction
+            },
+            implementation: ModuleImplementation::Native(Arc::new(module)),
+            eponymous: eponymous.then(|| {
+                Arc::new(EponymousSlot {
+                    name: name.to_string(),
+                    table: Mutex::new(None),
+                })
+            }),
+        };
+        let key = crate::util::normalize_ident(name);
+        {
+            let mut syms = self.syms.write();
+            syms.vtab_modules.remove(name);
+            syms.vtab_modules.insert(key, Arc::new(module));
+        }
+        self.bump_prepare_context_generation();
+        if creatable && self.is_db_initialized() {
+            if let Err(e) = self.connect_stored_vtabs(name) {
+                tracing::debug!("connecting stored tables of vtab module {name}: {e}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Connects the tables in sqlite_schema that use `module_name` and are
+    /// not loaded yet. No lock is held while the module's constructor runs,
+    /// since it may query this connection.
+    fn connect_stored_vtabs(self: &Arc<Connection>, module_name: &str) -> crate::Result<()> {
+        let mut rows: Vec<(String, String)> = Vec::new();
+        {
+            let mut stmt = self
+                .query("SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND rootpage = 0")?
+                .ok_or_else(|| crate::LimboError::InternalError("no statement".to_string()))?;
+            stmt.run_with_row_callback(|row| {
+                if let (Ok(name), Ok(sql)) = (row.get::<&str>(0), row.get::<&str>(1)) {
+                    rows.push((name.to_string(), sql.to_string()));
+                }
+                Ok(())
+            })?;
+        }
+        for (name, sql) in rows {
+            let Ok(Some(turso_parser::ast::Cmd::Stmt(
+                turso_parser::ast::Stmt::CreateVirtualTable(create),
+            ))) = turso_parser::parser::Parser::new(sql.as_bytes()).next_cmd()
+            else {
+                continue;
+            };
+            if !create
+                .module_name
+                .as_str()
+                .eq_ignore_ascii_case(module_name)
+                || self
+                    .schema
+                    .read()
+                    .get_table(NamespaceId::ROOT, &name)
+                    .is_some()
+            {
+                continue;
+            }
+            let Some(module) = self.syms.read().vtab_module(module_name).cloned() else {
+                return Ok(());
+            };
+            let args = create
+                .args
+                .iter()
+                .map(|a| crate::Value::from_text(a.to_string()))
+                .collect();
+            match VirtualTable::from_module(&name, create.module_name.as_str(), args, &module) {
+                Ok(vtab) => {
+                    self.with_schema_mut(|schema| {
+                        schema.add_virtual_table(NamespaceId::ROOT, vtab)
+                    })??;
+                }
+                Err(e) => tracing::debug!("connecting virtual table {name}: {e}"),
+            }
+        }
+        self.bump_prepare_context_generation();
+        Ok(())
+    }
+
+    /// Removes a module registered with [`Self::register_vtab_module_local`].
+    pub fn unregister_vtab_module_local(&self, name: &str) {
+        let mut syms = self.syms.write();
+        syms.vtab_modules.remove(name);
+        syms.vtab_modules
+            .remove(&crate::util::normalize_ident(name));
+        drop(syms);
+        self.bump_prepare_context_generation();
+    }
+
     /// Register statically linked functions or virtual tables against this
     /// connection using the generic extension API.
     pub fn register_static_extension<F>(&self, register: F)
