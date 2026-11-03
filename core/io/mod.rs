@@ -63,6 +63,7 @@ pub use memory_yield::MemoryYieldIO;
 pub mod clock;
 mod common;
 mod completions;
+pub mod os_path;
 pub use clock::Clock;
 pub use completions::*;
 
@@ -93,7 +94,7 @@ impl FileId {
 #[cfg(unix)]
 pub fn get_file_id(path: &str) -> Result<FileId, std::io::Error> {
     use std::os::unix::fs::MetadataExt;
-    let m = std::fs::metadata(path)?;
+    let m = std::fs::metadata(os_path::to_path(path))?;
     Ok(FileId {
         dev: m.dev(),
         ino: m.ino(),

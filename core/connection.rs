@@ -1951,8 +1951,9 @@ impl Connection {
             dialect,
         )?;
         if let Some(modeof) = opts.modeof {
-            let perms = std::fs::metadata(modeof).map_err(|e| io_error(e, "metadata"))?;
-            std::fs::set_permissions(&opts.path, perms.permissions())
+            let perms = std::fs::metadata(crate::io::os_path::to_path(&modeof))
+                .map_err(|e| io_error(e, "metadata"))?;
+            std::fs::set_permissions(crate::io::os_path::to_path(&opts.path), perms.permissions())
                 .map_err(|e| io_error(e, "set_permissions"))?;
         }
         let conn = db.connect(ConnectOpts::new())?;
@@ -2005,8 +2006,9 @@ impl Connection {
             dialect,
         )?;
         if let Some(modeof) = opts.modeof {
-            let perms = std::fs::metadata(modeof).map_err(|e| io_error(e, "metadata"))?;
-            std::fs::set_permissions(&opts.path, perms.permissions())
+            let perms = std::fs::metadata(crate::io::os_path::to_path(&modeof))
+                .map_err(|e| io_error(e, "metadata"))?;
+            std::fs::set_permissions(crate::io::os_path::to_path(&opts.path), perms.permissions())
                 .map_err(|e| io_error(e, "set_permissions"))?;
         }
         Ok((db, encryption_opts))
@@ -3628,8 +3630,8 @@ impl Connection {
             String::new()
         } else {
             // For file databases, try to show the full absolute path if that doesn't fail
-            match std::fs::canonicalize(&db.path) {
-                Ok(abs_path) => abs_path.to_string_lossy().to_string(),
+            match std::fs::canonicalize(crate::io::os_path::to_path(&db.path)) {
+                Ok(abs_path) => crate::io::os_path::from_path(&abs_path).into_owned(),
                 Err(_) => db.path.to_string(),
             }
         }
