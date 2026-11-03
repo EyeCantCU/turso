@@ -2386,6 +2386,15 @@ pub enum Insn {
         db: usize,
     },
 
+    /// Incremental vacuum: give up to `limit` free pages of database `db`
+    /// back to the file system (all of them when `limit` is 0) and store
+    /// how many were given back in `dest`.
+    IncrVacuum {
+        db: usize,
+        limit: u32,
+        dest: usize,
+    },
+
     /// Ensure turso_cdc_version table exists and insert/replace a version row,
     /// then enable CDC on the connection. Runs nested SQL at VDBE execution time
     /// (same pattern as ParseSchema). CDC is enabled after version table operations
@@ -2651,6 +2660,7 @@ impl InsnVariants {
             InsnVariants::HashGraceAdvancePartition => execute::op_hash_grace_advance_partition,
             InsnVariants::VacuumInto => execute::op_vacuum_into,
             InsnVariants::Vacuum => execute::op_vacuum,
+            InsnVariants::IncrVacuum => execute::op_incr_vacuum,
             InsnVariants::InitCdcVersion => execute::op_init_cdc_version,
         }
     }
@@ -2744,6 +2754,7 @@ impl Insn {
             | Self::AlterColumn { .. }
             | Self::ReplaceTable { .. }
             | Self::JournalMode { .. }
+            | Self::IncrVacuum { .. }
             | Self::Vacuum { .. } => false,
             Self::MaxPgcnt { new_max, .. } => *new_max == 0,
             // A recursive foreign-key action is treated as writable while it's still being

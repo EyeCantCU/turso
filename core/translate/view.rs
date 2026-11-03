@@ -580,6 +580,8 @@ pub fn translate_drop_view(
         }
     }
 
+    // Btree roots to destroy, largest first (see translate_drop_table).
+    let mut destroy_roots = Vec::new();
     // If this is a materialized view, we need to destroy its btree as well
     // and also clean up its internal tables (aggregate state, MIN/MAX
     // multiset) — those that exist for its shape.
@@ -589,22 +591,12 @@ pub fn translate_drop_view(
         }) {
             if let Some(btree_table) = table.btree() {
                 // Destroy the btree for the materialized view
-                program.emit_insn(Insn::Destroy {
-                    db: database_id,
-                    root: btree_table.root_page,
-                    former_root_reg: 0, // No autovacuum
-                    is_temp: 0,
-                });
+                destroy_roots.push(btree_table.root_page);
             }
         } else if let Some(root_page) = resolver.with_schema(database_id, |s| {
             s.incompatible_materialized_view_root(namespace.id, &normalized_view_name)
         }) {
-            program.emit_insn(Insn::Destroy {
-                db: database_id,
-                root: root_page,
-                former_root_reg: 0,
-                is_temp: 0,
-            });
+            destroy_roots.push(root_page);
         }
 
         // Every node-owned hidden state/multiset table of this view, including
@@ -633,26 +625,38 @@ pub fn translate_drop_view(
                 .collect()
         });
         for index in &internal_indexes {
-            program.emit_insn(Insn::Destroy {
-                db: database_id,
-                root: index.root_page,
-                former_root_reg: 0, // No autovacuum
-                is_temp: 0,
-            });
+            destroy_roots.push(index.root_page);
         }
 
         if let Some(internal_table) = resolver.with_schema(database_id, |s| {
             s.get_table(NamespaceId::ROOT, internal_table_name)
         }) {
             if let Some(internal_btree) = internal_table.btree() {
-                program.emit_insn(Insn::Destroy {
-                    db: database_id,
-                    root: internal_btree.root_page,
-                    former_root_reg: 0, // No autovacuum
-                    is_temp: 0,
-                });
+                destroy_roots.push(internal_btree.root_page);
             }
         }
+    }
+
+    destroy_roots.sort_unstable_by(|a, b| b.cmp(a));
+    let root_schema_table = resolver.with_schema(MAIN_DB_ID, |s| {
+        s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
+            .unwrap()
+    });
+    for root in destroy_roots {
+        let moved_reg = program.alloc_register();
+        program.emit_insn(Insn::Destroy {
+            db: database_id,
+            root,
+            former_root_reg: moved_reg,
+            is_temp: 0,
+        });
+        crate::translate::schema::emit_root_page_moved(
+            program,
+            database_id,
+            &root_schema_table,
+            moved_reg,
+            root,
+        )?;
     }
 
     // Open cursor to sqlite_schema table (structure is the same for all databases)

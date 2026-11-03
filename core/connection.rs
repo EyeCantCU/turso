@@ -7,7 +7,10 @@ use crate::namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
 use crate::security::roles::{RoleCatalog, RoleId, ROLES_TABLE_NAME, SELECT_ROLES_SQL};
 use crate::state_machine::StateMachine;
 use crate::statement::StatementOrigin;
-use crate::storage::{checksum::CHECKSUM_REQUIRED_RESERVED_BYTES, pager::SavepointResult};
+use crate::storage::{
+    checksum::CHECKSUM_REQUIRED_RESERVED_BYTES,
+    pager::{AutoVacuumMode, SavepointResult},
+};
 use crate::sync::{
     atomic::{
         AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU32, AtomicU64, AtomicU8, Ordering,
@@ -579,6 +582,8 @@ pub struct Connection {
     pub(super) is_mvcc_bootstrap_connection: AtomicBool,
     /// Whether pragma foreign_keys=ON for this connection
     pub(super) fk_pragma: AtomicBool,
+    /// Auto-vacuum mode the next VACUUM switches to (db->nextAutovac), or u8::MAX.
+    pub(super) next_auto_vacuum: AtomicU8,
     pub(crate) fk_deferred_violations: AtomicIsize,
     /// Whether non-TEMP triggers fire for statements prepared on this
     /// connection. TEMP triggers always fire, matching SQLite's
@@ -2061,6 +2066,18 @@ impl Connection {
                 .map_err(|e| io_error(e, "set_permissions"))?;
         }
         Ok((db, encryption_opts))
+    }
+
+    pub(crate) fn set_next_auto_vacuum(&self, mode: Option<AutoVacuumMode>) {
+        self.next_auto_vacuum
+            .store(mode.map_or(u8::MAX, u8::from), Ordering::Release);
+    }
+
+    pub(crate) fn next_auto_vacuum(&self) -> Option<AutoVacuumMode> {
+        match self.next_auto_vacuum.load(Ordering::Acquire) {
+            u8::MAX => None,
+            n => Some(AutoVacuumMode::from(n)),
+        }
     }
 
     pub fn set_foreign_keys_enabled(&self, enable: bool) {

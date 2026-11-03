@@ -1,0 +1,78 @@
+@database :temp:
+
+# Auto-vacuum databases keep pointer maps, move pages and shrink like SQLite.
+# PRAGMA incremental_vacuum returns one empty row per page, so it is covered
+# by the integration tests instead.
+
+test auto-vacuum-full-frees-on-commit {
+    PRAGMA auto_vacuum = FULL;
+    PRAGMA auto_vacuum;
+    CREATE TABLE t(x);
+    WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 60)
+    INSERT INTO t SELECT randomblob(1500) FROM n;
+    DELETE FROM t WHERE rowid % 2 = 0;
+    PRAGMA freelist_count;
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    0
+    ok
+}
+
+test auto-vacuum-drop-moves-last-root {
+    PRAGMA auto_vacuum = FULL;
+    CREATE TABLE t1(a);
+    CREATE INDEX i1 ON t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    INSERT INTO t3 VALUES (42);
+    DROP TABLE t1;
+    SELECT name, rootpage FROM sqlite_schema ORDER BY name;
+    SELECT c FROM t3;
+    PRAGMA integrity_check;
+}
+expect {
+    t2|3
+    t3|4
+    42
+    ok
+}
+
+test auto-vacuum-needs-vacuum-to-turn-on {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1);
+    PRAGMA auto_vacuum = FULL;
+    PRAGMA auto_vacuum;
+    VACUUM;
+    PRAGMA auto_vacuum;
+    SELECT x FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    0
+    1
+    1
+    ok
+}
+
+test auto-vacuum-full-to-incremental {
+    PRAGMA auto_vacuum = FULL;
+    CREATE TABLE t(x);
+    PRAGMA auto_vacuum = INCREMENTAL;
+    PRAGMA auto_vacuum;
+    PRAGMA auto_vacuum = NONE;
+    PRAGMA auto_vacuum;
+}
+expect {
+    2
+    2
+}
+
+test auto-vacuum-unknown-mode-means-none {
+    PRAGMA auto_vacuum = bogus;
+    PRAGMA auto_vacuum;
+}
+expect {
+    0
+}

@@ -598,7 +598,22 @@ fn update_pragma(
                         b"none" => Some(AutoVacuumMode::None),
                         b"full" => Some(AutoVacuumMode::Full),
                         b"incremental" => Some(AutoVacuumMode::Incremental),
-                        _ => Some(AutoVacuumMode::None),
+                        // getAutoVacuum: anything else goes through sqlite3Atoi.
+                        _ => {
+                            let digits = name.trim_ascii_start();
+                            let digits = digits.strip_prefix(b"+").unwrap_or(digits);
+                            let n = digits
+                                .iter()
+                                .take_while(|b| b.is_ascii_digit())
+                                .fold(0u64, |n, b| {
+                                    n.saturating_mul(10).saturating_add(u64::from(b - b'0'))
+                                });
+                            match n {
+                                1 => Some(AutoVacuumMode::Full),
+                                2 => Some(AutoVacuumMode::Incremental),
+                                _ => Some(AutoVacuumMode::None),
+                            }
+                        }
                     })
                 }
                 _ => match parse_signed_number(&value) {
@@ -609,32 +624,24 @@ fn update_pragma(
                 },
             };
 
-            // Auto-vacuum is off unless the experimental flag turns it on, so
-            // asking for NONE only restates the state the database is already
-            // in. Requiring the flag to switch the feature off would make every
-            // `PRAGMA auto_vacuum=NONE` in portable SQL fail for no reason.
-            if requested_mode != Some(AutoVacuumMode::None) && !connection.db.opts.enable_autovacuum
-            {
-                return Err(LimboError::InvalidArgument(
-                    "Autovacuum is not enabled. Use --experimental-autovacuum flag to enable it."
-                        .to_string(),
-                ));
-            }
-
-            let pager = connection.get_pager_from_database_index(&database_id)?;
-
-            // Like SQLite, the auto-vacuum mode is fixed once page 1 exists,
-            // so the pragma is silently ignored after that.
-            if pager.db_initialized() {
-                return Ok(TransactionMode::None);
-            }
-
             let Some(auto_vacuum_mode) = requested_mode else {
                 return Err(LimboError::InvalidArgument(
                     "invalid auto vacuum mode".to_string(),
                 ));
             };
-            pager.persist_auto_vacuum_mode(auto_vacuum_mode)?;
+            // VACUUM switches to the requested mode (db->nextAutovac).
+            connection.set_next_auto_vacuum(Some(auto_vacuum_mode));
+
+            let pager = connection.get_pager_from_database_index(&database_id)?;
+            // Like SQLite, a database that has no page 1 yet takes the mode when it is
+            // created. Afterwards only FULL and INCREMENTAL can be swapped (below); a
+            // switch to or from NONE needs VACUUM and is silently ignored.
+            if !pager.db_initialized() {
+                pager.persist_auto_vacuum_mode(auto_vacuum_mode)?;
+            }
+            if auto_vacuum_mode == AutoVacuumMode::None {
+                return Ok(TransactionMode::None);
+            }
             let largest_root_page_number_reg = program.alloc_register();
             program.emit_insn(Insn::ReadCookie {
                 db: database_id,
@@ -661,7 +668,7 @@ fn update_pragma(
                 value: i32::from(u8::from(auto_vacuum_mode)) - 1,
                 p5: 0,
             });
-            Ok(TransactionMode::None)
+            Ok(TransactionMode::Write)
         }
         PragmaName::IntegrityCheck => unreachable!("integrity_check cannot be set"),
         PragmaName::QuickCheck => unreachable!("quick_check cannot be set"),
@@ -691,6 +698,16 @@ fn update_pragma(
         PragmaName::TableList => unreachable!("table_list cannot be set"),
         PragmaName::QueryOnly => query_pragma(
             PragmaName::QueryOnly,
+            resolver,
+            Some(value),
+            pager,
+            connection,
+            namespace,
+            schema_was_explicit,
+            program,
+        ),
+        PragmaName::IncrementalVacuum => query_pragma(
+            PragmaName::IncrementalVacuum,
             resolver,
             Some(value),
             pager,
@@ -1643,23 +1660,42 @@ fn query_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::AutoVacuum => {
-            let pager = connection.get_pager_from_database_index(&database_id)?;
-            let auto_vacuum_mode = pager.get_auto_vacuum_mode();
-            let auto_vacuum_mode_i64: i64 = match auto_vacuum_mode {
-                AutoVacuumMode::None => 0,
-                AutoVacuumMode::Full => 1,
-                AutoVacuumMode::Incremental => 2,
-            };
+            // 0 when the largest-root field is zero, else 1 + the incremental flag.
             let register = program.alloc_register();
-            program.emit_insn(Insn::Int64 {
-                _p1: 0,
-                out_reg: register,
-                _p3: 0,
-                value: auto_vacuum_mode_i64,
+            let incr_register = program.alloc_register();
+            program.emit_insn(Insn::ReadCookie {
+                db: database_id,
+                dest: register,
+                cookie: Cookie::LargestRootPageNumber,
             });
+            let done_label = program.allocate_label();
+            program.emit_insn(Insn::IfNot {
+                reg: register,
+                target_pc: done_label,
+                jump_if_null: true,
+            });
+            program.emit_insn(Insn::ReadCookie {
+                db: database_id,
+                dest: incr_register,
+                cookie: Cookie::IncrementalVacuum,
+            });
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: register,
+            });
+            program.emit_insn(Insn::IfNot {
+                reg: incr_register,
+                target_pc: done_label,
+                jump_if_null: true,
+            });
+            program.emit_insn(Insn::Integer {
+                value: 2,
+                dest: register,
+            });
+            program.preassign_label_to_next_insn(done_label);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
-            Ok(TransactionMode::None)
+            Ok(TransactionMode::Read)
         }
         PragmaName::IntegrityCheck => {
             let max_errors = parse_max_errors_from_value(&value);
@@ -1751,6 +1787,40 @@ fn query_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::VdbeTrace => Ok(TransactionMode::None),
+        PragmaName::IncrementalVacuum => {
+            // Like sqlite3GetInt32: anything but a positive 32-bit count means "all".
+            let limit = match value.as_ref().map(parse_signed_number) {
+                Some(Ok(Value::Numeric(Numeric::Integer(n)))) if n > 0 && n <= i32::MAX as i64 => {
+                    n as u32
+                }
+                _ => 0,
+            };
+            // SQLite returns one empty row per page it gives back.
+            program.emit_insn(Insn::IncrVacuum {
+                db: database_id,
+                limit,
+                dest: register,
+            });
+            let loop_label = program.allocate_label();
+            let row_label = program.allocate_label();
+            let end_label = program.allocate_label();
+            program.preassign_label_to_next_insn(loop_label);
+            program.emit_insn(Insn::IfPos {
+                reg: register,
+                target_pc: row_label,
+                decrement_by: 1,
+            });
+            program.emit_insn(Insn::Goto {
+                target_pc: end_label,
+            });
+            program.preassign_label_to_next_insn(row_label);
+            program.emit_result_row(register, 0);
+            program.emit_insn(Insn::Goto {
+                target_pc: loop_label,
+            });
+            program.preassign_label_to_next_insn(end_label);
+            Ok(TransactionMode::Write)
+        }
         PragmaName::FreelistCount => {
             program.emit_insn(Insn::ReadCookie {
                 db: database_id,

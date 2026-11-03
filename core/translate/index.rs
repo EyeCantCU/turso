@@ -1675,12 +1675,24 @@ pub fn translate_drop_index(
         });
     } else {
         // Destroy index btree
+        let moved_reg = program.alloc_register();
         program.emit_insn(Insn::Destroy {
             db: database_id,
             root: index.root_page,
-            former_root_reg: 0,
+            former_root_reg: moved_reg,
             is_temp: 0,
         });
+        let schema_table = resolver.with_schema(crate::MAIN_DB_ID, |s| {
+            s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
+                .expect("sqlite_schema exists")
+        });
+        super::schema::emit_root_page_moved(
+            program,
+            database_id,
+            &schema_table,
+            moved_reg,
+            index.root_page,
+        )?;
     }
 
     // Remove from the Schema any mention of the index

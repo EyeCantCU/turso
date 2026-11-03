@@ -72,6 +72,10 @@ const PENDING_BYTE: u32 = 0x40000000;
 #[cfg(feature = "autovacuum")]
 use ptrmap::*;
 
+#[cfg(feature = "autovacuum")]
+#[path = "autovacuum.rs"]
+pub(crate) mod autovacuum;
+
 #[derive(Debug, Clone)]
 pub struct HeaderRef(PageRef);
 
@@ -1294,6 +1298,15 @@ enum CheckpointPhase {
         /// pages directly from WALto DB file, so cached page 1 of the checkpointer connection may have stale database_size)
         page1_invalidated: bool,
     },
+    /// Auto-vacuum: like SQLite's walCheckpoint, cut the database file down to
+    /// the database size once every frame is backfilled (any checkpoint mode).
+    #[cfg(feature = "autovacuum")]
+    ShrinkDbFile {
+        sync_mode: crate::SyncMode,
+        clear_page_cache: bool,
+        page1_invalidated: bool,
+        sent: bool,
+    },
     /// Sync the database file after checkpoint (if sync_mode != Off and we backfilled any frames from the WAL).
     SyncDbFile { clear_page_cache: bool },
     /// Read the synced database header before installing the durable backfill proof.
@@ -1442,14 +1455,6 @@ enum HeaderRefState {
         page: PageRef,
         completion: Option<Completion>,
     },
-}
-
-#[cfg(feature = "autovacuum")]
-#[derive(Debug, Clone, Copy)]
-enum BtreeCreateVacuumFullState {
-    Start,
-    AllocatePage { root_page_num: u32 },
-    PtrMapPut { allocated_page_id: u32 },
 }
 
 #[derive(Debug, Clone)]
@@ -1667,6 +1672,8 @@ pub struct Pager {
     header_ref_state: RwLock<HeaderRefState>,
     #[cfg(feature = "autovacuum")]
     vacuum_state: RwLock<VacuumState>,
+    #[cfg(feature = "autovacuum")]
+    av_state: RwLock<autovacuum::AvState>,
     pub(crate) io_ctx: RwLock<IOContext>,
     /// encryption is an opt-in feature. we will enable it only if the flag is passed
     enable_encryption: AtomicBool,
@@ -1802,7 +1809,6 @@ pub struct VacuumState {
     ptrmap_get_state: PtrMapGetState,
     /// State machine for [Pager::ptrmap_put]
     ptrmap_put_state: PtrMapPutState,
-    btree_create_vacuum_full_state: BtreeCreateVacuumFullState,
 }
 
 #[derive(Debug, Clone)]
@@ -1845,8 +1851,15 @@ enum AllocatePage1State {
 #[derive(Debug, Clone)]
 enum FreePageState {
     Start,
-    AddToTrunk { page: Arc<Page> },
-    NewTrunk { page: Arc<Page> },
+    AddToTrunk {
+        page: Arc<Page>,
+    },
+    NewTrunk {
+        page: Arc<Page>,
+    },
+    /// Page is on the freelist; its ptrmap entry is still to be written.
+    #[cfg(feature = "autovacuum")]
+    Ptrmap,
 }
 
 /// State machine for async cache spilling.
@@ -1976,8 +1989,9 @@ impl Pager {
             vacuum_state: RwLock::new(VacuumState {
                 ptrmap_get_state: PtrMapGetState::Start,
                 ptrmap_put_state: PtrMapPutState::Start,
-                btree_create_vacuum_full_state: BtreeCreateVacuumFullState::Start,
             }),
+            #[cfg(feature = "autovacuum")]
+            av_state: RwLock::new(autovacuum::AvState::default()),
             io_ctx: RwLock::new(IOContext::default()),
             enable_encryption: AtomicBool::new(false),
             ephemeral: AtomicBool::new(false),
@@ -2218,6 +2232,25 @@ impl Pager {
     ///
     /// A buffer of length page_size + 4 bytes is allocated and the page id
     /// is written to the beginning of the buffer. The rest of the buffer is filled with the page contents.
+    /// subjRequiresPage: some savepoint saw `page_id` exist and has no
+    /// journal record for it yet. The records written since savepoint i are
+    /// tracked by the bitmaps of savepoints i.. (released ones are merged into
+    /// their parent). Database sizes only shrink under auto-vacuum, so outer
+    /// savepoints can need a page the newest one never saw.
+    fn savepoints_require_page(savepoints: &[Savepoint], page_id: u32) -> bool {
+        let mut covered = false;
+        for savepoint in savepoints.iter().rev() {
+            covered = covered || savepoint.has_dirty_page(page_id);
+            if covered {
+                return false;
+            }
+            if page_id <= savepoint.db_size.load(Ordering::Acquire) {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn subjournal_page_if_required(&self, page: &Page) -> Result<()> {
         if self.subjournal.read().is_none() {
             return Ok(());
@@ -2232,10 +2265,7 @@ impl Pager {
             // truncating back to the original db_size. This matches SQLite's subjRequiresPage()
             // which checks: p->nOrig >= pgno.
             let page_id_u32 = page.get().id() as u32;
-            if page_id_u32 > cur_savepoint.db_size.load(Ordering::Acquire) {
-                return Ok(());
-            }
-            if cur_savepoint.has_dirty_page(page_id_u32) {
+            if !Self::savepoints_require_page(&savepoints, page_id_u32) {
                 return Ok(());
             }
             cur_savepoint.write_offset.load(Ordering::SeqCst)
@@ -2333,6 +2363,8 @@ impl Pager {
         let savepoint = savepoints.pop().expect("savepoint must exist");
         if let Some(parent) = savepoints.last() {
             parent.set_write_offset(savepoint.write_offset());
+            // See release_named_savepoint: the records now belong to the parent.
+            *parent.page_bitmap.write() |= &*savepoint.page_bitmap.read();
         } else {
             let subjournal = self.subjournal.read();
             let Some(subjournal) = subjournal.as_ref() else {
@@ -2401,6 +2433,16 @@ impl Pager {
             .last()
             .map(|savepoint| savepoint.write_offset())
             .unwrap_or(0);
+
+        // The released savepoints' journal records now belong to the parent:
+        // each holds the page as it was when the parent was opened, unless the
+        // parent already journaled that page itself.
+        if target_idx > 0 {
+            let mut bitmap = savepoints[target_idx - 1].page_bitmap.write();
+            for savepoint in &savepoints[target_idx..] {
+                *bitmap |= &*savepoint.page_bitmap.read();
+            }
+        }
 
         savepoints.truncate(target_idx);
 
@@ -2739,8 +2781,9 @@ impl Pager {
             match ptrmap_get_state {
                 PtrMapGetState::Start => {
                     tracing::trace!("ptrmap_get(page_idx = {})", target_page_num);
+                    // Pointer-map geometry follows the usable size, not the page size.
                     let configured_page_size =
-                        return_if_io!(self.with_header(|header| header.page_size)).get() as usize;
+                        return_if_io!(self.with_header(|header| header.usable_space()));
 
                     if target_page_num < FIRST_PTRMAP_PAGE_NO
                         || is_ptrmap_page(target_page_num, configured_page_size)
@@ -2839,8 +2882,7 @@ impl Pager {
             };
             match ptrmap_put_state {
                 PtrMapPutState::Start => {
-                    let page_size =
-                        return_if_io!(self.with_header(|header| header.page_size)).get() as usize;
+                    let page_size = return_if_io!(self.with_header(|header| header.usable_space()));
 
                     if db_page_no_to_update < FIRST_PTRMAP_PAGE_NO
                         || is_ptrmap_page(db_page_no_to_update, page_size)
@@ -2931,104 +2973,16 @@ impl Pager {
             Ok(IOResult::Done(page.get().id() as u32))
         }
 
-        //  If autovacuum is enabled, we need to allocate a new page number that is greater than the largest root page number
+        // Auto-vacuum keeps every root page below the first non-root page.
         #[cfg(feature = "autovacuum")]
         {
-            let auto_vacuum_mode =
-                AutoVacuumMode::from(self.auto_vacuum_mode.load(Ordering::SeqCst));
-            match auto_vacuum_mode {
-                AutoVacuumMode::None => {
-                    let page =
-                        return_if_io!(self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any));
-                    Ok(IOResult::Done(page.get().id() as u32))
-                }
-                AutoVacuumMode::Full => {
-                    loop {
-                        let btree_create_vacuum_full_state = {
-                            let vacuum_state = self.vacuum_state.read();
-                            vacuum_state.btree_create_vacuum_full_state
-                        };
-                        match btree_create_vacuum_full_state {
-                            BtreeCreateVacuumFullState::Start => {
-                                let (mut root_page_num, page_size) = return_if_io!(self
-                                    .with_header(|header| {
-                                        (
-                                            header.vacuum_mode_largest_root_page.get(),
-                                            header.page_size.get(),
-                                        )
-                                    }));
-
-                                turso_assert_greater_than!(root_page_num, 0, "Largest root page number cannot be 0 because that is set to 1 when creating the database with autovacuum enabled");
-                                root_page_num += 1;
-                                turso_assert_greater_than_or_equal!(
-                                    root_page_num,
-                                    FIRST_PTRMAP_PAGE_NO,
-                                    "can never be less than 2 because we have already incremented"
-                                );
-
-                                while is_ptrmap_page(root_page_num, page_size as usize) {
-                                    root_page_num += 1;
-                                }
-                                turso_assert_greater_than_or_equal!(
-                                    root_page_num,
-                                    3,
-                                    "root page must be >= 3 (number of the first root page)"
-                                );
-                                self.vacuum_state.write().btree_create_vacuum_full_state =
-                                    BtreeCreateVacuumFullState::AllocatePage { root_page_num };
-                            }
-                            BtreeCreateVacuumFullState::AllocatePage { root_page_num } => {
-                                //  root_page_num here is the desired root page
-                                let page = return_if_io!(self.do_allocate_page(
-                                    page_type,
-                                    0,
-                                    BtreePageAllocMode::Exact(root_page_num),
-                                ));
-                                let allocated_page_id = page.get().id() as u32;
-
-                                return_if_io!(self.with_header_mut(|header| {
-                                    if allocated_page_id
-                                        > header.vacuum_mode_largest_root_page.get()
-                                    {
-                                        tracing::debug!(
-                                            "Updating largest root page in header from {} to {}",
-                                            header.vacuum_mode_largest_root_page.get(),
-                                            allocated_page_id
-                                        );
-                                        header.vacuum_mode_largest_root_page =
-                                            allocated_page_id.into();
-                                    }
-                                }));
-
-                                if allocated_page_id != root_page_num {
-                                    //  TODO(Zaid): Handle swapping the allocated page with the desired root page
-                                }
-
-                                //  TODO(Zaid): Update the header metadata to reflect the new root page number
-                                self.vacuum_state.write().btree_create_vacuum_full_state =
-                                    BtreeCreateVacuumFullState::PtrMapPut { allocated_page_id };
-                            }
-                            BtreeCreateVacuumFullState::PtrMapPut { allocated_page_id } => {
-                                //  For now map allocated_page_id since we are not swapping it with root_page_num
-                                return_if_io!(self.ptrmap_put(
-                                    allocated_page_id,
-                                    PtrmapType::RootPage,
-                                    0,
-                                ));
-                                self.vacuum_state.write().btree_create_vacuum_full_state =
-                                    BtreeCreateVacuumFullState::Start;
-                                return Ok(IOResult::Done(allocated_page_id));
-                            }
-                        }
-                    }
-                }
-                AutoVacuumMode::Incremental => {
-                    return Err(LimboError::InternalError(
-                        "Incremental auto-vacuum is not supported".to_string(),
-                    )
-                    .into());
-                }
+            let mode = return_if_io!(self.with_header(autovacuum::mode_from_header));
+            if mode == AutoVacuumMode::None {
+                let page =
+                    return_if_io!(self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any));
+                return Ok(IOResult::Done(page.get().id() as u32));
             }
+            self.av_btree_create(page_type)
         }
     }
 
@@ -3418,8 +3372,16 @@ impl Pager {
             // Parent statement will handle the transaction commit.
             return Ok(IOResult::Done(()));
         }
+        #[cfg(feature = "autovacuum")]
+        if self.commit_info.read().state == CommitState::PrepareWal
+            && matches!(connection.get_tx_state(), TransactionState::Write { .. })
+        {
+            return_if_io!(self.av_commit());
+        }
         let Some(wal) = self.wal.as_ref() else {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
+            #[cfg(feature = "autovacuum")]
+            self.av_commit_end();
             self.clear_savepoints()?;
             return Ok(IOResult::Done(()));
         };
@@ -3465,6 +3427,8 @@ impl Pager {
                         sync_mode,
                         connection.get_data_sync_retry(),
                     ));
+                    #[cfg(feature = "autovacuum")]
+                    self.av_commit_end();
 
                     let schema_did_change = match connection.get_tx_state() {
                         TransactionState::Write { schema_did_change } => schema_did_change,
@@ -5123,6 +5087,19 @@ impl Pager {
                             clear_page_cache,
                             page1_invalidated: false,
                         };
+                    } else if cfg!(feature = "autovacuum")
+                        && res.everything_backfilled()
+                        && res.wal_checkpoint_backfilled > 0
+                    {
+                        #[cfg(feature = "autovacuum")]
+                        {
+                            state.phase = CheckpointPhase::ShrinkDbFile {
+                                sync_mode,
+                                clear_page_cache,
+                                page1_invalidated: false,
+                                sent: false,
+                            };
+                        }
                     } else if res.wal_checkpoint_backfilled == 0
                         || sync_mode == crate::SyncMode::Off
                     {
@@ -5131,6 +5108,60 @@ impl Pager {
                         state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
                     }
                     state.result = Some(res);
+                }
+                #[cfg(feature = "autovacuum")]
+                CheckpointPhase::ShrinkDbFile {
+                    sync_mode,
+                    clear_page_cache,
+                    page1_invalidated,
+                    sent,
+                } => {
+                    let next = if sync_mode == crate::SyncMode::Off {
+                        CheckpointPhase::Finalize { clear_page_cache }
+                    } else {
+                        CheckpointPhase::SyncDbFile { clear_page_cache }
+                    };
+                    if sent {
+                        self.checkpoint_state.write().phase = next;
+                        continue;
+                    }
+                    // The backfill wrote page 1 straight to the file; drop the cached copy.
+                    if !page1_invalidated {
+                        let page1_key = PageCacheKey::new(DatabaseHeader::PAGE_ID);
+                        self.page_cache.write().delete(page1_key)?;
+                        self.checkpoint_state.write().phase = CheckpointPhase::ShrinkDbFile {
+                            sync_mode,
+                            clear_page_cache,
+                            page1_invalidated: true,
+                            sent: false,
+                        };
+                    }
+                    let (db_size, auto_vacuum) = return_if_io!(self.with_header(|h| (
+                        h.database_size.get(),
+                        h.vacuum_mode_largest_root_page.get() > 0
+                    )));
+                    let page_size = self.get_page_size().unwrap_or_default();
+                    let expected = db_size as u64 * page_size.get() as u64;
+                    let shrink = auto_vacuum
+                        && db_size > 0
+                        && self.db_file.size().is_ok_and(|size| size > expected);
+                    if !shrink {
+                        self.checkpoint_state.write().phase = next;
+                        continue;
+                    }
+                    let c = self.db_file.truncate(
+                        expected as usize,
+                        Completion::new_trunc(move |_| {
+                            tracing::trace!("autovacuum: database file cut to {expected} bytes");
+                        }),
+                    )?;
+                    self.checkpoint_state.write().phase = CheckpointPhase::ShrinkDbFile {
+                        sync_mode,
+                        clear_page_cache,
+                        page1_invalidated: true,
+                        sent: true,
+                    };
+                    io_yield_one!(c);
                 }
                 CheckpointPhase::TruncateDbFile {
                     sync_mode,
@@ -5708,7 +5739,14 @@ impl Pager {
                     page.unpin();
                     break;
                 }
+                #[cfg(feature = "autovacuum")]
+                FreePageState::Ptrmap => break,
             }
+        }
+        #[cfg(feature = "autovacuum")]
+        if header.vacuum_mode_largest_root_page.get() > 0 {
+            *state = FreePageState::Ptrmap;
+            return_if_io!(self.av_mark_free(page_id as u32));
         }
         *state = FreePageState::Start;
         Ok(IOResult::Done(()))
@@ -5857,7 +5895,11 @@ impl Pager {
                     tracing::debug!("allocate_page(database_size={})", current_db_size);
 
                     let first_freelist_trunk_page_id = header.freelist_trunk_page.get();
-                    if first_freelist_trunk_page_id == 0 {
+                    #[cfg(feature = "autovacuum")]
+                    let force_grow = self.av_force_grow();
+                    #[cfg(not(feature = "autovacuum"))]
+                    let force_grow = false;
+                    if first_freelist_trunk_page_id == 0 || force_grow {
                         *state = AllocatePageState::AllocateNewPage { current_db_size };
                         continue;
                     }
@@ -6011,26 +6053,32 @@ impl Pager {
                 AllocatePageState::AllocateNewPage { current_db_size } => {
                     let mut new_db_size = *current_db_size + 1;
 
+                    // if new_db_size reaches the pending page, we need to allocate a new one
+                    let pending_byte_page_id = self.pending_byte_page_id();
+                    #[cfg_attr(not(feature = "autovacuum"), allow(unused_mut))]
+                    let mut skips_pending_byte_page = Some(new_db_size) == pending_byte_page_id;
+                    if skips_pending_byte_page {
+                        new_db_size += 1;
+                    }
+
                     // As in SQLite's allocateBtreePage, a pointer map page is only created
                     // when the file grows: if the next page is a pointer map page, it is
                     // allocated too and the page after it is returned.
                     #[cfg(feature = "autovacuum")]
+                    let av_geom = (header.vacuum_mode_largest_root_page.get() > 0)
+                        .then(|| self.av_geom(header));
+                    #[cfg(feature = "autovacuum")]
                     let mut ptrmap_page_id = None;
                     #[cfg(feature = "autovacuum")]
-                    if matches!(
-                        AutoVacuumMode::from(self.auto_vacuum_mode.load(Ordering::SeqCst)),
-                        AutoVacuumMode::Full
-                    ) && is_ptrmap_page(new_db_size, header.page_size.get() as usize)
-                    {
-                        ptrmap_page_id = Some(new_db_size);
-                        new_db_size += 1;
-                    }
-
-                    // if new_db_size reaches the pending page, we need to allocate a new one
-                    let pending_byte_page_id = self.pending_byte_page_id();
-                    let skips_pending_byte_page = Some(new_db_size) == pending_byte_page_id;
-                    if skips_pending_byte_page {
-                        new_db_size += 1;
+                    if let Some(geom) = av_geom {
+                        if geom.is_ptrmap(new_db_size) {
+                            ptrmap_page_id = Some(new_db_size);
+                            new_db_size += 1;
+                            if Some(new_db_size) == pending_byte_page_id {
+                                skips_pending_byte_page = true;
+                                new_db_size += 1;
+                            }
+                        }
                     }
 
                     // Check if allocating a new page would exceed the maximum page count
@@ -6039,35 +6087,69 @@ impl Pager {
                         return Err(LimboError::DatabaseFull.into());
                     }
 
+                    // The new page's ptrmap slot may hold a stale entry from before a
+                    // truncation; clear it so only its new parent claims the page.
+                    #[cfg(feature = "autovacuum")]
+                    let stale_ptrmap_slot = match av_geom {
+                        Some(geom) if Some(geom.ptrmap_pageno(new_db_size)) != ptrmap_page_id => {
+                            let (map, c) = return_if_io!(
+                                self.read_page(geom.ptrmap_pageno(new_db_size) as i64)
+                            );
+                            if !map.is_loaded() {
+                                io_yield_one!(c.unwrap_or_else(Completion::new_yield));
+                            }
+                            Some((map, geom.offset(new_db_size)))
+                        }
+                        _ => None,
+                    };
+                    // After an in-transaction truncation a "new" page may have existed when
+                    // the newest savepoint was opened; load it so its content is journaled.
+                    #[cfg(feature = "autovacuum")]
+                    let mut preimages = HashMap::new();
+                    #[cfg(feature = "autovacuum")]
+                    {
+                        let pending = skips_pending_byte_page
+                            .then_some(pending_byte_page_id)
+                            .flatten();
+                        for id in [ptrmap_page_id, pending, Some(new_db_size)]
+                            .into_iter()
+                            .flatten()
+                        {
+                            if self.av_needs_preimage(id) {
+                                let (page, c) = return_if_io!(self.read_page(id as i64));
+                                if !page.is_loaded() {
+                                    io_yield_one!(c.unwrap_or_else(Completion::new_yield));
+                                }
+                                preimages.insert(id, PinGuard::new(page));
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "autovacuum"))]
+                    let preimages: HashMap<u32, PinGuard> = HashMap::new();
+
+                    #[cfg(feature = "autovacuum")]
+                    if let Some((map, off)) = stale_ptrmap_slot {
+                        let slot = &mut map.get_contents().as_ptr()[off..off + PTRMAP_ENTRY_SIZE];
+                        if slot.iter().any(|b| *b != 0) {
+                            self.add_dirty(&map)?;
+                            map.get_contents().as_ptr()[off..off + PTRMAP_ENTRY_SIZE].fill(0);
+                        }
+                    }
+
                     #[cfg(feature = "autovacuum")]
                     if let Some(ptrmap_page_id) = ptrmap_page_id {
-                        let page = allocate_new_page(ptrmap_page_id as i64, &self.buffer_pool);
-                        self.add_dirty(&page)?;
-                        let page_key = PageCacheKey::new(ptrmap_page_id as usize);
-                        self.page_cache.write().force_insert_page(page_key, page)?;
+                        self.install_new_page(ptrmap_page_id, preimages.get(&ptrmap_page_id))?;
                     }
 
                     if skips_pending_byte_page {
                         // HIPP special page is assumed to zeroed and should never be read or written to by the BTREE
-                        let richard_hipp_special_page =
-                            allocate_new_page((new_db_size - 1) as i64, &self.buffer_pool);
-                        self.add_dirty(&richard_hipp_special_page)?;
-                        let page_key = PageCacheKey::new(richard_hipp_special_page.get().id());
-                        self.page_cache
-                            .write()
-                            .force_insert_page(page_key, richard_hipp_special_page)?;
+                        let pending_page = pending_byte_page_id.expect("pending byte page");
+                        self.install_new_page(pending_page, preimages.get(&pending_page))?;
                     }
 
                     // FIXME: should reserve page cache entry before modifying the database
-                    let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
+                    let page = self.install_new_page(new_db_size, preimages.get(&new_db_size))?;
                     {
-                        // setup page and add to cache
-                        self.add_dirty(&page)?;
-
-                        let page_key = PageCacheKey::new(page.get().id() as usize);
-                        self.page_cache
-                            .write()
-                            .force_insert_page(page_key, page.clone())?;
                         header.database_size = new_db_size.into();
                         *state = AllocatePageState::Start;
                         return Ok(IOResult::Done(page));
@@ -6075,6 +6157,25 @@ impl Pager {
                 }
             }
         }
+    }
+
+    /// Creates page `id` at the end of the file, dirty and zeroed. `existing` is
+    /// the loaded old copy of the page, when its content must be journaled.
+    fn install_new_page(&self, id: u32, existing: Option<&PinGuard>) -> Result<PageRef> {
+        if let Some(existing) = existing {
+            let page = existing.to_page();
+            self.add_dirty(&page)?;
+            page.get().overflow_cells.clear();
+            page.get_contents().as_ptr().fill(0);
+            return Ok(page);
+        }
+        let page = allocate_new_page(id as i64, &self.buffer_pool);
+        self.add_dirty(&page)?;
+        let page_key = PageCacheKey::new(id as usize);
+        self.page_cache
+            .write()
+            .force_insert_page(page_key, page.clone())?;
+        Ok(page)
     }
 
     pub fn upsert_page_in_cache(
@@ -6189,7 +6290,8 @@ impl Pager {
             let mut vacuum_state = self.vacuum_state.write();
             vacuum_state.ptrmap_get_state = PtrMapGetState::Start;
             vacuum_state.ptrmap_put_state = PtrMapPutState::Start;
-            vacuum_state.btree_create_vacuum_full_state = BtreeCreateVacuumFullState::Start;
+            drop(vacuum_state);
+            self.av_reset();
         }
 
         *self.header_ref_state.write() = HeaderRefState::Start;
@@ -6502,14 +6604,14 @@ pub(crate) mod ptrmap {
     /// Calculates how many database pages are mapped by a single pointer map page.
     /// This is based on the total page size, as ptrmap pages are filled with entries.
     pub fn entries_per_ptrmap_page(page_size: usize) -> usize {
-        turso_assert_greater_than_or_equal!(page_size, PageSize::MIN as usize);
+        turso_assert_greater_than_or_equal!(page_size, 480);
         page_size / PTRMAP_ENTRY_SIZE
     }
 
     /// Calculates the cycle length of pointer map pages
     /// The cycle length is the number of database pages that are mapped by a single pointer map page.
     pub fn ptrmap_page_cycle_length(page_size: usize) -> usize {
-        turso_assert_greater_than_or_equal!(page_size, PageSize::MIN as usize);
+        turso_assert_greater_than_or_equal!(page_size, 480);
         (page_size / PTRMAP_ENTRY_SIZE) + 1
     }
 
