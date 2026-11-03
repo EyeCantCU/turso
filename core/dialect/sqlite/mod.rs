@@ -175,6 +175,8 @@ pub fn register_builtin_catalog(
     {
         schema.register_internal_vtab(crate::json::vtab::JsonVirtualTable::json_each())?;
         schema.register_internal_vtab(crate::json::vtab::JsonVirtualTable::json_tree())?;
+        schema.register_internal_vtab(crate::json::vtab::JsonVirtualTable::jsonb_each())?;
+        schema.register_internal_vtab(crate::json::vtab::JsonVirtualTable::jsonb_tree())?;
     }
     #[cfg(feature = "cli_only")]
     {
@@ -471,6 +473,8 @@ pub(crate) fn resolve_builtin_function_name(
         "json_insert" => Ok(Some(Func::Json(JsonFunc::JsonInsert))),
         #[cfg(feature = "json")]
         "jsonb_insert" => Ok(Some(Func::Json(JsonFunc::JsonbInsert))),
+        "json_array_insert" => Ok(Some(Func::Json(JsonFunc::JsonArrayInsert))),
+        "jsonb_array_insert" => Ok(Some(Func::Json(JsonFunc::JsonbArrayInsert))),
         #[cfg(feature = "json")]
         "jsonb_replace" => Ok(Some(Func::Json(JsonFunc::JsonbReplace))),
         #[cfg(feature = "json")]

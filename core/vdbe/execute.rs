@@ -179,13 +179,14 @@ use crate::vdbe::vacuum::{
 #[cfg(feature = "json")]
 use crate::{
     function::JsonFunc, json, json::convert_dbtype_to_raw_jsonb, json::ensure_blob_arg_is_jsonb,
-    json::get_json, json::is_json_valid, json::json_array, json::json_array_length,
-    json::json_arrow_extract, json::json_arrow_shift_extract, json::json_error_position,
-    json::json_extract, json::json_from_raw_bytes_agg, json::json_insert, json::json_object,
-    json::json_patch, json::json_quote, json::json_remove, json::json_replace, json::json_set,
-    json::json_type, json::jsonb, json::jsonb_array, json::jsonb_extract, json::jsonb_insert,
-    json::jsonb_object, json::jsonb_patch, json::jsonb_remove, json::jsonb_replace,
-    json::jsonb_set, json::raw_jsonb_element_len, json::Conv,
+    json::get_json, json::is_json_valid, json::json_array, json::json_array_insert,
+    json::json_array_length, json::json_arrow_extract, json::json_arrow_shift_extract,
+    json::json_error_position, json::json_extract, json::json_from_raw_bytes_agg,
+    json::json_insert, json::json_object, json::json_patch, json::json_quote, json::json_remove,
+    json::json_replace, json::json_set, json::json_type, json::jsonb, json::jsonb_array,
+    json::jsonb_extract, json::jsonb_insert, json::jsonb_object, json::jsonb_patch,
+    json::jsonb_remove, json::jsonb_replace, json::jsonb_set, json::raw_jsonb_element_len,
+    json::Conv,
 };
 
 use super::{Program, ProgramState, Register};
@@ -10214,6 +10215,17 @@ pub fn op_function(
                 let json = jsonb_insert(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
+                )?;
+                state.registers[*dest].set_value(json);
+            }
+            JsonFunc::JsonArrayInsert | JsonFunc::JsonbArrayInsert => {
+                if arg_count % 2 == 0 {
+                    bail_constraint_error!("json_array_insert() needs an odd number of arguments")
+                }
+                let json = json_array_insert(
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
+                    &state.json_cache,
+                    matches!(json_func, JsonFunc::JsonbArrayInsert),
                 )?;
                 state.registers[*dest].set_value(json);
             }

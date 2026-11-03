@@ -39,18 +39,36 @@ impl JsonTraversalMode {
 
 pub struct JsonVirtualTable {
     traversal_mode: JsonTraversalMode,
+    /// jsonb_each/jsonb_tree: "value" is JSONB for arrays and objects.
+    binary: bool,
 }
 
 impl JsonVirtualTable {
     pub fn json_each() -> Self {
         Self {
             traversal_mode: JsonTraversalMode::Each,
+            binary: false,
         }
     }
 
     pub fn json_tree() -> Self {
         Self {
             traversal_mode: JsonTraversalMode::Tree,
+            binary: false,
+        }
+    }
+
+    pub fn jsonb_each() -> Self {
+        Self {
+            traversal_mode: JsonTraversalMode::Each,
+            binary: true,
+        }
+    }
+
+    pub fn jsonb_tree() -> Self {
+        Self {
+            traversal_mode: JsonTraversalMode::Tree,
+            binary: true,
         }
     }
 }
@@ -68,7 +86,12 @@ const COL_ROOT: usize = 9;
 
 impl InternalVirtualTable for JsonVirtualTable {
     fn name(&self) -> String {
-        self.traversal_mode.function_name().to_owned()
+        let name = self.traversal_mode.function_name();
+        if self.binary {
+            name.replacen("json", "jsonb", 1)
+        } else {
+            name.to_owned()
+        }
     }
 
     fn open(
@@ -77,6 +100,7 @@ impl InternalVirtualTable for JsonVirtualTable {
     ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor + 'static>>> {
         Ok(Arc::new(RwLock::new(JsonEachCursor::empty(
             self.traversal_mode.clone(),
+            self.binary,
         ))))
     }
 
@@ -197,6 +221,7 @@ pub struct JsonEachCursor {
     traversal_states: Vec<TraversalState>,
     columns: Columns,
     traversal_mode: JsonTraversalMode,
+    binary: bool,
 }
 
 struct TraversalState {
@@ -206,7 +231,7 @@ struct TraversalState {
 }
 
 impl JsonEachCursor {
-    fn empty(traversal_mode: JsonTraversalMode) -> Self {
+    fn empty(traversal_mode: JsonTraversalMode, binary: bool) -> Self {
         Self {
             rowid: 0,
             id: 0,
@@ -216,6 +241,7 @@ impl JsonEachCursor {
             path_to_current_value: InPlaceJsonPath::new_root(),
             columns: Columns::default(),
             traversal_mode,
+            binary,
         }
     }
 
@@ -331,7 +357,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
     fn column(&self, idx: usize) -> Result<Value, LimboError> {
         Ok(match idx {
             COL_KEY => self.columns.key(),
-            COL_VALUE => self.columns.value()?,
+            COL_VALUE => self.columns.value(self.binary)?,
             COL_TYPE => self.columns.ttype(),
             COL_ATOM => self.columns.atom()?,
             COL_ID => Value::from_i64(self.id),
@@ -577,11 +603,16 @@ mod columns {
             Self::atom_from_value(&self.value)
         }
 
-        pub(super) fn value(&self) -> Result<Value, LimboError> {
+        pub(super) fn value(&self, binary: bool) -> Result<Value, LimboError> {
             let element_type = self.value.element_type()?;
+            let output = if binary {
+                OutputVariant::Binary
+            } else {
+                OutputVariant::String
+            };
             Ok(match element_type {
                 ElementType::ARRAY | ElementType::OBJECT => {
-                    json_string_to_db_type(self.value.clone(), element_type, OutputVariant::String)?
+                    json_string_to_db_type(self.value.clone(), element_type, output)?
                 }
                 _ => Self::atom_from_value(&self.value)?,
             })

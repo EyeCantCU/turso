@@ -320,6 +320,8 @@ pub enum JsonFunc {
     JsonbReplace,
     JsonInsert,
     JsonbInsert,
+    JsonArrayInsert,
+    JsonbArrayInsert,
     JsonPretty,
     JsonSet,
     JsonbSet,
@@ -344,6 +346,7 @@ impl JsonFunc {
             | Self::JsonRemove
             | Self::JsonReplace
             | Self::JsonInsert
+            | Self::JsonArrayInsert
             | Self::JsonSet
             | Self::JsonPretty
             | Self::JsonQuote
@@ -355,6 +358,7 @@ impl JsonFunc {
             | Self::JsonbRemove
             | Self::JsonbReplace
             | Self::JsonbInsert
+            | Self::JsonbArrayInsert
             | Self::JsonbSet => Some(ReturnType::Blob),
             Self::JsonArrayLength | Self::JsonErrorPosition | Self::JsonValid => {
                 Some(ReturnType::Integer)
@@ -396,6 +400,8 @@ impl Display for JsonFunc {
                 Self::JsonbReplace => "jsonb_replace",
                 Self::JsonInsert => "json_insert",
                 Self::JsonbInsert => "jsonb_insert",
+                Self::JsonArrayInsert => "json_array_insert",
+                Self::JsonbArrayInsert => "jsonb_array_insert",
                 Self::JsonPretty => "json_pretty",
                 Self::JsonSet => "json_set",
                 Self::JsonbSet => "jsonb_set",
