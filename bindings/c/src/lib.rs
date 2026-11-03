@@ -13,11 +13,6 @@ use turso_ext::Value as ExtValue;
 use turso_macros::capi_guard;
 
 mod compat_stubs;
-mod udf;
-
-// Re-exported for the other bindings modules.
-pub use udf::{sqlite3_create_function_v2, sqlite3_create_window_function};
-
 /// Global flag: when set, all subsequently opened databases enable experimental features.
 static EXPERIMENTAL_ENABLED: AtomicBool = AtomicBool::new(false);
 static SQLITE_VERSION_C_STRING: OnceLock<CString> = OnceLock::new();
@@ -354,6 +349,11 @@ impl sqlite3_stmt {
 }
 
 // ===== Custom SQL function registration infrastructure =====
+
+mod udf;
+
+// Re-exported for the other bindings modules.
+pub use udf::{sqlite3_create_function_v2, sqlite3_create_window_function};
 
 /// Context passed to scalar function callbacks registered via sqlite3_create_function_v2.
 /// Exposed as an opaque `void*` to C callers.
