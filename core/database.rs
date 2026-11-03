@@ -2051,7 +2051,7 @@ impl Database {
                     let pager =
                         return_if_io!(self._init_nonblock(init, encryption_key, page_codec));
                     let log_exists =
-                        journal_mode::logical_log_exists(&crate::io::os_path::to_path(&self.path));
+                        journal_mode::logical_log_exists(crate::io::os_path::to_path(&self.path));
                     let is_readonly = self.open_flags.contains(OpenFlags::ReadOnly);
                     turso_assert!(pager.wal.is_none(), "Pager should have no WAL yet");
                     *st = HeaderValidationState::Validate {
@@ -2495,7 +2495,7 @@ impl Database {
             .write()
             .replace_after_external_restore(new_shared_wal.into_inner());
         if self.mvcc_enabled()
-            || journal_mode::logical_log_exists(&crate::io::os_path::to_path(&self.path))
+            || journal_mode::logical_log_exists(crate::io::os_path::to_path(&self.path))
         {
             let mv_store = journal_mode::open_mv_store(
                 self.io.clone(),

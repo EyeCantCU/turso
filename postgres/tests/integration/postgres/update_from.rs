@@ -47,7 +47,7 @@ fn query_text(conn: &PgConnection, sql: &str) -> Vec<String> {
             StepResult::Row => {
                 let row = rows.row().unwrap();
                 match row.get_value(0) {
-                    Value::Text(v) => result.push(v.value.to_string()),
+                    Value::Text(v) => result.push(v.as_str().to_string()),
                     Value::Null => result.push("NULL".to_string()),
                     other => panic!("expected text, got {other:?}"),
                 }

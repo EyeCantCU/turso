@@ -12,6 +12,8 @@ use turso_core::{CheckpointMode, ConnectOpts, DatabaseOpts, LimboError, Value};
 use turso_ext::ScalarFunction;
 use turso_ext::Value as ExtValue;
 
+mod textbytes;
+
 /// Global flag: when set, all subsequently opened databases enable experimental features.
 static EXPERIMENTAL_ENABLED: AtomicBool = AtomicBool::new(false);
 static SQLITE_VERSION_C_STRING: OnceLock<CString> = OnceLock::new();
@@ -1585,7 +1587,8 @@ pub unsafe extern "C" fn turso_printf_va(
     }
     // SAFETY: fmt checked non-null; caller guarantees a NUL-terminated string.
     let fmt_str = unsafe { CStr::from_ptr(fmt) };
-    let fmt_str = String::from_utf8_lossy(fmt_str.to_bytes()).into_owned();
+    // Strings are escaped so that bytes that are not UTF-8 come out unchanged.
+    let (fmt_str, mut escaped) = textbytes::escape(fmt_str.to_bytes());
 
     let mut args = Vec::new();
     for slot in turso_core::printf_c_arg_plan(&fmt_str) {
@@ -1605,8 +1608,9 @@ pub unsafe extern "C" fn turso_printf_va(
                     let value = if s.is_null() {
                         turso_core::Value::Null
                     } else {
-                        let text = String::from_utf8_lossy(CStr::from_ptr(s).to_bytes());
-                        turso_core::Value::build_text(text.into_owned())
+                        let (text, esc) = textbytes::escape(CStr::from_ptr(s).to_bytes());
+                        escaped |= esc;
+                        turso_core::Value::build_text(text)
                     };
                     if slot == PrintfCArg::OwnedText {
                         // %z: the caller yields the pointer.
@@ -1635,8 +1639,9 @@ pub unsafe extern "C" fn turso_printf_va(
     let rendered = match turso_core::exec_printf_values(&fmt_value, &arg_refs) {
         // The SQL function returns NULL for an empty format or an unknown
         // specifier before any output; the C API returns "" there.
-        Ok(turso_core::Value::Text(t)) => t.as_str().to_string(),
-        Ok(_) => String::new(),
+        Ok(turso_core::Value::Text(t)) if escaped => textbytes::unescape(t.as_str()),
+        Ok(turso_core::Value::Text(t)) => t.as_str().as_bytes().to_vec(),
+        Ok(_) => Vec::new(),
         Err(_) => return std::ptr::null_mut(),
     };
     let n = rendered.len();

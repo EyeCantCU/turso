@@ -770,7 +770,7 @@ pub extern "C" fn turso_statement_row_value_bytes_count(
 ) -> i64 {
     with_row_value!(statement, index, -1, |value_ref: turso_core::ValueRef| {
         match value_ref {
-            turso_core::ValueRef::Text(text) => text.len() as i64,
+            turso_core::ValueRef::Text(text) => text.as_bytes().len() as i64,
             turso_core::ValueRef::Blob(blob) => blob.len() as i64,
             _ => -1,
         }

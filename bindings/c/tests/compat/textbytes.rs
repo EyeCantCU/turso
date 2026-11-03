@@ -4,6 +4,7 @@ use super::*;
 use std::ffi::{CStr, CString};
 
 extern "C" {
+    fn sqlite3_mprintf(fmt: *const libc::c_char, ...) -> *mut libc::c_char;
     fn sqlite3_result_text(
         context: *mut libc::c_void,
         text: *const libc::c_char,
@@ -126,6 +127,25 @@ fn test_function_values_keep_invalid_utf8() {
         assert_eq!(sqlite3_column_int64(stmt, 1), 7);
         sqlite3_finalize(stmt);
         sqlite3_close(db);
+    }
+}
+
+#[test]
+fn test_mprintf_keeps_invalid_utf8() {
+    unsafe {
+        let arg = CString::new(&b"it's\xfa"[..]).unwrap();
+        let fmt = CString::new(&b"\xff%s|%q|%Q|%.2s"[..]).unwrap();
+        let out = sqlite3_mprintf(
+            fmt.as_ptr(),
+            arg.as_ptr(),
+            arg.as_ptr(),
+            arg.as_ptr(),
+            c"\xc3\xa9x".as_ptr(),
+        );
+        assert!(!out.is_null());
+        let got = CStr::from_ptr(out).to_bytes().to_vec();
+        sqlite3_free(out.cast());
+        assert_eq!(got, b"\xffit's\xfa|it''s\xfa|'it''s\xfa'|\xc3\xa9");
     }
 }
 
