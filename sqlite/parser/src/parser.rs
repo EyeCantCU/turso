@@ -4414,8 +4414,29 @@ impl<'a> Parser<'a> {
 
         match tok.token_type {
             TK_ADD => {
-                if self.peek_no_eof()?.token_type == TK_COLUMNKW {
-                    eat_assert!(self, TK_COLUMNKW);
+                match self.peek_no_eof()?.token_type {
+                    TK_COLUMNKW => {
+                        eat_assert!(self, TK_COLUMNKW);
+                    }
+                    TK_CONSTRAINT | TK_CHECK => {
+                        let name = if self.peek_no_eof()?.token_type == TK_CONSTRAINT {
+                            eat_assert!(self, TK_CONSTRAINT);
+                            Some(self.parse_nm()?)
+                        } else {
+                            None
+                        };
+                        peek_expect!(self, TK_CHECK);
+                        let constraint = self.parse_check_table_constraint()?;
+                        let conflict_clause = self.parse_on_conflict()?;
+                        return Ok(Stmt::AlterTable(AlterTable {
+                            name: tbl_name,
+                            body: AlterTableBody::AddCheck {
+                                constraint: NamedTableConstraint { name, constraint },
+                                conflict_clause,
+                            },
+                        }));
+                    }
+                    _ => {}
                 }
 
                 Ok(Stmt::AlterTable(AlterTable {
@@ -4424,8 +4445,18 @@ impl<'a> Parser<'a> {
                 }))
             }
             TK_DROP => {
-                if self.peek_no_eof()?.token_type == TK_COLUMNKW {
-                    eat_assert!(self, TK_COLUMNKW);
+                match self.peek_no_eof()?.token_type {
+                    TK_COLUMNKW => {
+                        eat_assert!(self, TK_COLUMNKW);
+                    }
+                    TK_CONSTRAINT => {
+                        eat_assert!(self, TK_CONSTRAINT);
+                        return Ok(Stmt::AlterTable(AlterTable {
+                            name: tbl_name,
+                            body: AlterTableBody::DropConstraint(self.parse_nm()?),
+                        }));
+                    }
+                    _ => {}
                 }
 
                 Ok(Stmt::AlterTable(AlterTable {
@@ -4464,10 +4495,34 @@ impl<'a> Parser<'a> {
                 }
             }
             TK_ALTER => {
-                eat_expect!(self, TK_COLUMNKW);
+                if self.peek_no_eof()?.token_type == TK_COLUMNKW {
+                    eat_assert!(self, TK_COLUMNKW);
+                }
                 let col_name = self.parse_nm()?;
 
-                eat_expect!(self, TK_TO);
+                match eat_expect!(self, TK_TO, TK_SET, TK_DROP).token_type {
+                    TK_SET => {
+                        eat_expect!(self, TK_NOT);
+                        eat_expect!(self, TK_NULL);
+                        let conflict_clause = self.parse_on_conflict()?;
+                        return Ok(Stmt::AlterTable(AlterTable {
+                            name: tbl_name,
+                            body: AlterTableBody::SetNotNull {
+                                column: col_name,
+                                conflict_clause,
+                            },
+                        }));
+                    }
+                    TK_DROP => {
+                        eat_expect!(self, TK_NOT);
+                        eat_expect!(self, TK_NULL);
+                        return Ok(Stmt::AlterTable(AlterTable {
+                            name: tbl_name,
+                            body: AlterTableBody::DropNotNull(col_name),
+                        }));
+                    }
+                    _ => {}
+                }
 
                 let new = self.parse_column_definition(true)?;
 
@@ -11031,6 +11086,46 @@ mod tests {
                     body: AlterTableBody::RenameColumn {
                         old: Name::exact("baz".to_owned()),
                         new: Name::exact("bar".to_owned())
+                    },
+                }))],
+            ),
+            (
+                b"ALTER TABLE foo ALTER baz SET NOT NULL ON CONFLICT IGNORE".as_slice(),
+                vec![Cmd::Stmt(Stmt::AlterTable(AlterTable {
+                    name: QualifiedName { namespace: None, name: Name::exact("foo".to_owned()), alias: None },
+                    body: AlterTableBody::SetNotNull {
+                        column: Name::exact("baz".to_owned()),
+                        conflict_clause: Some(ResolveType::Ignore),
+                    },
+                }))],
+            ),
+            (
+                b"ALTER TABLE foo ALTER COLUMN baz DROP NOT NULL".as_slice(),
+                vec![Cmd::Stmt(Stmt::AlterTable(AlterTable {
+                    name: QualifiedName { namespace: None, name: Name::exact("foo".to_owned()), alias: None },
+                    body: AlterTableBody::DropNotNull(Name::exact("baz".to_owned())),
+                }))],
+            ),
+            (
+                b"ALTER TABLE foo DROP CONSTRAINT ck".as_slice(),
+                vec![Cmd::Stmt(Stmt::AlterTable(AlterTable {
+                    name: QualifiedName { namespace: None, name: Name::exact("foo".to_owned()), alias: None },
+                    body: AlterTableBody::DropConstraint(Name::exact("ck".to_owned())),
+                }))],
+            ),
+            (
+                b"ALTER TABLE foo ADD CONSTRAINT ck CHECK (1)".as_slice(),
+                vec![Cmd::Stmt(Stmt::AlterTable(AlterTable {
+                    name: QualifiedName { namespace: None, name: Name::exact("foo".to_owned()), alias: None },
+                    body: AlterTableBody::AddCheck {
+                        constraint: NamedTableConstraint {
+                            name: Some(Name::exact("ck".to_owned())),
+                            constraint: TableConstraint::Check {
+                                expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
+                                source: Some("1".to_owned()),
+                            },
+                        },
+                        conflict_clause: None,
                     },
                 }))],
             ),

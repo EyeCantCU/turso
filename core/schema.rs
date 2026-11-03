@@ -5499,6 +5499,10 @@ impl BTreeTable {
             if column.notnull()
                 && (column.explicit_notnull() || !self.primary_key_implies_not_null(column))
             {
+                if let Some(name) = &column.notnull_constraint_name {
+                    sql.push_str(" CONSTRAINT ");
+                    sql.push_str(&quote_ident(name));
+                }
                 sql.push_str(" NOT NULL");
                 push_on_conflict_clause(&mut sql, column.notnull_conflict_clause);
             }
@@ -5746,7 +5750,7 @@ impl BTreeTable {
             .and_then(|column| column.collation)
     }
 
-    fn primary_key_implies_not_null(&self, column: &Column) -> bool {
+    pub(crate) fn primary_key_implies_not_null(&self, column: &Column) -> bool {
         column.primary_key()
             && (column.is_rowid_alias()
                 || self.is_strict
@@ -6772,6 +6776,7 @@ pub fn create_table(
                 let mut notnull = false;
                 let mut explicit_notnull = false;
                 let mut notnull_conflict_clause = None;
+                let mut notnull_constraint_name = None;
                 let mut order = SortOrder::Asc;
                 let mut unique = false;
                 let mut collation = None;
@@ -6836,6 +6841,8 @@ pub fn create_table(
                             notnull = !nullable;
                             explicit_notnull = !nullable;
                             notnull_conflict_clause = *conflict_clause;
+                            notnull_constraint_name =
+                                c_def.name.as_ref().map(|n| n.as_str().to_owned());
                         }
                         ast::ColumnConstraint::Default(ref expr) => {
                             default = Some(
@@ -7006,6 +7013,7 @@ pub fn create_table(
                     )
                 });
                 col.ty_params = ty_params;
+                col.notnull_constraint_name = notnull_constraint_name;
                 if let Some(t) = col_type.as_ref() {
                     col.apply_written_type(t);
                 }
@@ -7383,6 +7391,8 @@ pub struct Column {
     explicit_notnull: bool,
     /// ON CONFLICT clause for NOT NULL constraint on this column.
     pub notnull_conflict_clause: Option<ResolveType>,
+    /// Name of a `CONSTRAINT name NOT NULL` on this column.
+    pub notnull_constraint_name: Option<String>,
 }
 
 #[derive(Default)]
@@ -7539,6 +7549,7 @@ impl Column {
             type_ordering: None,
             explicit_notnull: coldef.flags.contains(ColDefFlags::ExplicitNotNull),
             notnull_conflict_clause: coldef.notnull_conflict_clause,
+            notnull_constraint_name: None,
         }
     }
 
@@ -7647,6 +7658,12 @@ impl Column {
                 }
             )
         });
+        col.notnull_constraint_name = value.constraints.iter().find_map(|c| match c.constraint {
+            ast::ColumnConstraint::NotNull {
+                nullable: false, ..
+            } => c.name.as_ref().map(|n| n.as_str().to_owned()),
+            _ => None,
+        });
         col.ty_params = ty_params;
         if let Some(t) = value.col_type.as_ref() {
             col.apply_written_type(t);
@@ -7679,6 +7696,11 @@ impl Column {
     #[inline]
     pub fn explicit_notnull(&self) -> bool {
         self.explicit_notnull
+    }
+
+    #[inline]
+    pub fn set_explicit_notnull(&mut self, v: bool) {
+        self.explicit_notnull = v;
     }
 
     /// Returns an error if this column is a generated column.

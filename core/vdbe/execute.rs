@@ -3702,6 +3702,8 @@ pub fn halt(
         // SqlError displays bare like sqlite3_errmsg and abort() doesn't apply
         // ON CONFLICT resolution to it.
         SQLITE_ERROR => Some(LimboError::SqlError(description.to_string())),
+        // Plain SQLITE_CONSTRAINT, e.g. an ALTER TABLE constraint edit failing on existing rows.
+        SQLITE_CONSTRAINT => Some(LimboError::Constraint(description.to_string())),
         _ => Some(LimboError::Constraint(format!(
             "undocumented halt error code {description}"
         ))),
@@ -18180,6 +18182,25 @@ pub fn op_add_column(
         Ok(())
     })??;
 
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_replace_table(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(ReplaceTable { data }, insn);
+    let conn = program.connection.clone();
+    let name = normalize_ident(data.table.name.as_str());
+    conn.with_database_schema_mut(data.db, |schema| {
+        let table_ref = schema
+            .table_mut(data.namespace, &name)
+            .expect("table being altered should be in schema");
+        *table_ref = Arc::new(crate::schema::Table::BTree(data.table.clone()));
+    })?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

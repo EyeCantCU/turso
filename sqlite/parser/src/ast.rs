@@ -1481,6 +1481,24 @@ pub enum AlterTableBody {
     },
     /// `DROP COLUMN`
     DropColumn(Name), // TODO distinction between DROP and DROP COLUMN
+    /// `ALTER [COLUMN] col SET NOT NULL [ON CONFLICT ...]` (SQLite 3.53)
+    SetNotNull {
+        /// column name
+        column: Name,
+        /// ON CONFLICT clause
+        conflict_clause: Option<ResolveType>,
+    },
+    /// `ALTER [COLUMN] col DROP NOT NULL` (SQLite 3.53)
+    DropNotNull(Name),
+    /// `ADD [CONSTRAINT name] CHECK (expr) [ON CONFLICT ...]` (SQLite 3.53)
+    AddCheck {
+        /// the CHECK constraint, with its optional name
+        constraint: NamedTableConstraint,
+        /// ON CONFLICT clause
+        conflict_clause: Option<ResolveType>,
+    },
+    /// `DROP CONSTRAINT name` (SQLite 3.53)
+    DropConstraint(Name),
 }
 
 /// Operator mapping in a `CREATE TYPE` body

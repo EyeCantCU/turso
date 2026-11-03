@@ -2591,6 +2591,15 @@ pub fn insn_to_row(
                 0,
                 format!("drop_column({table}, {column_index})"),
             ),
+            Insn::ReplaceTable { data } => (
+                "ReplaceTable",
+                0,
+                0,
+                0,
+                Value::build_text(""),
+                0,
+                format!("replace_table({})", data.table.name),
+            ),
             Insn::AddColumn { data } => (
                 "AddColumn",
                 0,

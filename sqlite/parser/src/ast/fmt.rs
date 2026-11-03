@@ -1715,6 +1715,49 @@ impl ToTokens for AlterTableBody {
                 s.append(TK_COLUMNKW, None)?;
                 name.to_tokens(s, context)
             }
+            Self::SetNotNull {
+                column,
+                conflict_clause,
+            } => {
+                s.append(TK_ALTER, None)?;
+                s.append(TK_COLUMNKW, None)?;
+                column.to_tokens(s, context)?;
+                s.append(TK_SET, None)?;
+                s.append(TK_NOT, None)?;
+                s.append(TK_NULL, None)?;
+                if let Some(conflict_clause) = conflict_clause {
+                    s.append(TK_ON, None)?;
+                    s.append(TK_CONFLICT, None)?;
+                    conflict_clause.to_tokens(s, context)?;
+                }
+                Ok(())
+            }
+            Self::DropNotNull(column) => {
+                s.append(TK_ALTER, None)?;
+                s.append(TK_COLUMNKW, None)?;
+                column.to_tokens(s, context)?;
+                s.append(TK_DROP, None)?;
+                s.append(TK_NOT, None)?;
+                s.append(TK_NULL, None)
+            }
+            Self::AddCheck {
+                constraint,
+                conflict_clause,
+            } => {
+                s.append(TK_ADD, None)?;
+                constraint.to_tokens(s, context)?;
+                if let Some(conflict_clause) = conflict_clause {
+                    s.append(TK_ON, None)?;
+                    s.append(TK_CONFLICT, None)?;
+                    conflict_clause.to_tokens(s, context)?;
+                }
+                Ok(())
+            }
+            Self::DropConstraint(name) => {
+                s.append(TK_DROP, None)?;
+                s.append(TK_CONSTRAINT, None)?;
+                name.to_tokens(s, context)
+            }
         }
     }
 }

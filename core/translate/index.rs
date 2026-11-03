@@ -806,26 +806,27 @@ fn resolve_reindex_targets(
     };
 
     let normalized_name = normalize_ident(name.name.as_str());
-    if name.namespace.is_none() {
-        let collation = CollationSeq::new(&normalized_name).ok();
-        if let Some(collation) = collation {
-            let targets = collect_reindex_targets_by_collation(resolver, connection, collation);
-            if !targets.is_empty()
-                || !matches!(collation, CollationSeq::Text(TextCollation::Locale(_)))
+    // SQLite 3.53: REINDEX EXPRESSIONS adds every expression index to whatever
+    // the name matches as a collation, table or index.
+    if name.namespace.is_none() && normalized_name.eq_ignore_ascii_case("expressions") {
+        let mut targets: Vec<ReindexTarget> = collect_all_reindex_targets(resolver, connection)
+            .into_iter()
+            .filter(|(_, table, index)| index_has_expression(table, index))
+            .collect();
+        let named =
+            resolve_reindex_name(&normalized_name, resolver, connection).unwrap_or_default();
+        for target in named {
+            if !targets
+                .iter()
+                .any(|(ns, _, index)| *ns == target.0 && index.name == target.2.name)
             {
-                return Ok(targets);
+                targets.push(target);
             }
         }
-        if let Some(targets) = find_reindex_table(&normalized_name, resolver, connection) {
-            return Ok(targets);
-        }
-        if let Some(target) = find_reindex_index(&normalized_name, resolver, connection) {
-            return Ok(vec![target]);
-        }
-        if collation.is_some() {
-            return Ok(Vec::new());
-        }
-        bail_parse_error!("unable to identify the object to be reindexed");
+        return Ok(targets);
+    }
+    if name.namespace.is_none() {
+        return resolve_reindex_name(&normalized_name, resolver, connection);
     }
 
     let namespace = resolver.resolve_namespace(name)?;
@@ -836,6 +837,43 @@ fn resolve_reindex_targets(
         find_reindex_index_in_db(&normalized_name, namespace.database_id, resolver)
     {
         return Ok(vec![target]);
+    }
+    bail_parse_error!("unable to identify the object to be reindexed");
+}
+
+/// An index on an expression or a virtual generated column (SQLite's bHasExpr).
+fn index_has_expression(table: &BTreeTable, index: &Index) -> bool {
+    index.columns.iter().any(|column| {
+        column.expr.is_some()
+            || table
+                .columns()
+                .get(column.pos_in_table)
+                .is_some_and(|c| c.is_virtual_generated())
+    })
+}
+
+/// Resolve an unqualified REINDEX name as a collation, then a table, then an index.
+fn resolve_reindex_name(
+    normalized_name: &str,
+    resolver: &CatalogContext,
+    connection: &Arc<crate::Connection>,
+) -> crate::Result<Vec<ReindexTarget>> {
+    let collation = CollationSeq::new(normalized_name).ok();
+    if let Some(collation) = collation {
+        let targets = collect_reindex_targets_by_collation(resolver, connection, collation);
+        if !targets.is_empty() || !matches!(collation, CollationSeq::Text(TextCollation::Locale(_)))
+        {
+            return Ok(targets);
+        }
+    }
+    if let Some(targets) = find_reindex_table(normalized_name, resolver, connection) {
+        return Ok(targets);
+    }
+    if let Some(target) = find_reindex_index(normalized_name, resolver, connection) {
+        return Ok(vec![target]);
+    }
+    if collation.is_some() {
+        return Ok(Vec::new());
     }
     bail_parse_error!("unable to identify the object to be reindexed");
 }
