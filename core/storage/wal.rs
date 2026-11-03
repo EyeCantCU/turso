@@ -1464,6 +1464,9 @@ struct ShmWalCoordination {
     /// SQLite's `-shm` wal-index, kept current for real SQLite readers.
     #[cfg(target_os = "linux")]
     sqlite: Option<Arc<crate::storage::sqlite_shm_interlock::SqliteShmInterlock>>,
+    /// SQLite read mark this connection holds for its read transaction.
+    #[cfg(target_os = "linux")]
+    sqlite_mark: Mutex<Option<usize>>,
 }
 
 #[cfg(host_shared_wal)]
@@ -1524,6 +1527,8 @@ impl ShmWalCoordination {
             active_reader: Mutex::new(None),
             #[cfg(target_os = "linux")]
             sqlite: None,
+            #[cfg(target_os = "linux")]
+            sqlite_mark: Mutex::new(None),
         };
         coordination.seed_or_sync_authority();
         coordination
@@ -1537,6 +1542,13 @@ impl ShmWalCoordination {
     ) -> Self {
         if let Some(interlock) = sqlite.as_ref() {
             if interlock.claim_index_rebuild() {
+                // Under WAL_WRITE_LOCK so no SQLite recovery runs meanwhile.
+                for _ in 0..1000 {
+                    if interlock.index().try_lock_write().unwrap_or(false) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
                 let snapshot = self.authority.snapshot();
                 if let Err(err) = interlock.index().rebuild(
                     self.sqlite_index_header(
@@ -1547,6 +1559,7 @@ impl ShmWalCoordination {
                 ) {
                     tracing::error!("building SQLite wal-index failed: {err}");
                 }
+                interlock.index().unlock_write();
             }
         }
         self.sqlite = sqlite;
@@ -1588,12 +1601,195 @@ impl ShmWalCoordination {
     ) -> Result<CoordinationCheckpointGuardKind> {
         #[cfg(target_os = "linux")]
         if let Some(sqlite) = self.sqlite.as_ref() {
-            if !sqlite.index().try_lock_read0().unwrap_or(false) {
+            let index = sqlite.index();
+            if !index.try_lock_ckpt().unwrap_or(false) {
                 self.release_checkpoint_guard_without_sqlite(guard);
                 return Err(LimboError::Busy);
             }
+            if !index.try_lock_read0().unwrap_or(false) {
+                index.unlock_ckpt();
+                self.release_checkpoint_guard_without_sqlite(guard);
+                return Err(LimboError::Busy);
+            }
+            if matches!(guard, CoordinationCheckpointGuardKind::Writer) {
+                if !index.try_lock_write().unwrap_or(false) {
+                    index.unlock_read0();
+                    index.unlock_ckpt();
+                    self.release_checkpoint_guard_without_sqlite(guard);
+                    return Err(LimboError::Busy);
+                }
+                // A restart or truncate must not drop SQLite's newer commits.
+                self.import_sqlite_commits();
+            }
         }
         Ok(guard)
+    }
+
+    fn try_begin_read_tx_tshm(&self, snapshot: WalSnapshot) -> Option<ReadGuardKind> {
+        turso_assert!(
+            snapshot.max_frame <= u32::MAX as u64,
+            "max_frame exceeds u32 read mark range"
+        );
+        let shared = self.shared.read();
+        let read_locks = &shared.runtime.read_locks;
+
+        // See the in-process coordination: a checkpoint holding read-mark 0
+        // must not make readers wait, so fall through to the other marks.
+        if snapshot.max_frame == snapshot.nbackfills && read_locks[0].read() {
+            if self.load_snapshot() != snapshot {
+                read_locks[0].unlock();
+                return None;
+            }
+            if !self.publish_shared_reader(read_locks, snapshot, 0) {
+                return None;
+            }
+            return Some(ReadGuardKind::DbFile);
+        }
+
+        let mut best_idx: i64 = -1;
+        let mut best_mark: u32 = 0;
+        for (idx, lock) in read_locks.iter().enumerate().take(5).skip(1) {
+            let mark = lock.get_value();
+            // See the in-process scan: a mark pinned at frame 0 must be
+            // shareable, so "found" is tracked explicitly.
+            if mark != READMARK_NOT_USED
+                && mark <= snapshot.max_frame as u32
+                && (best_idx == -1 || mark > best_mark)
+            {
+                best_mark = mark;
+                best_idx = idx as i64;
+            }
+        }
+
+        if best_idx == -1 || (best_mark as u64) < snapshot.max_frame {
+            for (idx, lock) in read_locks.iter().enumerate().take(5).skip(1) {
+                if !lock.write() {
+                    continue;
+                }
+                lock.set_value_exclusive(snapshot.max_frame as u32);
+                best_idx = idx as i64;
+                best_mark = snapshot.max_frame as u32;
+                read_locks[idx].unlock();
+                break;
+            }
+        }
+
+        if best_idx == -1 || !read_locks[best_idx as usize].read() {
+            return None;
+        }
+
+        let current_slot_mark = read_locks[best_idx as usize].get_value();
+        if current_slot_mark != best_mark || self.load_snapshot() != snapshot {
+            read_locks[best_idx as usize].unlock();
+            return None;
+        }
+
+        let read_mark_index =
+            NonZeroUsize::new(best_idx as usize).expect("best_idx checked to be positive");
+        if !self.publish_shared_reader(read_locks, snapshot, best_idx as usize) {
+            return None;
+        }
+        Some(ReadGuardKind::ReadMark(read_mark_index))
+    }
+
+    /// Bring commits made by SQLite processes into the tshm authority, if
+    /// the index changed and the writer locks are free right now.
+    #[cfg(target_os = "linux")]
+    fn try_import_sqlite_commits(&self) {
+        let Some(sqlite) = self.sqlite.as_ref() else {
+            return;
+        };
+        let Ok(Some(header)) = sqlite.index().read_header() else {
+            return;
+        };
+        if sqlite.change_seen(header.change) {
+            return;
+        }
+        if !self.authority.try_acquire_writer(self.owner) {
+            return;
+        }
+        if self.fallback.try_write_lock() {
+            if sqlite.index().try_lock_write().unwrap_or(false) {
+                self.import_sqlite_commits();
+                sqlite.index().unlock_write();
+            }
+            self.fallback.unlock_write_lock();
+        }
+        self.authority.release_writer(self.owner);
+    }
+
+    /// Import SQLite's commits. The caller holds the tshm writer and
+    /// SQLite's WAL_WRITE_LOCK, so neither side can commit meanwhile.
+    #[cfg(target_os = "linux")]
+    fn import_sqlite_commits(&self) {
+        let Some(sqlite) = self.sqlite.as_ref() else {
+            return;
+        };
+        let index = sqlite.index();
+        let Ok(Some(header)) = index.read_header() else {
+            return;
+        };
+        sqlite.note_change(header.change);
+        let current = self.authority.snapshot();
+        if header.salt_1 != current.salt_1 || header.salt_2 != current.salt_2 {
+            // SQLite restarted the WAL: begin the new generation here too.
+            let wal = index
+                .read_wal_header()
+                .filter(|w| w.salt_1 == header.salt_1 && w.salt_2 == header.salt_2);
+            let restarted = SharedWalCoordinationHeader {
+                max_frame: 0,
+                nbackfills: 0,
+                transaction_count: current.transaction_count + 1,
+                visibility_generation: current.visibility_generation + 1,
+                checkpoint_seq: wal
+                    .map_or(current.checkpoint_seq.wrapping_add(1), |w| w.checkpoint_seq),
+                checkpoint_epoch: current.checkpoint_epoch,
+                page_size: wal.map_or(current.page_size, |w| w.page_size),
+                salt_1: header.salt_1,
+                salt_2: header.salt_2,
+                checksum_1: wal.map_or(0, |w| w.checksum.0),
+                checksum_2: wal.map_or(0, |w| w.checksum.1),
+                reader_slot_count: current.reader_slot_count,
+            };
+            {
+                let mut shared = self.shared.write();
+                Self::install_local_snapshot(&mut shared, restarted, true);
+                if let Some(w) = wal {
+                    shared.metadata.wal_header.lock().magic = w.magic;
+                }
+                shared
+                    .metadata
+                    .initialized
+                    .store(wal.is_some(), Ordering::Release);
+                shared.runtime.frame_cache.lock().clear();
+                shared
+                    .runtime
+                    .frame_cache_high_water
+                    .store(0, Ordering::Release);
+                shared.runtime.overflow_fallback_coverage.lock().clear();
+            }
+            self.authority.rollback_frames(0);
+            self.authority.install_snapshot(restarted);
+        }
+        let current = self.authority.snapshot();
+        if u64::from(header.max_frame) <= current.max_frame {
+            return;
+        }
+        let Ok(frames) = index.frame_pages(
+            current.max_frame as u32 + 1,
+            header.max_frame,
+            current.page_size,
+        ) else {
+            return;
+        };
+        for (frame, page) in frames {
+            self.cache_frame(page as u64, frame as u64);
+        }
+        self.publish_commit(WalCommitState {
+            max_frame: header.max_frame as u64,
+            last_checksum: header.checksum,
+            transaction_count: current.transaction_count + 1,
+        });
     }
 
     fn release_checkpoint_guard_without_sqlite(&self, guard: CoordinationCheckpointGuardKind) {
@@ -2031,6 +2227,8 @@ impl ShmWalCoordination {
 #[cfg(host_shared_wal)]
 impl WalCoordination for ShmWalCoordination {
     fn load_snapshot(&self) -> WalSnapshot {
+        #[cfg(target_os = "linux")]
+        self.try_import_sqlite_commits();
         let snapshot = self.authority.snapshot();
         WalSnapshot {
             max_frame: snapshot.max_frame,
@@ -2078,6 +2276,11 @@ impl WalCoordination for ShmWalCoordination {
             if let Some(Err(err)) = self.sqlite_index(|index| index.commit(header)) {
                 tracing::error!("updating SQLite wal-index failed: {err}");
                 let _ = self.sqlite_index(|index| index.invalidate());
+            }
+            if let Some(sqlite) = self.sqlite.as_ref() {
+                if let Ok(Some(h)) = sqlite.index().read_header() {
+                    sqlite.note_change(h.change);
+                }
             }
         }
         let shared = self.shared.read();
@@ -2206,75 +2409,35 @@ impl WalCoordination for ShmWalCoordination {
     }
 
     fn try_begin_read_tx(&self, snapshot: WalSnapshot) -> Option<ReadGuardKind> {
-        turso_assert!(
-            snapshot.max_frame <= u32::MAX as u64,
-            "max_frame exceeds u32 read mark range"
-        );
-        let shared = self.shared.read();
-        let read_locks = &shared.runtime.read_locks;
-
-        // See the in-process coordination: a checkpoint holding read-mark 0
-        // must not make readers wait, so fall through to the other marks.
-        if snapshot.max_frame == snapshot.nbackfills && read_locks[0].read() {
-            if self.load_snapshot() != snapshot {
-                read_locks[0].unlock();
-                return None;
-            }
-            if !self.publish_shared_reader(read_locks, snapshot, 0) {
-                return None;
-            }
-            return Some(ReadGuardKind::DbFile);
-        }
-
-        let mut best_idx: i64 = -1;
-        let mut best_mark: u32 = 0;
-        for (idx, lock) in read_locks.iter().enumerate().take(5).skip(1) {
-            let mark = lock.get_value();
-            // See the in-process scan: a mark pinned at frame 0 must be
-            // shareable, so "found" is tracked explicitly.
-            if mark != READMARK_NOT_USED
-                && mark <= snapshot.max_frame as u32
-                && (best_idx == -1 || mark > best_mark)
+        let guard = self.try_begin_read_tx_tshm(snapshot)?;
+        // Pin the snapshot's frames against SQLite checkpoints and restarts.
+        #[cfg(target_os = "linux")]
+        if let Some(sqlite) = self.sqlite.as_ref() {
+            match sqlite
+                .index()
+                .acquire_read_mark(snapshot.max_frame, snapshot.nbackfills)
             {
-                best_mark = mark;
-                best_idx = idx as i64;
-            }
-        }
-
-        if best_idx == -1 || (best_mark as u64) < snapshot.max_frame {
-            for (idx, lock) in read_locks.iter().enumerate().take(5).skip(1) {
-                if !lock.write() {
-                    continue;
+                Ok(Some(mark)) => {
+                    if let Some(old) = self.sqlite_mark.lock().replace(mark) {
+                        sqlite.index().release_read_mark(old);
+                    }
                 }
-                lock.set_value_exclusive(snapshot.max_frame as u32);
-                best_idx = idx as i64;
-                best_mark = snapshot.max_frame as u32;
-                read_locks[idx].unlock();
-                break;
+                _ => {
+                    self.end_read_tx(guard);
+                    return None;
+                }
             }
         }
-
-        if best_idx == -1 || !read_locks[best_idx as usize].read() {
-            return None;
-        }
-
-        let current_slot_mark = read_locks[best_idx as usize].get_value();
-        if current_slot_mark != best_mark || self.load_snapshot() != snapshot {
-            read_locks[best_idx as usize].unlock();
-            return None;
-        }
-
-        let read_mark_index =
-            NonZeroUsize::new(best_idx as usize).expect("best_idx checked to be positive");
-        if !self.publish_shared_reader(read_locks, snapshot, best_idx as usize) {
-            return None;
-        }
-        Some(ReadGuardKind::ReadMark(read_mark_index))
+        Some(guard)
     }
 
     fn end_read_tx(&self, guard: ReadGuardKind) {
         if let Some(reader) = self.active_reader.lock().take() {
             self.authority.unregister_reader_for_snapshot(reader);
+        }
+        #[cfg(target_os = "linux")]
+        if let (Some(sqlite), Some(mark)) = (self.sqlite.as_ref(), self.sqlite_mark.lock().take()) {
+            sqlite.index().release_read_mark(mark);
         }
         self.fallback.end_read_tx(guard);
     }
@@ -2287,10 +2450,24 @@ impl WalCoordination for ShmWalCoordination {
             self.authority.release_writer(self.owner);
             return false;
         }
+        // SQLite writers take the same lock; then catch up with their commits.
+        #[cfg(target_os = "linux")]
+        if let Some(sqlite) = self.sqlite.as_ref() {
+            if !sqlite.index().try_lock_write().unwrap_or(false) {
+                self.fallback.unlock_write_lock();
+                self.authority.release_writer(self.owner);
+                return false;
+            }
+            self.import_sqlite_commits();
+        }
         true
     }
 
     fn end_write_tx(&self) {
+        #[cfg(target_os = "linux")]
+        if let Some(sqlite) = self.sqlite.as_ref() {
+            sqlite.index().unlock_write();
+        }
         self.fallback.unlock_write_lock();
         self.authority.release_writer(self.owner);
     }
@@ -2376,7 +2553,11 @@ impl WalCoordination for ShmWalCoordination {
     fn release_checkpoint_guard(&self, guard: CoordinationCheckpointGuardKind) {
         #[cfg(target_os = "linux")]
         if let Some(sqlite) = self.sqlite.as_ref() {
+            if matches!(guard, CoordinationCheckpointGuardKind::Writer) {
+                sqlite.index().unlock_write();
+            }
             sqlite.index().unlock_read0();
+            sqlite.index().unlock_ckpt();
         }
         self.release_checkpoint_guard_without_sqlite(guard);
     }
