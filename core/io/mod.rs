@@ -6,7 +6,7 @@ use crate::turso_assert;
 use crate::{BufferPool, Result};
 use bitflags::bitflags;
 use cfg_block::cfg_block;
-use rand::{Rng, RngCore};
+use rand::RngCore;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
@@ -620,12 +620,14 @@ pub trait IO: Clock + Send + Sync {
     }
 
     fn generate_random_number(&self) -> i64 {
-        rand::rng().random()
+        let mut buf = [0u8; 8];
+        random_fill(&mut buf);
+        i64::from_ne_bytes(buf)
     }
 
     /// Fill `dest` with random data.
     fn fill_bytes(&self, dest: &mut [u8]) {
-        rand::rng().fill_bytes(dest);
+        random_fill(dest);
     }
 
     fn get_memory_io(&self) -> Arc<MemoryIO> {
@@ -974,6 +976,33 @@ impl Buffer {
 crate::thread::thread_local! {
     /// thread local cache to re-use temporary buffers to prevent churn when pool overflows
     pub static TEMP_BUFFER_CACHE: RefCell<TempBufferCache> = RefCell::new(TempBufferCache::new());
+}
+
+/// Fill `dest` with random bytes without thread-local state: `rand::rng()`
+/// panics once TLS is destroyed, e.g. in `sqlite3_close()` from atexit.
+fn random_fill(dest: &mut [u8]) {
+    #[cfg(target_os = "linux")]
+    {
+        let mut off = 0;
+        while off < dest.len() {
+            // SAFETY: the pointer/length pair is the unfilled tail of `dest`.
+            let n = unsafe {
+                libc::getrandom(
+                    dest[off..].as_mut_ptr() as *mut libc::c_void,
+                    dest.len() - off,
+                    0,
+                )
+            };
+            if n <= 0 {
+                break;
+            }
+            off += n as usize;
+        }
+        if off == dest.len() {
+            return;
+        }
+    }
+    rand::rng().fill_bytes(dest);
 }
 
 #[cfg(test)]
