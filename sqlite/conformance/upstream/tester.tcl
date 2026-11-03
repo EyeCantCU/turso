@@ -645,11 +645,14 @@ proc test_find_sqldiff {args} { return "" }
 proc test_find_binary {args} { return "" }
 proc test_binary_name {args} { return "" }
 
-# testvfs NAME ?options? creates a command NAME in upstream; here it
-# creates one that accepts every subcommand and does nothing.
-proc testvfs {name args} {
-  proc ::$name {args} { return "" }
-  return $name
+# testvfs NAME ?options? creates a test VFS (bindings/tcl/testvfs); without
+# the extension's implementation, create a command that accepts every
+# subcommand and does nothing.
+if {[info commands testvfs] eq ""} {
+  proc testvfs {name args} {
+    proc ::$name {args} { return "" }
+    return $name
+  }
 }
 proc sqlite3_backup {name db1 dbname1 db2 dbname2} {
   proc ::$name {args} {

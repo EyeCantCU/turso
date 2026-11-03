@@ -21,6 +21,8 @@
 ROOT_DIR  := $(shell cd ../.. && pwd)
 TURSO_LIB := $(shell $(ROOT_DIR)/scripts/cargo-target-dir)/release
 SRC       := $(ROOT_DIR)/bindings/tcl/turso_tcl.c
+# SQLite's [testvfs] test VFS, vendored unchanged with a small sqliteInt.h.
+TESTVFS   := $(ROOT_DIR)/bindings/tcl/testvfs
 INCLUDE   := $(ROOT_DIR)/bindings/c/include
 
 # Default target — local build (no Docker required).
@@ -100,6 +102,7 @@ build:
 	cargo build --release -p turso_sqlite3 --features csv
 	gcc $(SHARED_FLAG) -o $(TARGET) \
 	    $(SRC) \
+	    -DSQLITE_TEST=1 -I$(TESTVFS) $(TESTVFS)/test_vfs.c \
 	    $(TCL_INCLUDE) \
 	    -I$(INCLUDE) \
 	    -L$(TURSO_LIB) \

@@ -852,6 +852,7 @@ pub unsafe extern "C" fn sqlite3_close(db: *mut sqlite3) -> ffi::c_int {
             return SQLITE_BUSY;
         }
     }
+    vfs::close_connection_early(db);
     compat_config::forget_connection(db);
     drop(Arc::from_raw(db));
     SQLITE_OK
@@ -872,6 +873,7 @@ pub unsafe extern "C" fn sqlite3_close_v2(db: *mut sqlite3) -> ffi::c_int {
             inner.e_open_state = SQLITE_STATE_ZOMBIE;
         }
     }
+    vfs::close_connection_early(db);
     compat_config::forget_connection(db);
     drop(Arc::from_raw(db));
     SQLITE_OK

@@ -221,7 +221,7 @@ unsafe extern "C" fn x_file_size(p: *mut sqlite3_file, out: *mut i64) -> ffi::c_
         f.last_errno = errno();
         return SQLITE_IOERR_FSTAT;
     }
-    *out = st.st_size as i64;
+    *out = st.st_size;
     SQLITE_OK
 }
 
@@ -359,7 +359,7 @@ unsafe extern "C" fn x_file_control(
         SQLITE_FCNTL_VFSNAME => {
             let p = sqlite3_malloc(5) as *mut u8;
             if !p.is_null() {
-                std::ptr::copy_nonoverlapping(b"unix\0".as_ptr(), p, 5);
+                std::ptr::copy_nonoverlapping(c"unix".as_ptr() as *const u8, p, 5);
             }
             *(arg as *mut *mut u8) = p;
         }
@@ -467,7 +467,7 @@ unsafe extern "C" fn x_shm_map(
         if libc::fstat(shm.fd, &mut st) != 0 {
             return SQLITE_IOERR_SHMSIZE;
         }
-        if (st.st_size as i64) < need {
+        if st.st_size < need {
             if extend == 0 {
                 return SQLITE_OK;
             }

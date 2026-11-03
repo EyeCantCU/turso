@@ -179,6 +179,9 @@ fn vfs_err(rc: ffi::c_int, op: &'static str) -> LimboError {
     }
 }
 
+/// A filename block and the offset of the WAL name inside it.
+type NameBlock = (Arc<[u8]>, usize);
+
 /// Owner of an application `sqlite3_vfs`. The application keeps the struct
 /// alive while it is registered and while connections use it, as SQLite
 /// requires.
@@ -188,7 +191,7 @@ pub(crate) struct VfsIo {
     files: Mutex<Map<String, Weak<VfsFile>>>,
     /// SQLite-format filename blocks (name, URI parameters, journal and WAL
     /// names) of main databases, by path; xOpen names point into them.
-    names: Mutex<Map<String, (Arc<[u8]>, usize)>>,
+    names: Mutex<Map<String, NameBlock>>,
 }
 
 // The VFS methods are called with the per-file mutex held, as SQLite does.
@@ -433,8 +436,13 @@ impl IO for VfsIo {
                     }
                 }
             };
-            let file = VfsFile::open(self.vfs, name, oflags)?;
+            let (file, out_flags) = VfsFile::open(self.vfs, name, oflags)?;
             if let FileKind::Main = kind {
+                // The VFS fell back to read-only (as unix does for a file it
+                // cannot write); the caller reopens read-only.
+                if !readonly && out_flags & SQLITE_OPEN_READONLY != 0 {
+                    return Err(LimboError::ReadOnly);
+                }
                 if !readonly && !flags.contains(OpenFlags::NoLock) {
                     // Turso's single-process WAL needs the file to itself.
                     file.lock(SQLITE_LOCK_SHARED)?;
@@ -468,11 +476,57 @@ impl IO for VfsIo {
     }
 
     fn file_id(&self, path: &str) -> turso_core::Result<FileId> {
-        // Identity is (VFS, full path): the VFS decides what a name means.
         let full = unsafe { self.resolve(path)? };
+        // A name that is a host file shares the Database of every other
+        // connection to that file (native or through another VFS): turso's
+        // WAL index lives in that shared object, so two instances over one
+        // file would corrupt it.
+        if let Ok(id) = turso_core::io::get_file_id(&full) {
+            return Ok(id);
+        }
+        // Otherwise identity is (VFS, full path): the VFS defines the name.
         let mut id = FileId::from_path_hash(&full);
         id.dev = self.vfs as usize as u64;
         Ok(id)
+    }
+}
+
+/// A lock that its owning thread may take again.
+struct ReentrantLock {
+    state: Mutex<(Option<std::thread::ThreadId>, usize)>,
+    cv: std::sync::Condvar,
+}
+
+struct ReentrantGuard<'a>(&'a ReentrantLock);
+
+impl ReentrantLock {
+    fn new() -> Self {
+        ReentrantLock {
+            state: Mutex::new((None, 0)),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> ReentrantGuard<'_> {
+        let me = std::thread::current().id();
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        while st.0.is_some_and(|t| t != me) {
+            st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+        st.0 = Some(me);
+        st.1 += 1;
+        ReentrantGuard(self)
+    }
+}
+
+impl Drop for ReentrantGuard<'_> {
+    fn drop(&mut self) {
+        let mut st = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.1 -= 1;
+        if st.1 == 0 {
+            st.0 = None;
+            self.0.cv.notify_one();
+        }
     }
 }
 
@@ -483,8 +537,9 @@ pub(crate) struct VfsFile {
     /// Keeps the xOpen name alive for the life of the file.
     _name: Option<Arc<[u8]>>,
     lock_level: std::sync::atomic::AtomicI32,
-    /// Serialises calls into the C methods.
-    guard: Mutex<()>,
+    /// Serialises calls into the C methods across threads. Reentrant: a VFS
+    /// callback may use another connection to the same file on this thread.
+    guard: ReentrantLock,
 }
 
 unsafe impl Send for VfsFile {}
@@ -495,7 +550,7 @@ impl VfsFile {
         vfs: *mut sqlite3_vfs,
         name: Option<(Arc<[u8]>, usize)>,
         flags: ffi::c_int,
-    ) -> turso_core::Result<Arc<VfsFile>> {
+    ) -> turso_core::Result<(Arc<VfsFile>, ffi::c_int)> {
         let v = &*vfs;
         let Some(x_open) = v.x_open else {
             return Err(vfs_err(SQLITE_CANTOPEN, "open"));
@@ -505,7 +560,7 @@ impl VfsFile {
             mem: std::cell::UnsafeCell::new(vec![0u64; words].into_boxed_slice()),
             _name: name.as_ref().map(|(b, _)| b.clone()),
             lock_level: std::sync::atomic::AtomicI32::new(SQLITE_LOCK_NONE),
-            guard: Mutex::new(()),
+            guard: ReentrantLock::new(),
         });
         let zname = match &name {
             Some((b, off)) => b.as_ptr().add(*off) as *const ffi::c_char,
@@ -520,7 +575,7 @@ impl VfsFile {
         if file.methods().is_none() {
             return Err(vfs_err(SQLITE_CANTOPEN, "open"));
         }
-        Ok(file)
+        Ok((file, out_flags))
     }
 
     pub(crate) fn raw(&self) -> *mut sqlite3_file {
@@ -539,7 +594,7 @@ impl VfsFile {
     }
 
     fn lock(&self, level: ffi::c_int) -> turso_core::Result<()> {
-        let _g = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = self.guard.lock();
         let Some(f) = self.methods().and_then(|m| m.x_lock) else {
             return Ok(());
         };
@@ -557,7 +612,7 @@ impl VfsFile {
     }
 
     fn unlock(&self, level: ffi::c_int) -> turso_core::Result<()> {
-        let _g = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = self.guard.lock();
         let Some(f) = self.methods().and_then(|m| m.x_unlock) else {
             return Ok(());
         };
@@ -583,7 +638,7 @@ impl VfsFile {
 
     /// sqlite3_file_control on this file.
     pub(crate) unsafe fn file_control(&self, op: ffi::c_int, arg: *mut ffi::c_void) -> ffi::c_int {
-        let _g = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = self.guard.lock();
         match self.methods().and_then(|m| m.x_file_control) {
             Some(f) => f(self.raw(), op, arg),
             None => SQLITE_NOTFOUND,
@@ -593,7 +648,7 @@ impl VfsFile {
 
 impl Drop for VfsFile {
     fn drop(&mut self) {
-        let _g = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = self.guard.lock();
         let Some(m) = self.methods() else {
             return;
         };
@@ -626,7 +681,7 @@ impl File for VfsFile {
     }
 
     fn pread(&self, pos: u64, c: Completion) -> turso_core::Result<Completion> {
-        let _g = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = self.guard.lock();
         let Some(f) = self.methods().and_then(|m| m.x_read) else {
             return Err(vfs_err(SQLITE_IOERR, "pread"));
         };
@@ -663,7 +718,7 @@ impl File for VfsFile {
         buffer: Arc<Buffer>,
         c: Completion,
     ) -> turso_core::Result<Completion> {
-        let _g = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = self.guard.lock();
         let Some(f) = self.methods().and_then(|m| m.x_write) else {
             return Err(vfs_err(SQLITE_IOERR, "pwrite"));
         };
@@ -684,7 +739,7 @@ impl File for VfsFile {
     }
 
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> turso_core::Result<Completion> {
-        let _g = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = self.guard.lock();
         if let Some(f) = self.methods().and_then(|m| m.x_sync) {
             let flags = match sync_type {
                 FileSyncType::Fsync => SQLITE_SYNC_NORMAL,
@@ -700,12 +755,12 @@ impl File for VfsFile {
     }
 
     fn size(&self) -> turso_core::Result<u64> {
-        let _g = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = self.guard.lock();
         self.file_size()
     }
 
     fn truncate(&self, len: u64, c: Completion) -> turso_core::Result<Completion> {
-        let _g = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = self.guard.lock();
         let Some(f) = self.methods().and_then(|m| m.x_truncate) else {
             return Err(vfs_err(SQLITE_IOERR, "truncate"));
         };
@@ -872,29 +927,45 @@ pub(crate) unsafe fn open_v2_via_vfs(
         Ok(p) => p,
         Err(_) => return Some(SQLITE_CANTOPEN),
     };
-    // As SQLite's unix VFS: an existing file that cannot be written opens
-    // read-only.
-    let readonly = flags & SQLITE_OPEN_READONLY != 0
-        || (io.access(&full, SQLITE_ACCESS_EXISTS).unwrap_or(false)
-            && !io.access(&full, SQLITE_ACCESS_READWRITE).unwrap_or(true));
-    let open_flags = if readonly {
-        OpenFlags::ReadOnly
-    } else if flags & SQLITE_OPEN_CREATE != 0 {
-        OpenFlags::Create
-    } else {
-        OpenFlags::None
+    // nolock=1 / immutable=1 (SQLite's URI parameters): no file locking;
+    // an immutable database is also never written.
+    let flag = |k: &[u8]| {
+        param_value(&params, k).is_some_and(|v| {
+            matches!(v.first(), Some(b'1' | b'y' | b'Y' | b't' | b'T'))
+                || v.eq_ignore_ascii_case(b"on")
+        })
     };
-    PENDING_PARAMS.with(|p| *p.borrow_mut() = Some((full.clone(), params)));
+    let immutable = flag(b"immutable");
+    let nolock = immutable || flag(b"nolock");
+    let mut readonly = flags & SQLITE_OPEN_READONLY != 0 || immutable;
     let io_dyn: Arc<dyn IO> = io;
-    let res = turso_core::Database::open_file_with_flags(
-        io_dyn.clone(),
-        &full,
-        open_flags,
-        default_db_opts(),
-        None,
-        Arc::new(SqliteDialect),
-    );
-    PENDING_PARAMS.with(|p| *p.borrow_mut() = None);
+    let res = loop {
+        let mut open_flags = if readonly {
+            OpenFlags::ReadOnly
+        } else if flags & SQLITE_OPEN_CREATE != 0 {
+            OpenFlags::Create
+        } else {
+            OpenFlags::None
+        };
+        if nolock {
+            open_flags |= OpenFlags::NoLock;
+        }
+        PENDING_PARAMS.with(|p| *p.borrow_mut() = Some((full.clone(), params.clone())));
+        let res = turso_core::Database::open_file_with_flags(
+            io_dyn.clone(),
+            &full,
+            open_flags,
+            default_db_opts(),
+            None,
+            Arc::new(SqliteDialect),
+        );
+        PENDING_PARAMS.with(|p| *p.borrow_mut() = None);
+        match res {
+            // xOpen granted read-only access only: open read-only, as SQLite.
+            Err(LimboError::ReadOnly) if !readonly => readonly = true,
+            res => break res,
+        }
+    };
     let db = match res {
         Ok(db) => db,
         Err(e) => {
@@ -912,6 +983,17 @@ pub(crate) unsafe fn open_v2_via_vfs(
     let name = CString::new(full).unwrap_or_default();
     *db_out = sqlite3::new(io_dyn, db, conn, name).into_raw();
     Some(extension::run_auto_extensions(*db_out))
+}
+
+/// Closes the engine connection (the final checkpoint) while the handle is
+/// still valid, so VFS callbacks that re-enter it during close do not touch
+/// freed memory. Skipped while statements keep a zombie handle alive.
+pub(crate) unsafe fn close_connection_early(db: *mut sqlite3) {
+    let conn = match (*db).inner.lock() {
+        Ok(inner) if inner.stmt_list.is_null() => inner.conn.clone(),
+        _ => return,
+    };
+    let _ = conn.close();
 }
 
 /// sqlite3_file_control for a connection whose main database was opened

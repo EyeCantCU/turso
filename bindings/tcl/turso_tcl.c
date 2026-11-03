@@ -635,6 +635,15 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
     /* ---- close ---- */
 
     case CMD_CLOSE:
+        /* Close before deleting the command: VFS callbacks run during the
+         * close may still invoke this command, which Tcl 9 cannot do once
+         * deletion has started. */
+        if (tdb->db && !tdb->zombie_name) {
+            sqlite3 *db = tdb->db;
+            cache_free(tdb);
+            tdb->db = NULL;
+            if (sqlite3_close(db) != SQLITE_OK) tdb->db = db;
+        }
         Tcl_DeleteCommand(interp, Tcl_GetString(objv[0]));
         return TCL_OK;
 
@@ -3281,10 +3290,11 @@ static int TursoOpenCmd(ClientData cd, Tcl_Interp *interp,
     const char *handle_name = Tcl_GetString(objv[1]);
     const char *filename    = Tcl_GetString(objv[2]);
 
-    /* Options of the upstream binding. -readonly and -uri change how the
-     * file is opened; -vfs, -key, -nomutex, -fullmutex, -nofollow and
-     * -create have no Turso equivalent and are accepted and ignored. */
+    /* Options of the upstream binding. -readonly, -uri, -create and -vfs
+     * change how the file is opened; -key, -nomutex, -fullmutex and
+     * -nofollow have no Turso equivalent and are accepted and ignored. */
     int flags = TURSO_OPEN_READWRITE | TURSO_OPEN_CREATE;
+    const char *vfs = NULL;
     int i;
     for (i = 3; i + 1 < objc; i += 2) {
         const char *opt = Tcl_GetString(objv[i]);
@@ -3305,11 +3315,13 @@ static int TursoOpenCmd(ClientData cd, Tcl_Interp *interp,
                 return TCL_ERROR;
             }
             if (!val) flags &= ~TURSO_OPEN_CREATE;
+        } else if (strcmp(opt, "-vfs") == 0) {
+            vfs = Tcl_GetString(objv[i + 1]);
         }
     }
 
     sqlite3 *db  = NULL;
-    int      rc  = sqlite3_open_v2(filename, &db, flags, NULL);
+    int      rc  = sqlite3_open_v2(filename, &db, flags, vfs);
 
     if (rc != SQLITE_OK) {
         const char *errmsg = db ? sqlite3_errmsg(db) : sqlite3_errstr(rc);
@@ -3344,6 +3356,25 @@ static int TursoOpenCmd(ClientData cd, Tcl_Interp *interp,
 
 /* Defined in the sqlite3 Rust crate (bindings/c/src/lib.rs) */
 extern int sqlite3_search_count;
+
+/* Glue for the vendored testvfs/test_vfs.c ([testvfs], [vfs_shmlock]). */
+int getDbPointer(Tcl_Interp *interp, const char *zA, sqlite3 **ppDb)
+{
+    TursoDb *tdb = find_turso_db(interp, zA);
+    if (!tdb) {
+        Tcl_AppendResult(interp, "no such database: ", zA, (char *)NULL);
+        return TCL_ERROR;
+    }
+    *ppDb = tdb->db;
+    return TCL_OK;
+}
+
+const char *sqlite3ErrName(int rc)
+{
+    return turso_err_name(rc);
+}
+
+extern int Sqlitetestvfs_Init(Tcl_Interp *interp);
 
 int Tursotcl_Init(Tcl_Interp *interp)
 {
@@ -3506,6 +3537,12 @@ int Tursotcl_Init(Tcl_Interp *interp)
     /* Link the global B-tree search counter so TCL tests can read/reset it. */
     Tcl_LinkVar(interp, "sqlite_search_count",
                 (char *)&sqlite3_search_count, TCL_LINK_INT);
+
+    /* [testvfs] only: vfs_shmlock and vfs_set_readmark poke SQLite's
+     * wal-index, which turso does not keep; tester.tcl stubs them. */
+    Sqlitetestvfs_Init(interp);
+    Tcl_DeleteCommand(interp, "vfs_shmlock");
+    Tcl_DeleteCommand(interp, "vfs_set_readmark");
 
     Tcl_PkgProvide(interp, "tursotcl", TURSO_TCL_VERSION);
     return TCL_OK;
