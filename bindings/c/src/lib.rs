@@ -25,6 +25,7 @@ pub use misc::{sqlite3_prepare_v2, sqlite3_step};
 mod compat_stubs;
 
 mod hooks;
+mod session;
 
 mod vtab;
 

@@ -4,8 +4,8 @@
 #![allow(unused_imports)]
 use std::ptr;
 
-mod lifecycle;
 mod dbstat;
+mod lifecycle;
 mod vtab;
 
 #[repr(C)]
@@ -235,6 +235,7 @@ mod stubs;
 mod errmsg;
 mod misc;
 mod reentrancy;
+mod session;
 
 mod tests {
     use super::*;
