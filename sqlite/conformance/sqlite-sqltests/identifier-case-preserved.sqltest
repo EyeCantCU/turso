@@ -162,3 +162,13 @@ expect {
     trigger|TmpTr|TmpY
     table|TmpY|TmpY
 }
+
+test integrity-check-finds-indexes-of-mixed-case-tables {
+    CREATE TABLE Table1 (col TEXT NOT NULL PRIMARY KEY);
+    CREATE INDEX Idx1 ON table1(col);
+    INSERT INTO TABLE1 VALUES ('a');
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}

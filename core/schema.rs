@@ -1512,7 +1512,9 @@ impl Schema {
     }
 
     pub fn has_table(&self, namespace: NamespaceId, name: &str) -> bool {
-        self.namespace(namespace).tables.contains_key(name)
+        self.namespace(namespace)
+            .tables
+            .contains_key(&normalize_ident(name))
     }
 
     pub fn table_mut(&mut self, namespace: NamespaceId, name: &str) -> Option<&mut Arc<Table>> {
@@ -1540,7 +1542,9 @@ impl Schema {
     /// Puts `table` in the namespace under `name`, replacing a table of
     /// that name.
     pub fn insert_table(&mut self, namespace: NamespaceId, name: String, table: Arc<Table>) {
-        self.namespace_mut(namespace).tables.insert(name, table);
+        self.namespace_mut(namespace)
+            .tables
+            .insert(normalize_ident(&name), table);
     }
 
     /// Takes the table named `name` out of the namespace.
@@ -1569,11 +1573,15 @@ impl Schema {
     }
 
     pub fn is_broken_view(&self, namespace: NamespaceId, name: &str) -> bool {
-        self.namespace(namespace).broken_views.contains(name)
+        self.namespace(namespace)
+            .broken_views
+            .contains(&normalize_ident(name))
     }
 
     pub fn remove_broken_view(&mut self, namespace: NamespaceId, name: &str) -> bool {
-        self.namespace_mut(namespace).broken_views.remove(name)
+        self.namespace_mut(namespace)
+            .broken_views
+            .remove(&normalize_ident(name))
     }
 
     /// The root pages of the materialized views of the namespace that were
@@ -1639,7 +1647,7 @@ impl Schema {
     ) -> impl Iterator<Item = &Arc<Index>> {
         self.namespace(namespace)
             .indexes
-            .get(table_name)
+            .get(&normalize_ident(table_name))
             .map(|v| v.iter())
             .unwrap_or_default()
     }
@@ -1676,7 +1684,7 @@ impl Schema {
     ) {
         self.namespace_mut(namespace)
             .indexes
-            .insert(table_name, indexes);
+            .insert(normalize_ident(&table_name), indexes);
     }
 
     pub fn triggers(&self, namespace: NamespaceId) -> impl Iterator<Item = &Arc<Trigger>> {
@@ -1717,7 +1725,7 @@ impl Schema {
     ) {
         self.namespace_mut(namespace)
             .triggers
-            .insert(table_name, triggers);
+            .insert(normalize_ident(&table_name), triggers);
     }
 
     /// Adds `triggers` after the triggers `table_name` already has.
@@ -1729,7 +1737,7 @@ impl Schema {
     ) {
         self.namespace_mut(namespace)
             .triggers
-            .entry(table_name)
+            .entry(normalize_ident(&table_name))
             .or_default()
             .extend(triggers);
     }
@@ -3973,7 +3981,9 @@ impl Schema {
                         "view '{view_name}' has unparseable SQL in sqlite_schema; \
                          it is unavailable but can be removed with DROP VIEW: {sql}"
                     );
-                    self.namespace_mut(namespace).broken_views.insert(view_name);
+                    self.namespace_mut(namespace)
+                        .broken_views
+                        .insert(normalize_ident(&view_name));
                 } else if let Ok(Some(Cmd::Stmt(stmt))) = parsed {
                     match stmt {
                         Stmt::CreateMaterializedView { .. } => {
