@@ -3516,6 +3516,25 @@ fn translate_virtual_table_insert(
     if virtual_table.readonly() && !allow_dbpage_write {
         crate::bail_constraint_error!("Table is read-only: {}", virtual_table.name);
     }
+    let is_values = matches!(
+        &body,
+        InsertBody::Select(select, None)
+            if select.body.compounds.is_empty()
+                && matches!(select.body.select, OneSelect::Values(_))
+    );
+    if !is_values {
+        if let InsertBody::Select(select, None) = body {
+            return translate_virtual_table_insert_select(
+                program,
+                virtual_table,
+                columns,
+                select,
+                on_conflict,
+                resolver,
+                connection,
+            );
+        }
+    }
     let (num_values, rows) = match &mut body {
         InsertBody::Select(select, None) => match &mut select.body.select {
             OneSelect::Values(values) => (values[0].len(), std::mem::take(values)),
@@ -3566,6 +3585,87 @@ fn translate_virtual_table_insert(
     let halt_label = program.allocate_label();
     program.preassign_label_to_next_insn(halt_label);
 
+    Ok(())
+}
+
+/// `INSERT INTO vtab SELECT ...`: one xUpdate per row of the SELECT, which
+/// runs as a coroutine (SQLite's insert template 3).
+fn translate_virtual_table_insert_select(
+    program: &mut ProgramBuilder,
+    virtual_table: Arc<VirtualTable>,
+    columns: Vec<ast::Name>,
+    select: ast::Select,
+    on_conflict: Option<ResolveType>,
+    resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+) -> Result<()> {
+    // A SELECT can produce many rows.
+    program.set_multi_write(true);
+    program.set_may_abort(true);
+    let table = Table::Virtual(virtual_table.clone());
+    let required = if columns.is_empty() {
+        table.columns().iter().filter(|c| !c.hidden()).count()
+    } else {
+        columns.len()
+    };
+    let halt_label = program.allocate_label();
+    let yield_reg = program.alloc_register();
+    let jump_on_definition = program.allocate_label();
+    let start_offset = program.allocate_label();
+    program.emit_insn(Insn::InitCoroutine {
+        yield_reg,
+        jump_on_definition,
+        start_offset,
+    });
+    program.preassign_label_to_next_insn(start_offset);
+    let destination = QueryDestination::CoroutineYield {
+        yield_reg,
+        coroutine_implementation_start: halt_label,
+    };
+    let num_result_cols = program
+        .nested(|program| translate_select(select, resolver, program, destination, connection))?;
+    if num_result_cols != required {
+        crate::bail_parse_error!(
+            "table {} has {required} columns but {num_result_cols} values were supplied",
+            table.get_name()
+        );
+    }
+    program.emit_insn(Insn::EndCoroutine { yield_reg });
+    program.preassign_label_to_next_insn(jump_on_definition);
+    let result_start = program.reg_result_cols_start.unwrap_or(yield_reg + 1);
+
+    let cursor_id = program.alloc_cursor_id(CursorType::VirtualTable(virtual_table));
+    program.emit_insn(Insn::VOpen { cursor_id });
+    program.emit_insn(Insn::VBegin { cursor_id });
+    let registers_start = program.alloc_register();
+    program.emit_insn(Insn::Null {
+        dest: registers_start,
+        dest_end: None,
+    });
+    let insertion = build_insertion(program, &table, &columns, num_result_cols)?;
+    let conflict_action = on_conflict.as_ref().map(|c| c.bit_value()).unwrap_or(0) as u16;
+    let loop_start = program.allocate_label();
+    let done = program.allocate_label();
+    program.preassign_label_to_next_insn(loop_start);
+    program.emit_insn(Insn::Yield {
+        yield_reg,
+        end_offset: done,
+        subtype_clear_start_reg: 0,
+        subtype_clear_count: 0,
+    });
+    translate_rows_multiple(program, &insertion, result_start, resolver, &None, false)?;
+    program.emit_insn(Insn::VUpdate {
+        cursor_id,
+        arg_count: insertion.col_mappings.len() + 2,
+        start_reg: registers_start,
+        conflict_action,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: loop_start,
+    });
+    program.preassign_label_to_next_insn(done);
+    program.emit_insn(Insn::Close { cursor_id });
+    program.preassign_label_to_next_insn(halt_label);
     Ok(())
 }
 

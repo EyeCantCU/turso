@@ -331,3 +331,39 @@ fn malformed_match_expressions() {
         assert_eq!(run_turso(&conn, q), run_sqlite(&sqlite, q), "{q}");
     }
 }
+
+/// INSERT ... SELECT into a virtual table, and an external content table
+/// whose columns are taken from the content table on reload.
+#[test]
+fn insert_select_and_content_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.db");
+    let setup = [
+        "CREATE TABLE src(a, b)",
+        "INSERT INTO src VALUES('red apple', 'fruit'), ('green leaf', 'plant')",
+        "CREATE VIRTUAL TABLE t USING fts4(content=src)",
+        "INSERT INTO t(docid, a, b) SELECT rowid, a, b FROM src",
+        "CREATE VIRTUAL TABLE cl USING fts4(x, content='')",
+        "INSERT INTO cl(docid, x) VALUES(3, 'alpha beta')",
+    ];
+    let queries = [
+        "SELECT docid, a, b FROM t WHERE t MATCH 'apple OR plant'",
+        "SELECT * FROM t_segdir",
+        "SELECT docid FROM cl WHERE cl MATCH 'beta'",
+        "SELECT x FROM cl WHERE cl MATCH 'beta'",
+        "DELETE FROM cl WHERE docid = 3",
+    ];
+    {
+        let (_db, conn) = open_turso(&path);
+        for s in setup {
+            conn.execute(s).unwrap();
+        }
+    }
+    let sqlite = rusqlite::Connection::open(dir.path().join("s.db")).unwrap();
+    sqlite.execute_batch(&setup.join(";")).unwrap();
+    // Reopen: the content table's columns come from the loaded schema.
+    let (_db, conn) = open_turso(&path);
+    for q in queries {
+        assert_eq!(run_turso(&conn, q), run_sqlite(&sqlite, q), "{q}");
+    }
+}

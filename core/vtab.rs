@@ -146,6 +146,37 @@ impl VirtualTable {
         Self::table_for(tbl_name, module_name, args, syms, None)
     }
 
+    /// Like [`Self::table`], for a table loaded from the schema: `lookup`
+    /// finds the columns of other tables.
+    pub(crate) fn table_with_lookup(
+        tbl_name: Option<&str>,
+        module_name: &str,
+        args: Vec<Value>,
+        syms: &SymbolTable,
+        lookup: &crate::native_ext::ColumnLookup<'_>,
+    ) -> crate::Result<Arc<VirtualTable>> {
+        let module = syms.vtab_module(module_name);
+        let info = crate::native_ext::ConnectInfo {
+            module_name,
+            schema_name: "main",
+            table_name: tbl_name.unwrap_or(module_name),
+            create: false,
+            connection: None,
+            lookup_columns: Some(lookup),
+        };
+        let (vtab_type, schema) =
+            crate::ext::create_virtual_table(&info, module, args, VTabKind::VirtualTable)?;
+        Ok(Arc::new(VirtualTable {
+            name: tbl_name.unwrap_or(module_name).to_owned(),
+            columns: Self::resolve_columns(schema)?,
+            kind: VTabKind::VirtualTable,
+            vtab_type,
+            vtab_id: VTAB_ID_COUNTER.fetch_add(1, Ordering::Acquire),
+            is_droppable: true,
+            innocuous: module.is_some_and(|module| module.implementation.innocuous()),
+        }))
+    }
+
     /// Like [`Self::table`]; `create` is the connection running `CREATE VIRTUAL TABLE`.
     pub(crate) fn table_for(
         tbl_name: Option<&str>,

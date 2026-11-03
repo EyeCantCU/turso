@@ -120,6 +120,15 @@ impl Fts3Table {
         matches!(&self.content, Some(c) if c.is_empty())
     }
 
+    /// `SELECT zReadExprlist`. SQLite fails to prepare it for a
+    /// contentless table, whose content table name is empty.
+    pub(crate) fn read_select(&self) -> Result<String> {
+        if self.contentless() {
+            return Err(sql_error("SQL logic error"));
+        }
+        Ok(format!("SELECT {}", self.read_exprlist()))
+    }
+
     /// `zReadExprlist`: docid, the columns and the language id.
     pub(crate) fn read_exprlist(&self) -> String {
         let mut s;
@@ -323,7 +332,7 @@ fn parse_args(
     db: &str,
     name: &str,
     args: &[String],
-    lookup_columns: Option<&crate::native_ext::ColumnLookup>,
+    lookup_columns: Option<&crate::native_ext::ColumnLookup<'_>>,
 ) -> Result<Fts3Table> {
     let fts4 = module.as_bytes().get(3) == Some(&b'4');
     let mut cols: Vec<String> = Vec::new();
@@ -885,10 +894,7 @@ impl CursorState {
     fn fill_scan(&mut self) -> Result<()> {
         let last = self.prev_id;
         let (lo, hi) = (self.min_docid, self.max_docid);
-        let mut sql = format!(
-            "SELECT {} WHERE rowid BETWEEN ? AND ?",
-            self.tab.read_exprlist()
-        );
+        let mut sql = format!("{} WHERE rowid BETWEEN ? AND ?", self.tab.read_select()?);
         let mut params = vec![Value::from_i64(lo), Value::from_i64(hi)];
         if self.scan_started {
             sql.push_str(if self.bdesc {
@@ -929,7 +935,7 @@ impl CursorState {
             }
             DOCID_SEARCH => {
                 if let Some(v) = self.docid_cons.take() {
-                    let sql = format!("SELECT {} WHERE rowid = ?", self.tab.read_exprlist());
+                    let sql = format!("{} WHERE rowid = ?", self.tab.read_select()?);
                     match Sql::new(&self.conn).row(&sql, &[v])? {
                         Some(r) => {
                             self.prev_id = value_int(&r[0]);
@@ -962,7 +968,7 @@ impl CursorState {
     pub(crate) fn seek(&mut self) -> Result<()> {
         if self.require_seek {
             self.require_seek = false;
-            let sql = format!("SELECT {} WHERE rowid = ?", self.tab.read_exprlist());
+            let sql = format!("{} WHERE rowid = ?", self.tab.read_select()?);
             match Sql::new(&self.conn).row(&sql, &[Value::from_i64(self.prev_id)])? {
                 Some(r) => self.row = Some(r),
                 None => {

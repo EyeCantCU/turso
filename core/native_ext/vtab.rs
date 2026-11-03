@@ -18,11 +18,11 @@ pub struct ConnectInfo<'a> {
     pub connection: Option<&'a Arc<Connection>>,
     /// Column names of another table in the schema being loaded, for
     /// modules that derive their columns from one.
-    pub lookup_columns: Option<&'a ColumnLookup>,
+    pub lookup_columns: Option<&'a ColumnLookup<'a>>,
 }
 
 /// Finds the column names of a table by name.
-pub type ColumnLookup = dyn Fn(&str) -> Option<Vec<String>>;
+pub type ColumnLookup<'a> = dyn Fn(&str) -> Option<Vec<String>> + 'a;
 
 impl Debug for ConnectInfo<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

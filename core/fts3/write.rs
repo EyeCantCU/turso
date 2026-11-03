@@ -892,10 +892,6 @@ fn update_doc_totals(ctx: &Ctx, ins: &[u32], del: &[u32], nchng: i64) -> Result<
     replace_stat(ctx, STAT_DOCTOTAL, blob(&encode_ints(&a)))
 }
 
-fn read_select(tab: &super::table::Fts3Table) -> String {
-    format!("SELECT {}", tab.read_exprlist())
-}
-
 fn langid_of(tab: &super::table::Fts3Table, row: &[Value]) -> i32 {
     if tab.langid.is_some() {
         row.get(tab.ncol() + 1).map(value_int).unwrap_or(0) as i32
@@ -907,7 +903,7 @@ fn langid_of(tab: &super::table::Fts3Table, row: &[Value]) -> i32 {
 /// `fts3DeleteTerms`: queues delete entries for a row; false if not found.
 fn delete_terms(ctx: &Ctx, rowid: &Value, sz: &mut [u32]) -> Result<bool> {
     let tab = ctx.tab;
-    let sql = format!("{} WHERE rowid=?", read_select(tab));
+    let sql = format!("{} WHERE rowid=?", tab.read_select()?);
     let Some(row) = ctx.sql().row(&sql, std::slice::from_ref(rowid))? else {
         return Ok(false);
     };
@@ -1168,7 +1164,7 @@ fn do_rebuild(ctx: &Ctx) -> Result<()> {
     let mut ins_tot = vec![0u32; ncol + 1];
     let del = vec![0u32; ncol + 1];
     let mut nentry: i64 = 0;
-    let rows = ctx.sql().rows(&read_select(tab), &[])?;
+    let rows = ctx.sql().rows(&tab.read_select()?, &[])?;
     for row in rows {
         let langid = langid_of(tab, &row);
         pending_docid(ctx, false, langid, value_int(&row[0]))?;
@@ -1276,7 +1272,7 @@ pub(crate) fn integrity_check(ctx: &Ctx) -> Result<bool> {
         return Ok(true);
     }
     let tok = tab.tokenizer(Some(ctx.conn))?;
-    let rows = ctx.sql().rows(&read_select(tab), &[])?;
+    let rows = ctx.sql().rows(&tab.read_select()?, &[])?;
     for row in rows {
         let docid = value_int(&row[0]);
         let lang = langid_of(tab, &row);

@@ -17822,7 +17822,19 @@ pub fn op_rename_table(
                 normalized_to.clone_into(&mut btree.declared_name);
             }
             Table::Virtual(vtab) => {
-                Arc::make_mut(vtab).name.clone_from(&normalized_to);
+                let vtab = Arc::make_mut(vtab);
+                vtab.name.clone_from(&normalized_to);
+                // SQLite reconnects a renamed table; modules such as FTS3
+                // declare a hidden column named after the table.
+                for col in vtab.columns.iter_mut().filter(|c| c.hidden()) {
+                    if col
+                        .name
+                        .as_deref()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(&normalized_from))
+                    {
+                        col.name = Some(to.clone());
+                    }
+                }
             }
             _ => panic!("only btree and virtual tables can be renamed"),
         }
