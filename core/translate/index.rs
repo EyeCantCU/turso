@@ -1158,6 +1158,9 @@ fn resolve_sorted_columns_with_catalog(
             }
         } else {
             if !validate_index_expression(unwrapped_expr, table) {
+                if let ast::Expr::Id(name) | ast::Expr::Name(name) = unwrapped_expr {
+                    crate::bail_parse_error!("no such column: {}", name.as_str());
+                }
                 crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
             }
             let ordering = expression_type_ordering(unwrapped_expr, table, schema, syms)?;

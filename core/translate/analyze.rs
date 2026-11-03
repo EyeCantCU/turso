@@ -50,7 +50,7 @@ fn resolve_analyze_targets(
                 // But first check if the name is actually a database name too (shouldn't be with db_name set)
                 let targets = resolve_targets_in_db(&normalized, namespace, resolver)?;
                 if targets.is_empty() {
-                    bail_parse_error!("no such table or index: {}.{}", db_normalized, normalized);
+                    bail_parse_error!("no such table: {}.{}", db_normalized, normalized);
                 }
                 return Ok((namespace, targets));
             }
@@ -85,7 +85,7 @@ fn resolve_analyze_targets(
                 .unwrap_or(NamespaceRef::root_of(crate::MAIN_DB_ID));
             let targets = resolve_targets_in_db(&normalized, table_namespace, resolver)?;
             if targets.is_empty() {
-                bail_parse_error!("no such table or index: {}", target.name);
+                bail_parse_error!("no such table: {}", target.name);
             }
             Ok((table_namespace, targets))
         }

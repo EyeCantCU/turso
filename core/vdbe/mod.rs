@@ -1801,7 +1801,9 @@ impl ProgramState {
                 if let Some(tx_id) = connection.get_mv_tx_id() {
                     mv_store.begin_savepoint(tx_id);
                 }
-            } else {
+            } else if !self.is_blob_handle {
+                // A blob handle outlives its statement and would hold the single
+                // subjournal; its writes are covered by the enclosing transaction.
                 // Non-MVCC mode: use pager savepoints
                 let db_size = return_if_io!(pager.with_header(|header| header.database_size.get()));
                 pager.open_subjournal()?;

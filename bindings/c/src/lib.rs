@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tracing::trace;
 use turso_core::dialect::sqlite::{SQLITE_VERSION, SQLITE_VERSION_NUMBER};
+mod errmsg;
 use turso_core::SqliteDialect;
 use turso_core::{CheckpointMode, ConnectOpts, DatabaseOpts, LimboError, Value};
 use turso_ext::ScalarFunction;
@@ -74,7 +75,8 @@ pub extern "C" fn turso_enable_experimental() {
 
 /// Build `DatabaseOpts` respecting the global experimental flag.
 fn default_db_opts() -> DatabaseOpts {
-    let mut opts = DatabaseOpts::new();
+    // ATTACH and VACUUM are always on: a libsqlite3 consumer cannot opt in.
+    let mut opts = DatabaseOpts::new().with_attach(true).with_vacuum(true);
     if EXPERIMENTAL_ENABLED.load(Ordering::Acquire) {
         opts = opts
             .with_vacuum(true)
@@ -335,7 +337,8 @@ fn register_csv_module(conn: &Arc<turso_core::Connection>) {
 }
 
 impl sqlite3_stmt {
-    pub fn new(db: Arc<sqlite3>, stmt: turso_core::Statement) -> Self {
+    pub fn new(db: Arc<sqlite3>, mut stmt: turso_core::Statement) -> Self {
+        stmt.set_structured_errors(true);
         let n_cols = stmt.num_columns();
         let sql = CString::new(stmt.get_sql()).unwrap_or_default();
         Self {
@@ -1181,7 +1184,7 @@ pub(crate) unsafe fn prepare_v2_impl(
             if !tail.is_null() {
                 *tail = sql.add(sql_bytes.len());
             }
-            return set_db_err(&mut db, err);
+            return set_db_err_sql(&mut db, err, Some(sql_str));
         }
     };
     if !tail.is_null() {
@@ -1229,6 +1232,11 @@ pub unsafe extern "C" fn sqlite3_prepare_v3(
 
 unsafe fn stmt_run_to_completion(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     let stmt_ref = &mut *stmt;
+    // SQLite resets a read-only statement where it stands; running it on
+    // would re-invoke UDFs (and their side effects) for every remaining row.
+    if stmt_ref.stmt.get_program().is_readonly() {
+        return SQLITE_OK;
+    }
     while stmt_ref.stmt.execution_state().is_running() {
         let result = step_impl(stmt);
         if result != SQLITE_DONE && result != SQLITE_ROW {
@@ -3177,7 +3185,22 @@ pub unsafe extern "C" fn sqlite3_create_collation_v2(
         Ok(s) => s.to_owned(),
         Err(_) => return SQLITE_MISUSE,
     };
-    let inner = (*db).inner.lock().unwrap();
+    let mut inner = (*db).inner.lock().unwrap();
+    // SQLite refuses to replace or drop a collation while statements are running.
+    if inner.conn.has_external_collation(&name) {
+        let mut p = inner.stmt_list;
+        while !p.is_null() {
+            if (*p).stmt.is_busy() {
+                set_db_err_msg(
+                    &mut inner,
+                    SQLITE_BUSY,
+                    "unable to delete/modify collation sequence due to active statements",
+                );
+                return SQLITE_BUSY;
+            }
+            p = (*p).next;
+        }
+    }
     let Some(cmp) = cmp else {
         inner.conn.unregister_external_collation(&name);
         return SQLITE_OK;
@@ -3323,7 +3346,8 @@ pub unsafe extern "C" fn sqlite3_create_function_v2(
         api.ctx,
         func_name_c.as_ptr(),
         _n_args,
-        false,
+        // SQLITE_DETERMINISTIC
+        _enc & 0x800 != 0,
         0,
         bridge,
         None,
@@ -3825,7 +3849,13 @@ pub unsafe extern "C" fn sqlite3_table_column_metadata(
 }
 
 fn limbo_err_code(err: &LimboError) -> i32 {
+    if let Some(code) = errmsg::extended_code(err) {
+        return code;
+    }
     match err {
+        LimboError::Constraint(m) if m == "datatype mismatch" => SQLITE_MISMATCH,
+        LimboError::ConstraintViolation(v) if v.message == "datatype mismatch" => SQLITE_MISMATCH,
+        LimboError::TooBig => SQLITE_TOOBIG,
         LimboError::Corrupt(..) => SQLITE_CORRUPT,
         LimboError::NotADB => SQLITE_NOTADB,
         // A Raise is a constraint error that carries its own conflict
@@ -3854,7 +3884,7 @@ fn limbo_err_code(err: &LimboError) -> i32 {
 fn handle_limbo_err(err: LimboError, container: *mut *mut ffi::c_char) -> i32 {
     let code = limbo_err_code(&err);
     if !container.is_null() {
-        let err_msg = format!("{err}");
+        let err_msg = errmsg::message(&err, None);
         unsafe { *container = CString::new(err_msg).unwrap().into_raw() };
     }
     code
@@ -3863,12 +3893,12 @@ fn handle_limbo_err(err: LimboError, container: *mut *mut ffi::c_char) -> i32 {
 /// Store a LimboError on the database handle, returning the SQLite error code.
 /// Like SQLite, the result is masked unless extended result codes are on.
 unsafe fn set_db_err(db: &mut sqlite3Inner, err: LimboError) -> i32 {
-    // Errors raised by user-defined functions carry the application's own
-    // message; SQLite reports it verbatim, without turso's prefix.
-    if let LimboError::ExtensionError(msg) = &err {
-        return set_db_err_msg(db, limbo_err_code(&err), msg) & db.err_mask;
-    }
-    set_db_err_msg(db, limbo_err_code(&err), &format!("{err}")) & db.err_mask
+    set_db_err_sql(db, err, None)
+}
+
+/// Like `set_db_err`; `sql` lets lexer errors quote the whole bad token.
+unsafe fn set_db_err_sql(db: &mut sqlite3Inner, err: LimboError, sql: Option<&str>) -> i32 {
+    set_db_err_msg(db, limbo_err_code(&err), &errmsg::message(&err, sql)) & db.err_mask
 }
 
 unsafe fn set_db_err_msg(db: &mut sqlite3Inner, code: i32, err_msg: &str) -> i32 {
@@ -3892,22 +3922,21 @@ mod tests {
 
     #[test]
     fn structured_constraint_errors_keep_sqlite_codes() {
-        for kind in [
-            turso_core::ConstraintKind::PrimaryKey,
-            turso_core::ConstraintKind::Unique,
-            turso_core::ConstraintKind::ForeignKey,
-            turso_core::ConstraintKind::NotNull,
-            turso_core::ConstraintKind::Check,
-            turso_core::ConstraintKind::Other,
+        use turso_core::ConstraintKind::*;
+        for (kind, extended) in [
+            (PrimaryKey, 1555),
+            (Unique, 2067),
+            (ForeignKey, 787),
+            (NotNull, 1299),
+            (Check, 275),
+            (Other, super::SQLITE_CONSTRAINT),
         ] {
             let error = turso_core::LimboError::ConstraintViolation(Box::new(
                 turso_core::ConstraintViolation::new(kind, "constraint message".to_string()),
             ));
-            assert_eq!(
-                super::limbo_err_code(&error),
-                super::SQLITE_CONSTRAINT,
-                "{kind:?}"
-            );
+            let code = super::limbo_err_code(&error);
+            assert_eq!(code, extended, "{kind:?}");
+            assert_eq!(code & 0xff, super::SQLITE_CONSTRAINT, "{kind:?}");
         }
     }
     use super::*;

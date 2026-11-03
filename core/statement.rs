@@ -225,6 +225,8 @@ pub struct Statement {
     /// The command the statement was prepared from, when its SQL text cannot
     /// be parsed again, so that preparing it again translates the command.
     reprepare_cmd: Option<Cmd>,
+    /// Report constraint errors with their kind instead of the dialect's text-only form.
+    structured_errors: bool,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -308,6 +310,7 @@ impl Statement {
             nested_guard_active,
             analyze_refresh: None,
             reprepare_cmd: None,
+            structured_errors: false,
         }
     }
 
@@ -790,7 +793,15 @@ impl Statement {
             .map_err(|err| *err)
     }
 
+    /// Keep `LimboError::ConstraintViolation` kinds in step/reset errors (C API extended codes).
+    pub fn set_structured_errors(&mut self, on: bool) {
+        self.structured_errors = on;
+    }
+
     fn format_error(&self, error: LimboError) -> LimboError {
+        if self.structured_errors {
+            return error;
+        }
         self.program.connection.dialect().format_error(error)
     }
 

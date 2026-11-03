@@ -75,7 +75,7 @@ fn validate(
             };
             crate::bail_parse_error!("table {} may not be altered", name);
         }
-        crate::bail_parse_error!("table {} may not be modified", table_name);
+        crate::bail_parse_error!("table {} may not be altered", table_name);
     }
     if let ast::AlterTableBody::RenameTo(new_table_name) = alter_table {
         let normalized_new_name = normalize_ident(new_table_name.as_str());

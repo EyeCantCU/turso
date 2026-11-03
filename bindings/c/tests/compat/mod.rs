@@ -1,3 +1,4 @@
+#![allow(clashing_extern_declarations)]
 #![allow(non_camel_case_types)]
 #![allow(dead_code)]
 #![allow(unused_imports)]
@@ -231,6 +232,7 @@ mod config;
 mod hooks;
 mod stubs;
 
+mod errmsg;
 mod misc;
 
 mod tests {
