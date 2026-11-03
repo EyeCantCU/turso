@@ -1480,12 +1480,12 @@ pub fn translate_create_table(
         }
     }
 
-    // Create the backing table for the hidden AUTOINCREMENT sequence. The
-    // `__turso_internal_autoincrement_` prefix identifies the sequence object;
-    // `sequence_backing_table_name` then maps it to the physical
-    // `__turso_internal_seq_<sequence-name>` table.
+    // Only MVCC needs the backing table of the hidden AUTOINCREMENT sequence:
+    // WAL mode keeps the counter in sqlite_sequence, like SQLite, so the file
+    // holds no turso-specific object. MVCC bootstrap creates it for tables
+    // that predate the switch.
     // Skip if it already exists (e.g. VACUUM INTO copies all tables first).
-    if has_autoincrement {
+    if has_autoincrement && connection.mv_store_for_db(database_id).is_some() {
         let autoinc_seq_name = crate::schema::autoincrement_sequence_name(&mangled_tbl_name);
         let backing_table_name =
             crate::translate::sequence::sequence_backing_table_name(&autoinc_seq_name);
@@ -2830,12 +2830,24 @@ pub fn translate_drop_table(
     // contract as DROP SEQUENCE IF EXISTS.
     if table.btree().is_some_and(|bt| bt.has_autoincrement) {
         let seq_name = crate::schema::autoincrement_sequence_name(&mangled_name);
-        crate::translate::sequence::emit_drop_sequence_cleanup(
+        let cleaned = crate::translate::sequence::emit_drop_sequence_cleanup(
             program,
             resolver,
             NamespaceRef::root_of(database_id),
             &seq_name,
         )?;
+        // Without a backing table (WAL mode) only the in-memory sequence is left.
+        if !cleaned
+            && resolver.with_schema(database_id, |s| {
+                s.get_sequence(NamespaceId::ROOT, &seq_name).is_some()
+            })
+        {
+            program.emit_insn(Insn::DropSequence {
+                db: database_id,
+                namespace: NamespaceId::ROOT,
+                seq_name,
+            });
+        }
     }
 
     let current_schema_version = resolver.with_schema(database_id, |s| s.schema_version);

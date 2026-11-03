@@ -933,6 +933,13 @@ pub const ROWID_SENTINEL: usize = usize::MAX;
 pub const EXPR_INDEX_SENTINEL: usize = usize::MAX;
 
 /// Internal table prefixes that should be protected from CREATE/DROP
+/// Whether `name` is an engine-owned object that user-visible catalog
+/// listings leave out.
+pub fn is_turso_internal_name(name: &str) -> bool {
+    name.get(..TURSO_INTERNAL_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(TURSO_INTERNAL_PREFIX))
+}
+
 pub const RESERVED_TABLE_PREFIXES: [&str; 2] = ["sqlite_", "__turso_internal_"];
 
 /// Check if a table name refers to a system table that should be protected from direct writes
@@ -3694,6 +3701,21 @@ impl Schema {
             })
             .try_collect()
             .expect(crate::alloc::ALLOC_ERR_MSG)
+    }
+
+    /// Names of the AUTOINCREMENT tables that have no sequence backing table.
+    pub fn autoincrement_tables_without_backing(&self) -> Vec<String> {
+        let ns = self.namespace(NamespaceId::ROOT);
+        ns.tables
+            .iter()
+            .filter(|(_, table)| table.btree().is_some_and(|bt| bt.has_autoincrement))
+            .filter(|(name, _)| {
+                let backing =
+                    String::from(SEQ_BACKING_TABLE_PREFIX) + &autoincrement_sequence_name(name);
+                !ns.tables.contains_key(&backing)
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     fn sequence_backing_tables(&self) -> Vec<SequenceBackingTableSource> {

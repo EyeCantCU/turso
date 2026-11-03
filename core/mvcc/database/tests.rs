@@ -2061,11 +2061,20 @@ fn wipe_table_leaf_cells(page: &mut [u8], page_no: u32) -> bool {
 }
 
 fn metadata_root_page(conn: &Arc<Connection>) -> u32 {
-    let rows = get_rows(
-        conn,
-        "SELECT rootpage FROM sqlite_schema
-         WHERE type = 'table' AND name = '__turso_internal_mvcc_meta'",
-    );
+    // An internal statement: user queries of sqlite_schema hide this table.
+    let mut stmt = conn
+        .prepare_with_origin(
+            "SELECT rootpage FROM sqlite_schema
+             WHERE type = 'table' AND name = '__turso_internal_mvcc_meta'",
+            crate::statement::StatementOrigin::EngineMetadataRead,
+        )
+        .unwrap();
+    let mut rows = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        rows.push(row.get_values().cloned().collect::<Vec<_>>());
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(rows.len(), 1, "expected exactly one metadata table row");
     rows[0][0].as_int().unwrap() as u32
 }

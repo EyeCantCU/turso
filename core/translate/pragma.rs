@@ -156,6 +156,7 @@ fn emit_table_list_rows_for_schema(
     database_name: &str,
     base_reg: usize,
     filter_name: Option<&str>,
+    hide_internal: bool,
 ) {
     let emit_table_row = |program: &mut ProgramBuilder,
                           name: &str,
@@ -207,6 +208,9 @@ fn emit_table_list_rows_for_schema(
         let Some(bt) = table.btree() else {
             continue;
         };
+        if hide_internal && crate::schema::is_turso_internal_name(&bt.name) {
+            continue;
+        }
         emit_table_row(
             program,
             &bt.name,
@@ -1421,6 +1425,7 @@ fn query_pragma(
                             &database_name,
                             base_reg,
                             name.as_deref(),
+                            resolver.hide_internal_schema_rows,
                         )
                     }
                 });

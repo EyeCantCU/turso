@@ -3986,4 +3986,67 @@ mod tests {
             );
         }
     }
+
+    /// Collect the first column of every row `sql` returns as text.
+    unsafe fn column_texts(db: *mut sqlite3, sql: &std::ffi::CStr) -> Vec<String> {
+        let mut stmt = ptr::null_mut();
+        assert_eq!(
+            sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut()),
+            SQLITE_OK
+        );
+        let mut out = Vec::new();
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let text = sqlite3_column_text(stmt, 0);
+            out.push(
+                std::ffi::CStr::from_ptr(text)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+        out
+    }
+
+    /// A schema walk sees what the user made and `sqlite_sequence`, nothing the
+    /// engine keeps for itself.
+    #[test]
+    fn test_schema_listing_has_no_internal_objects() {
+        unsafe {
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+            let rc = sqlite3_exec(
+                db,
+                c"CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+                  CREATE INDEX t_v ON t(v);
+                  CREATE VIEW vt AS SELECT v FROM t;
+                  INSERT INTO t(v) VALUES ('a'), ('b'), ('c');
+                  DELETE FROM t WHERE id = 3;"
+                    .as_ptr(),
+                None,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            assert_eq!(rc, SQLITE_OK);
+
+            let all = column_texts(db, c"SELECT name FROM sqlite_schema ORDER BY name");
+            assert_eq!(all, ["sqlite_sequence", "t", "t_v", "vt"]);
+            let master = column_texts(db, c"SELECT name FROM sqlite_master ORDER BY name");
+            assert_eq!(master, all);
+            let listed = column_texts(
+                db,
+                c"SELECT name FROM pragma_table_list WHERE schema = 'main'",
+            );
+            assert!(listed
+                .iter()
+                .all(|name| !name.starts_with("__turso_internal_")));
+            assert_eq!(
+                column_texts(db, c"SELECT seq FROM sqlite_sequence WHERE name = 't'"),
+                ["3"]
+            );
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
 }

@@ -4069,6 +4069,10 @@ pub enum BootstrapState {
         tvfs: Vec<Arc<crate::vtab::VirtualTable>>,
         reparse_st: crate::connection::ReparseSchemaState,
     },
+    /// Creating the counter tables of AUTOINCREMENT tables made in WAL mode.
+    EnsureAutoincBacking {
+        create_st: crate::connection::CreateBackingState,
+    },
     /// Reading the persistent tx-ts-max from the MVCC metadata table to decide
     /// whether the metadata-bootstrap IO chain is needed.
     BeginReadTxTs {
@@ -5169,6 +5173,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 BootstrapState::PreReparse { tvfs, reparse_st } => {
                     return_if_io!(bootstrap_conn.reparse_schema_nonblock(reparse_st));
                     self.rehydrate_connection_table_valued_functions(bootstrap_conn, tvfs)?;
+                    *st = BootstrapState::EnsureAutoincBacking {
+                        create_st: crate::connection::CreateBackingState::default(),
+                    };
+                }
+                BootstrapState::EnsureAutoincBacking { create_st } => {
+                    return_if_io!(
+                        bootstrap_conn.create_autoincrement_backing_tables_nonblock(create_st)
+                    );
                     // pre_metadata done. Decide whether metadata bootstrap IO is needed.
                     if !self.uses_durable_mvcc_metadata(bootstrap_conn) {
                         self.bootstrap_map_root_pages(bootstrap_conn)?;
@@ -9694,11 +9706,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     else {
                         unreachable!("state is ReadCookie");
                     };
-                    let stmt = connection
-                        .query(
-                            "SELECT rowid, type, name, tbl_name, rootpage, sql FROM sqlite_schema",
-                        )?
-                        .map(Box::new);
+                    let stmt = Some(Box::new(connection.prepare_with_origin(
+                        "SELECT rowid, type, name, tbl_name, rootpage, sql FROM sqlite_schema",
+                        crate::statement::StatementOrigin::EngineMetadataRead,
+                    )?));
                     *st = RecoverLogicalLogState::QuerySchema {
                         reader,
                         preserved_tvfs,

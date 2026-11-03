@@ -3000,8 +3000,6 @@ mod tests {
                     vec![
                         "sqlite_sequence".to_string(),
                         "turso_cdc".to_string(),
-                        // Implicit AUTOINCREMENT backing table for turso_cdc.
-                        "__turso_internal_seq___turso_internal_autoincrement_turso_cdc".to_string(),
                         "turso_cdc_version".to_string(),
                         "sqlite_autoindex_turso_cdc_version_1".to_string(),
                         "t".to_string(),

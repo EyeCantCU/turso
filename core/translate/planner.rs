@@ -6,11 +6,12 @@ use super::plan::NamedWindowBound;
 use super::{
     expr::{walk_expr, walk_expr_mut},
     plan::{
-        alias_or_stored_name, left_using_column_sources, merge_columns, query_output_columns,
-        resolve_unqualified_column, Aggregate, ColumnUsedMask, Distinctness, EvalAt,
-        IterationDirection, JoinInfo, JoinOrderMember, JoinOrigin, JoinType as PlanJoinType,
-        JoinedTable, Operation, OuterQueryReference, Plan, QueryDestination, ResolvedColumn,
-        ResultSetColumn, Scan, TableReferences, WhereTerm, WhereTermOrigin,
+        alias_or_stored_name, is_schema_table, left_using_column_sources, merge_columns,
+        query_output_columns, resolve_unqualified_column, Aggregate, ColumnUsedMask, Distinctness,
+        EvalAt, IterationDirection, JoinInfo, JoinOrderMember, JoinOrigin,
+        JoinType as PlanJoinType, JoinedTable, Operation, OuterQueryReference, Plan,
+        QueryDestination, ResolvedColumn, ResultSetColumn, Scan, TableReferences, WhereTerm,
+        WhereTermOrigin,
     },
     select::{prepare_select_plan, prepare_select_plan_from_arms},
 };
@@ -2448,6 +2449,7 @@ pub fn parse_from(
 ) -> Result<()> {
     let mut cte_definitions = Vec::new();
     let mut shadowed_outer_ctes = Vec::new();
+    let first_new_table = table_references.joined_tables().len();
 
     if let Some(with) = with {
         cte_definitions = collect_cte_definitions(with, program)?;
@@ -2512,7 +2514,57 @@ pub fn parse_from(
     }
 
     program.unmask_shadowed_ctes_being_defined(shadowed_outer_ctes);
+    if resolver.hide_internal_schema_rows {
+        hide_internal_schema_rows(table_references, first_new_table, out_where_clause);
+    }
     Ok(())
+}
+
+/// Adds a term that drops the engine's `__turso_internal_*` objects from each
+/// sqlite_schema read in `table_references[first..]`.
+fn hide_internal_schema_rows(
+    table_references: &mut TableReferences,
+    first: usize,
+    out_where_clause: &mut Vec<WhereTerm>,
+) {
+    // sqlite_schema columns: type, name, tbl_name, rootpage, sql
+    const NAME: usize = 1;
+    const TBL_NAME: usize = 2;
+    for idx in first..table_references.joined_tables().len() {
+        let table = &table_references.joined_tables()[idx];
+        if !is_schema_table(&table.table) {
+            continue;
+        }
+        let id = table.internal_id;
+        let origin = match &table.join_info {
+            Some(info) => WhereTermOrigin::Join(JoinOrigin::new(id, info.is_outer())),
+            None => WhereTermOrigin::Where,
+        };
+        let not_internal = |column: usize| Expr::Like {
+            lhs: Box::new(Expr::Column {
+                database: None,
+                table: id,
+                column,
+                is_rowid_alias: false,
+            }),
+            not: true,
+            op: ast::LikeOperator::Like,
+            rhs: Box::new(Expr::Literal(ast::Literal::String(
+                "'\\_\\_turso\\_internal\\_%'".to_string(),
+            ))),
+            escape: Some(Box::new(Expr::Literal(ast::Literal::String(
+                "'\\'".to_string(),
+            )))),
+        };
+        for column in [NAME, TBL_NAME] {
+            out_where_clause.push(WhereTerm {
+                expr: not_internal(column),
+                origin,
+                consumed: false,
+            });
+            table_references.mark_column_used(id, column);
+        }
+    }
 }
 
 /// Plans the CTEs that subqueries read and adds them as outer query references.

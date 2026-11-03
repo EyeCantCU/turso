@@ -1945,8 +1945,9 @@ impl Limbo {
 
     fn dump_custom_types<W: Write>(conn: &Arc<Connection>, out: &mut W) -> anyhow::Result<()> {
         // Check if the internal types table exists before querying it.
+        // Named in table_list, as sqlite_schema hides the table from users.
         let check = format!(
-            "SELECT 1 FROM sqlite_schema WHERE name='{}' AND type='table'",
+            "SELECT 1 FROM pragma_table_list('{}')",
             turso_core::schema::TURSO_TYPES_TABLE_NAME
         );
         let mut has_types = false;
