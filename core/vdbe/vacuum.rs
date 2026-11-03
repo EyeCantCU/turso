@@ -1903,6 +1903,14 @@ fn vacuum_in_place_step(
                 if connection.is_readonly(db) {
                     return Err(LimboError::ReadOnly.into());
                 }
+                // An empty database has nothing to copy; a pending auto_vacuum
+                // mode applies when it is created.
+                if !source_pager.db_initialized() {
+                    if let Some(mode) = connection.next_auto_vacuum() {
+                        source_pager.persist_auto_vacuum_mode(mode)?;
+                    }
+                    return Ok(IOResult::Done(()));
+                }
                 // 4. Resolve source database mode.
                 let source_db = connection.get_source_database(db);
                 let source_mvcc_enabled = source_db.mvcc_enabled();

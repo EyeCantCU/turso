@@ -2371,10 +2371,12 @@ pub enum Insn {
     },
 
     /// Incremental vacuum: give up to `limit` free pages of database `db`
-    /// back to the file system (all of them when `limit` is 0).
+    /// back to the file system (all of them when `limit` is 0) and store
+    /// how many were given back in `dest`.
     IncrVacuum {
         db: usize,
         limit: u32,
+        dest: usize,
     },
 
     /// Ensure turso_cdc_version table exists and insert/replace a version row,

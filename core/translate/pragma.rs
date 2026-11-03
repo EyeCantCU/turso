@@ -578,7 +578,22 @@ fn update_pragma(
                         b"none" => Some(AutoVacuumMode::None),
                         b"full" => Some(AutoVacuumMode::Full),
                         b"incremental" => Some(AutoVacuumMode::Incremental),
-                        _ => Some(AutoVacuumMode::None),
+                        // getAutoVacuum: anything else goes through sqlite3Atoi.
+                        _ => {
+                            let digits = name.trim_ascii_start();
+                            let digits = digits.strip_prefix(b"+").unwrap_or(digits);
+                            let n = digits
+                                .iter()
+                                .take_while(|b| b.is_ascii_digit())
+                                .fold(0u64, |n, b| {
+                                    n.saturating_mul(10).saturating_add(u64::from(b - b'0'))
+                                });
+                            match n {
+                                1 => Some(AutoVacuumMode::Full),
+                                2 => Some(AutoVacuumMode::Incremental),
+                                _ => Some(AutoVacuumMode::None),
+                            }
+                        }
                     })
                 }
                 _ => match parse_signed_number(&value) {
@@ -1738,10 +1753,30 @@ fn query_pragma(
                 }
                 _ => 0,
             };
+            // SQLite returns one empty row per page it gives back.
             program.emit_insn(Insn::IncrVacuum {
                 db: database_id,
                 limit,
+                dest: register,
             });
+            let loop_label = program.allocate_label();
+            let row_label = program.allocate_label();
+            let end_label = program.allocate_label();
+            program.preassign_label_to_next_insn(loop_label);
+            program.emit_insn(Insn::IfPos {
+                reg: register,
+                target_pc: row_label,
+                decrement_by: 1,
+            });
+            program.emit_insn(Insn::Goto {
+                target_pc: end_label,
+            });
+            program.preassign_label_to_next_insn(row_label);
+            program.emit_result_row(register, 0);
+            program.emit_insn(Insn::Goto {
+                target_pc: loop_label,
+            });
+            program.preassign_label_to_next_insn(end_label);
             Ok(TransactionMode::Write)
         }
         PragmaName::FreelistCount => {

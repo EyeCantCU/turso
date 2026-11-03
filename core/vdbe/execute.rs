@@ -17650,6 +17650,10 @@ pub fn op_integrity_check(
         } => {
             use crate::storage::btree::PageCategory as C;
             let geom = *geom;
+            // Inside a write transaction the pointer map is brought up to date lazily.
+            if *next_page == 2 {
+                return_if_io!(state, target_pager.av_fixup());
+            }
             while (*next_page as usize) <= check_state.db_size && errors.len() < *max_errors {
                 let page = *next_page as i64;
                 let Some(&parent) = check_state.page_reference.get(&page) else {
@@ -20766,8 +20770,9 @@ pub fn op_incr_vacuum(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(IncrVacuum { db, limit }, insn);
+    load_insn!(IncrVacuum { db, limit, dest }, insn);
     check_db_write_allowed(program, state, None)?;
+    let mut freed = 0;
     #[cfg(feature = "autovacuum")]
     if program.connection.mv_store_for_db(*db).is_none() {
         let pager = program.get_pager_from_database_index(db)?;
@@ -20777,11 +20782,12 @@ pub fn op_incr_vacuum(
         );
         if mode != crate::storage::pager::AutoVacuumMode::None {
             let limit = (*limit != 0).then_some(*limit);
-            return_if_io!(state, pager.av_vacuum(limit));
+            freed = return_if_io!(state, pager.av_vacuum(limit));
         }
     }
     #[cfg(not(feature = "autovacuum"))]
     let _ = (db, limit);
+    state.registers[*dest].set_int(freed as i64);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
