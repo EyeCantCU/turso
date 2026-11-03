@@ -122,6 +122,9 @@ impl VirtualTableModule for Fts5Module {
     fn connect(&self, info: &ConnectInfo, args: &[Value]) -> Result<(Fts5Table, String)> {
         let cfg =
             Fts5Config::parse(info.schema_name, info.table_name, &args_text(args)).map_err(err)?;
+        if info.create || cfg.preload_tokenizer() {
+            cfg.tokenizer().map_err(err)?;
+        }
         if info.create {
             if let Some(conn) = info.connection {
                 Storage::create_tables(conn, &cfg)?;
@@ -1069,7 +1072,7 @@ impl CursorState {
                 })
                 .collect();
             let mut ioff: i64 = ((icol as i64) << 32) - 1;
-            let rc = cfg.tokenizer.tokenize(
+            let rc = cfg.tokenizer().map_err(err)?.tokenize(
                 tokenize::TOKENIZE_DOCUMENT,
                 &text,
                 loc.as_deref(),
@@ -1156,7 +1159,7 @@ impl CursorState {
                 }
                 let text = row.get(i + 1).and_then(value_text).unwrap_or_default();
                 let mut n = 0i64;
-                self.inner.cfg.tokenizer.tokenize(
+                self.inner.cfg.tokenizer().map_err(err)?.tokenize(
                     tokenize::TOKENIZE_AUX,
                     &text,
                     None,
@@ -1212,11 +1215,12 @@ impl AuxApi for CursorState {
         locale: Option<&[u8]>,
         cb: &mut dyn FnMut(i32, &[u8], i32, i32) -> i32,
     ) -> ApiResult<()> {
-        let rc = self
+        let tok = self
             .inner
             .cfg
-            .tokenizer
-            .tokenize(tokenize::TOKENIZE_AUX, text, locale, cb);
+            .tokenizer()
+            .map_err(|e| ApiError::Err(err(e)))?;
+        let rc = tok.tokenize(tokenize::TOKENIZE_AUX, text, locale, cb);
         if rc != 0 {
             return Err(ApiError::Code(rc));
         }

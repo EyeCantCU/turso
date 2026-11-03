@@ -249,17 +249,19 @@ impl<'a> Storage<'a> {
         f: &mut dyn FnMut(&[u8], i32),
     ) -> Result<i32> {
         let mut sz = 0i32;
-        let rc = self
-            .cfg
-            .tokenizer
-            .tokenize(flags, text, locale, &mut |tflags, tok, _, _| {
+        let rc = self.cfg.tokenizer().map_err(err)?.tokenize(
+            flags,
+            text,
+            locale,
+            &mut |tflags, tok, _, _| {
                 let tok = &tok[..tok.len().min(MAX_TOKEN_SIZE)];
                 if (tflags & TOKEN_COLOCATED) == 0 || sz == 0 {
                     sz += 1;
                 }
                 f(tok, sz - 1);
                 0
-            });
+            },
+        );
         if rc != 0 {
             return Err(err(format!("tokenizer error {rc}")));
         }

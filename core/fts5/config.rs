@@ -2,7 +2,7 @@
 //! %_config table (fts5_config.c).
 
 use super::tokenize::{self, Pattern, Tokenizer};
-use crate::sync::Arc;
+use crate::sync::{Arc, Mutex};
 use crate::Value;
 
 pub(crate) const DEFAULT_PAGE_SIZE: i32 = 4050;
@@ -52,7 +52,8 @@ pub(crate) struct Fts5Config {
     pub content_rowid: String,
     pub content_exprlist: String,
     pub tokenizer_args: Vec<String>,
-    pub tokenizer: Arc<dyn Tokenizer>,
+    /// Created on first use, as in SQLite (except for CREATE and trigram).
+    tokenizer: Mutex<Option<Arc<dyn Tokenizer>>>,
 }
 
 impl std::fmt::Debug for Fts5Config {
@@ -532,18 +533,6 @@ impl Fts5Config {
             }
         }
         let tokenizer_args = b.tokenize.unwrap_or_default();
-        let module = tokenize::find_module(tokenizer_args.first().map(|s| s.as_str()))
-            .ok_or_else(|| format!("no such tokenizer: {}", tokenizer_args[0]))?;
-        let rest = if tokenizer_args.is_empty() {
-            &[][..]
-        } else {
-            &tokenizer_args[1..]
-        };
-        let tokenizer: Arc<dyn Tokenizer> = Arc::from(
-            module
-                .create(rest)
-                .map_err(|_| "error in tokenizer constructor".to_string())?,
-        );
         Ok(Self {
             db: db.to_string(),
             name: name.to_string(),
@@ -561,8 +550,34 @@ impl Fts5Config {
             content_rowid,
             content_exprlist: exprlist,
             tokenizer_args,
-            tokenizer,
+            tokenizer: Mutex::new(None),
         })
+    }
+
+    /// The table's tokenizer, created on first use (sqlite3Fts5LoadTokenizer).
+    pub(crate) fn tokenizer(&self) -> Result<Arc<dyn Tokenizer>, String> {
+        let mut slot = self.tokenizer.lock();
+        if let Some(t) = slot.as_ref() {
+            return Ok(t.clone());
+        }
+        let args = &self.tokenizer_args;
+        let module = tokenize::find_module(args.first().map(|s| s.as_str()))
+            .ok_or_else(|| format!("no such tokenizer: {}", args[0]))?;
+        let rest = if args.is_empty() { &[][..] } else { &args[1..] };
+        let tok: Arc<dyn Tokenizer> = Arc::from(
+            module
+                .create(rest)
+                .map_err(|_| "error in tokenizer constructor".to_string())?,
+        );
+        *slot = Some(tok.clone());
+        Ok(tok)
+    }
+
+    /// Whether the tokenizer is created at connect time (trigram).
+    pub(crate) fn preload_tokenizer(&self) -> bool {
+        self.tokenizer_args
+            .first()
+            .is_some_and(|a| a.eq_ignore_ascii_case("trigram"))
     }
 
     pub(crate) fn ncol(&self) -> usize {
@@ -570,7 +585,7 @@ impl Fts5Config {
     }
 
     pub(crate) fn pattern(&self) -> Pattern {
-        self.tokenizer.pattern()
+        self.tokenizer().map_or(Pattern::None, |t| t.pattern())
     }
 
     /// `CREATE TABLE x(...)` declared to the core.

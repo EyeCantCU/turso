@@ -35,7 +35,8 @@ fn tq(conn: &Arc<Connection>, sql: &str) -> String {
     })();
     match r {
         Ok(()) => out.join("\n"),
-        Err(e) => format!("ERR: {e}"),
+        // turso prefixes parse errors; SQLite does not.
+        Err(e) => format!("ERR: {}", e.to_string().trim_start_matches("Parse error: ")),
     }
 }
 
@@ -500,4 +501,133 @@ fn fts5_differential_fuzz() {
             fuzz_case(seed * 1000 + i as u64 + 1, case, nops, 30);
         }
     }
+}
+
+/// Runs each statement on both engines and compares results and errors.
+fn compare_script(stmts: &[&str]) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open(&temp_path(&dir, "c.db"));
+    let s = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in stmts {
+        assert_eq!(
+            norm_floats(&tq(&t, sql)),
+            norm_floats(&sq(&s, sql)),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn fts5_external_content() {
+    compare_script(&[
+        "CREATE TABLE docs(id INTEGER PRIMARY KEY, title, body)",
+        "INSERT INTO docs VALUES(1, 'red apple', 'a sweet fruit'), (2, 'green pear', 'also a fruit'), (3, 'blue sky', 'not a fruit')",
+        "CREATE VIRTUAL TABLE t USING fts5(title, body, content='docs', content_rowid='id')",
+        "INSERT INTO t(t) VALUES('rebuild')",
+        "SELECT rowid, title FROM t WHERE t MATCH 'fruit' ORDER BY rowid",
+        "SELECT rowid, highlight(t, 1, '[', ']') FROM t WHERE t MATCH 'fruit NOT not'",
+        "INSERT INTO t(t, rowid, title, body) VALUES('delete', 3, 'blue sky', 'not a fruit')",
+        "DELETE FROM docs WHERE id = 3",
+        "SELECT rowid FROM t WHERE t MATCH 'sky'",
+        "INSERT INTO t(t) VALUES('integrity-check')",
+        "INSERT INTO t(t, rank) VALUES('integrity-check', 1)",
+        "SELECT * FROM t",
+        "INSERT INTO t(t) VALUES('delete-all')",
+        "SELECT count(*) FROM t WHERE t MATCH 'fruit'",
+        "CREATE VIRTUAL TABLE u USING fts5(a, content='')",
+        "INSERT INTO u(rowid, a) VALUES(1, 'one two'), (2, 'two three')",
+        "SELECT rowid, a FROM u WHERE u MATCH 'two'",
+        "DELETE FROM u WHERE rowid = 1",
+        "UPDATE u SET a = 'x' WHERE rowid = 2",
+        "INSERT INTO u(u, rowid, a) VALUES('delete', 1, 'one two')",
+        "SELECT rowid FROM u WHERE u MATCH 'two'",
+        "INSERT INTO u(u) VALUES('rebuild')",
+        "SELECT * FROM u",
+    ]);
+}
+
+#[test]
+fn fts5_contentless_delete_and_secure_delete() {
+    compare_script(&[
+        "CREATE VIRTUAL TABLE t USING fts5(a, b, content='', contentless_delete=1)",
+        "INSERT INTO t(rowid, a, b) VALUES(1, 'alpha beta', 'gamma'), (2, 'beta', 'delta'), (3, 'alpha', 'beta')",
+        "DELETE FROM t WHERE rowid = 2",
+        "SELECT rowid FROM t WHERE t MATCH 'beta' ORDER BY rowid",
+        "INSERT INTO t(t) VALUES('integrity-check')",
+        "UPDATE t SET a = 'zeta', b = 'eta' WHERE rowid = 3",
+        "SELECT rowid FROM t WHERE t MATCH 'zeta OR eta' ORDER BY rowid",
+        "INSERT INTO t(t) VALUES('optimize')",
+        "SELECT rowid FROM t WHERE t MATCH 'alpha OR zeta' ORDER BY rowid",
+        "INSERT INTO t(t, rowid, a, b) VALUES('delete', 1, 'x', 'y')",
+        "CREATE VIRTUAL TABLE s USING fts5(a)",
+        "INSERT INTO s(s, rank) VALUES('secure-delete', 1)",
+        "INSERT INTO s(rowid, a) VALUES(1, 'one two three'), (2, 'two three four'), (3, 'three four five')",
+        "DELETE FROM s WHERE rowid = 2",
+        "SELECT rowid FROM s WHERE s MATCH 'three' ORDER BY rowid",
+        "SELECT * FROM s_config ORDER BY k",
+        "INSERT INTO s(s) VALUES('integrity-check')",
+        "CREATE VIRTUAL TABLE v USING fts5vocab(s, row)",
+        "SELECT * FROM v",
+    ]);
+}
+
+#[test]
+fn fts5_options_and_errors() {
+    compare_script(&[
+        "CREATE VIRTUAL TABLE e1 USING fts5(a, rank)",
+        "CREATE VIRTUAL TABLE e2 USING fts5(a, detail=bogus)",
+        "CREATE VIRTUAL TABLE e3 USING fts5(a, tokenize='nosuch')",
+        "CREATE VIRTUAL TABLE e4 USING fts5(a, prefix='0')",
+        "CREATE VIRTUAL TABLE e5 USING fts5(a, contentless_delete=1)",
+        "CREATE VIRTUAL TABLE e6 USING fts5(a b c)",
+        "CREATE VIRTUAL TABLE e7 USING fts5(a, unknown=1)",
+        "CREATE VIRTUAL TABLE t USING fts5(a, b UNINDEXED, tokenize = \"unicode61 tokenchars '-' separators 'x'\")",
+        "INSERT INTO t VALUES('well-known taxi', 'skip me')",
+        "SELECT * FROM t WHERE t MATCH 'well-known'",
+        "SELECT * FROM t WHERE t MATCH 'ta'",
+        "SELECT * FROM t WHERE t MATCH 'skip'",
+        "SELECT * FROM t WHERE t MATCH 'a:(well-known OR taxi)'",
+        "SELECT * FROM t WHERE t MATCH 'b:skip'",
+        "SELECT * FROM t WHERE t MATCH 'nosuchcol:x'",
+        "SELECT * FROM t WHERE t MATCH '\"unterminated'",
+        "SELECT * FROM t WHERE t MATCH 'x AND'",
+        "SELECT * FROM t WHERE t MATCH ''",
+        "SELECT * FROM t WHERE t MATCH 'NEAR(a b, x)'",
+        "SELECT * FROM t WHERE t MATCH '*bogus'",
+        "SELECT rowid FROM t WHERE t NOT MATCH 'taxi'",
+        "INSERT INTO t(t, rank) VALUES('pgsz', 10)",
+        "INSERT INTO t(t, rank) VALUES('nosuch', 1)",
+        "INSERT INTO t(t, rank) VALUES('automerge', 8)",
+        "INSERT INTO t(t, rank) VALUES('rank', 'bm25(10.0, 1.0)')",
+        "SELECT k, v FROM t_config ORDER BY k",
+        "SELECT rowid, rank FROM t WHERE t MATCH 'taxi'",
+        "SELECT rowid, rank FROM t WHERE t MATCH 'taxi' AND rank MATCH 'bm25(1.0)'",
+        "INSERT INTO t(t) VALUES('delete-all')",
+        "CREATE VIRTUAL TABLE tri USING fts5(x, tokenize='trigram')",
+        "INSERT INTO tri VALUES('the quick brown fox'), ('jumped over'), ('ABCDEF')",
+        "SELECT rowid FROM tri WHERE tri MATCH 'uic'",
+        "SELECT rowid FROM tri WHERE x LIKE '%BROWN%'",
+        "SELECT rowid FROM tri WHERE x GLOB '*own*'",
+        "SELECT rowid FROM tri WHERE tri MATCH 'cde'",
+        "CREATE VIRTUAL TABLE tri2 USING fts5(x, tokenize='trigram case_sensitive 1')",
+        "INSERT INTO tri2 VALUES('ABCDEF')",
+        "SELECT rowid FROM tri2 WHERE tri2 MATCH 'cde'",
+        "SELECT rowid FROM tri2 WHERE tri2 MATCH 'CDE'",
+        "CREATE VIRTUAL TABLE asc USING fts5(x, tokenize='ascii')",
+        "INSERT INTO asc VALUES('Héllo wörld')",
+        "SELECT rowid FROM asc WHERE asc MATCH 'héllo'",
+        "SELECT rowid FROM asc WHERE asc MATCH 'hello'",
+        "CREATE VIRTUAL TABLE loc USING fts5(a, locale=1)",
+        "INSERT INTO loc VALUES(fts5_locale('en', 'hello world'))",
+        "INSERT INTO loc VALUES('plain text')",
+        "SELECT rowid, a, fts5_get_locale(loc, 0) FROM loc",
+        "SELECT rowid FROM loc WHERE loc MATCH 'world'",
+        "INSERT INTO t VALUES(fts5_locale('en', 'x'), 'y')",
+        "SELECT fts5_locale('', 'text'), typeof(fts5_locale('de', 'text'))",
+        "DROP TABLE t",
+        "SELECT name FROM sqlite_schema WHERE name LIKE 't_%' ORDER BY name",
+        "ALTER TABLE tri RENAME TO tri3",
+        "SELECT name FROM sqlite_schema WHERE name LIKE 'tri3%' ORDER BY name",
+        "SELECT rowid FROM tri3 WHERE tri3 MATCH 'uic'",
+    ]);
 }

@@ -221,23 +221,21 @@ impl<'a> Parser<'a> {
         let z = dequote_query(text);
         let flags = TOKENIZE_QUERY | if prefix { TOKENIZE_PREFIX } else { 0 };
         let terms = &mut phrase.terms;
-        let rc = self
-            .cfg
-            .tokenizer
-            .tokenize(flags, &z, self.locale, &mut |tflags, tok, _, _| {
-                let tok = &tok[..tok.len().min(MAX_TOKEN_SIZE)];
-                if !terms.is_empty() && (tflags & TOKEN_COLOCATED) != 0 {
-                    // Synonyms are kept newest first after the main term, as in SQLite.
-                    terms.last_mut().unwrap().alts.insert(1, tok.to_vec());
-                } else {
-                    terms.push(Term {
-                        alts: vec![tok.to_vec()],
-                        prefix: false,
-                        first: false,
-                    });
-                }
-                0
-            });
+        let tokenizer = self.cfg.tokenizer()?;
+        let rc = tokenizer.tokenize(flags, &z, self.locale, &mut |tflags, tok, _, _| {
+            let tok = &tok[..tok.len().min(MAX_TOKEN_SIZE)];
+            if !terms.is_empty() && (tflags & TOKEN_COLOCATED) != 0 {
+                // Synonyms are kept newest first after the main term, as in SQLite.
+                terms.last_mut().unwrap().alts.insert(1, tok.to_vec());
+            } else {
+                terms.push(Term {
+                    alts: vec![tok.to_vec()],
+                    prefix: false,
+                    first: false,
+                });
+            }
+            0
+        });
         if rc != 0 {
             return Err(format!("tokenizer error {rc}"));
         }

@@ -1662,6 +1662,9 @@ pub fn op_vupdate(
                 LimboError::Constraint(_)
                     | LimboError::ConstraintViolation(_)
                     | LimboError::ReadOnly
+                    // Module errors that carry SQLite's message.
+                    | LimboError::SqlError(_)
+                    | LimboError::CorruptVtab(_)
             ) =>
         {
             mark_unlikely();
@@ -17778,9 +17781,16 @@ pub fn op_rename_table(
             _ => panic!("only btree and virtual tables can be renamed"),
         }
 
+        // A renamed virtual table is connected again by the ParseSchema that
+        // follows, so its module sees the new name.
+        let reconnect = matches!(table.as_ref(), Table::Virtual(_));
         #[cfg(feature = "conn_raw_api")]
-        schema.register_table_root_page(&normalized_to, table.as_ref());
-        schema.insert_table(*namespace, normalized_to.to_owned(), table);
+        if !reconnect {
+            schema.register_table_root_page(&normalized_to, table.as_ref());
+        }
+        if !reconnect {
+            schema.insert_table(*namespace, normalized_to.to_owned(), table);
+        }
 
         for (child_namespace, tname, t_arc) in schema.all_tables_mut() {
             // skip the table we just renamed
