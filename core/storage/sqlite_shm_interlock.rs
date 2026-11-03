@@ -74,6 +74,19 @@ impl SqliteShmInterlock {
         )))
     }
 
+    /// Upgrade the database SHARED-byte lock to exclusive, for
+    /// `PRAGMA locking_mode=EXCLUSIVE`. Fails while any other process (turso
+    /// or SQLite) has the database open.
+    pub(crate) fn try_exclusive(&self) -> Result<bool> {
+        self._db
+            .shared_wal_try_lock_byte(DB_SHARED_FIRST, true, KIND)
+    }
+
+    /// Downgrade back to the shared lock.
+    pub(crate) fn release_exclusive(&self) -> Result<()> {
+        self._db.shared_wal_lock_byte(DB_SHARED_FIRST, false, KIND)
+    }
+
     /// Take the shared locks; false on a conflict, with nothing left held.
     fn try_lock(
         shm: &Arc<dyn File>,

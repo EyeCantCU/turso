@@ -703,6 +703,8 @@ pub struct Database<
     /// SQLite lock bytes held while the database is shared across processes.
     #[cfg(all(host_shared_wal, target_os = "linux"))]
     sqlite_shm_interlock: OnceLock<storage::sqlite_shm_interlock::SqliteShmInterlock>,
+    /// Connection (by address) holding `PRAGMA locking_mode=EXCLUSIVE`.
+    exclusive_lock_holder: parking_lot::Mutex<Option<usize>>,
     pub(crate) open_flags: OpenFlags,
     // Use parking lot RwLock here and not `crate::sync::RwLock` because it relies on `data_ptr` and that is experimental
     // in std.
@@ -869,6 +871,7 @@ impl Database {
             shared_wal_coordination: OnceLock::new(),
             #[cfg(all(host_shared_wal, target_os = "linux"))]
             sqlite_shm_interlock: OnceLock::new(),
+            exclusive_lock_holder: parking_lot::Mutex::new(None),
             db_file,
             builtin_syms: parking_lot::RwLock::new(syms),
             dialect,
@@ -3675,6 +3678,41 @@ impl Database {
     /// False in a child that inherited this instance across fork.
     pub(crate) fn opened_in_this_process(&self) -> bool {
         self.owner_pid == std::process::id()
+    }
+
+    /// Apply a connection's `PRAGMA locking_mode` before a transaction:
+    /// EXCLUSIVE takes (and keeps) the database from every other connection
+    /// and process, NORMAL gives it back. Busy while another holder exists.
+    pub(crate) fn apply_locking_mode(
+        &self,
+        conn: usize,
+        exclusive: bool,
+        write: bool,
+    ) -> Result<()> {
+        let mut holder = self.exclusive_lock_holder.lock();
+        match (*holder, exclusive) {
+            (Some(h), _) if h != conn => Err(LimboError::Busy),
+            (Some(_), true) | (None, false) => Ok(()),
+            (None, true) if !write => Ok(()),
+            (None, true) => {
+                #[cfg(all(host_shared_wal, target_os = "linux"))]
+                if let Some(interlock) = self.sqlite_shm_interlock.get() {
+                    if !interlock.try_exclusive()? {
+                        return Err(LimboError::Busy);
+                    }
+                }
+                *holder = Some(conn);
+                Ok(())
+            }
+            (Some(_), false) => {
+                #[cfg(all(host_shared_wal, target_os = "linux"))]
+                if let Some(interlock) = self.sqlite_shm_interlock.get() {
+                    interlock.release_exclusive()?;
+                }
+                *holder = None;
+                Ok(())
+            }
+        }
     }
 
     /// Whether another process has this multiprocess-WAL database open.
