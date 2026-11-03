@@ -94,6 +94,8 @@ static PROCESS_LOCAL_COORDINATION_OPENS: LazyLock<
 struct ProcessLocalCoordinationEntry {
     /// Number of live mappings in this process for the same canonical tshm path.
     open_count: usize,
+    /// Process that created the entry; entries inherited across fork are stale.
+    pid: u32,
     /// Shared publish mutex reused only by tests that bypass `DATABASE_MANAGER`.
     #[cfg(test)]
     frame_index_publish_lock: Arc<Mutex<()>>,
@@ -387,7 +389,7 @@ fn pid_is_alive(pid: u32) -> bool {
 }
 
 /// Serializable snapshot of the authoritative shared WAL coordination state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct SharedWalCoordinationHeader {
     pub max_frame: u64,
     pub nbackfills: u64,
@@ -686,6 +688,9 @@ pub(crate) struct MappedSharedWalCoordination {
     sanitized_backfill_proof_on_open: bool,
     /// Canonical path used as the key in `PROCESS_LOCAL_COORDINATION_OPENS`.
     registry_path: Option<PathBuf>,
+    /// Process that created the mapping. A forked child must not release the
+    /// parent's OFD locks (shared via the inherited descriptors) on drop.
+    opened_pid: u32,
     #[cfg(test)]
     frame_index_blocks_scanned: AtomicU64,
 }
@@ -726,6 +731,11 @@ impl std::fmt::Debug for MappedSharedWalCoordination {
 
 impl Drop for MappedSharedWalCoordination {
     fn drop(&mut self) {
+        if self.opened_pid != std::process::id() {
+            // Inherited across fork: only unmap, leave the parent's locks alone.
+            self.frame_index_blocks.get_mut().clear();
+            return;
+        }
         self.release_owned_locks_on_drop();
         if let Some(path) = self.registry_path.as_ref() {
             let mut opens = PROCESS_LOCAL_COORDINATION_OPENS.lock();
@@ -807,6 +817,7 @@ impl MappedSharedWalCoordination {
             open_mode,
             sanitized_backfill_proof_on_open: false,
             registry_path: None,
+            opened_pid: std::process::id(),
             #[cfg(test)]
             frame_index_blocks_scanned: AtomicU64::new(0),
         }
@@ -828,6 +839,10 @@ impl MappedSharedWalCoordination {
         let mut opens = PROCESS_LOCAL_COORDINATION_OPENS.lock();
         #[cfg(not(test))]
         let _ = reader_slot_count;
+        let pid = std::process::id();
+        // Entries inherited from the parent across fork belong to mappings this
+        // process never uses; forget them.
+        opens.retain(|_, entry| entry.pid == pid);
 
         #[cfg(test)]
         if let Some(entry) = opens.get_mut(&canonical_path) {
@@ -855,6 +870,7 @@ impl MappedSharedWalCoordination {
             canonical_path.clone(),
             ProcessLocalCoordinationEntry {
                 open_count: 1,
+                pid,
                 #[cfg(test)]
                 frame_index_publish_lock: frame_index_publish_lock.clone(),
                 #[cfg(test)]

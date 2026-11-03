@@ -1329,9 +1329,9 @@ impl WalCoordination for InProcessWalCoordination {
             } else {
                 WAL_MAGIC_LE
             };
-            if hdr.page_size == 0 {
-                hdr.page_size = page_size.get();
-            }
+            // A WAL without frames takes the writer's page size, like SQLite's
+            // walFrames at mxFrame == 0; a stale header may carry another one.
+            hdr.page_size = page_size.get();
             if hdr.salt_1 == 0 && hdr.salt_2 == 0 {
                 hdr.salt_1 = io.generate_random_number() as u32;
                 hdr.salt_2 = io.generate_random_number() as u32;
@@ -5703,7 +5703,8 @@ fn read_database_identity_from_file_path(
         .strip_suffix("-wal")
         .unwrap_or(wal_path)
         .to_string();
-    let file = match io.open_file(&db_path, crate::OpenFlags::None, false) {
+    // No lock: the open database holds OFD locks on its SQLite lock bytes.
+    let file = match io.open_file(&db_path, crate::OpenFlags::NoLock, false) {
         Ok(file) => file,
         Err(LimboError::CompletionError(CompletionError::IOError(
             std::io::ErrorKind::NotFound,
@@ -5851,6 +5852,25 @@ impl WalFileShared {
             Err(e) => return Err(e),
         };
         let wal_size = file.size()?;
+
+        let frame_size = WAL_FRAME_HEADER_SIZE as u64 + snapshot.page_size as u64;
+        let fresh = SharedWalCoordinationHeader {
+            reader_slot_count: snapshot.reader_slot_count,
+            ..Default::default()
+        };
+        if authority.open_mode() == SharedWalCoordinationOpenMode::Exclusive
+            && snapshot != fresh
+            && ((snapshot.max_frame > 0
+                && wal_size < WAL_HEADER_SIZE as u64 + snapshot.max_frame * frame_size)
+                || (wal_size == 0 && db_file.size()? == 0))
+        {
+            // The WAL lost frames, or WAL and database were both removed, while
+            // no process had them open: the persisted authority describes
+            // nothing on disk, so let the WAL scan seed it afresh.
+            authority.discard_durable_frame_index_for_exclusive_rebuild();
+            authority.install_snapshot(fresh);
+            return sqlite3_ondisk::build_shared_wal(&file, io);
+        }
 
         match classify_authority_snapshot_against_wal(io, &file, snapshot)? {
             AuthoritySnapshotValidation::Trusted => {}
@@ -9454,6 +9474,8 @@ pub mod test {
             SharedWalCoordinationOpenMode::Exclusive
         );
 
+        // A truncated WAL next to a live database, not a removed database.
+        std::fs::write(wal_path.with_extension("db"), vec![0u8; 4096]).unwrap();
         let shared = WalFileShared::open_shared_from_authority_if_exists(
             &io,
             wal_path.to_str().unwrap(),
@@ -9471,6 +9493,48 @@ pub mod test {
             .metadata
             .loaded_from_disk_scan
             .load(Ordering::Acquire));
+    }
+
+    #[cfg(host_shared_wal)]
+    #[test]
+    fn test_open_shared_from_authority_resets_authority_of_removed_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-gone.db-wal");
+        let shm_path = dir.path().join("test-gone.db-tshm");
+        let io = shared_wal_test_io();
+
+        io.open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        {
+            let authority =
+                Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+            authority.install_snapshot(SharedWalCoordinationHeader {
+                transaction_count: 9,
+                checkpoint_seq: 5,
+                page_size: 4096,
+                salt_1: 17,
+                salt_2: 23,
+                checksum_1: 31,
+                checksum_2: 37,
+                reader_slot_count: 64,
+                ..Default::default()
+            });
+        }
+        let reopened_authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        // Empty database and WAL: the database was removed and recreated.
+        let shared = WalFileShared::open_shared_from_authority_if_exists(
+            &io,
+            wal_path.to_str().unwrap(),
+            crate::OpenFlags::Create,
+            &reopened_authority,
+            &open_test_db_file_for_wal(&io, &wal_path),
+        )
+        .unwrap();
+
+        assert_eq!(shared.read().metadata.wal_header.lock().page_size, 0);
+        let snapshot = reopened_authority.snapshot();
+        assert_eq!((snapshot.page_size, snapshot.checkpoint_seq), (0, 0));
     }
 
     #[cfg(host_shared_wal)]

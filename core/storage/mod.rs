@@ -29,6 +29,8 @@ pub(crate) mod shared_wal_coordination;
 #[allow(dead_code)]
 pub(super) mod slot_bitmap;
 pub mod sqlite3_ondisk;
+#[cfg(all(host_shared_wal, target_os = "linux"))]
+pub(crate) mod sqlite_shm_interlock;
 mod state_machines;
 pub(crate) mod subjournal;
 #[allow(clippy::arc_with_non_send_sync)]

@@ -472,6 +472,9 @@ impl Connection {
                     } else {
                         self.db.io.clone()
                     };
+                    // Share the attached file across processes like the main one.
+                    let db_opts = db_opts
+                        .with_multiprocess_wal(self.db.experimental_multiprocess_wal_enabled());
                     let main_db_flags = self.db.open_flags;
                     let (db, encryption_opts) = Self::from_uri_attached(
                         path,
