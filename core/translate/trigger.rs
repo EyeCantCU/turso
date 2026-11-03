@@ -203,21 +203,31 @@ pub fn translate_create_trigger(
         );
     }
 
-    if time
+    let instead_of = time
         .as_ref()
-        .is_some_and(|t| *t == ast::TriggerTime::InsteadOf)
-    {
-        bail_parse_error!("INSTEAD OF triggers are not supported yet");
+        .is_some_and(|t| *t == ast::TriggerTime::InsteadOf);
+    let target_is_view = resolver.with_schema(target_table_database_id, |s| {
+        s.get_view(target_table_namespace.id, &normalized_table_name)
+            .is_some()
+    });
+    // SQLite allows INSTEAD OF triggers only on views (sqlite3BeginTrigger).
+    if instead_of && !target_is_view {
+        bail_parse_error!(
+            "cannot create INSTEAD OF trigger on table: {}",
+            tbl_name.name.as_str()
+        );
     }
 
     // SQLite allows only INSTEAD OF triggers on views (sqlite3BeginTrigger in
     // trigger.c). A materialized view's storage is registered as a table, so
     // check for views before the table lookup.
-    if resolver.with_schema(target_table_database_id, |s| {
-        s.get_view(target_table_namespace.id, &normalized_table_name)
-            .is_some()
-            || s.materialized_view_exists(target_table_namespace.id, &normalized_table_name)
-    }) {
+    if !instead_of
+        && resolver.with_schema(target_table_database_id, |s| {
+            s.get_view(target_table_namespace.id, &normalized_table_name)
+                .is_some()
+                || s.materialized_view_exists(target_table_namespace.id, &normalized_table_name)
+        })
+    {
         let time = match time.as_ref() {
             Some(ast::TriggerTime::After) => "AFTER",
             _ => "BEFORE",
@@ -232,7 +242,14 @@ pub fn translate_create_trigger(
     let table = resolver.with_schema(target_table_database_id, |s| {
         s.get_table(target_table_namespace.id, &normalized_table_name)
     });
-    let Some(table) = table else {
+    let Some(table) = table.or_else(|| {
+        // An INSTEAD OF trigger's target is the view, which has no table.
+        target_is_view.then(|| {
+            Arc::new(crate::schema::Table::BTree(Arc::new(
+                crate::schema::sqlite_schema_table().expect("schema table builds"),
+            )))
+        })
+    }) else {
         // SQLite qualifies a non-temp trigger's missing target table with its
         // database ("no such table: main.t1"); temp triggers report the name
         // as the user wrote it.

@@ -24,6 +24,7 @@ pub(crate) mod fkeys;
 pub(crate) mod group_by;
 pub(crate) mod index;
 pub(crate) mod insert;
+pub(crate) mod instead_of;
 pub(crate) mod integrity_check;
 pub(crate) mod main_loop;
 pub(crate) mod optimizer;

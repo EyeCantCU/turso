@@ -1,6 +1,5 @@
 @database :memory:
 @skip-file-if mvcc "WITHOUT ROWID writes are not supported in MVCC mode"
-@skip-file-if sqlite "SQLite supports WITHOUT ROWID operations that Turso does not yet implement"
 
 test without-rowid-hidden-rowid {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID;
@@ -37,72 +36,203 @@ expect error {
     PRIMARY KEY missing on table t
 }
 
-test without-rowid-secondary-unique-rejected {
-    CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER UNIQUE, c TEXT) WITHOUT ROWID;
+test without-rowid-secondary-unique {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT UNIQUE) WITHOUT ROWID;
+    INSERT INTO t VALUES (1, 'x'), (2, 'y');
+    INSERT OR IGNORE INTO t VALUES (3, 'x');
+    SELECT * FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    1|x
+    2|y
+    ok
+}
+
+test without-rowid-secondary-unique-violation {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT UNIQUE) WITHOUT ROWID;
+    INSERT INTO t VALUES (1, 'x');
+    INSERT INTO t VALUES (2, 'x');
 }
 expect error {
-    secondary UNIQUE constraints on WITHOUT ROWID tables are not supported
+    UNIQUE constraint failed: t.b
 }
 
 test without-rowid-autoincrement-rejected {
-    CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT) WITHOUT ROWID;
+    CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT) WITHOUT ROWID;
 }
 expect error {
-    AUTOINCREMENT is not allowed on WITHOUT ROWID tables
+    AUTOINCREMENT
 }
 
-test without-rowid-create-index-rejected {
-    CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER) WITHOUT ROWID;
-    CREATE INDEX idx_t_b ON t(b);
+test without-rowid-record-puts-primary-key-first {
+    CREATE TABLE t(a TEXT, b INT, c, PRIMARY KEY(b, a)) WITHOUT ROWID;
+    INSERT INTO t VALUES ('x', 1, 'c1'), ('y', 2, 'c2'), ('z', 1, 'c3');
+    SELECT a, b, typeof(b), c FROM t;
+}
+expect {
+    x|1|integer|c1
+    z|1|integer|c3
+    y|2|integer|c2
+}
+
+test without-rowid-create-index {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT, c) WITHOUT ROWID;
+    INSERT INTO t VALUES (1, 'q', 10), (2, 'p', 20), (3, 'q', 30);
+    CREATE INDEX t_b ON t(b);
+    SELECT name, key FROM pragma_index_xinfo('t_b');
+    INSERT INTO t VALUES (4, 'p', 40);
+    PRAGMA integrity_check;
+}
+expect {
+    b|1
+    a|0
+    ok
+}
+
+test without-rowid-update {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT UNIQUE, c) WITHOUT ROWID;
+    CREATE INDEX t_c ON t(c);
+    INSERT INTO t VALUES (1, 'x', 10), (2, 'y', 20), (3, 'z', 30);
+    UPDATE t SET c = c + 1 WHERE b = 'y';
+    UPDATE t SET a = a + 10;
+    UPDATE OR IGNORE t SET b = 'x' WHERE a = 12;
+    SELECT * FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    11|x|10
+    12|y|21
+    13|z|30
+    ok
+}
+
+test without-rowid-update-key-conflict {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b) WITHOUT ROWID;
+    INSERT INTO t VALUES (1, 'x'), (2, 'y');
+    UPDATE t SET a = 2 WHERE a = 1;
 }
 expect error {
-    CREATE INDEX on WITHOUT ROWID tables is not supported
+    UNIQUE constraint failed: t.a
 }
 
-test without-rowid-update-rejected {
-    CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER) WITHOUT ROWID;
-    INSERT INTO t VALUES ('k', 1);
-    UPDATE t SET b = 2 WHERE a = 'k';
+test without-rowid-update-or-replace-key {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b) WITHOUT ROWID;
+    INSERT INTO t VALUES (1, 'x'), (2, 'y');
+    UPDATE OR REPLACE t SET a = 2 WHERE a = 1;
+    SELECT * FROM t;
 }
-expect error {
-    UPDATE of WITHOUT ROWID tables is not supported
-}
-
-test without-rowid-delete-rejected {
-    CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER) WITHOUT ROWID;
-    INSERT INTO t VALUES ('k', 1);
-    DELETE FROM t WHERE a = 'k';
-}
-expect error {
-    DELETE from WITHOUT ROWID tables is not supported
+expect {
+    2|x
 }
 
-test without-rowid-insert-or-replace-rejected {
-    CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER) WITHOUT ROWID;
-    INSERT OR REPLACE INTO t VALUES ('k', 1);
+test without-rowid-delete {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID;
+    CREATE INDEX t_b ON t(b);
+    INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, 'x');
+    DELETE FROM t WHERE b = 'x';
+    SELECT * FROM t;
+    SELECT changes();
+    PRAGMA integrity_check;
 }
-expect error {
-    UPSERT and REPLACE on WITHOUT ROWID tables are not supported
-}
-
-test without-rowid-upsert-rejected {
-    CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER) WITHOUT ROWID;
-    INSERT INTO t VALUES ('k', 1);
-    INSERT INTO t VALUES ('k', 2) ON CONFLICT DO UPDATE SET b = excluded.b;
-}
-expect error {
-    UPSERT and REPLACE on WITHOUT ROWID tables are not supported
+expect {
+    2|y
+    2
+    ok
 }
 
-test without-rowid-foreign-keys-rejected {
+test without-rowid-delete-with-trigger {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID;
+    CREATE TABLE log(x);
+    CREATE TRIGGER t_d AFTER DELETE ON t BEGIN INSERT INTO log VALUES (old.a || old.b); END;
+    INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, 'x');
+    DELETE FROM t WHERE b = 'x';
+    SELECT * FROM log;
+}
+expect {
+    1x
+    3x
+}
+
+test without-rowid-insert-or-replace {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT UNIQUE) WITHOUT ROWID;
+    INSERT INTO t VALUES (1, 'x'), (2, 'y');
+    INSERT OR REPLACE INTO t VALUES (1, 'y');
+    SELECT * FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    1|y
+    ok
+}
+
+test without-rowid-upsert {
+    CREATE TABLE t(k TEXT, n INT, v, PRIMARY KEY(k, n)) WITHOUT ROWID;
+    INSERT INTO t VALUES ('a', 1, 0);
+    INSERT INTO t VALUES ('a', 1, 5) ON CONFLICT(n, k) DO UPDATE SET v = v + excluded.v;
+    INSERT INTO t VALUES ('a', 1, 5) ON CONFLICT(k, n) DO UPDATE SET v = v + excluded.v;
+    INSERT INTO t VALUES ('a', 1, 5) ON CONFLICT DO NOTHING;
+    SELECT * FROM t;
+}
+expect {
+    a|1|10
+}
+
+test without-rowid-foreign-keys {
     PRAGMA foreign_keys = ON;
-    CREATE TABLE parent(id INTEGER PRIMARY KEY);
-    INSERT INTO parent VALUES (1);
-    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id)) WITHOUT ROWID;
-    INSERT INTO child VALUES (10, 1);
+    CREATE TABLE p(a, b, PRIMARY KEY(a, b)) WITHOUT ROWID;
+    CREATE TABLE c(x, y, FOREIGN KEY(x, y) REFERENCES p ON DELETE CASCADE) ;
+    INSERT INTO p VALUES (1, 2), (3, 4);
+    INSERT INTO c VALUES (1, 2), (3, 4);
+    DELETE FROM p WHERE a = 1;
+    SELECT * FROM c;
+}
+expect {
+    3|4
+}
+
+test without-rowid-foreign-key-violation {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p(a PRIMARY KEY) WITHOUT ROWID;
+    CREATE TABLE c(x REFERENCES p);
+    INSERT INTO c VALUES (1);
 }
 expect error {
-    foreign keys on WITHOUT ROWID tables are not supported
+    FOREIGN KEY constraint failed
+}
+
+test without-rowid-redundant-unique-has-no-index {
+    CREATE TABLE t(a, b UNIQUE PRIMARY KEY) WITHOUT ROWID;
+    CREATE TABLE u(a UNIQUE, b, PRIMARY KEY(b)) WITHOUT ROWID;
+    SELECT name FROM sqlite_schema ORDER BY name;
+}
+expect {
+    sqlite_autoindex_u_1
+    t
+    u
+}
+
+test without-rowid-analyze {
+    CREATE TABLE m(a, b, c, PRIMARY KEY(a, b)) WITHOUT ROWID;
+    CREATE INDEX m_c ON m(c);
+    INSERT INTO m VALUES (1, 1, 1), (1, 2, 1), (2, 1, 3);
+    ANALYZE;
+    SELECT * FROM sqlite_stat1 ORDER BY idx;
+}
+expect {
+    m|m|3 2 1
+    m|m_c|3 2
+}
+
+test without-rowid-drop-column {
+    CREATE TABLE t(k TEXT PRIMARY KEY, v, x, y) WITHOUT ROWID;
+    INSERT INTO t VALUES ('a', 1, 0, 9), ('b', 2, 0, 8);
+    ALTER TABLE t DROP COLUMN x;
+    SELECT * FROM t;
+}
+expect {
+    a|1|9
+    b|2|8
 }
 
 test without-rowid-add-column-check-reads-columns-in-declared-order {
@@ -115,6 +245,7 @@ expect {
     1|2|3|4
 }
 
+@skip-if sqlite "SQLite does not name the failing CHECK of ADD COLUMN"
 test without-rowid-add-column-check-rejects-primary-key-value {
     CREATE TABLE t(c, a PRIMARY KEY) WITHOUT ROWID;
     INSERT INTO t VALUES (5, 2);

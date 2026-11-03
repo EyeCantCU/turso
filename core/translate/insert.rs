@@ -268,6 +268,12 @@ pub fn translate_insert(
     let opts = ProgramBuilderOpts::new(1, 30, 5);
     program.extend(&opts);
 
+    if let Some((namespace, view)) = super::instead_of::view_target(resolver, &tbl_name)? {
+        return super::instead_of::translate_view_insert(
+            program, resolver, connection, namespace, &view, &columns, body, with,
+        );
+    }
+
     // Merge INSERT's WITH clause into the SELECT source's WITH clause.
     // For VALUES/DEFAULT VALUES with subqueries, we route through the multi-row
     // path which goes through translate_select and handles CTEs properly.

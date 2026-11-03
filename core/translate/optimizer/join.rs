@@ -3182,6 +3182,7 @@ mod tests {
             name: "sqlite_autoindex_test_table_1".to_string(),
             table_name: "test_table".to_string(),
             where_clause: None,
+            n_key_col: 1,
             columns: crate::alloc::vec![IndexColumn::new(
                 "id",
                 0,
@@ -3280,6 +3281,7 @@ mod tests {
             name: "index1".to_string(),
             table_name: "table1".to_string(),
             where_clause: None,
+            n_key_col: 1,
             columns: crate::alloc::vec![IndexColumn::new(
                 "id",
                 0,
@@ -3424,6 +3426,7 @@ mod tests {
                     name: index_name,
                     where_clause: None,
                     table_name: table_name.to_string(),
+                    n_key_col: 1,
                     columns: crate::alloc::vec![IndexColumn::new(
                         "id",
                         0,
@@ -3447,6 +3450,7 @@ mod tests {
             name: "orders_customer_id_idx".to_string(),
             table_name: "orders".to_string(),
             where_clause: None,
+            n_key_col: 1,
             columns: crate::alloc::vec![IndexColumn::new(
                 "customer_id",
                 1,
@@ -3464,6 +3468,7 @@ mod tests {
             name: "order_items_order_id_idx".to_string(),
             table_name: "order_items".to_string(),
             where_clause: None,
+            n_key_col: 1,
             columns: crate::alloc::vec![IndexColumn::new(
                 "order_id",
                 1,
@@ -3979,6 +3984,7 @@ mod tests {
             name: "idx_xy".to_string(),
             table_name: "t1".to_string(),
             where_clause: None,
+            n_key_col: 2,
             columns: crate::alloc::vec![
                 IndexColumn::new("x", 0, crate::translate::collate::CollationSeq::BINARY),
                 IndexColumn::new("y", 1, crate::translate::collate::CollationSeq::BINARY),
@@ -4083,6 +4089,7 @@ mod tests {
             name: "idx1".to_string(),
             table_name: "t1".to_string(),
             where_clause: None,
+            n_key_col: 3,
             columns: crate::alloc::vec![
                 IndexColumn::new("c1", 0, crate::translate::collate::CollationSeq::BINARY),
                 IndexColumn::new("c2", 1, crate::translate::collate::CollationSeq::BINARY),
@@ -4206,6 +4213,7 @@ mod tests {
             name: "idx1".to_string(),
             table_name: "t1".to_string(),
             where_clause: None,
+            n_key_col: IndexColumn::new_many(vec!["c1", "c2", "c3"]).len(),
             columns: IndexColumn::new_many(vec!["c1", "c2", "c3"]),
             root_page: 2,
             ephemeral: false,
@@ -4391,6 +4399,7 @@ mod tests {
             name: name.to_string(),
             table_name: table_name.to_string(),
             where_clause: None,
+            n_key_col: columns.len(),
             columns: columns
                 .iter()
                 .map(|(name, pos_in_table)| {
@@ -4549,6 +4558,7 @@ mod tests {
             name: "idx_t2_a".to_string(),
             table_name: "t2".to_string(),
             where_clause: None,
+            n_key_col: 1,
             columns: crate::alloc::vec![IndexColumn::new(
                 "a",
                 0,

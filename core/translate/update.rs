@@ -66,6 +66,11 @@ pub fn translate_update(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<()> {
+    if let Some((namespace, view)) = super::instead_of::view_target(resolver, &body.tbl_name)? {
+        return super::instead_of::translate_view_update(
+            program, resolver, connection, namespace, &view, &body,
+        );
+    }
     let plan = prepare_and_optimize_update_plan(program, resolver, body, connection, false, None)?;
     let Plan::Update(ref update_plan) = plan else {
         unreachable!("prepare_and_optimize_update_plan must return Plan::Update");

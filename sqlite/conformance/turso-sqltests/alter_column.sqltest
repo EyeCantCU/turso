@@ -335,6 +335,7 @@ expect {
 # Adding a stored generated column via ALTER TABLE should error
 test alter-table-add-generated-column-error {
     CREATE TABLE t(a);
+    INSERT INTO t VALUES(1);
     ALTER TABLE t ADD COLUMN b AS (NULL) STORED;
 }
 expect error {

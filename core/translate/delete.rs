@@ -91,6 +91,18 @@ pub fn translate_delete(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
+    if let Some((namespace, view)) = super::instead_of::view_target(resolver, tbl_name)? {
+        return super::instead_of::translate_view_delete(
+            program,
+            resolver,
+            connection,
+            namespace,
+            &view,
+            tbl_name,
+            where_clause.as_deref(),
+            with.as_ref(),
+        );
+    }
     let namespace = resolver.resolve_queried_table(tbl_name)?;
     let database_id = namespace.database_id;
     let normalized_table_name = normalize_ident(tbl_name.name.as_str());

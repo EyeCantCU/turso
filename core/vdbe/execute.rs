@@ -14998,6 +14998,7 @@ pub fn op_drop_view(
     conn.with_database_schema_mut(*db, |schema| {
         schema.remove_view(*namespace, view_name).ok();
         schema.remove_broken_view(*namespace, view_name);
+        schema.remove_triggers_for_table(*namespace, view_name);
     })?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)

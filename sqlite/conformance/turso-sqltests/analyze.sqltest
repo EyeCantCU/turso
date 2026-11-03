@@ -140,13 +140,14 @@ expect {
     idx|4 4 4
 }
 
-# Things that don't work:
-test analyze-table-without-rowid-fails {
+test analyze-table-without-rowid {
     CREATE TABLE tbl (a integer primary key) WITHOUT ROWID;
+    INSERT INTO tbl VALUES (1), (2);
     ANALYZE tbl;
+    SELECT * FROM sqlite_stat1;
 }
-expect error {
-    Parse error: ANALYZE on tables without rowid is not supported
+expect {
+    tbl|tbl|2 1
 }
 
 # This test will fail if a ColumnRange opcode incorrectly collapses Column opcodes where the nth consecutive Column

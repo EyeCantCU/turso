@@ -52,25 +52,6 @@ pub(crate) fn emit_pk_from_index(
     Ok(())
 }
 
-/// Read the primary key of the row `table_cursor` points at into `dest..`.
-pub(crate) fn emit_pk_from_table(
-    program: &mut ProgramBuilder,
-    table: &BTreeTable,
-    table_cursor: usize,
-    dest: usize,
-) -> Result<()> {
-    // The key columns come first in the record.
-    for i in 0..pk_len(table)? {
-        program.emit_insn(Insn::Column {
-            cursor_id: table_cursor,
-            column: i,
-            dest: dest + i,
-            default: None,
-        });
-    }
-    Ok(())
-}
-
 /// Position `table_cursor` on the row whose primary key is in `start..`, or
 /// jump to `not_found`.
 pub(crate) fn emit_seek_row(

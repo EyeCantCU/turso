@@ -719,6 +719,53 @@ pub fn translate_drop_view(
 
     program.preassign_label_to_next_insn(end_loop_label);
 
+    // Like SQLite, dropping a view drops its INSTEAD OF triggers.
+    {
+        let trigger_type_reg = program.alloc_register();
+        program.emit_insn(Insn::String8 {
+            dest: trigger_type_reg,
+            value: "trigger".to_string(),
+        });
+        let tbl_name_reg = program.alloc_register();
+        let done = program.allocate_label();
+        let start = program.allocate_label();
+        let skip = program.allocate_label();
+        program.emit_insn(Insn::Rewind {
+            cursor_id: sqlite_schema_cursor_id,
+            pc_if_empty: done,
+        });
+        program.preassign_label_to_next_insn(start);
+        program.emit_column_or_rowid(sqlite_schema_cursor_id, 0, col0_reg);
+        program.emit_insn(Insn::Ne {
+            lhs: col0_reg,
+            rhs: trigger_type_reg,
+            target_pc: skip,
+            flags: CmpInsFlags::default(),
+            collation: CollationSeq::for_internal_values(),
+        });
+        program.emit_column_or_rowid(sqlite_schema_cursor_id, 2, tbl_name_reg);
+        program.emit_insn(Insn::Ne {
+            lhs: tbl_name_reg,
+            rhs: view_name_reg,
+            target_pc: skip,
+            flags: CmpInsFlags::default(),
+            collation: CollationSeq::NOCASE,
+        });
+        program.emit_insn(Insn::Delete {
+            cursor_id: sqlite_schema_cursor_id,
+            table_name: "sqlite_schema".to_string(),
+            is_part_of_update: false,
+        });
+        program.preassign_label_to_next_insn(skip);
+        program.emit_insn(Insn::Next {
+            cursor_id: sqlite_schema_cursor_id,
+            pc_if_next: start,
+            fullscan: false,
+            is_index: false,
+        });
+        program.preassign_label_to_next_insn(done);
+    }
+
     // If this is a materialized view, delete internal table and index
     // entries in a second pass, one loop per internal table. We do this in
     // separate loops to ensure we catch all entries even if they come in

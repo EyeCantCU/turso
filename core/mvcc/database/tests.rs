@@ -10420,6 +10420,7 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
         name: "testindex".to_string(),
         table_name: "test".to_string(),
         root_page: 0,
+        n_key_col: IndexColumn::new_many(vec!["id"]).len(),
         columns: IndexColumn::new_many(vec!["id"]),
         unique: true,
         ephemeral: false,
