@@ -1004,7 +1004,11 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
         return TCL_OK;
     }
 
+    /* No busy-handler support: accepted and ignored, as before. */
     case CMD_BUSY:
+        Tcl_ResetResult(interp);
+        return TCL_OK;
+
     case CMD_AUTH:
     case CMD_AUTHORIZER: {
         if (objc > 3) {
