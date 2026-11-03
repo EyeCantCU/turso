@@ -45,7 +45,7 @@ impl Drop for UdfScope {
     }
 }
 
-fn forget(addr: usize) {
+pub(crate) fn forget(addr: usize) {
     let _ = BUFS.try_with(|b| b.borrow_mut().retain(|(a, _), _| *a != addr));
 }
 

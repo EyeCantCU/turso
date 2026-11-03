@@ -41,6 +41,12 @@ static SQLITE_VERSION_C_STRING: OnceLock<CString> = OnceLock::new();
 #[allow(non_upper_case_globals)]
 pub static mut sqlite3_search_count: ffi::c_int = 0;
 
+/// SQLite's data directory override. Exported for link compatibility; the
+/// engine does not consult it (sqlite3_temp_directory lives in compat_config).
+#[no_mangle]
+#[allow(non_upper_case_globals)]
+pub static mut sqlite3_data_directory: *mut ffi::c_char = std::ptr::null_mut();
+
 /// Test-only export of core's SQLite varint encoder for the TCL harness's
 /// btree_varint_test command (upstream test3.c). `buf` must have room for
 /// 9 bytes. Returns the number of bytes written. Not part of the sqlite3
@@ -375,7 +381,9 @@ impl sqlite3_stmt {
         }
         // Drop cached ExtValues for the previous row
         for v in &mut self.value_cache {
-            *v = None;
+            if let Some(v) = v.take() {
+                value_conv::forget(&v as *const ExtValue as usize);
+            }
         }
     }
 }
@@ -2131,9 +2139,9 @@ pub unsafe extern "C" fn sqlite3_bind_null(stmt: *mut sqlite3_stmt, idx: ffi::c_
 pub unsafe extern "C" fn sqlite3_bind_int(
     stmt: *mut sqlite3_stmt,
     idx: ffi::c_int,
-    val: i64,
+    val: ffi::c_int,
 ) -> ffi::c_int {
-    sqlite3_bind_int64(stmt, idx, val)
+    sqlite3_bind_int64(stmt, idx, val as i64)
 }
 
 #[capi_guard]

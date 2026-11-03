@@ -198,3 +198,17 @@ int turso_sqlite3_config_va(int op, ...) {
     va_end(ap);
     return turso_sqlite3_config_apply(op, i1, i2, p1, p2);
 }
+
+/*
+** sqlite3_test_control() and sqlite3_vtab_config() are variadic in SQLite.
+** Turso accepts every option and ignores its arguments, so these only
+** need a genuinely variadic entry point that forwards the named arguments.
+*/
+extern int turso_test_control_impl(int op);
+extern int turso_vtab_config_impl(sqlite3 *db, int op);
+
+int turso_sqlite3_test_control_va(int op, ...) { return turso_test_control_impl(op); }
+
+int turso_sqlite3_vtab_config_va(sqlite3 *db, int op, ...) {
+    return turso_vtab_config_impl(db, op);
+}

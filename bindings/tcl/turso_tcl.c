@@ -465,7 +465,7 @@ static void capture_stmt_status(TursoDb *tdb, sqlite3_stmt *stmt)
 /* Tcl scalar function bridge                                           */
 /* ------------------------------------------------------------------ */
 
-static void tcl_scalar_bridge(void *ctx, int argc, void **argv)
+static void tcl_scalar_bridge(sqlite3_context *ctx, int argc, sqlite3_value **argv)
 {
     TclFuncData *func = (TclFuncData *)sqlite3_user_data(ctx);
     Tcl_Interp  *interp = func->interp;
@@ -937,8 +937,8 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
         Tcl_IncrRefCount(data->script);
         int rc = sqlite3_create_collation_v2(
             tdb->db, Tcl_GetString(objv[2]), 0, (void *)data,
-            (int (*)(void))tcl_collate_bridge,
-            (void (*)(void))tcl_collate_destroy);
+            tcl_collate_bridge,
+            tcl_collate_destroy);
         if (rc != SQLITE_OK) {
             tcl_collate_destroy(data);
             Tcl_SetResult(interp, (char *)sqlite3_errmsg(tdb->db), TCL_VOLATILE);
@@ -1365,9 +1365,9 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
             sql_n_args,
             0, /* SQLITE_UTF8 */
             (void *)func_data,
-            (void (*)(void))tcl_scalar_bridge,
+            tcl_scalar_bridge,
             NULL, NULL,
-            (void (*)(void))tcl_func_destroy
+            tcl_func_destroy
         );
 
         if (rc != SQLITE_OK) {
@@ -1623,7 +1623,7 @@ static int TursoBlobOpenCmd(ClientData cd, Tcl_Interp *interp,
     if (Tcl_GetWideIntFromObj(interp, objv[5], &rowid) != TCL_OK) return TCL_ERROR;
     if (Tcl_GetIntFromObj(interp, objv[6], &flags) != TCL_OK) return TCL_ERROR;
 
-    void *blob = NULL;
+    sqlite3_blob *blob = NULL;
     int rc = sqlite3_blob_open(tdb->db, Tcl_GetString(objv[2]),
                                Tcl_GetString(objv[3]), Tcl_GetString(objv[4]),
                                (int64_t)rowid, flags, &blob);
@@ -2778,7 +2778,7 @@ static void rj_expand(const char *src, char *dest, RjPrng *p, int e_type,
     if (j < RJ_STRSZ) dest[j] = 0;
 }
 
-static void rj_func(void *context, int argc, void **argv)
+static void rj_func(sqlite3_context *context, int argc, sqlite3_value **argv)
 {
     (void)argc;
     int e_type = *(int *)sqlite3_user_data(context);
@@ -2798,10 +2798,10 @@ static int rj_register(sqlite3 *db)
     static int c_zero = 0;
     static int c_one = 1;
     int rc = sqlite3_create_function_v2(db, "random_json", 1, 0, &c_zero,
-                                        (void (*)(void))rj_func, NULL, NULL, NULL);
+                                        rj_func, NULL, NULL, NULL);
     if (rc == SQLITE_OK) {
         rc = sqlite3_create_function_v2(db, "random_json5", 1, 0, &c_one,
-                                        (void (*)(void))rj_func, NULL, NULL, NULL);
+                                        rj_func, NULL, NULL, NULL);
     }
     return rc;
 }

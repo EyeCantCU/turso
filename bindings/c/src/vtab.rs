@@ -995,9 +995,23 @@ unsafe fn set_err(db: *mut sqlite3, code: c_int, msg: Option<&str>) -> c_int {
 /// `sqlite3_vtab_config(db, op, ...)`. The variadic argument is never read
 /// (every option is accepted and ignored), so a fixed-argument definition
 /// is ABI-compatible on every target.
+/// Variadic in SQLite; the trampoline tail-jumps to varargs.c.
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_vtab_config(_db: *mut sqlite3, _op: c_int) -> c_int {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    core::arch::naked_asm!("jmp {}", sym turso_sqlite3_vtab_config_va);
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    core::arch::naked_asm!("b {}", sym turso_sqlite3_vtab_config_va);
+}
+
+extern "C" {
+    fn turso_sqlite3_vtab_config_va(db: *mut sqlite3, op: c_int, ...) -> c_int;
+}
+
 #[capi_guard]
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_vtab_config(db: *mut sqlite3, op: c_int) -> c_int {
+pub unsafe extern "C" fn turso_vtab_config_impl(db: *mut sqlite3, op: c_int) -> c_int {
     if db.is_null() {
         return SQLITE_MISUSE;
     }

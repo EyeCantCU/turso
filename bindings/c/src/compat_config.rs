@@ -143,9 +143,23 @@ pub unsafe extern "C" fn turso_sqlite3_config_apply(
 /// SQLite itself returns 0 for ops it does not act on. The variadic
 /// arguments are never read, which is valid for a callee on every ABI, so a
 /// plain fixed-signature function suffices here.
-#[capi_guard]
+/// Variadic in SQLite; the trampoline tail-jumps to varargs.c.
+#[unsafe(naked)]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_test_control(_op: ffi::c_int) -> ffi::c_int {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    core::arch::naked_asm!("jmp {}", sym turso_sqlite3_test_control_va);
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    core::arch::naked_asm!("b {}", sym turso_sqlite3_test_control_va);
+}
+
+extern "C" {
+    fn turso_sqlite3_test_control_va(op: ffi::c_int, ...) -> ffi::c_int;
+}
+
+#[capi_guard]
+#[no_mangle]
+pub unsafe extern "C" fn turso_test_control_impl(_op: ffi::c_int) -> ffi::c_int {
     0
 }
 

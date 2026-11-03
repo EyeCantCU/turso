@@ -89,16 +89,16 @@ extern "C" {
         frame_len: u32,
     ) -> i32;
     fn libsql_wal_disable_checkpoint(db: *mut sqlite3) -> i32;
-    fn sqlite3_column_int(stmt: *mut sqlite3_stmt, idx: i32) -> i64;
+    fn sqlite3_column_int(stmt: *mut sqlite3_stmt, idx: i32) -> i32;
     fn sqlite3_next_stmt(db: *mut sqlite3, stmt: *mut sqlite3_stmt) -> *mut sqlite3_stmt;
-    fn sqlite3_bind_int(stmt: *mut sqlite3_stmt, idx: i32, val: i64) -> i32;
+    fn sqlite3_bind_int(stmt: *mut sqlite3_stmt, idx: i32, val: i32) -> i32;
     fn sqlite3_bind_parameter_count(stmt: *mut sqlite3_stmt) -> i32;
     fn sqlite3_bind_parameter_name(stmt: *mut sqlite3_stmt, idx: i32) -> *const libc::c_char;
     fn sqlite3_bind_parameter_index(stmt: *mut sqlite3_stmt, name: *const libc::c_char) -> i32;
     fn sqlite3_clear_bindings(stmt: *mut sqlite3_stmt) -> i32;
     fn sqlite3_column_name(stmt: *mut sqlite3_stmt, idx: i32) -> *const libc::c_char;
     fn sqlite3_column_table_name(stmt: *mut sqlite3_stmt, idx: i32) -> *const libc::c_char;
-    fn sqlite3_last_insert_rowid(db: *mut sqlite3) -> i32;
+    fn sqlite3_last_insert_rowid(db: *mut sqlite3) -> i64;
     fn sqlite3_column_count(stmt: *mut sqlite3_stmt) -> i32;
     fn sqlite3_bind_text(
         stmt: *mut sqlite3_stmt,
@@ -115,7 +115,7 @@ extern "C" {
         destructor: Option<unsafe extern "C" fn(*mut libc::c_void)>,
     ) -> i32;
     fn sqlite3_column_text(stmt: *mut sqlite3_stmt, idx: i32) -> *const libc::c_char;
-    fn sqlite3_column_bytes(stmt: *mut sqlite3_stmt, idx: i32) -> i64;
+    fn sqlite3_column_bytes(stmt: *mut sqlite3_stmt, idx: i32) -> i32;
     fn sqlite3_column_blob(stmt: *mut sqlite3_stmt, idx: i32) -> *const libc::c_void;
     fn sqlite3_column_type(stmt: *mut sqlite3_stmt, idx: i32) -> i32;
     fn sqlite3_column_decltype(stmt: *mut sqlite3_stmt, idx: i32) -> *const libc::c_char;
@@ -232,6 +232,7 @@ mod config;
 mod hooks;
 mod stubs;
 
+mod abi_values;
 mod errmsg;
 mod misc;
 mod reentrancy;

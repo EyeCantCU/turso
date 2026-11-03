@@ -608,7 +608,7 @@ void test_sqlite3_bind_blob()
     sqlite3_close(db);
 }
 
-static void result_malloc_text(void *ctx, int argc, void **argv)
+static void result_malloc_text(sqlite3_context *ctx, int argc, sqlite3_value **argv)
 {
     (void)argc;
     (void)argv;
@@ -618,7 +618,7 @@ static void result_malloc_text(void *ctx, int argc, void **argv)
     sqlite3_result_text(ctx, text, -1, custom_destructor);
 }
 
-static void result_malloc_blob(void *ctx, int argc, void **argv)
+static void result_malloc_blob(sqlite3_context *ctx, int argc, sqlite3_value **argv)
 {
     (void)argc;
     (void)argv;
@@ -628,7 +628,7 @@ static void result_malloc_blob(void *ctx, int argc, void **argv)
     sqlite3_result_blob(ctx, blob, 3, custom_destructor);
 }
 
-static void result_null_text(void *ctx, int argc, void **argv)
+static void result_null_text(sqlite3_context *ctx, int argc, sqlite3_value **argv)
 {
     (void)argc;
     (void)argv;
@@ -636,7 +636,7 @@ static void result_null_text(void *ctx, int argc, void **argv)
     sqlite3_result_text(ctx, NULL, 0, SQLITE_TRANSIENT);
 }
 
-static void result_null_blob(void *ctx, int argc, void **argv)
+static void result_null_blob(sqlite3_context *ctx, int argc, sqlite3_value **argv)
 {
     (void)argc;
     (void)argv;
@@ -667,13 +667,13 @@ void test_sqlite3_result_text_and_blob()
     rc = sqlite3_open(":memory:", &db);
     assert(rc == SQLITE_OK);
 
-    rc = sqlite3_create_function_v2(db, "malloc_text", 0, SQLITE_UTF8, NULL, (void (*)(void))result_malloc_text, NULL, NULL, NULL);
+    rc = sqlite3_create_function_v2(db, "malloc_text", 0, SQLITE_UTF8, NULL, result_malloc_text, NULL, NULL, NULL);
     assert(rc == SQLITE_OK);
-    rc = sqlite3_create_function_v2(db, "malloc_blob", 0, SQLITE_UTF8, NULL, (void (*)(void))result_malloc_blob, NULL, NULL, NULL);
+    rc = sqlite3_create_function_v2(db, "malloc_blob", 0, SQLITE_UTF8, NULL, result_malloc_blob, NULL, NULL, NULL);
     assert(rc == SQLITE_OK);
-    rc = sqlite3_create_function_v2(db, "null_text", 0, SQLITE_UTF8, NULL, (void (*)(void))result_null_text, NULL, NULL, NULL);
+    rc = sqlite3_create_function_v2(db, "null_text", 0, SQLITE_UTF8, NULL, result_null_text, NULL, NULL, NULL);
     assert(rc == SQLITE_OK);
-    rc = sqlite3_create_function_v2(db, "null_blob", 0, SQLITE_UTF8, NULL, (void (*)(void))result_null_blob, NULL, NULL, NULL);
+    rc = sqlite3_create_function_v2(db, "null_blob", 0, SQLITE_UTF8, NULL, result_null_blob, NULL, NULL, NULL);
     assert(rc == SQLITE_OK);
 
     // A custom destructor releases the buffer once, and the result keeps its value.
