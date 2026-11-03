@@ -3,6 +3,8 @@
 #![allow(unused_imports)]
 use std::ptr;
 
+mod vtab;
+
 #[repr(C)]
 struct sqlite3 {
     _private: [u8; 0],
