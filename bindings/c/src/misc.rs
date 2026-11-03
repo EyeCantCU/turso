@@ -135,7 +135,7 @@ pub unsafe extern "C" fn sqlite3_limit(
 }
 
 /// SQLITE_LIMIT_LENGTH of the connection owning `stmt`.
-pub(crate) unsafe fn length_limit(db: &sqlite3) -> usize {
+pub(crate) fn length_limit(db: &sqlite3) -> usize {
     let conn = db.inner.lock().map(|i| i.conn.clone());
     conn.ok()
         .and_then(|c| c.limit(turso_core::limits::LIMIT_LENGTH))

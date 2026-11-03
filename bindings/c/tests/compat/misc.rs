@@ -1629,3 +1629,31 @@ fn value_bytes_counts_utf8_after_utf16_reads() {
         sqlite3_close(db);
     }
 }
+
+#[test]
+fn expanded_sql_is_null_beyond_the_length_limit() {
+    unsafe {
+        let db = open_mem();
+        sqlite3_limit(db, LIMIT_LENGTH, 30);
+        let mut stmt = ptr::null_mut();
+        assert_eq!(
+            sqlite3_prepare_v2(db, c"SELECT ?".as_ptr(), -1, &mut stmt, ptr::null_mut()),
+            SQLITE_OK
+        );
+        assert_eq!(
+            sqlite3_bind_text(stmt, 1, c"short".as_ptr(), 5, None),
+            SQLITE_OK
+        );
+        let e = sqlite3_expanded_sql(stmt);
+        assert!(!e.is_null());
+        sqlite3_free(e.cast());
+        let long = c"0123456789012345678901234567";
+        assert_eq!(
+            sqlite3_bind_text(stmt, 1, long.as_ptr(), 28, None),
+            SQLITE_OK
+        );
+        assert!(sqlite3_expanded_sql(stmt).is_null());
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+    }
+}

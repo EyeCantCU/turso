@@ -1892,6 +1892,10 @@ pub unsafe extern "C" fn sqlite3_expanded_sql(stmt: *mut sqlite3_stmt) -> *mut f
         &full[full.len() - trail..]
     );
     let n = expanded.len();
+    // SQLite gives up when the text would exceed SQLITE_LIMIT_LENGTH.
+    if n > misc::length_limit(&stmt.db) {
+        return std::ptr::null_mut();
+    }
     let buf = unsafe { libc::malloc(n + 1) } as *mut ffi::c_char;
     if buf.is_null() {
         return std::ptr::null_mut();
