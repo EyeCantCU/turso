@@ -65,6 +65,8 @@ mod functions;
 mod incremental;
 mod incremental_blob;
 pub use incremental_blob::Blob;
+#[cfg(feature = "fts5")]
+mod fts5;
 mod info;
 #[cfg(all(feature = "json", not(any(feature = "fuzz", feature = "bench"))))]
 mod json;
