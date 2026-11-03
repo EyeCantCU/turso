@@ -257,10 +257,7 @@ fn prepare_update_plan(
         s.get_table(namespace.id, target_name.as_str())
     }) {
         Some(table) => table,
-        None => bail_parse_error!(
-            "no such table: {}",
-            crate::util::table_name_for_error(&body.tbl_name)
-        ),
+        None => return Err(crate::translate::catalog::dml_no_table_error(resolver, namespace, &body.tbl_name)),
     };
     if program.trigger.is_some() && table.virtual_table().is_some() {
         bail_parse_error!(
@@ -504,7 +501,7 @@ fn collect_update_set_clauses(
                 None => match rowid_name_column_index(table, &ident) {
                     Some(idx) => idx,
                     None => {
-                        crate::bail_parse_error!("no such column: {}.{}", table_name, col_name)
+                        crate::bail_parse_error!("no such column: {}", col_name)
                     }
                 },
             };

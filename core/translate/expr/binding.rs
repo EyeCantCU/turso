@@ -315,7 +315,7 @@ pub fn bind_and_rewrite_expr<'a>(
                             referenced_tables.mark_column_used(m.table_id, m.col_idx);
                             return Ok(WalkControl::Continue);
                         }
-                        crate::bail_parse_error!("no such table: {}", normalized_table_name);
+                        crate::bail_parse_error!("no such column: {}.{}", tbl.as_str(), id.as_str());
                     }
                     match qualified_match {
                         QualifiedNameMatch::Found(table_id, column) => {
@@ -622,7 +622,7 @@ pub(crate) fn validate_function_tail(
         Err(err) if filter_over.over_clause.is_some() => {
             match crate::dialect::sqlite::resolve_builtin_function_name(name, arg_count) {
                 Ok(Some(Func::Scalar(_))) => {
-                    crate::bail_parse_error!("{} may not be used as a window function", name)
+                    crate::bail_parse_error!("{}() may not be used as a window function", name)
                 }
                 _ => return Err(err),
             }
@@ -636,7 +636,7 @@ pub(crate) fn validate_function_tail(
             crate::bail_parse_error!("ORDER BY may not be used with non-aggregate {}()", name)
         }
         _ if filter_over.over_clause.is_some() => {
-            crate::bail_parse_error!("{} may not be used as a window function", name)
+            crate::bail_parse_error!("{}() may not be used as a window function", name)
         }
         _ => crate::bail_parse_error!("FILTER may not be used with non-aggregate {}()", name),
     }

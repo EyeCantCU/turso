@@ -1311,7 +1311,7 @@ fn plan_cte(
             let result_column_count = cte_query_plan.select_result_columns().len();
             if columns.len() != result_column_count {
                 crate::bail_parse_error!(
-                    "table {} has {} columns but {} column names were provided",
+                    "table {} has {} values for {} columns",
                     cte_definition.name,
                     result_column_count,
                     columns.len()
@@ -2101,7 +2101,7 @@ fn parse_table(
                     let result_column_count = cte_query_plan.select_result_columns().len();
                     if columns.len() != result_column_count {
                         crate::bail_parse_error!(
-                            "table {} has {} columns but {} column names were provided",
+                            "table {} has {} values for {} columns",
                             normalized_qualified_name,
                             result_column_count,
                             columns.len()
@@ -2405,10 +2405,9 @@ fn transform_args_into_where_terms(
 
     if args_iter.next().is_some() {
         return Err(crate::LimboError::ParseError(format!(
-            "Too many arguments for {}: expected at most {}, got {}",
+            "too many arguments on {}() - max {}",
             table.get_name(),
             hidden_count,
-            hidden_count + 1 + args_iter.count()
         )));
     }
 

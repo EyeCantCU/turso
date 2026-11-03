@@ -308,7 +308,8 @@ fn register_csv_module(conn: &Arc<turso_core::Connection>) {
 }
 
 impl sqlite3_stmt {
-    pub fn new(db: Arc<sqlite3>, stmt: turso_core::Statement) -> Self {
+    pub fn new(db: Arc<sqlite3>, mut stmt: turso_core::Statement) -> Self {
+        stmt.set_structured_errors(true);
         let n_cols = stmt.num_columns();
         let sql = CString::new(stmt.get_sql()).unwrap_or_default();
         Self {
@@ -3734,6 +3735,7 @@ fn limbo_err_code(err: &LimboError) -> i32 {
     }
     match err {
         LimboError::Constraint(m) if m == "datatype mismatch" => SQLITE_MISMATCH,
+        LimboError::ConstraintViolation(v) if v.message == "datatype mismatch" => SQLITE_MISMATCH,
         LimboError::TooBig => SQLITE_TOOBIG,
         LimboError::Corrupt(..) => SQLITE_CORRUPT,
         LimboError::NotADB => SQLITE_NOTADB,

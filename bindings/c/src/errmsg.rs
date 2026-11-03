@@ -82,6 +82,22 @@ fn rewrite(msg: &str) -> String {
             return format!("{to}{rest}");
         }
     }
+    if let Some(head) = msg.strip_suffix(" in ALTER TABLE statement") {
+        if head.starts_with("Cannot add a ") {
+            return head.to_string();
+        }
+    }
+    // cannot drop column "x": PRIMARY KEY  ->  cannot drop PRIMARY KEY column: "x"
+    if let Some(rest) = msg.strip_prefix("cannot drop column ") {
+        for kind in ["PRIMARY KEY", "UNIQUE"] {
+            if let Some(name) = rest.strip_suffix(&format!(": {kind}")) {
+                return format!("cannot drop {kind} column: {name}");
+            }
+        }
+    }
+    if msg.starts_with("coalesce function with less than") {
+        return "wrong number of arguments to function coalesce()".to_string();
+    }
     msg.to_string()
 }
 
@@ -105,6 +121,7 @@ pub fn message(err: &LimboError, sql: Option<&str>) -> String {
         LimboError::LexerError(e) => parser_message(e, sql),
         // Core appends the result code the shell would print.
         LimboError::Constraint(msg) => strip_code_suffix(msg).to_string(),
+        LimboError::ConstraintViolation(v) => strip_code_suffix(&v.message).to_string(),
         _ => err.to_string(),
     }
 }
@@ -129,6 +146,9 @@ pub fn extended_code(err: &LimboError) -> Option<i32> {
             ConstraintKind::ForeignKey => SQLITE_CONSTRAINT_FOREIGNKEY,
             ConstraintKind::NotNull => SQLITE_CONSTRAINT_NOTNULL,
             ConstraintKind::Check => SQLITE_CONSTRAINT_CHECK,
+            ConstraintKind::Other if v.message.starts_with("cannot store ") => {
+                SQLITE_CONSTRAINT_DATATYPE
+            }
             ConstraintKind::Other => return None,
         }),
         LimboError::ForeignKeyConstraint(_) => Some(SQLITE_CONSTRAINT_FOREIGNKEY),

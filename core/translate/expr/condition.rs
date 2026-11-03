@@ -409,8 +409,13 @@ fn translate_leaf_condition_expr(
         ast::Expr::InTable { .. } => {
             crate::bail_parse_error!("Table expression in WHERE clause is not supported");
         }
-        ast::Expr::FunctionCallStar { .. } => {
-            crate::bail_parse_error!("FunctionCallStar in WHERE clause is not supported");
+        ast::Expr::FunctionCallStar { name, filter_over } => {
+            let kind = if filter_over.over_clause.is_some() {
+                "window"
+            } else {
+                "aggregate"
+            };
+            crate::bail_parse_error!("misuse of {kind} function {}()", name.as_str());
         }
         ast::Expr::Raise(_, _) => {
             crate::bail_parse_error!("RAISE in WHERE clause is not supported");
