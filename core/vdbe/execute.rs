@@ -171,9 +171,9 @@ use turso_parser::parser::Parser;
 
 use super::sorter::Sorter;
 use crate::vdbe::vacuum::{
-    capture_custom_types, mirror_symbols, reject_unsupported_vacuum_auto_vacuum_mode,
-    vacuum_target_build_step, vacuum_target_opts_from_source, VacuumDbHeaderMeta,
-    VacuumTargetBuildConfig, VacuumTargetBuildContext,
+    capture_custom_types, mirror_symbols, vacuum_target_auto_vacuum_mode, vacuum_target_build_step,
+    vacuum_target_opts_from_source, VacuumDbHeaderMeta, VacuumTargetBuildConfig,
+    VacuumTargetBuildContext,
 };
 
 #[cfg(feature = "json")]
@@ -14720,6 +14720,11 @@ pub fn op_index_method_query(
 pub enum OpDestroyState {
     CreateCursor,
     DestroyBtree(Arc<RwLock<BTreeCursor>>),
+    /// Auto-vacuum: empty the tree but keep its root page for `DropRoot`.
+    #[cfg(feature = "autovacuum")]
+    ClearForDrop(Arc<RwLock<BTreeCursor>>),
+    #[cfg(feature = "autovacuum")]
+    DropRoot,
 }
 
 /// State carried across asynchronous steps while clearing an existing b-tree.
@@ -14763,11 +14768,43 @@ pub fn op_destroy(
     loop {
         match state.active_op_state.destroy() {
             OpDestroyState::CreateCursor => {
+                #[cfg(feature = "autovacuum")]
+                let auto_vacuum = return_if_io!(
+                    state,
+                    destroy_pager.with_header(|h| h.vacuum_mode_largest_root_page.get() > 0)
+                );
                 // Destroy doesn't do anything meaningful with the table/index distinction so we can just use a
                 // table btree cursor for both.
-                let cursor = BTreeCursor::new(destroy_pager.clone(), *root, 0);
-                *state.active_op_state.destroy() =
-                    OpDestroyState::DestroyBtree(Arc::new(RwLock::new(cursor)));
+                let cursor = Arc::new(RwLock::new(BTreeCursor::new(
+                    destroy_pager.clone(),
+                    *root,
+                    0,
+                )));
+                #[cfg(feature = "autovacuum")]
+                if auto_vacuum {
+                    *state.active_op_state.destroy() = OpDestroyState::ClearForDrop(cursor);
+                    continue;
+                }
+                *state.active_op_state.destroy() = OpDestroyState::DestroyBtree(cursor);
+            }
+            #[cfg(feature = "autovacuum")]
+            OpDestroyState::ClearForDrop(ref mut cursor) => {
+                let cleared = cursor.write().clear_btree();
+                return_if_io!(state, cleared);
+                *state.active_op_state.destroy() = OpDestroyState::DropRoot;
+            }
+            #[cfg(feature = "autovacuum")]
+            OpDestroyState::DropRoot => {
+                let moved = return_if_io!(state, destroy_pager.av_drop_root(*root as u32));
+                if moved != 0 {
+                    program.connection.with_database_schema_mut(*db, |schema| {
+                        schema.root_page_moved(moved as i64, *root)
+                    })?;
+                }
+                state.registers[*former_root_reg].set_int(moved as i64);
+                state.active_op_state.clear();
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
             }
             OpDestroyState::DestroyBtree(ref mut cursor) => {
                 let destroyed = cursor.write().btree_destroy();
@@ -16493,6 +16530,7 @@ pub fn op_read_cookie(
                 Cookie::LargestRootPageNumber => header.vacuum_mode_largest_root_page.get().into(),
                 Cookie::PageSize => header.page_size.get().into(),
                 Cookie::FreePageCount => header.freelist_pages.get().into(),
+                Cookie::IncrementalVacuum => header.incremental_vacuum_enabled.get().into(),
                 cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
             },
         ) {
@@ -17367,6 +17405,16 @@ pub enum OpIntegrityCheckState {
         current_root_idx: usize,
         current_dropped_idx: usize,
         state: IntegrityCheckState,
+        #[cfg(feature = "autovacuum")]
+        av_geom: Option<crate::storage::pager::autovacuum::Geom>,
+    },
+    /// Auto-vacuum: compare every pointer-map entry with what the walk saw (checkPtrmap).
+    #[cfg(feature = "autovacuum")]
+    CheckingPtrmap {
+        errors: crate::alloc::Vec<IntegrityCheckError>,
+        state: IntegrityCheckState,
+        geom: crate::storage::pager::autovacuum::Geom,
+        next_page: u32,
     },
 }
 
@@ -17398,6 +17446,19 @@ pub fn op_integrity_check(
         .filter(|mv_store| !mv_store.uses_passive_checkpoint());
     match state.active_op_state.integrity_check() {
         OpIntegrityCheckState::Start => {
+            #[cfg(feature = "autovacuum")]
+            let av_geom = if mv_store.is_none() {
+                let (mode, geom) = return_if_io!(
+                    state,
+                    target_pager.with_header(|h| (
+                        crate::storage::pager::autovacuum::mode_from_header(h),
+                        target_pager.av_geom(h)
+                    ))
+                );
+                (mode != crate::storage::pager::AutoVacuumMode::None).then_some(geom)
+            } else {
+                None
+            };
             let (freelist_trunk_page, db_size) = return_if_io!(
                 state,
                 with_header(
@@ -17440,6 +17501,8 @@ pub fn op_integrity_check(
                     state: integrity_check_state,
                     current_root_idx,
                     current_dropped_idx: 0,
+                    #[cfg(feature = "autovacuum")]
+                    av_geom,
                 };
         }
         OpIntegrityCheckState::CheckingBTreeStructure {
@@ -17447,6 +17510,8 @@ pub fn op_integrity_check(
             current_root_idx,
             current_dropped_idx,
             state: integrity_check_state,
+            #[cfg(feature = "autovacuum")]
+            av_geom,
         } => {
             return_if_io!(
                 state,
@@ -17505,20 +17570,29 @@ pub fn op_integrity_check(
                 )?;
             }
 
+            // In auto-vacuum databases pointer-map pages are used but never referenced.
             #[cfg(feature = "autovacuum")]
-            let skip_page_never_used = !matches!(
-                target_pager.get_auto_vacuum_mode(),
-                crate::storage::pager::AutoVacuumMode::None
-            );
+            let av_geom = *av_geom;
+            #[cfg(feature = "autovacuum")]
+            let is_ptrmap = |p: u32| av_geom.is_some_and(|g| g.is_ptrmap(p));
             #[cfg(not(feature = "autovacuum"))]
-            let skip_page_never_used = false;
+            let is_ptrmap = |_: u32| false;
 
-            if !skip_page_never_used {
+            {
                 for page_number in 2..=integrity_check_state.db_size {
-                    if !integrity_check_state
+                    let referenced = integrity_check_state
                         .page_reference
-                        .contains_key(&(page_number as i64))
-                    {
+                        .contains_key(&(page_number as i64));
+                    if is_ptrmap(page_number as u32) {
+                        if referenced {
+                            crate::with_btree_allocation_site!(
+                                IntegrityCheck,
+                                errors.try_push(IntegrityCheckError::PointerMapReferenced {
+                                    page_id: page_number as i64,
+                                })
+                            )?;
+                        }
+                    } else if !referenced {
                         if target_pager.pending_byte_page_id() != Some(page_number as u32) {
                             crate::with_btree_allocation_site!(
                                 IntegrityCheck,
@@ -17542,6 +17616,76 @@ pub fn op_integrity_check(
                 }
             }
 
+            #[cfg(feature = "autovacuum")]
+            if let Some(geom) = av_geom {
+                if errors.len() < *max_errors {
+                    let errors = std::mem::take(errors);
+                    let check_state =
+                        std::mem::replace(integrity_check_state, IntegrityCheckState::new(0));
+                    *state.active_op_state.integrity_check() =
+                        OpIntegrityCheckState::CheckingPtrmap {
+                            errors,
+                            state: check_state,
+                            geom,
+                            next_page: 2,
+                        };
+                    return Ok(InsnFunctionStepResult::Step);
+                }
+            }
+
+            errors.truncate(*max_errors);
+            match format_integrity_check_result(errors)? {
+                Some(msg) => state.registers[*message_register].set_text(Text::new(msg))?,
+                None => state.registers[*message_register].set_null(),
+            }
+            state.active_op_state.clear();
+            state.pc += 1;
+        }
+        #[cfg(feature = "autovacuum")]
+        OpIntegrityCheckState::CheckingPtrmap {
+            errors,
+            state: check_state,
+            geom,
+            next_page,
+        } => {
+            use crate::storage::btree::PageCategory as C;
+            let geom = *geom;
+            while (*next_page as usize) <= check_state.db_size && errors.len() < *max_errors {
+                let page = *next_page as i64;
+                let Some(&parent) = check_state.page_reference.get(&page) else {
+                    *next_page += 1;
+                    continue;
+                };
+                if geom.skip(page as u32) {
+                    *next_page += 1;
+                    continue;
+                }
+                let (got_type, got_parent) =
+                    return_if_io!(state, target_pager.av_get(geom, page as u32));
+                let category = check_state.page_category.get(&page).copied();
+                let (expected_type, expected_parent) = match category {
+                    Some(C::FreeListTrunk | C::FreePage) => (2, 0),
+                    Some(C::Overflow) => match check_state.page_category.get(&parent) {
+                        Some(C::Overflow) => (4, parent as u32),
+                        _ => (3, parent as u32),
+                    },
+                    _ if parent == 0 => (1, 0),
+                    _ => (5, parent as u32),
+                };
+                if (got_type, got_parent) != (expected_type, expected_parent) {
+                    crate::with_btree_allocation_site!(
+                        IntegrityCheck,
+                        errors.try_push(IntegrityCheckError::BadPtrmapEntry {
+                            page_id: page,
+                            expected_type,
+                            expected_parent,
+                            got_type,
+                            got_parent,
+                        })
+                    )?;
+                }
+                *next_page += 1;
+            }
             errors.truncate(*max_errors);
             match format_integrity_check_result(errors)? {
                 Some(msg) => state.registers[*message_register].set_text(Text::new(msg))?,
@@ -20453,8 +20597,8 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                 let source_pager = program
                     .connection
                     .get_pager_from_database_index(&source_db_id)?;
-                let source_auto_vacuum_mode = source_pager.get_auto_vacuum_mode();
-                reject_unsupported_vacuum_auto_vacuum_mode(source_auto_vacuum_mode)?;
+                let source_auto_vacuum_mode =
+                    vacuum_target_auto_vacuum_mode(&program.connection, &source_pager)?;
                 let header_meta = if let Some(mv_store) =
                     program.connection.mv_store_for_db(source_db_id)
                 {
@@ -20616,6 +20760,32 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
 
 /// In-place VACUUM - compact the database via target build + direct-WAL
 /// copy-back. The opcode owns the source transaction lifecycle.
+pub fn op_incr_vacuum(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(IncrVacuum { db, limit }, insn);
+    check_db_write_allowed(program, state, None)?;
+    #[cfg(feature = "autovacuum")]
+    if program.connection.mv_store_for_db(*db).is_none() {
+        let pager = program.get_pager_from_database_index(db)?;
+        let mode = return_if_io!(
+            state,
+            pager.with_header(crate::storage::pager::autovacuum::mode_from_header)
+        );
+        if mode != crate::storage::pager::AutoVacuumMode::None {
+            let limit = (*limit != 0).then_some(*limit);
+            return_if_io!(state, pager.av_vacuum(limit));
+        }
+    }
+    #[cfg(not(feature = "autovacuum"))]
+    let _ = (db, limit);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_vacuum(
     program: &Program,
     state: &mut ProgramState,

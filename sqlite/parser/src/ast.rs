@@ -1975,6 +1975,8 @@ pub enum PragmaName {
     Encoding,
     /// Current free page count.
     FreelistCount,
+    /// Run an incremental vacuum step on an auto-vacuum database.
+    IncrementalVacuum,
     /// Enable or disable foreign key constraint enforcement
     ForeignKeys,
     /// Returns information about foreign keys declared by a table

@@ -220,13 +220,23 @@ pub(crate) fn vacuum_target_opts_from_source(source_db: &Database) -> DatabaseOp
         .with_without_rowid(source_db.experimental_without_rowid_enabled())
 }
 
-pub(crate) fn reject_unsupported_vacuum_auto_vacuum_mode(mode: AutoVacuumMode) -> Result<()> {
-    if matches!(mode, AutoVacuumMode::Incremental) {
-        return Err(LimboError::InternalError(
-            "Incremental auto-vacuum is not supported".to_string(),
-        ));
+/// Auto-vacuum mode of a VACUUM target: a pending `PRAGMA auto_vacuum`
+/// (db->nextAutovac) wins over the source database's mode.
+pub(crate) fn vacuum_target_auto_vacuum_mode(
+    connection: &Connection,
+    source_pager: &Pager,
+) -> Result<AutoVacuumMode> {
+    if let Some(mode) = connection.next_auto_vacuum() {
+        return Ok(mode);
     }
-    Ok(())
+    #[cfg(feature = "autovacuum")]
+    {
+        source_pager
+            .io
+            .block(|| source_pager.with_header(crate::storage::pager::autovacuum::mode_from_header))
+    }
+    #[cfg(not(feature = "autovacuum"))]
+    Ok(source_pager.get_auto_vacuum_mode())
 }
 
 /// Database header metadata that the target build must finalize before commit.
@@ -1903,7 +1913,6 @@ fn vacuum_in_place_step(
                     )
                     .into());
                 }
-                reject_unsupported_vacuum_auto_vacuum_mode(source_pager.get_auto_vacuum_mode())?;
                 // 6. Reject non-WAL pagers.
                 let wal = source_pager.wal.as_ref().ok_or_else(|| {
                     LimboError::InternalError("VACUUM requires a WAL-mode database".to_string())
@@ -2011,6 +2020,8 @@ fn vacuum_in_place_step(
                         (h.reserved_space, VacuumDbHeaderMeta::from_source_header(h))
                     })
                 })?;
+                let target_auto_vacuum_mode =
+                    vacuum_target_auto_vacuum_mode(connection, &source_pager)?;
                 // Create temp database.
                 let new_temp_db =
                     open_vacuum_temp_db(connection, &source_db, page_size, reserved_space)?;
@@ -2025,7 +2036,7 @@ fn vacuum_in_place_step(
                     header_meta,
                     source_custom_types,
                     target_mvcc_enabled: false,
-                    target_auto_vacuum_mode: source_pager.get_auto_vacuum_mode(),
+                    target_auto_vacuum_mode,
                     copy_mvcc_metadata_table: source_db.mvcc_enabled(),
                 };
 

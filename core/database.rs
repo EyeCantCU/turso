@@ -77,6 +77,7 @@ pub struct DatabaseOpts {
     pub enable_custom_types: bool,
     pub enable_encryption: bool,
     pub enable_index_method: bool,
+    /// No longer needed: auto-vacuum is always supported. Kept for API compatibility.
     pub enable_autovacuum: bool,
     pub enable_vacuum: bool,
     pub enable_attach: bool,
@@ -2068,18 +2069,20 @@ impl Database {
                     let is_readonly = *is_readonly;
                     let log_exists = *log_exists;
 
-                    // Re-entrant reads: both `with_header` and `from_pager`
-                    // resume via their own state machines, and the autovacuum
-                    // flag update is idempotent.
-                    let is_autovacuumed_db = return_if_io!(pager.with_header(|header| {
-                        header.vacuum_mode_largest_root_page.get() > 0
-                            || header.incremental_vacuum_enabled.get() > 0
-                    }));
-                    if is_autovacuumed_db && !self.opts.enable_autovacuum {
-                        tracing::warn!(
-                            "Database has autovacuum enabled but --experimental-autovacuum flag is not set. Opening in readonly mode."
-                        );
-                        self.open_flags |= OpenFlags::ReadOnly;
+                    // Without the autovacuum feature, auto-vacuum databases cannot
+                    // keep their pointer maps up to date, so they open read-only.
+                    #[cfg(not(feature = "autovacuum"))]
+                    {
+                        let is_autovacuumed_db = return_if_io!(pager.with_header(|header| {
+                            header.vacuum_mode_largest_root_page.get() > 0
+                                || header.incremental_vacuum_enabled.get() > 0
+                        }));
+                        if is_autovacuumed_db {
+                            tracing::warn!(
+                                "Database has autovacuum enabled but autovacuum support is not compiled in. Opening in readonly mode."
+                            );
+                            self.open_flags |= OpenFlags::ReadOnly;
+                        }
                     }
 
                     let header: HeaderRefMut = return_if_io!(HeaderRefMut::from_pager(pager));
@@ -2790,6 +2793,7 @@ impl Database {
             ),
             enable_load_extension: AtomicBool::new(self.can_load_extensions()),
             fk_pragma: AtomicBool::new(false),
+            next_auto_vacuum: AtomicU8::new(u8::MAX),
             fk_deferred_violations: AtomicIsize::new(0),
             triggers_enabled: AtomicBool::new(true),
             n_active_writes: AtomicI32::new(0),

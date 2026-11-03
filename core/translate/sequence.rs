@@ -1097,6 +1097,17 @@ pub(crate) fn emit_drop_sequence_cleanup(
         former_root_reg,
         is_temp: 0,
     });
+    let schema_table = resolver.with_schema(crate::MAIN_DB_ID, |s| {
+        s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
+            .expect("sqlite_schema exists")
+    });
+    crate::translate::schema::emit_root_page_moved(
+        program,
+        database_id,
+        &schema_table,
+        former_root_reg,
+        root_page,
+    )?;
 
     // Remove from the in-memory schema (sequences + tables maps)
     program.emit_insn(Insn::DropSequence {

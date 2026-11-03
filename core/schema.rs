@@ -2781,6 +2781,34 @@ impl Schema {
         self.analyze_stats.remove_table(namespace, &name);
     }
 
+    /// sqlite3RootPageMoved: auto-vacuum moved the btree rooted at `from` to `to`.
+    pub fn root_page_moved(&mut self, from: i64, to: i64) {
+        for ns in self.namespaces.values_mut() {
+            for table in ns.tables.values_mut() {
+                if let Table::BTree(bt) = table.as_ref() {
+                    if bt.root_page == from {
+                        let mut moved = bt.as_ref().clone();
+                        moved.root_page = to;
+                        *table = Arc::new(Table::BTree(Arc::new(moved)));
+                    }
+                }
+            }
+            for indexes in ns.indexes.values_mut() {
+                for index in indexes.iter_mut() {
+                    if index.root_page == from {
+                        let mut moved = index.as_ref().clone();
+                        moved.root_page = to;
+                        *index = Arc::new(moved);
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "conn_raw_api")]
+        if let Some(name) = self.table_names_by_root_page.remove(&from) {
+            self.table_names_by_root_page.insert(to, name);
+        }
+    }
+
     pub fn remove_index(&mut self, namespace: NamespaceId, idx: &Index) {
         let name = normalize_ident(&idx.table_name);
         self.namespace_mut(namespace)

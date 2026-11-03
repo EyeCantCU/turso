@@ -2899,6 +2899,15 @@ pub fn insn_to_row(
             0,
             format!("db={db}"),
         ),
+        Insn::IncrVacuum { db, limit } => (
+            "IncrVacuum",
+            *db as i64,
+            *limit as i64,
+            0,
+            Value::Null,
+            0,
+            format!("db={db} limit={limit}"),
+        ),
         Insn::InitCdcVersion { cdc_table_name, version, cdc_mode } => (
             "InitCdcVersion",
             0,

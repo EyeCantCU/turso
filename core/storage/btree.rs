@@ -8237,6 +8237,16 @@ pub enum IntegrityCheckError {
     PageNeverUsed { page_id: i64 },
     #[error("Pending byte page {page_id} is being used")]
     PendingBytePageUsed { page_id: i64 },
+    #[error("Page {page_id}: pointer map referenced")]
+    PointerMapReferenced { page_id: i64 },
+    #[error("Bad ptr map entry key={page_id} expected=({expected_type},{expected_parent}) got=({got_type},{got_parent})")]
+    BadPtrmapEntry {
+        page_id: i64,
+        expected_type: u8,
+        expected_parent: u32,
+        got_type: u8,
+        got_parent: u32,
+    },
     #[error("Freelist: freelist leaf count too big on page {page_id}")]
     FreelistTrunkCorrupt {
         page_id: i64,
@@ -8285,6 +8295,8 @@ pub struct IntegrityCheckState {
     pub db_size: usize,
     first_leaf_level: Option<usize>,
     pub page_reference: HashMap<i64, i64>,
+    /// Category of every referenced page, for the auto-vacuum pointer-map check.
+    pub page_category: HashMap<i64, PageCategory>,
     page: Option<PageRef>,
     pub freelist_count: CheckFreelist,
 }
@@ -8295,6 +8307,7 @@ impl IntegrityCheckState {
             page_stack: crate::alloc::vec![],
             db_size,
             page_reference: HashMap::default(),
+            page_category: HashMap::default(),
             first_leaf_level: None,
             page: None,
             freelist_count: CheckFreelist {
@@ -8346,6 +8359,7 @@ impl IntegrityCheckState {
         let Some(previous) = self.page_reference.get(&page_id).copied() else {
             crate::with_btree_allocation_site!(IntegrityCheck, self.page_stack.try_reserve(1))?;
             let previous = self.page_reference.insert(page_id, referenced_by);
+            self.page_category.insert(page_id, entry.page_category);
             turso_assert!(
                 previous.is_none(),
                 "page reference changed during insertion"
@@ -11220,6 +11234,8 @@ mod tests {
                 current_root_idx: 0,
                 current_dropped_idx: 0,
                 state: IntegrityCheckState::new(0),
+                #[cfg(feature = "autovacuum")]
+                av_geom: None,
             };
         let crate::vdbe::execute::OpIntegrityCheckState::CheckingBTreeStructure { errors, .. } =
             op_integrity_check
