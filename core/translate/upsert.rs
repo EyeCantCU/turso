@@ -439,6 +439,23 @@ pub fn resolve_upsert_target(
     if upsert_matches_rowid_alias(upsert, table) {
         return Ok(ResolvedUpsertTarget::PrimaryKey);
     }
+    // The PRIMARY KEY of a WITHOUT ROWID table is the table b-tree itself.
+    if let Some(bt) = table.btree().filter(|bt| !bt.has_rowid) {
+        let pk_index = Index::automatic_from_primary_key(
+            &bt,
+            (String::new(), bt.root_page),
+            bt.primary_key_columns.len(),
+            None,
+            bt.unique_sets
+                .iter()
+                .find(|u| u.is_primary_key)
+                .map_or(&[], |u| u.columns.as_slice()),
+            None,
+        )?;
+        if upsert_matches_index(upsert, &pk_index, table) {
+            return Ok(ResolvedUpsertTarget::PrimaryKey);
+        }
+    }
 
     // Otherwise match a UNIQUE index, also covering non-rowid PRIMARY KEYs
     for idx in schema.get_indices(namespace, table.get_name()) {
@@ -491,12 +508,10 @@ pub fn emit_upsert(
 ) -> crate::Result<()> {
     let constraint_on_error = do_update_constraint_on_error(program);
 
+    // A WITHOUT ROWID row is located by the conflicting primary key.
+    let wr = table.btree().filter(|bt| !bt.has_rowid);
     // Seek & snapshot CURRENT
-    program.emit_insn(Insn::SeekRowid {
-        cursor_id: ctx.cursor_id,
-        src_reg: ctx.conflict_rowid_reg,
-        target_pc: ctx.loop_labels.row_done,
-    });
+    emit_seek_conflict_row(program, ctx, &wr)?;
     if let Some(written_rowids_cursor_id) = ctx.written_rowids_cursor_id {
         let row_not_written = program.allocate_label();
         program.emit_insn(Insn::NotExists {
@@ -937,11 +952,7 @@ pub fn emit_upsert(
             }
 
             // BEFORE UPDATE triggers may have altered the btree, need to re-seek
-            program.emit_insn(Insn::NotExists {
-                cursor: ctx.cursor_id,
-                rowid_reg: ctx.conflict_rowid_reg,
-                target_pc: ctx.loop_labels.row_done,
-            });
+            emit_seek_conflict_row(program, ctx, &wr)?;
 
             // The triggers may also have changed this row, so re-read it:
             // index deletion must use the row as it is on disk now, or the
@@ -1117,6 +1128,51 @@ pub fn emit_upsert(
     // table (issue #6858).
     let new_rowid = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
 
+    // If SET changed a WITHOUT ROWID primary key, no other row may own the new one.
+    let pk_changed = wr.as_ref().is_some_and(|bt| {
+        directly_changed_cols
+            .iter()
+            .any(|c| bt.columns().get(c).is_some_and(|col| col.primary_key()))
+    });
+    if let (true, Some(bt)) = (pk_changed, &wr) {
+        let pk_cols = bt.without_rowid_pk_columns()?;
+        let n = pk_cols.len();
+        let new_pk = program.alloc_registers(n);
+        for (i, col) in pk_cols.iter().enumerate() {
+            program.emit_insn(Insn::Copy {
+                src_reg: layout.to_register(new_start, col.pos_in_table),
+                dst_reg: new_pk + i,
+                extra_amount: 0,
+            });
+        }
+        let ok = program.allocate_label();
+        crate::translate::without_rowid::emit_jump_if_pk_equal(
+            program,
+            bt,
+            new_pk,
+            ctx.conflict_pk_reg,
+            ok,
+        )?;
+        program.emit_insn(Insn::NoConflict {
+            cursor_id: ctx.cursor_id,
+            target_pc: ok,
+            record_reg: new_pk,
+            num_regs: n,
+        });
+        program.emit_insn(Insn::Halt {
+            constraint_info: None,
+            err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+            description: pk_cols
+                .iter()
+                .map(|c| format!("{}.{}", bt.name, c.name))
+                .collect::<Vec<_>>()
+                .join(", "),
+            on_error: constraint_on_error,
+            description_reg: None,
+        });
+        program.preassign_label_to_next_insn(ok);
+    }
+
     // If SET changed the rowid, ensure no other row already owns the new one.
     if let Some(rnew) = new_rowid_reg {
         let ok = program.allocate_label();
@@ -1209,7 +1265,8 @@ pub fn emit_upsert(
             });
 
             // NEW key (use NEW rowid if present)
-            let ins = program.alloc_registers(k + 1);
+            let rec_len = k + idx_meta.has_rowid as usize;
+            let ins = program.alloc_registers(rec_len);
             for (i, ic) in idx_meta.columns.iter().enumerate() {
                 if ic.expression().is_some() {
                     emit_upsert_expr_index_value(
@@ -1231,16 +1288,18 @@ pub fn emit_upsert(
                     });
                 }
             }
-            program.emit_insn(Insn::Copy {
-                src_reg: new_rowid,
-                dst_reg: ins + k,
-                extra_amount: 0,
-            });
+            if idx_meta.has_rowid {
+                program.emit_insn(Insn::Copy {
+                    src_reg: new_rowid,
+                    dst_reg: ins + k,
+                    extra_amount: 0,
+                });
+            }
 
             let rec = program.alloc_register();
             program.emit_insn(Insn::MakeRecord {
                 start_reg: to_u32(ins),
-                count: to_u32(k + 1),
+                count: to_u32(rec_len),
                 dest_reg: to_u32(rec),
                 index_name: Some((*idx_name).clone()),
                 affinity_str: None,
@@ -1270,30 +1329,48 @@ pub fn emit_upsert(
                     count: NonZeroUsize::new(k).unwrap(),
                     affinities: aff,
                 });
+                let k = idx_meta.n_key_col;
                 program.emit_insn(Insn::NoConflict {
                     cursor_id: *idx_cid,
                     target_pc: ok,
                     record_reg: ins,
                     num_regs: k,
                 });
-                let hit = program.alloc_register();
-                program.emit_insn(Insn::IdxRowId {
-                    cursor_id: *idx_cid,
-                    dest: hit,
-                });
                 // A hit on the row being updated is not a conflict: its old
                 // key is deleted before the new one is inserted below.
-                program.emit_insn(Insn::Eq {
-                    lhs: ctx.conflict_rowid_reg,
-                    rhs: hit,
-                    target_pc: ok,
-                    flags: CmpInsFlags::default(),
-                    collation: CollationSeq::for_internal_values(),
-                });
+                if let Some(bt) = &wr {
+                    let hit = program.alloc_registers(bt.without_rowid_pk_columns()?.len());
+                    crate::translate::without_rowid::emit_pk_from_index(
+                        program, bt, &idx_meta, *idx_cid, hit,
+                    )?;
+                    crate::translate::without_rowid::emit_jump_if_pk_equal(
+                        program,
+                        bt,
+                        hit,
+                        ctx.conflict_pk_reg,
+                        ok,
+                    )?;
+                } else {
+                    let hit = program.alloc_register();
+                    program.emit_insn(Insn::IdxRowId {
+                        cursor_id: *idx_cid,
+                        dest: hit,
+                    });
+                    program.emit_insn(Insn::Eq {
+                        lhs: ctx.conflict_rowid_reg,
+                        rhs: hit,
+                        target_pc: ok,
+                        flags: CmpInsFlags::default(),
+                        collation: CollationSeq::for_internal_values(),
+                    });
+                }
                 let description = format_unique_violation_desc(table.get_name(), &idx_meta);
                 let regs: Vec<usize> = (0..k).map(|i| ins + i).collect();
-                let idx_col_names: Vec<&str> =
-                    idx_meta.columns.iter().map(|c| c.name.as_str()).collect();
+                let idx_col_names: Vec<&str> = idx_meta
+                    .key_columns()
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect();
                 let (pk_col_names, pk_constraint_name) = table
                     .btree()
                     .map(|bt| {
@@ -1367,7 +1444,8 @@ pub fn emit_upsert(
             });
 
             // DELETE old key
-            let del = program.alloc_registers(k + 1);
+            let rec_len = k + pending.idx_meta.has_rowid as usize;
+            let del = program.alloc_registers(rec_len);
             for (i, ic) in pending.idx_meta.columns.iter().enumerate() {
                 if ic.expression().is_some() {
                     emit_upsert_expr_index_value(
@@ -1389,14 +1467,16 @@ pub fn emit_upsert(
                     });
                 }
             }
-            program.emit_insn(Insn::Copy {
-                src_reg: ctx.conflict_rowid_reg,
-                dst_reg: del + k,
-                extra_amount: 0,
-            });
+            if pending.idx_meta.has_rowid {
+                program.emit_insn(Insn::Copy {
+                    src_reg: ctx.conflict_rowid_reg,
+                    dst_reg: del + k,
+                    extra_amount: 0,
+                });
+            }
             program.emit_insn(Insn::IdxDelete {
                 start_reg: del,
-                num_regs: k + 1,
+                num_regs: rec_len,
                 cursor_id: pending.idx_cid,
                 raise_error_if_no_matching_entry: true,
             });
@@ -1419,7 +1499,7 @@ pub fn emit_upsert(
                 cursor_id: pending.idx_cid,
                 record_reg: pending.record_reg,
                 unpacked_start: Some(pending.ins_start),
-                unpacked_count: Some((k + 1) as u32),
+                unpacked_count: Some(rec_len as u32),
                 flags: IdxInsertFlags::new().nchange(true),
             });
 
@@ -1519,6 +1599,33 @@ pub fn emit_upsert(
         }
 
         cdc_before_rec
+    } else if wr.is_some() {
+        // Probes above may have moved the cursor: find the row again, move it
+        // if its key changed, and leave the cursor on the new entry.
+        emit_seek_conflict_row(program, ctx, &wr)?;
+        if pk_changed {
+            program.emit_insn(Insn::Delete {
+                cursor_id: ctx.cursor_id,
+                table_name: table.get_name().to_string(),
+                is_part_of_update: true,
+            });
+        }
+        program.emit_insn(Insn::Insert {
+            cursor: ctx.cursor_id,
+            key_reg: ctx.conflict_rowid_reg,
+            record_reg,
+            flag: InsertFlags::new().require_seek().skip_last_rowid(),
+            table_name: table.get_name().to_string(),
+        });
+        let positioned = program.allocate_label();
+        program.emit_insn(Insn::NotFound {
+            cursor_id: ctx.cursor_id,
+            target_pc: positioned,
+            record_reg,
+            num_regs: 0,
+        });
+        program.preassign_label_to_next_insn(positioned);
+        None
     } else {
         // Read the before image before the insert below overwrites it in place.
         let cdc_before_rec = cdc_wants_before
@@ -1993,4 +2100,30 @@ fn rewrite_expr_to_registers(
             Ok(WalkControl::Continue)
         },
     )
+}
+
+/// Position the table cursor on the conflicting row: by rowid, or by the
+/// primary key of a WITHOUT ROWID table. Skips the row if it is gone.
+fn emit_seek_conflict_row(
+    program: &mut ProgramBuilder,
+    ctx: &InsertEmitCtx,
+    wr: &Option<Arc<BTreeTable>>,
+) -> crate::Result<()> {
+    match wr {
+        Some(bt) => crate::translate::without_rowid::emit_seek_row(
+            program,
+            bt,
+            ctx.cursor_id,
+            ctx.conflict_pk_reg,
+            ctx.loop_labels.row_done,
+        ),
+        None => {
+            program.emit_insn(Insn::SeekRowid {
+                cursor_id: ctx.cursor_id,
+                src_reg: ctx.conflict_rowid_reg,
+                target_pc: ctx.loop_labels.row_done,
+            });
+            Ok(())
+        }
+    }
 }

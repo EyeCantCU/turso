@@ -7182,7 +7182,16 @@ pub fn create_table(
                                 );
                             }
                         }
-                        unique_sets.remove(j);
+                        // The surviving set stands for the PRIMARY KEY if either was it.
+                        let removed = unique_sets.remove(j);
+                        if removed.is_primary_key && !unique_sets[i].is_primary_key {
+                            unique_sets[i].is_primary_key = true;
+                            unique_sets[i].conflict_clause =
+                                unique_sets[i].conflict_clause.or(removed.conflict_clause);
+                            if unique_sets[i].constraint_name.is_none() {
+                                unique_sets[i].constraint_name = removed.constraint_name;
+                            }
+                        }
                     } else {
                         j += 1;
                     }

@@ -9818,7 +9818,7 @@ pub fn op_sorter_compare(
         && compare_immutable(
             previous_sorter_values,
             current_sorter_values,
-            &cursor.index_key_info,
+            &cursor.index_key_info[..(*num_regs).min(cursor.index_key_info.len())],
         )
         .is_eq();
     if is_equal {

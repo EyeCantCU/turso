@@ -425,12 +425,7 @@ pub fn translate_insert(
         if has_fks {
             crate::bail_parse_error!("foreign keys on WITHOUT ROWID tables are not supported");
         }
-        if upsert_actions
-            .iter()
-            .any(|(_, _, upsert)| matches!(upsert.do_clause, UpsertDo::Set { .. }))
-        {
-            crate::bail_parse_error!("UPSERT DO UPDATE on WITHOUT ROWID tables is not supported");
-        }
+
         if cdc_table.is_some() {
             crate::bail_parse_error!("CDC on WITHOUT ROWID tables is not supported");
         }
@@ -476,6 +471,7 @@ pub fn translate_insert(
         .catalog
         .dialect
         .upsert_rejects_row_written_by_same_statement()
+        && btree_table.has_rowid
         && upsert_actions
             .iter()
             .any(|(_, _, upsert)| matches!(upsert.do_clause, UpsertDo::Set { .. }))
@@ -3070,6 +3066,11 @@ fn emit_pk_uniqueness_check(
             num_regs: ctx.table.primary_key_columns.len(),
         });
         if let Some(position) = position.or(upsert_catch_all) {
+            program.emit_insn(Insn::Copy {
+                src_reg: pk_regs,
+                dst_reg: ctx.conflict_pk_reg,
+                extra_amount: ctx.table.primary_key_columns.len() - 1,
+            });
             program.emit_insn(Insn::Goto {
                 target_pc: preflight.upsert_actions[position].1,
             });
@@ -3362,10 +3363,7 @@ fn emit_unique_index_check(
                 }
                 UpsertDo::Set { .. } => {
                     // Route to DO UPDATE: capture conflicting rowid then jump
-                    program.emit_insn(Insn::IdxRowId {
-                        cursor_id: idx_cursor_id,
-                        dest: ctx.conflict_rowid_reg,
-                    });
+                    emit_conflict_row_key(program, ctx, index, idx_cursor_id)?;
                     program.emit_insn(Insn::Goto {
                         target_pc: preflight.upsert_actions[position].1,
                     });

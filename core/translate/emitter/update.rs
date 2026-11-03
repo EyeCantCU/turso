@@ -1479,116 +1479,115 @@ fn emit_update_insns<'a>(
 
     // Fire BEFORE UPDATE triggers and preserve old_registers for AFTER triggers
     let mut has_after_triggers = false;
-    let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) =
-        target_table.table.btree()
-    {
-        has_after_triggers = has_triggers_including_temp(
-            &t_ctx.resolver,
-            update_namespace,
-            TriggerEvent::Update,
-            Some(&updated_column_names),
-            &btree_table,
-            connection,
-        );
-
-        let needs_old_registers =
-            has_before_triggers || has_after_triggers || has_parent_fk_actions;
-
-        // Only read OLD row values when triggers or FK cascades need them
-        let columns = target_table.table.columns();
-        let old_registers: Option<Vec<usize>> = if needs_old_registers {
-            let mut regs = Vec::with_capacity(col_len + 1);
-            for (i, column) in columns.iter().enumerate() {
-                let reg = program.alloc_register();
-                emit_table_column(
-                    program,
-                    target_table_cursor_id,
-                    internal_id,
-                    table_references,
-                    column,
-                    i,
-                    reg,
-                    &t_ctx.resolver,
-                )?;
-                regs.push(reg);
-            }
-            regs.push(beg);
-            Some(regs)
-        } else {
-            None
-        };
-
-        if has_before_triggers {
-            let old_registers =
-                old_registers.expect("old_registers allocated when has_before_triggers");
-            // SQLite rejects a wrong type before firing the triggers, so they
-            // never see it.
-            if btree_table.is_strict {
-                emit_input_type_check(
-                    program,
-                    &btree_table,
-                    start,
-                    &layout,
-                    &updated_column_indices,
-                    &t_ctx.resolver,
-                )?;
-            }
-            // NEW row values are already in 'start' registers.
-            // If the rowid is being updated (INTEGER PRIMARY KEY in SET clause),
-            // use the new rowid register; otherwise use the current rowid (beg).
-            let new_rowid_reg = effective_rowid_reg;
-
-            // Compute virtual columns for NEW values
-            //TODO only emit required virtual columns
-            if let Table::BTree(ref btree) = target_table.table {
-                let new_ctx = DmlColumnContext::layout(
-                    columns,
-                    start,
-                    new_rowid_reg,
-                    layout.clone(),
-                    DmlRowForm::StoredExceptUpdated(updated_column_indices.clone()),
-                );
-                compute_virtual_columns(
-                    program,
-                    &btree.columns_topo_sort()?,
-                    &new_ctx,
-                    &t_ctx.resolver,
-                    btree,
-                )?;
-            }
-
-            let new_registers = (0..col_len)
-                .map(|i| layout.to_register(start, i))
-                .chain(std::iter::once(new_rowid_reg))
-                .collect();
-
-            // Propagate conflict resolution to trigger context:
-            // 1. UPSERT DO UPDATE override takes precedence
-            // 2. Outer UPDATE's explicit ON CONFLICT overrides trigger body
-            // 3. Otherwise, use trigger's own conflict resolution
-            let trigger_ctx = update_trigger_context(
-                program,
+    let preserved_old_registers: Option<Vec<usize>> =
+        if let Some(btree_table) = target_table.table.btree() {
+            has_after_triggers = has_triggers_including_temp(
+                &t_ctx.resolver,
+                update_namespace,
+                TriggerEvent::Update,
+                Some(&updated_column_names),
                 &btree_table,
-                Some(new_registers),
-                DmlRowForm::StoredExceptUpdated(updated_column_indices.clone()),
-                Some(old_registers.clone()),
-                or_conflict,
+                connection,
             );
 
-            for trigger in relevant_before_update_triggers {
-                fire_trigger(
-                    program,
-                    &mut t_ctx.resolver,
-                    trigger,
-                    &trigger_ctx,
-                    connection,
-                    update_namespace,
-                    trigger_ignore_jump_label,
-                )?;
-            }
+            let needs_old_registers =
+                has_before_triggers || has_after_triggers || has_parent_fk_actions;
 
-            // BEFORE UPDATE Triggers may have altered the btree so we need to seek again.
-            emit_seek_target_row(
+            // Only read OLD row values when triggers or FK cascades need them
+            let columns = target_table.table.columns();
+            let old_registers: Option<Vec<usize>> = if needs_old_registers {
+                let mut regs = Vec::with_capacity(col_len + 1);
+                for (i, column) in columns.iter().enumerate() {
+                    let reg = program.alloc_register();
+                    emit_table_column(
+                        program,
+                        target_table_cursor_id,
+                        internal_id,
+                        table_references,
+                        column,
+                        i,
+                        reg,
+                        &t_ctx.resolver,
+                    )?;
+                    regs.push(reg);
+                }
+                regs.push(beg);
+                Some(regs)
+            } else {
+                None
+            };
+
+            if has_before_triggers {
+                let old_registers =
+                    old_registers.expect("old_registers allocated when has_before_triggers");
+                // SQLite rejects a wrong type before firing the triggers, so they
+                // never see it.
+                if btree_table.is_strict {
+                    emit_input_type_check(
+                        program,
+                        &btree_table,
+                        start,
+                        &layout,
+                        &updated_column_indices,
+                        &t_ctx.resolver,
+                    )?;
+                }
+                // NEW row values are already in 'start' registers.
+                // If the rowid is being updated (INTEGER PRIMARY KEY in SET clause),
+                // use the new rowid register; otherwise use the current rowid (beg).
+                let new_rowid_reg = effective_rowid_reg;
+
+                // Compute virtual columns for NEW values
+                //TODO only emit required virtual columns
+                if let Table::BTree(ref btree) = target_table.table {
+                    let new_ctx = DmlColumnContext::layout(
+                        columns,
+                        start,
+                        new_rowid_reg,
+                        layout.clone(),
+                        DmlRowForm::StoredExceptUpdated(updated_column_indices.clone()),
+                    );
+                    compute_virtual_columns(
+                        program,
+                        &btree.columns_topo_sort()?,
+                        &new_ctx,
+                        &t_ctx.resolver,
+                        btree,
+                    )?;
+                }
+
+                let new_registers = (0..col_len)
+                    .map(|i| layout.to_register(start, i))
+                    .chain(std::iter::once(new_rowid_reg))
+                    .collect();
+
+                // Propagate conflict resolution to trigger context:
+                // 1. UPSERT DO UPDATE override takes precedence
+                // 2. Outer UPDATE's explicit ON CONFLICT overrides trigger body
+                // 3. Otherwise, use trigger's own conflict resolution
+                let trigger_ctx = update_trigger_context(
+                    program,
+                    &btree_table,
+                    Some(new_registers),
+                    DmlRowForm::StoredExceptUpdated(updated_column_indices.clone()),
+                    Some(old_registers.clone()),
+                    or_conflict,
+                );
+
+                for trigger in relevant_before_update_triggers {
+                    fire_trigger(
+                        program,
+                        &mut t_ctx.resolver,
+                        trigger,
+                        &trigger_ctx,
+                        connection,
+                        update_namespace,
+                        trigger_ignore_jump_label,
+                    )?;
+                }
+
+                // BEFORE UPDATE Triggers may have altered the btree so we need to seek again.
+                emit_seek_target_row(
                 program,
                 &pk_old,
                 target_table_cursor_id,
@@ -1598,32 +1597,32 @@ fn emit_update_insns<'a>(
                 ),
             )?;
 
-            if has_after_triggers {
-                // Preserve pseudo-row 'OLD' for AFTER triggers by copying to new registers
-                // (since registers might be overwritten during trigger execution)
-                let preserved: Vec<usize> = old_registers
-                    .iter()
-                    .map(|old_reg| {
-                        let preserved_reg = program.alloc_register();
-                        program.emit_insn(Insn::Copy {
-                            src_reg: *old_reg,
-                            dst_reg: preserved_reg,
-                            extra_amount: 0,
-                        });
-                        preserved_reg
-                    })
-                    .collect();
-                Some(preserved)
+                if has_after_triggers {
+                    // Preserve pseudo-row 'OLD' for AFTER triggers by copying to new registers
+                    // (since registers might be overwritten during trigger execution)
+                    let preserved: Vec<usize> = old_registers
+                        .iter()
+                        .map(|old_reg| {
+                            let preserved_reg = program.alloc_register();
+                            program.emit_insn(Insn::Copy {
+                                src_reg: *old_reg,
+                                dst_reg: preserved_reg,
+                                extra_amount: 0,
+                            });
+                            preserved_reg
+                        })
+                        .collect();
+                    Some(preserved)
+                } else {
+                    Some(old_registers)
+                }
             } else {
-                Some(old_registers)
+                // No BEFORE triggers — pass through whatever old_registers we have
+                old_registers
             }
         } else {
-            // No BEFORE triggers — pass through whatever old_registers we have
-            old_registers
-        }
-    } else {
-        None
-    };
+            None
+        };
 
     // If BEFORE UPDATE triggers fired, they may have modified the row being updated.
     // According to the SQLite documentation, the behavior in these cases is undefined:
