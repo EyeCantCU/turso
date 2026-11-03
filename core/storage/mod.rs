@@ -31,6 +31,8 @@ pub(super) mod slot_bitmap;
 pub mod sqlite3_ondisk;
 #[cfg(all(host_shared_wal, target_os = "linux"))]
 pub(crate) mod sqlite_shm_interlock;
+#[cfg(all(host_shared_wal, target_os = "linux"))]
+pub(crate) mod sqlite_wal_index;
 mod state_machines;
 pub(crate) mod subjournal;
 #[allow(clippy::arc_with_non_send_sync)]

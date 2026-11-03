@@ -24,8 +24,10 @@
 //! when turso opens and closes other descriptors of the same file.
 
 use crate::io::{File, SharedWalLockKind, IO};
+use crate::storage::sqlite_wal_index::SqliteWalIndex;
 use crate::sync::Arc;
 use crate::{LimboError, Result};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const SHM_WRITE_LOCK: u64 = 120;
 const SHM_CKPT_LOCK: u64 = 121;
@@ -39,6 +41,9 @@ const KIND: SharedWalLockKind = SharedWalLockKind::LinuxOfd;
 pub(crate) struct SqliteShmInterlock {
     _shm: Arc<dyn File>,
     _db: Arc<dyn File>,
+    index: SqliteWalIndex,
+    /// Whether this process built (or found peers maintaining) the index.
+    index_ready: AtomicBool,
 }
 
 /// Attempts before concluding a lock conflict is not transient: turso
@@ -63,7 +68,19 @@ impl SqliteShmInterlock {
                     // A mapped, zeroed header page sends SQLite to the recover lock.
                     shm.shared_wal_set_len(SHM_PAGE_SIZE)?;
                 }
-                return Ok(Self { _shm: shm, _db: db });
+                let index = SqliteWalIndex::new(shm.clone(), &format!("{db_path}-wal"))?;
+                let peers = turso_peers_live();
+                if !peers {
+                    // Stale contents from an earlier session must not be trusted
+                    // by a SQLite reader before the index is rebuilt.
+                    index.invalidate()?;
+                }
+                return Ok(Self {
+                    _shm: shm,
+                    _db: db,
+                    index,
+                    index_ready: AtomicBool::new(peers),
+                });
             }
             if attempt < ATTEMPTS {
                 std::thread::sleep(std::time::Duration::from_millis(1));
@@ -72,6 +89,15 @@ impl SqliteShmInterlock {
         Err(LimboError::LockingError(format!(
             "Failed opening database '{db_path}'. Database is open in a SQLite process"
         )))
+    }
+
+    pub(crate) fn index(&self) -> &SqliteWalIndex {
+        &self.index
+    }
+
+    /// Claim the one-time index rebuild for this process.
+    pub(crate) fn claim_index_rebuild(&self) -> bool {
+        !self.index_ready.swap(true, Ordering::AcqRel)
     }
 
     /// Upgrade the database SHARED-byte lock to exclusive, for
@@ -114,5 +140,11 @@ impl SqliteShmInterlock {
             return Ok(false);
         }
         Ok(true)
+    }
+}
+
+impl std::fmt::Debug for SqliteShmInterlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqliteShmInterlock").finish_non_exhaustive()
     }
 }

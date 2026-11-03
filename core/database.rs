@@ -702,7 +702,7 @@ pub struct Database<
     shared_wal_coordination: OnceLock<Arc<MappedSharedWalCoordination>>,
     /// SQLite lock bytes held while the database is shared across processes.
     #[cfg(all(host_shared_wal, target_os = "linux"))]
-    sqlite_shm_interlock: OnceLock<storage::sqlite_shm_interlock::SqliteShmInterlock>,
+    sqlite_shm_interlock: OnceLock<Arc<storage::sqlite_shm_interlock::SqliteShmInterlock>>,
     /// Connection (by address) holding `PRAGMA locking_mode=EXCLUSIVE`.
     exclusive_lock_holder: parking_lot::Mutex<Option<usize>>,
     pub(crate) open_flags: OpenFlags,
@@ -3214,7 +3214,7 @@ impl Database {
                 &self.path,
                 || !authority.is_last_process_mapping(),
             )?;
-            let _ = self.sqlite_shm_interlock.set(interlock);
+            let _ = self.sqlite_shm_interlock.set(Arc::new(interlock));
         }
         let _ = self.shared_wal_coordination.set(authority.clone());
         Ok(Some(
@@ -3344,6 +3344,8 @@ impl Database {
                 self.io.clone(),
                 self.shared_wal.clone(),
                 authority,
+                #[cfg(target_os = "linux")]
+                self.sqlite_shm_interlock.get().cloned(),
                 last_checksum_and_max_frame,
                 buffer_pool,
             )));

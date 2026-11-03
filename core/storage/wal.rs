@@ -1461,6 +1461,9 @@ struct ShmWalCoordination {
     /// Copied from `authority.owner_record()` at construction — all connections
     /// in the same process share the same owner identity.
     owner: SharedOwnerRecord,
+    /// SQLite's `-shm` wal-index, kept current for real SQLite readers.
+    #[cfg(target_os = "linux")]
+    sqlite: Option<Arc<crate::storage::sqlite_shm_interlock::SqliteShmInterlock>>,
 }
 
 #[cfg(host_shared_wal)]
@@ -1519,9 +1522,95 @@ impl ShmWalCoordination {
             owner: authority.owner_record(),
             authority,
             active_reader: Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            sqlite: None,
         };
         coordination.seed_or_sync_authority();
         coordination
+    }
+
+    /// Attach SQLite's wal-index; the first process to open builds it.
+    #[cfg(target_os = "linux")]
+    fn with_sqlite_index(
+        mut self,
+        sqlite: Option<Arc<crate::storage::sqlite_shm_interlock::SqliteShmInterlock>>,
+    ) -> Self {
+        if let Some(interlock) = sqlite.as_ref() {
+            if interlock.claim_index_rebuild() {
+                let snapshot = self.authority.snapshot();
+                if let Err(err) = interlock.index().rebuild(
+                    self.sqlite_index_header(
+                        snapshot.max_frame,
+                        (snapshot.checksum_1, snapshot.checksum_2),
+                    ),
+                    snapshot.nbackfills as u32,
+                ) {
+                    tracing::error!("building SQLite wal-index failed: {err}");
+                }
+            }
+        }
+        self.sqlite = sqlite;
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sqlite_index_header(
+        &self,
+        max_frame: u64,
+        checksum: (u32, u32),
+    ) -> crate::storage::sqlite_wal_index::WalIndexHeader {
+        let header = self.fallback.wal_header();
+        crate::storage::sqlite_wal_index::WalIndexHeader {
+            max_frame: max_frame as u32,
+            page_size: header.page_size,
+            salt_1: header.salt_1,
+            salt_2: header.salt_2,
+            checksum,
+            big_endian_checksum: header.magic & 1 == 1,
+        }
+    }
+
+    /// Run `f` on SQLite's wal-index, if attached.
+    #[cfg(target_os = "linux")]
+    fn sqlite_index<T>(
+        &self,
+        f: impl FnOnce(&crate::storage::sqlite_wal_index::SqliteWalIndex) -> Result<T>,
+    ) -> Option<Result<T>> {
+        self.sqlite.as_ref().map(|s| f(s.index()))
+    }
+
+    /// Hold SQLite's READ(0) exclusively for a checkpoint, like walCheckpoint
+    /// does while backfilling, so no SQLite reader of the database file alone
+    /// sees pages change under it. Busy (with `guard` released) if one holds it.
+    fn lock_sqlite_read0(
+        &self,
+        guard: CoordinationCheckpointGuardKind,
+    ) -> Result<CoordinationCheckpointGuardKind> {
+        #[cfg(target_os = "linux")]
+        if let Some(sqlite) = self.sqlite.as_ref() {
+            if !sqlite.index().try_lock_read0().unwrap_or(false) {
+                self.release_checkpoint_guard_without_sqlite(guard);
+                return Err(LimboError::Busy);
+            }
+        }
+        Ok(guard)
+    }
+
+    fn release_checkpoint_guard_without_sqlite(&self, guard: CoordinationCheckpointGuardKind) {
+        match guard {
+            CoordinationCheckpointGuardKind::Writer => {
+                self.fallback.unlock_write_lock();
+                self.fallback.unlock_read_mark(0);
+                self.fallback.unlock_checkpoint_lock();
+                self.authority.release_writer(self.owner);
+                self.authority.release_checkpoint(self.owner);
+            }
+            CoordinationCheckpointGuardKind::Read0 => {
+                self.fallback.unlock_read_mark(0);
+                self.fallback.unlock_checkpoint_lock();
+                self.authority.release_checkpoint(self.owner);
+            }
+        }
     }
 
     fn authority_is_uninitialized(snapshot: SharedWalCoordinationHeader) -> bool {
@@ -1983,6 +2072,14 @@ impl WalCoordination for ShmWalCoordination {
             commit.last_checksum.1,
             commit.transaction_count,
         );
+        #[cfg(target_os = "linux")]
+        {
+            let header = self.sqlite_index_header(commit.max_frame, commit.last_checksum);
+            if let Some(Err(err)) = self.sqlite_index(|index| index.commit(header)) {
+                tracing::error!("updating SQLite wal-index failed: {err}");
+                let _ = self.sqlite_index(|index| index.invalidate());
+            }
+        }
         let shared = self.shared.read();
         let mut coverage = shared.runtime.overflow_fallback_coverage.lock();
 
@@ -2013,6 +2110,8 @@ impl WalCoordination for ShmWalCoordination {
             .nbackfills
             .store(max_frame, Ordering::Release);
         self.authority.publish_backfill(max_frame);
+        #[cfg(target_os = "linux")]
+        let _ = self.sqlite_index(|index| index.publish_backfill(max_frame));
     }
 
     fn install_durable_backfill_proof(
@@ -2225,7 +2324,7 @@ impl WalCoordination for ShmWalCoordination {
                     self.authority.release_checkpoint(self.owner);
                     return Err(LimboError::Busy);
                 }
-                Ok(CoordinationCheckpointGuardKind::Read0)
+                self.lock_sqlite_read0(CoordinationCheckpointGuardKind::Read0)
             }
             CheckpointMode::Full | CheckpointMode::Restart | CheckpointMode::Truncate { .. } => {
                 if !self.fallback.try_read_mark_exclusive(0) {
@@ -2241,7 +2340,7 @@ impl WalCoordination for ShmWalCoordination {
                     self.authority.release_checkpoint(self.owner);
                     return Err(LimboError::Busy);
                 }
-                Ok(CoordinationCheckpointGuardKind::Writer)
+                self.lock_sqlite_read0(CoordinationCheckpointGuardKind::Writer)
             }
         }
     }
@@ -2271,24 +2370,15 @@ impl WalCoordination for ShmWalCoordination {
             self.authority.release_checkpoint(self.owner);
             return Err(LimboError::Busy);
         }
-        Ok(CoordinationCheckpointGuardKind::Writer)
+        self.lock_sqlite_read0(CoordinationCheckpointGuardKind::Writer)
     }
 
     fn release_checkpoint_guard(&self, guard: CoordinationCheckpointGuardKind) {
-        match guard {
-            CoordinationCheckpointGuardKind::Writer => {
-                self.fallback.unlock_write_lock();
-                self.fallback.unlock_read_mark(0);
-                self.fallback.unlock_checkpoint_lock();
-                self.authority.release_writer(self.owner);
-                self.authority.release_checkpoint(self.owner);
-            }
-            CoordinationCheckpointGuardKind::Read0 => {
-                self.fallback.unlock_read_mark(0);
-                self.fallback.unlock_checkpoint_lock();
-                self.authority.release_checkpoint(self.owner);
-            }
+        #[cfg(target_os = "linux")]
+        if let Some(sqlite) = self.sqlite.as_ref() {
+            sqlite.index().unlock_read0();
         }
+        self.release_checkpoint_guard_without_sqlite(guard);
     }
 
     #[aristo::intent(
@@ -2328,6 +2418,11 @@ impl WalCoordination for ShmWalCoordination {
         }
         if self.authority.has_active_db_file_reader() {
             max_safe_frame = max_safe_frame.min(self.load_snapshot().nbackfills);
+        }
+        // SQLite readers in other processes pin frames through its read marks.
+        #[cfg(target_os = "linux")]
+        if let Some(limited) = self.sqlite_index(|index| index.limit_backfill(max_safe_frame)) {
+            max_safe_frame = limited.unwrap_or(self.load_snapshot().nbackfills);
         }
         match self.authority.min_active_reader_frame() {
             Some(shared_min) => max_safe_frame.min(shared_min),
@@ -2375,6 +2470,19 @@ impl WalCoordination for ShmWalCoordination {
                 self.fallback.unlock_read_mark(idx);
             }
             return Err(LimboError::Busy);
+        }
+        // So must SQLite readers: a restart needs all of its read marks.
+        #[cfg(target_os = "linux")]
+        {
+            let header = self.sqlite_index_header(0, (0, 0));
+            if let Some(result) = self.sqlite_index(|index| index.try_restart(header)) {
+                if !result.unwrap_or(false) {
+                    for idx in 1..5 {
+                        self.fallback.unlock_read_mark(idx);
+                    }
+                    return Err(LimboError::Busy);
+                }
+            }
         }
         Ok(self.restart_snapshot_from_authority(self.authority.snapshot(), io))
     }
@@ -4865,11 +4973,16 @@ impl WalFile {
         io: Arc<dyn IO>,
         shared: Arc<RwLock<WalFileShared>>,
         authority: Arc<MappedSharedWalCoordination>,
+        #[cfg(target_os = "linux")] sqlite: Option<
+            Arc<crate::storage::sqlite_shm_interlock::SqliteShmInterlock>,
+        >,
         _last_checksum_and_max_frame: ((u32, u32), u64),
         buffer_pool: Arc<BufferPool>,
     ) -> Self {
-        let coordination: Arc<dyn WalCoordination> =
-            Arc::new(ShmWalCoordination::new(shared, authority));
+        let coordination = ShmWalCoordination::new(shared, authority);
+        #[cfg(target_os = "linux")]
+        let coordination = coordination.with_sqlite_index(sqlite);
+        let coordination: Arc<dyn WalCoordination> = Arc::new(coordination);
         let snapshot = coordination.load_snapshot();
         Self::new_with_coordination(
             io,
@@ -8761,6 +8874,8 @@ pub mod test {
             io.clone(),
             shared.clone(),
             reopened_authority.clone(),
+            #[cfg(target_os = "linux")]
+            None,
             ((0, 0), 0),
             buffer_pool,
         );
@@ -8905,8 +9020,15 @@ pub mod test {
 
         let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
         buffer_pool.finalize_with_page_size(4096).unwrap();
-        let wal =
-            WalFile::new_with_shared_coordination(io, shared, authority, ((0, 0), 0), buffer_pool);
+        let wal = WalFile::new_with_shared_coordination(
+            io,
+            shared,
+            authority,
+            #[cfg(target_os = "linux")]
+            None,
+            ((0, 0), 0),
+            buffer_pool,
+        );
 
         assert_eq!(wal.get_max_frame(), 1);
         assert_eq!(wal.get_last_checksum(), (31, 37));
