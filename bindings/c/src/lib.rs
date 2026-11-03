@@ -116,6 +116,7 @@ pub const SQLITE_STATE_ZOMBIE: u8 = 0xa7;
 
 pub const SQLITE_CHECKPOINT_PASSIVE: ffi::c_int = 0;
 pub const SQLITE_CHECKPOINT_FULL: ffi::c_int = 1;
+pub const SQLITE_CHECKPOINT_NOOP: ffi::c_int = -1;
 pub const SQLITE_CHECKPOINT_RESTART: ffi::c_int = 2;
 pub const SQLITE_CHECKPOINT_TRUNCATE: ffi::c_int = 3;
 
@@ -1724,7 +1725,7 @@ pub unsafe extern "C" fn sqlite3_limit(
     _id: ffi::c_int,
     _new_value: ffi::c_int,
 ) -> ffi::c_int {
-    stub!();
+    sqlite354::limit(_db, _id, _new_value)
 }
 
 #[no_mangle]
@@ -3298,14 +3299,7 @@ pub unsafe extern "C" fn sqlite3_extended_errcode(db: *mut sqlite3) -> ffi::c_in
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_complete(sql: *const ffi::c_char) -> ffi::c_int {
-    if sql.is_null() {
-        return 0;
-    }
-    let s = CStr::from_ptr(sql).to_bytes();
-    s.iter()
-        .rev()
-        .find(|&&b| !b.is_ascii_whitespace())
-        .map_or(0, |&b| (b == b';') as ffi::c_int)
+    sqlite354::complete(sql)
 }
 
 #[no_mangle]
@@ -3422,6 +3416,7 @@ pub unsafe extern "C" fn sqlite3_wal_checkpoint_v2(
             upper_bound_inclusive: None,
         },
         SQLITE_CHECKPOINT_FULL => CheckpointMode::Full,
+        SQLITE_CHECKPOINT_NOOP => CheckpointMode::Noop,
         _ => return SQLITE_MISUSE, // Unsupported mode
     };
     match db.conn.checkpoint(chkptmode) {
@@ -3430,7 +3425,8 @@ pub unsafe extern "C" fn sqlite3_wal_checkpoint_v2(
                 (*log_size) = res.wal_max_frame as ffi::c_int;
             }
             if !checkpoint_count.is_null() {
-                (*checkpoint_count) = res.wal_checkpoint_backfilled as ffi::c_int;
+                // SQLite reports the total number of backfilled frames.
+                (*checkpoint_count) = res.wal_total_backfilled as ffi::c_int;
             }
             SQLITE_OK
         }
@@ -3779,6 +3775,8 @@ fn set_db_err_code(db: &mut sqlite3Inner, code: i32) -> i32 {
     db.err_code = code;
     code
 }
+
+pub mod sqlite354;
 
 #[cfg(test)]
 mod tests {

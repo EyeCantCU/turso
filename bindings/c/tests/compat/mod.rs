@@ -13,6 +13,8 @@ struct sqlite3_stmt {
     _private: [u8; 0],
 }
 
+mod sqlite354;
+
 #[cfg_attr(
     all(not(feature = "sqlite3"), not(target_os = "windows")),
     link(name = "turso_sqlite3")
