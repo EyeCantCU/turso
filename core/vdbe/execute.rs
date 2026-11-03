@@ -13072,7 +13072,7 @@ pub fn op_insert(
                     && !flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT)
                     && !flag.has(InsertFlags::SKIP_ALL_CHANGE_COUNTS)
                 {
-                    super::row_hooks::hook_target(program, state, *cursor_id)
+                    super::row_hooks::hook_target(program, state, *cursor_id, true)
                 } else {
                     None
                 };
@@ -13272,7 +13272,7 @@ pub fn op_insert(
                         && !flag.has(InsertFlags::SKIP_ALL_CHANGE_COUNTS)
                     {
                         if let Some(target) =
-                            super::row_hooks::hook_target(program, state, *cursor_id)
+                            super::row_hooks::hook_target(program, state, *cursor_id, false)
                         {
                             if let Value::Numeric(Numeric::Integer(rowid)) =
                                 state.registers[*key_reg].get_value()
@@ -13530,7 +13530,9 @@ pub fn op_delete(
                 if program.connection.data_hooks.has_row_hook()
                     && !state.active_op_state.delete().hooks_done
                 {
-                    if let Some(target) = super::row_hooks::hook_target(program, state, *cursor_id)
+                    let preupdate = program.connection.data_hooks.has_preupdate_hook();
+                    if let Some(target) =
+                        super::row_hooks::hook_target(program, state, *cursor_id, preupdate)
                     {
                         let cursor = state.get_cursor(*cursor_id);
                         let cursor = cursor.as_btree_mut();
@@ -13572,7 +13574,9 @@ pub fn op_delete(
                                         None,
                                     );
                                 }
-                                if program.connection.data_hooks.has_update_hook() {
+                                if program.connection.data_hooks.has_update_hook()
+                                    && crate::data_hooks::hook_reports_table(&target.table.name)
+                                {
                                     state.active_op_state.delete().update_hook_row =
                                         Some((target.db_name, target.table.name.clone(), rowid));
                                 }

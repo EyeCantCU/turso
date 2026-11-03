@@ -203,8 +203,13 @@ fn translate_expr_by_kind(
             translate_column_expr(program, referenced_tables, expr, target_register, resolver)
         }
         ast::Expr::RowId { table, .. } => {
-            if crate::authorizer::check_column_read(resolver, referenced_tables, *table, None)?
-                == crate::authorizer::Auth::Ignore
+            if crate::authorizer::check_column_read(
+                resolver,
+                referenced_tables,
+                *table,
+                None,
+                false,
+            )? == crate::authorizer::Auth::Ignore
             {
                 program.emit_insn(Insn::Null {
                     dest: target_register,
@@ -2478,6 +2483,7 @@ fn translate_column_expr(
         referenced_tables,
         *table_ref_id,
         Some(*column),
+        false,
     )? == crate::authorizer::Auth::Ignore
     {
         program.emit_insn(Insn::Null {

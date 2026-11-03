@@ -123,11 +123,13 @@ pub(crate) fn check_read(
 }
 
 /// SQLITE_READ for a column (`None`: the rowid) of a table in a query.
+/// Unless `always`, a column already asked about is not asked again.
 pub(crate) fn check_column_read(
     resolver: &Resolver,
     tables: Option<&crate::translate::plan::TableReferences>,
     table_id: ast::TableInternalId,
     column: Option<usize>,
+    always: bool,
 ) -> Result<Auth> {
     if resolver.authorizer.is_none() {
         return Ok(Auth::Ok);
@@ -145,7 +147,7 @@ pub(crate) fn check_column_read(
     let crate::schema::Table::BTree(btree) = table else {
         return Ok(Auth::Ok);
     };
-    if !resolver.auth_reads.borrow_mut().insert((table_id, column)) {
+    if !resolver.auth_reads.borrow_mut().insert((table_id, column)) && !always {
         return Ok(Auth::Ok);
     }
     let column = column.or_else(|| btree.get_rowid_alias_column().map(|(i, _)| i));
@@ -156,22 +158,31 @@ pub(crate) fn check_column_read(
     check_read(resolver, &btree.name, &name, database_id)
 }
 
-/// SQLITE_READ for every column `expr` reads; an ignored column becomes NULL.
+/// SQLITE_READ for each name just bound to a column (`bound`, in order);
+/// columns the authorizer ignores read as NULL in `expr`.
 pub(crate) fn authorize_column_reads(
     resolver: &Resolver,
     tables: &crate::translate::plan::TableReferences,
     expr: &mut ast::Expr,
+    bound: &[(ast::TableInternalId, Option<usize>)],
 ) -> Result<()> {
     use crate::translate::expr::{walk_expr_mut, WalkControl};
+    let mut ignored = Vec::new();
+    for &(table, column) in bound {
+        if check_column_read(resolver, Some(tables), table, column, true)? == Auth::Ignore {
+            ignored.push((table, column));
+        }
+    }
+    if ignored.is_empty() {
+        return Ok(());
+    }
     walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-        let (table, column) = match e {
-            ast::Expr::Column { table, column, .. } if !table.is_self_table() => {
-                (*table, Some(*column))
-            }
+        let key = match e {
+            ast::Expr::Column { table, column, .. } => (*table, Some(*column)),
             ast::Expr::RowId { table, .. } => (*table, None),
             _ => return Ok(WalkControl::Continue),
         };
-        if check_column_read(resolver, Some(tables), table, column)? == Auth::Ignore {
+        if ignored.contains(&key) {
             *e = ast::Expr::Literal(ast::Literal::Null);
         }
         Ok(WalkControl::Continue)

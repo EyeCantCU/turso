@@ -3096,7 +3096,8 @@ impl Program {
                 return Ok(IOResult::Done(()));
             }
         }
-        if self.connection.is_nested_stmt() {
+        // Nor on statements the commit hook runs while the commit waits on it.
+        if self.connection.is_nested_stmt() || self.connection.data_hooks.in_commit_hook() {
             // We don't want to commit on nested statements. Let parent handle it.
             return Ok(IOResult::Done(()));
         }

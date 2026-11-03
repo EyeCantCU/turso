@@ -28,10 +28,14 @@ pub(crate) struct PendingOldRow {
 /// The table to report for writes through `cursor_id`, if any: a user rowid
 /// table, not an ephemeral, internal or `sqlite_*` table. Only called while a
 /// row hook is installed.
+///
+/// SQLite also reports `sqlite_stat1` writes, but only to the preupdate
+/// hook; `preupdate` selects that.
 pub(crate) fn hook_target(
     program: &Program,
     state: &ProgramState,
     cursor_id: usize,
+    preupdate: bool,
 ) -> Option<HookTarget> {
     if program
         .prepared()
@@ -45,7 +49,8 @@ pub(crate) fn hook_target(
         Some((_, CursorType::BTreeTable(table))) if table.has_rowid => table.clone(),
         _ => return None,
     };
-    if !crate::data_hooks::hook_reports_table(&table.name) {
+    let is_stat1 = preupdate && table.name.eq_ignore_ascii_case("sqlite_stat1");
+    if !is_stat1 && !crate::data_hooks::hook_reports_table(&table.name) {
         return None;
     }
     let db = state.cursor_databases.get(cursor_id).copied().flatten()?;

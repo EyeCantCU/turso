@@ -64,6 +64,8 @@ pub(crate) struct DataChangeHooks {
     has_preupdate: AtomicBool,
     /// Set once the commit hook let a commit through, until it finishes.
     commit_in_progress: AtomicBool,
+    /// The commit hook is running; statements it runs must not commit.
+    in_commit_hook: AtomicBool,
     /// Trigger / FK-action programs currently on the stack.
     depth: AtomicI32,
     /// WAL databases written by the commit in progress, for the WAL hook.
@@ -130,9 +132,15 @@ impl DataChangeHooks {
     /// Run the commit hook. Returns `true` if the commit must become a rollback.
     pub(crate) fn before_commit(&self) -> bool {
         let cb = self.commit.read().clone();
+        self.in_commit_hook.store(true, Ordering::SeqCst);
         let veto = cb.is_some_and(|cb| cb());
+        self.in_commit_hook.store(false, Ordering::SeqCst);
         self.commit_in_progress.store(!veto, Ordering::SeqCst);
         veto
+    }
+
+    pub(crate) fn in_commit_hook(&self) -> bool {
+        self.in_commit_hook.load(Ordering::SeqCst)
     }
 
     /// True once per commit that `before_commit` let through.
