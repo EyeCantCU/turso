@@ -813,7 +813,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
     if !use_memory
         && !filename_str.is_empty()
         && (flags & SQLITE_OPEN_CREATE) == 0
-        && !std::path::Path::new(&effective_filename).exists()
+        && !turso_core::io::os_path::to_path(&effective_filename).exists()
     {
         return compat_lifecycle::open_failed(db_out, SQLITE_CANTOPEN);
     }
