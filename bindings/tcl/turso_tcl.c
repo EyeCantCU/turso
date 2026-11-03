@@ -1128,7 +1128,7 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
         );
 
         if (rc != SQLITE_OK) {
-            tcl_func_destroy(func_data);
+            /* sqlite3_create_function_v2 already ran tcl_func_destroy. */
             Tcl_SetResult(interp,
                 (char *)sqlite3_errmsg(tdb->db), TCL_VOLATILE);
             return TCL_ERROR;
