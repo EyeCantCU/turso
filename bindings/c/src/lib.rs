@@ -22,6 +22,34 @@ static SQLITE_VERSION_C_STRING: OnceLock<CString> = OnceLock::new();
 #[allow(non_upper_case_globals)]
 pub static mut sqlite3_search_count: ffi::c_int = 0;
 
+const SQLITE_VERSION_BYTES: usize = SQLITE_VERSION.len() + 1;
+
+const fn version_array() -> [ffi::c_char; SQLITE_VERSION_BYTES] {
+    let src = SQLITE_VERSION.as_bytes();
+    let mut out = [0; SQLITE_VERSION_BYTES];
+    let mut i = 0;
+    while i < src.len() {
+        out[i] = src[i] as ffi::c_char;
+        i += 1;
+    }
+    out
+}
+
+/// `const char sqlite3_version[]`: the library version string.
+#[no_mangle]
+#[allow(non_upper_case_globals)]
+pub static sqlite3_version: [ffi::c_char; SQLITE_VERSION_BYTES] = version_array();
+
+/// SQLite's directory overrides for temp and data files. Exported for link
+/// compatibility; the engine does not consult them.
+#[no_mangle]
+#[allow(non_upper_case_globals)]
+pub static mut sqlite3_temp_directory: *mut ffi::c_char = std::ptr::null_mut();
+
+#[no_mangle]
+#[allow(non_upper_case_globals)]
+pub static mut sqlite3_data_directory: *mut ffi::c_char = std::ptr::null_mut();
+
 /// Test-only export of core's SQLite varint encoder for the TCL harness's
 /// btree_varint_test command (upstream test3.c). `buf` must have room for
 /// 9 bytes. Returns the number of bytes written. Not part of the sqlite3
@@ -861,7 +889,12 @@ pub unsafe extern "C" fn sqlite3_trace_v2(
     _db: *mut sqlite3,
     _mask: ffi::c_uint,
     _callback: Option<
-        unsafe extern "C" fn(ffi::c_uint, *mut ffi::c_void, *mut ffi::c_void, *mut ffi::c_void),
+        unsafe extern "C" fn(
+            ffi::c_uint,
+            *mut ffi::c_void,
+            *mut ffi::c_void,
+            *mut ffi::c_void,
+        ) -> ffi::c_int,
     >,
     _context: *mut ffi::c_void,
 ) -> ffi::c_int {
@@ -1459,10 +1492,9 @@ pub unsafe extern "C" fn sqlite3_next_stmt(
 pub unsafe extern "C" fn sqlite3_serialize(
     _db: *mut sqlite3,
     _schema: *const ffi::c_char,
-    _out: *mut *mut ffi::c_void,
-    _out_bytes: *mut ffi::c_int,
+    _out_size: *mut i64,
     _flags: ffi::c_uint,
-) -> ffi::c_int {
+) -> *mut ffi::c_uchar {
     stub!();
 }
 
@@ -1470,8 +1502,9 @@ pub unsafe extern "C" fn sqlite3_serialize(
 pub unsafe extern "C" fn sqlite3_deserialize(
     _db: *mut sqlite3,
     _schema: *const ffi::c_char,
-    _in_: *const ffi::c_void,
-    _in_bytes: ffi::c_int,
+    _data: *mut ffi::c_uchar,
+    _size: i64,
+    _buf_size: i64,
     _flags: ffi::c_uint,
 ) -> ffi::c_int {
     stub!();
@@ -1714,8 +1747,10 @@ pub unsafe extern "C" fn sqlite3_db_handle(stmt: *mut sqlite3_stmt) -> *mut sqli
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_sleep(_ms: ffi::c_int) {
-    stub!();
+pub unsafe extern "C" fn sqlite3_sleep(ms: ffi::c_int) -> ffi::c_int {
+    let ms = ms.max(0);
+    std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+    ms
 }
 
 #[no_mangle]
@@ -1729,12 +1764,15 @@ pub unsafe extern "C" fn sqlite3_limit(
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_malloc(n: ffi::c_int) -> *mut ffi::c_void {
-    sqlite3_malloc64(n)
+    if n <= 0 {
+        return std::ptr::null_mut();
+    }
+    sqlite3_malloc64(n as u64)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_malloc64(n: ffi::c_int) -> *mut ffi::c_void {
-    if n <= 0 {
+pub unsafe extern "C" fn sqlite3_malloc64(n: u64) -> *mut ffi::c_void {
+    if n == 0 || n > isize::MAX as u64 {
         return std::ptr::null_mut();
     }
     libc::malloc(n as usize)
@@ -1989,9 +2027,9 @@ pub unsafe extern "C" fn sqlite3_bind_null(stmt: *mut sqlite3_stmt, idx: ffi::c_
 pub unsafe extern "C" fn sqlite3_bind_int(
     stmt: *mut sqlite3_stmt,
     idx: ffi::c_int,
-    val: i64,
+    val: ffi::c_int,
 ) -> ffi::c_int {
-    sqlite3_bind_int64(stmt, idx, val)
+    sqlite3_bind_int64(stmt, idx, val as i64)
 }
 
 #[no_mangle]
@@ -2555,7 +2593,6 @@ impl TabResult {
     }
 }
 
-#[no_mangle]
 unsafe extern "C" fn sqlite_get_table_cb(
     context: *mut ffi::c_void,
     n_column: ffi::c_int,
