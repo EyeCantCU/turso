@@ -53,7 +53,7 @@ struct sqlite3_rtree_query_info {
   int eParentWithin;
   int eWithin;
   sqlite3_rtree_dbl rScore;
-  sqlite3_value **apSqlParam;
+  void **apSqlParam;  /* sqlite3_value** */
 };
 
 #define NOT_WITHIN       0

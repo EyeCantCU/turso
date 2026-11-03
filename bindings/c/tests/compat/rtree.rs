@@ -252,6 +252,16 @@ fn test_rtreecheck_reports_corruption() {
                  Wrong number of entries in %_parent table - expected 0, actual 1"
             ]]
         );
+        // PRAGMA integrity_check runs the same check (xIntegrity).
+        assert_eq!(
+            query(db, "PRAGMA integrity_check"),
+            vec![vec![
+                "In RTree main.rt:\n\
+                 Mapping (2 -> 1) missing from %_rowid table\n\
+                 Wrong number of entries in %_rowid table - expected 2, actual 1\n\
+                 Wrong number of entries in %_parent table - expected 0, actual 1"
+            ]]
+        );
         sqlite3_close(db);
     }
 }

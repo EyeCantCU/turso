@@ -292,6 +292,19 @@ expect {
     0
 }
 
+test rtree-default-values-and-integrity {
+    CREATE VIRTUAL TABLE rt USING rtree(id, x0, x1);
+    INSERT INTO rt DEFAULT VALUES;
+    INSERT INTO rt DEFAULT VALUES;
+    SELECT * FROM rt;
+    PRAGMA integrity_check;
+}
+expect {
+    1|0.0|0.0
+    2|0.0|0.0
+    ok
+}
+
 test rtree-functions {
     SELECT rtreedepth(x'00030000');
     SELECT rtreenode(1, x'0000000100000000000000053F80000040000000');
