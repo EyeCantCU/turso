@@ -154,7 +154,7 @@ pub unsafe extern "C" fn sqlite3_test_control(_op: ffi::c_int) -> ffi::c_int {
 // ---------------------------------------------------------------------------
 
 const SQLITE_STATUS_MAX: ffi::c_int = 9;
-const SQLITE_DBSTATUS_MAX: ffi::c_int = 12;
+const SQLITE_DBSTATUS_MAX: ffi::c_int = 13;
 
 /// Turso does not track SQLite's allocator counters, so every global status
 /// parameter reads as zero.

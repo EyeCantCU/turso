@@ -61,6 +61,20 @@ fn validate(
 ) -> Result<()> {
     // Check if someone is trying to ALTER a system table
     if crate::schema::is_system_table(table_name) {
+        if matches!(
+            alter_table,
+            ast::AlterTableBody::SetNotNull { .. }
+                | ast::AlterTableBody::DropNotNull(_)
+                | ast::AlterTableBody::AddCheck { .. }
+                | ast::AlterTableBody::DropConstraint(_)
+        ) {
+            let name = match normalize_ident(table_name).as_str() {
+                "sqlite_schema" | "sqlite_master" => "sqlite_master".to_string(),
+                "sqlite_temp_schema" | "sqlite_temp_master" => "sqlite_temp_master".to_string(),
+                _ => table_name.to_string(),
+            };
+            crate::bail_parse_error!("table {} may not be altered", name);
+        }
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
     if let ast::AlterTableBody::RenameTo(new_table_name) = alter_table {
@@ -825,6 +839,19 @@ pub fn translate_alter_table(
             crate::util::table_name_for_error(&qualified_name)
         )));
     };
+    let is_constraint_edit = matches!(
+        alter_table,
+        ast::AlterTableBody::SetNotNull { .. }
+            | ast::AlterTableBody::DropNotNull(_)
+            | ast::AlterTableBody::AddCheck { .. }
+            | ast::AlterTableBody::DropConstraint(_)
+    );
+    if is_constraint_edit && table.virtual_table().is_some() {
+        crate::bail_parse_error!(
+            "cannot edit constraints of virtual table \"{}\"",
+            normalize_ident(table_name)
+        );
+    }
     if let Some(tbl) = table.virtual_table() {
         if let ast::AlterTableBody::RenameTo(new_name) = &alter_table {
             let new_name_norm = normalize_ident(new_name.as_str());
@@ -856,6 +883,21 @@ pub fn translate_alter_table(
 
     let mut btree = (*original_btree).clone();
 
+    if is_constraint_edit {
+        return translate_alter_constraint(
+            alter_table,
+            btree,
+            &mangled_table_name,
+            &qualified_schema_table,
+            schema_version,
+            resolver,
+            program,
+            connection,
+            input,
+            namespace,
+        );
+    }
+
     match alter_table {
         ast::AlterTableBody::DropColumn(column_name) => {
             let column_name = column_name.as_str();
@@ -863,15 +905,16 @@ pub fn translate_alter_table(
             // Tables always have at least one column.
             turso_assert_ne!(btree.columns().len(), 0);
 
+            let (dropped_index, column) = btree.get_column(column_name).ok_or_else(|| {
+                LimboError::ParseError(format!("no such column: \"{column_name}\""))
+            })?;
+            reject_rowid_alias_name(&btree, column_name, "drop")?;
+
             if btree.columns().len() == 1 {
                 return Err(LimboError::ParseError(format!(
                     "cannot drop column \"{column_name}\": no other columns exist"
                 )));
             }
-
-            let (dropped_index, column) = btree.get_column(column_name).ok_or_else(|| {
-                LimboError::ParseError(format!("no such column: \"{column_name}\""))
-            })?;
 
             // Column cannot be dropped if:
             // The column is a PRIMARY KEY or part of one.
@@ -1244,6 +1287,7 @@ pub fn translate_alter_table(
                     "duplicate column name: ".to_string() + &new_column_name,
                 ));
             }
+            reject_rowid_alias_name(&btree, &new_column_name, "add")?;
 
             let default_type_mismatch;
             {
@@ -1869,6 +1913,10 @@ pub fn translate_alter_table(
                     "no such column: \"{from}\""
                 )));
             };
+            if rename {
+                reject_rowid_alias_name(&btree, from, "rename from")?;
+                reject_rowid_alias_name(&btree, col_name, "rename to")?;
+            }
 
             if btree.get_column(col_name).is_some() {
                 return Err(LimboError::ParseError(format!(
@@ -2495,6 +2543,10 @@ pub fn translate_alter_table(
                 }),
             });
         }
+        ast::AlterTableBody::SetNotNull { .. }
+        | ast::AlterTableBody::DropNotNull(_)
+        | ast::AlterTableBody::AddCheck { .. }
+        | ast::AlterTableBody::DropConstraint(_) => unreachable!("handled above"),
     };
 
     Ok(())
@@ -2531,7 +2583,22 @@ fn reject_alter_of_view(
         ast::AlterTableBody::DropColumn(_) => {
             crate::bail_parse_error!("cannot drop column from view \"{view_name}\"")
         }
+        ast::AlterTableBody::SetNotNull { .. }
+        | ast::AlterTableBody::DropNotNull(_)
+        | ast::AlterTableBody::AddCheck { .. }
+        | ast::AlterTableBody::DropConstraint(_) => {
+            crate::bail_parse_error!("cannot edit constraints of view \"{view_name}\"")
+        }
     }
+}
+
+/// SQLite 3.54 isRowidAlias(): a rowid table column may not be added,
+/// dropped or renamed under the names rowid, _rowid_ or oid.
+fn reject_rowid_alias_name(btree: &BTreeTable, name: &str, op: &str) -> Result<()> {
+    if btree.has_rowid && ROWID_STRS.iter().any(|r| r.eq_ignore_ascii_case(name)) {
+        crate::bail_parse_error!("cannot {op} rowid alias: {name}");
+    }
+    Ok(())
 }
 
 /// Refuse an ALTER COLUMN that changes how an indexed column sorts, such as
@@ -4552,6 +4619,7 @@ fn apply_trigger_cmd_for_column_rename(
         ast::TriggerCmd::Delete {
             tbl_name,
             where_clause,
+            ..
         } => {
             let delete_table_name_norm = normalize_ident(tbl_name.as_str());
             if let Some(where_expr) = where_clause {
@@ -5926,4 +5994,357 @@ fn merge_column_lists(left: &[String], right: &[String]) -> Vec<String> {
         }
     }
     result
+}
+
+/// Where a named constraint lives in a table, in SQLite's search order.
+enum NamedConstraint {
+    NotNull(usize),
+    Check(usize),
+    ForeignKey(usize),
+    /// PRIMARY KEY or UNIQUE, which DROP CONSTRAINT refuses.
+    Key,
+}
+
+fn find_named_constraint(btree: &BTreeTable, name: &str) -> Option<NamedConstraint> {
+    let matches = |n: &Option<String>| n.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(name));
+    for (idx, column) in btree.columns().iter().enumerate() {
+        let column_name = column.name.as_deref().unwrap_or_default();
+        let inline_key = btree.unique_sets.iter().any(|set| {
+            set.is_inline
+                && set.columns.len() == 1
+                && set.columns[0].name.eq_ignore_ascii_case(column_name)
+                && matches(&set.constraint_name)
+        });
+        if inline_key {
+            return Some(NamedConstraint::Key);
+        }
+        if column.notnull() && matches(&column.notnull_constraint_name) {
+            return Some(NamedConstraint::NotNull(idx));
+        }
+        if let Some(i) = btree.check_constraints.iter().position(|c| {
+            c.column
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case(column_name))
+                && matches(&c.name)
+        }) {
+            return Some(NamedConstraint::Check(i));
+        }
+    }
+    if matches(&btree.primary_key_constraint_name)
+        || btree
+            .unique_sets
+            .iter()
+            .any(|s| matches(&s.constraint_name))
+    {
+        return Some(NamedConstraint::Key);
+    }
+    if let Some(i) = btree
+        .foreign_keys
+        .iter()
+        .position(|fk| matches(&fk.constraint_name))
+    {
+        return Some(NamedConstraint::ForeignKey(i));
+    }
+    btree
+        .check_constraints
+        .iter()
+        .position(|c| matches(&c.name))
+        .map(NamedConstraint::Check)
+}
+
+/// Remove the NOT NULL text of a column; a key column stays implicitly NOT NULL.
+fn clear_column_notnull(btree: &mut BTreeTable, idx: usize) {
+    let implied = btree.primary_key_implies_not_null(&btree.columns()[idx]);
+    let column = &mut btree.columns_mut()[idx];
+    column.set_explicit_notnull(false);
+    column.notnull_conflict_clause = None;
+    column.notnull_constraint_name = None;
+    if !implied {
+        column.set_notnull(false);
+    }
+}
+
+fn emit_halt(program: &mut ProgramBuilder, err_code: usize, description: String) {
+    program.emit_insn(Insn::Halt {
+        constraint_info: None,
+        err_code,
+        description,
+        on_error: None,
+        description_reg: None,
+    });
+}
+
+/// Scan the rows and fail with SQLITE_CONSTRAINT "constraint failed" when
+/// `notnull_col` is NULL or `check` is false, as SQLite 3.53 does before it
+/// edits the schema text.
+#[allow(clippy::too_many_arguments)]
+fn emit_alter_constraint_row_scan(
+    program: &mut ProgramBuilder,
+    table: &BTreeTable,
+    notnull_col: Option<usize>,
+    check: Option<&CheckConstraint>,
+    resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+    namespace: NamespaceRef,
+) -> Result<()> {
+    let mut resolved_table = table.clone();
+    resolved_table.prepare_generated_columns()?;
+    let resolved_table_arc = Arc::new(resolved_table.clone());
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(resolved_table_arc.clone()));
+    program.emit_insn(Insn::OpenRead {
+        cursor_id,
+        root_page: resolved_table_arc.root_page,
+        db: namespace.database_id,
+    });
+    let done_label = program.allocate_label();
+    let loop_start = program.allocate_label();
+    let next_label = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id,
+        pc_if_empty: done_label,
+    });
+    program.preassign_label_to_next_insn(loop_start);
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::RowId {
+        cursor_id,
+        dest: rowid_reg,
+    });
+    let layout = resolved_table.column_layout()?;
+    let base_dest_reg = program.alloc_registers(layout.column_count());
+    for (idx, column) in resolved_table.columns().iter().enumerate() {
+        if column.is_virtual_generated() || column.is_rowid_alias() {
+            continue;
+        }
+        emit_stored_column(
+            program,
+            cursor_id,
+            idx,
+            layout.to_register(base_dest_reg, idx),
+            resolver,
+        )?;
+    }
+    let dml_ctx = DmlColumnContext::layout(
+        resolved_table.columns(),
+        base_dest_reg,
+        rowid_reg,
+        layout,
+        DmlRowForm::Stored,
+    );
+    compute_virtual_columns(
+        program,
+        &resolved_table.columns_topo_sort()?,
+        &dml_ctx,
+        resolver,
+        &resolved_table_arc,
+    )?;
+    let fail_label = program.allocate_label();
+    if let Some(idx) = notnull_col {
+        program.emit_insn(Insn::IsNull {
+            reg: dml_ctx.to_column_reg(idx),
+            target_pc: fail_label,
+        });
+    }
+    if let Some(check) = check {
+        let table = Table::BTree(resolved_table_arc.clone());
+        let table_references = TableReferences::new(
+            vec![JoinedTable {
+                op: Operation::default_scan_for(&table),
+                unmatched_right_rows_plan: None,
+                table,
+                identifier: resolved_table.name.clone(),
+                has_alias: false,
+                internal_id: program.table_reference_counter.next(),
+                join_info: None,
+                col_used_mask: ColumnUsedMask::default(),
+                column_use_counts: Vec::new(),
+                expression_index_usages: Vec::new(),
+                namespace,
+                indexed: None,
+                plan_estimate: None,
+            }],
+            vec![],
+        );
+        let mut check_resolver = resolver.fork();
+        // Ignore jumps to fail_label on a false CHECK; NULL passes, as `IS FALSE`.
+        emit_check_constraints(
+            program,
+            std::slice::from_ref(check),
+            &mut check_resolver,
+            &resolved_table,
+            rowid_reg,
+            resolved_table
+                .columns()
+                .iter()
+                .enumerate()
+                .map(|(idx, col)| (col, dml_ctx.to_column_reg(idx))),
+            connection,
+            ast::ResolveType::Ignore,
+            None,
+            fail_label,
+            Some(&table_references),
+        )?;
+    }
+    program.emit_insn(Insn::Goto {
+        target_pc: next_label,
+    });
+    program.preassign_label_to_next_insn(fail_label);
+    emit_halt(
+        program,
+        crate::error::SQLITE_CONSTRAINT,
+        "constraint failed".to_string(),
+    );
+    program.preassign_label_to_next_insn(next_label);
+    program.emit_insn(Insn::Next {
+        cursor_id,
+        pc_if_next: loop_start,
+        fullscan: false,
+        is_index: false,
+    });
+    program.preassign_label_to_next_insn(done_label);
+    Ok(())
+}
+
+/// ALTER TABLE ... ALTER COLUMN SET/DROP NOT NULL, ADD CHECK and DROP
+/// CONSTRAINT (SQLite 3.53). The CREATE TABLE text is regenerated from the
+/// edited table definition.
+#[allow(clippy::too_many_arguments)]
+fn translate_alter_constraint(
+    body: ast::AlterTableBody,
+    mut btree: BTreeTable,
+    mangled_table_name: &str,
+    qualified_schema_table: &str,
+    schema_version: u32,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+    input: &str,
+    namespace: NamespaceRef,
+) -> Result<()> {
+    let database_id = namespace.database_id;
+    let find_column = |btree: &BTreeTable, name: &ast::Name| -> Result<usize> {
+        btree
+            .get_column(name.as_str())
+            .map(|(idx, _)| idx)
+            .ok_or_else(|| LimboError::ParseError(format!("no such column: {}", name.as_str())))
+    };
+    match body {
+        ast::AlterTableBody::SetNotNull {
+            column,
+            conflict_clause,
+        } => {
+            let idx = find_column(&btree, &column)?;
+            emit_alter_constraint_row_scan(
+                program,
+                &btree,
+                Some(idx),
+                None,
+                resolver,
+                connection,
+                namespace,
+            )?;
+            let column = &mut btree.columns_mut()[idx];
+            column.set_notnull(true);
+            column.set_explicit_notnull(true);
+            column.notnull_conflict_clause = conflict_clause;
+            column.notnull_constraint_name = None;
+        }
+        ast::AlterTableBody::DropNotNull(column) => {
+            let idx = find_column(&btree, &column)?;
+            if btree.columns()[idx].explicit_notnull() {
+                clear_column_notnull(&mut btree, idx);
+            }
+        }
+        ast::AlterTableBody::AddCheck { constraint, .. } => {
+            let ast::TableConstraint::Check { expr, source } = &constraint.constraint else {
+                crate::bail_parse_error!("only CHECK constraints may be added");
+            };
+            let column_names: Vec<&str> = btree
+                .columns()
+                .iter()
+                .filter_map(|c| c.name.as_deref())
+                .collect();
+            validate_check_expr(expr, &btree.name, &column_names, &resolver.catalog)?;
+            if let Some(name) = &constraint.name {
+                if find_named_constraint(&btree, name.as_str()).is_some() {
+                    emit_halt(
+                        program,
+                        crate::error::SQLITE_ERROR,
+                        format!("constraint {} already exists", name.as_str()),
+                    );
+                }
+            }
+            let check =
+                CheckConstraint::new(constraint.name.as_ref(), expr, source.as_deref(), None);
+            emit_alter_constraint_row_scan(
+                program,
+                &btree,
+                None,
+                Some(&check),
+                resolver,
+                connection,
+                namespace,
+            )?;
+            btree.check_constraints.push(check);
+        }
+        ast::AlterTableBody::DropConstraint(name) => {
+            match find_named_constraint(&btree, name.as_str()) {
+                None => {
+                    emit_halt(
+                        program,
+                        crate::error::SQLITE_ERROR,
+                        format!("no such constraint: {}", name.as_str()),
+                    );
+                }
+                Some(NamedConstraint::Key) => {
+                    emit_halt(
+                        program,
+                        crate::error::SQLITE_ERROR,
+                        format!("constraint may not be dropped: {}", name.as_str()),
+                    );
+                }
+                Some(NamedConstraint::NotNull(idx)) => clear_column_notnull(&mut btree, idx),
+                Some(NamedConstraint::Check(i)) => {
+                    btree.check_constraints.remove(i);
+                }
+                Some(NamedConstraint::ForeignKey(i)) => {
+                    btree.foreign_keys.remove(i);
+                }
+            }
+        }
+        _ => unreachable!("not a constraint edit"),
+    }
+
+    let sql = escape_sql_string_literal(
+        &btree.to_sql_as(&resolver.mangle_name(namespace, &btree.declared_name)),
+    );
+    let escaped_table_name = escape_sql_string_literal(mangled_table_name);
+    let stmt = format!(
+        "UPDATE {qualified_schema_table} SET sql = '{sql}' \
+         WHERE name = '{escaped_table_name}' COLLATE NOCASE AND type = 'table'"
+    );
+    let mut parser = Parser::new(stmt.as_bytes());
+    let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = parser.next_cmd().map_err(|e| {
+        LimboError::ParseError(format!("failed to parse generated UPDATE statement: {e}"))
+    })?
+    else {
+        return Err(LimboError::ParseError(
+            "generated UPDATE statement did not parse as expected".to_string(),
+        ));
+    };
+    let table = Arc::new(btree);
+    translate_update_for_schema_change(update, resolver, program, connection, input, |program| {
+        program.emit_insn(Insn::SetCookie {
+            db: database_id,
+            cookie: Cookie::SchemaVersion,
+            value: schema_version as i32 + 1,
+            p5: 0,
+        });
+        program.emit_insn(Insn::ReplaceTable {
+            data: Box::new(crate::vdbe::insn::ReplaceTableData {
+                db: database_id,
+                namespace: namespace.id,
+                table,
+            }),
+        });
+    })
 }

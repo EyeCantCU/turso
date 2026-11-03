@@ -894,7 +894,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         // Truncate (blocking). Full/Restart map to Truncate — the pre-feature baseline
         // always checkpointed via TRUNCATE.
         let mode = match mode {
-            CheckpointMode::Passive { .. } | CheckpointMode::Truncate { .. } => mode,
+            CheckpointMode::Passive { .. }
+            | CheckpointMode::Truncate { .. }
+            | CheckpointMode::Noop => mode,
             CheckpointMode::Full | CheckpointMode::Restart => CheckpointMode::Truncate {
                 upper_bound_inclusive: None,
             },

@@ -1,0 +1,314 @@
+# SQLite 3.53 ALTER TABLE constraint edits: ALTER COLUMN SET/DROP NOT NULL,
+# ADD [CONSTRAINT name] CHECK and DROP CONSTRAINT. SQLite 3.54 refuses to add,
+# drop or rename columns of a rowid table under the names rowid, _rowid_, oid.
+# SQLite 3.53 REINDEX EXPRESSIONS.
+
+@database :memory:
+
+test alter-set-not-null {
+    CREATE TABLE t (a INT, b);
+    INSERT INTO t VALUES (1, 2);
+    ALTER TABLE t ALTER COLUMN a SET NOT NULL;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    CREATE TABLE t (a INT NOT NULL, b)
+}
+
+test alter-set-not-null-without-column-keyword-and-on-conflict {
+    CREATE TABLE t (a INT, b);
+    ALTER TABLE t ALTER a SET NOT NULL ON CONFLICT IGNORE;
+    INSERT INTO t VALUES (NULL, 1);
+    INSERT INTO t VALUES (2, 2);
+    SELECT a, b FROM t;
+}
+expect {
+    2|2
+}
+
+test alter-set-not-null-is-enforced {
+    CREATE TABLE t (a INT, b);
+    ALTER TABLE t ALTER COLUMN a SET NOT NULL;
+    INSERT INTO t VALUES (NULL, 1);
+}
+expect error {
+    NOT NULL constraint failed: t.a
+}
+
+test alter-set-not-null-existing-null-row {
+    CREATE TABLE t (a INT, b);
+    INSERT INTO t VALUES (NULL, 1);
+    ALTER TABLE t ALTER COLUMN a SET NOT NULL;
+}
+expect error {
+    constraint failed
+}
+
+test alter-set-not-null-virtual-column-null-row {
+    CREATE TABLE t (a, b AS (a + 1));
+    INSERT INTO t (a) VALUES (NULL);
+    ALTER TABLE t ALTER COLUMN b SET NOT NULL;
+}
+expect error {
+    constraint failed
+}
+
+test alter-set-not-null-no-such-column {
+    CREATE TABLE t (a INT, b);
+    ALTER TABLE t ALTER COLUMN zz SET NOT NULL;
+}
+expect error {
+    no such column: zz
+}
+
+test alter-set-not-null-replaces-existing {
+    CREATE TABLE t (a INT NOT NULL ON CONFLICT IGNORE, b);
+    ALTER TABLE t ALTER COLUMN a SET NOT NULL;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    CREATE TABLE t (a INT NOT NULL, b)
+}
+
+test alter-drop-not-null {
+    CREATE TABLE t (a INT NOT NULL, b);
+    ALTER TABLE t ALTER COLUMN a DROP NOT NULL;
+    INSERT INTO t VALUES (NULL, 1);
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT count(*) FROM t WHERE a IS NULL;
+}
+expect {
+    CREATE TABLE t (a INT, b)
+    1
+}
+
+test alter-drop-not-null-on-nullable-column-is-a-no-op {
+    CREATE TABLE t (a INT, b);
+    ALTER TABLE t ALTER COLUMN a DROP NOT NULL;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    CREATE TABLE t (a INT, b)
+}
+
+test alter-add-check {
+    CREATE TABLE t (a INT, b);
+    INSERT INTO t VALUES (1, 2);
+    ALTER TABLE t ADD CHECK(a>0);
+    ALTER TABLE t ADD CONSTRAINT ck CHECK(b>0);
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    CREATE TABLE t (a INT, b, CHECK(a>0), CONSTRAINT ck CHECK(b>0))
+}
+
+test alter-add-check-is-enforced {
+    CREATE TABLE t (a INT, b);
+    ALTER TABLE t ADD CONSTRAINT ck CHECK(b>0);
+    INSERT INTO t VALUES (1, -1);
+}
+expect error {
+    CHECK constraint failed: ck
+}
+
+test alter-add-check-existing-row-fails {
+    CREATE TABLE t (a INT, b);
+    INSERT INTO t VALUES (1, -1);
+    ALTER TABLE t ADD CHECK(b>0);
+}
+expect error {
+    constraint failed
+}
+
+test alter-add-check-null-row-passes {
+    CREATE TABLE t (a INT, b);
+    INSERT INTO t VALUES (1, NULL);
+    ALTER TABLE t ADD CHECK(b>0);
+    SELECT count(*) FROM t;
+}
+expect {
+    1
+}
+
+test alter-add-check-duplicate-name {
+    CREATE TABLE t (a INT, b, CONSTRAINT ck CHECK(a<>0));
+    ALTER TABLE t ADD CONSTRAINT "CK" CHECK(b>0);
+}
+expect error {
+    constraint CK already exists
+}
+
+test alter-add-check-name-of-unique-constraint {
+    CREATE TABLE t (a INT, b, CONSTRAINT u1 UNIQUE (a));
+    ALTER TABLE t ADD CONSTRAINT u1 CHECK(b>0);
+}
+expect error {
+    constraint u1 already exists
+}
+
+test alter-add-check-no-such-column {
+    CREATE TABLE t (a INT, b);
+    ALTER TABLE t ADD CHECK(zz>0);
+}
+expect error {
+    no such column: zz
+}
+
+test alter-add-check-subquery {
+    CREATE TABLE t (a INT, b);
+    ALTER TABLE t ADD CHECK((SELECT 1));
+}
+expect error {
+    subqueries prohibited in CHECK constraints
+}
+
+test alter-drop-constraint-check {
+    CREATE TABLE t (a INT, b CONSTRAINT bc CHECK(b>0), CONSTRAINT tc CHECK(a>0));
+    ALTER TABLE t DROP CONSTRAINT TC;
+    ALTER TABLE t DROP CONSTRAINT bc;
+    INSERT INTO t VALUES (-1, -1);
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    CREATE TABLE t (a INT, b)
+}
+
+test alter-drop-constraint-not-null {
+    CREATE TABLE t (a INT CONSTRAINT nn NOT NULL, b);
+    ALTER TABLE t DROP CONSTRAINT nn;
+    INSERT INTO t VALUES (NULL, 1);
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    CREATE TABLE t (a INT, b)
+}
+
+test alter-drop-constraint-foreign-key {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (x, y, CONSTRAINT fk FOREIGN KEY (x) REFERENCES p(id));
+    ALTER TABLE c DROP CONSTRAINT fk;
+    INSERT INTO c VALUES (5, 1);
+    SELECT sql FROM sqlite_schema WHERE name = 'c';
+}
+expect {
+    CREATE TABLE c (x, y)
+}
+
+test alter-drop-constraint-unique-refused {
+    CREATE TABLE t (a INT, b, CONSTRAINT u1 UNIQUE (a));
+    ALTER TABLE t DROP CONSTRAINT u1;
+}
+expect error {
+    constraint may not be dropped: u1
+}
+
+test alter-drop-constraint-missing {
+    CREATE TABLE t (a INT, b);
+    ALTER TABLE t DROP CONSTRAINT nope;
+}
+expect error {
+    no such constraint: nope
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-constraint-edit-on-view {
+    CREATE VIEW v AS SELECT 1 AS x;
+    ALTER TABLE v ALTER COLUMN x SET NOT NULL;
+}
+expect error {
+    cannot edit constraints of view "v"
+}
+
+test alter-constraint-edit-on-system-table {
+    ALTER TABLE sqlite_schema DROP CONSTRAINT x;
+}
+expect error {
+    table sqlite_master may not be altered
+}
+
+test alter-constraint-edit-in-rolled-back-transaction {
+    CREATE TABLE t (a INT, b, CONSTRAINT pos CHECK(b>0));
+    BEGIN;
+    ALTER TABLE t DROP CONSTRAINT pos;
+    ROLLBACK;
+    INSERT INTO t VALUES (1, -1);
+}
+expect error {
+    CHECK constraint failed: pos
+}
+
+test alter-add-rowid-alias-column {
+    CREATE TABLE t (a, b);
+    ALTER TABLE t ADD COLUMN oid;
+}
+expect error {
+    cannot add rowid alias: oid
+}
+
+test alter-add-quoted-rowid-alias-column {
+    CREATE TABLE t (a, b);
+    ALTER TABLE t ADD COLUMN "ROWID";
+}
+expect error {
+    cannot add rowid alias: ROWID
+}
+
+test alter-rename-column-to-rowid-alias {
+    CREATE TABLE t (a, b);
+    ALTER TABLE t RENAME COLUMN a TO _rowid_;
+}
+expect error {
+    cannot rename to rowid alias: _rowid_
+}
+
+test alter-rename-column-from-rowid-alias {
+    CREATE TABLE t (a, oid);
+    ALTER TABLE t RENAME COLUMN oid TO c;
+}
+expect error {
+    cannot rename from rowid alias: oid
+}
+
+test alter-drop-rowid-alias-column {
+    CREATE TABLE t (a, oid);
+    ALTER TABLE t DROP COLUMN oid;
+}
+expect error {
+    cannot drop rowid alias: oid
+}
+
+test alter-drop-missing-rowid-name-column {
+    CREATE TABLE t (a, b);
+    ALTER TABLE t DROP COLUMN rowid;
+}
+expect error {
+    no such column: "rowid"
+}
+
+@skip-file-if mvcc "REINDEX is not supported in MVCC mode"
+test reindex-expressions {
+    CREATE TABLE x (a, b, v AS (a * 2));
+    INSERT INTO x (a, b) VALUES (1, 2), (3, 4);
+    CREATE INDEX x_expr ON x (a + 1);
+    CREATE INDEX x_virtual ON x (v);
+    CREATE INDEX x_plain ON x (b);
+    REINDEX EXPRESSIONS;
+    PRAGMA integrity_check;
+    SELECT b FROM x WHERE a + 1 = 4;
+}
+expect {
+    ok
+    4
+}
+
+test reindex-expressions-also-matches-table-named-expressions {
+    CREATE TABLE expressions (p);
+    CREATE INDEX e_p ON expressions (p);
+    INSERT INTO expressions VALUES (1);
+    REINDEX expressions;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}

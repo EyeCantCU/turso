@@ -18,7 +18,10 @@ pub const LIMIT_LIKE_PATTERN_LENGTH: i32 = 8;
 pub const LIMIT_VARIABLE_NUMBER: i32 = 9;
 pub const LIMIT_TRIGGER_DEPTH: i32 = 10;
 pub const LIMIT_WORKER_THREADS: i32 = 11;
-const LIMIT_COUNT: usize = 12;
+pub const LIMIT_PARSER_DEPTH: i32 = 12;
+pub const LIMIT_SCHEMA: i32 = 13;
+pub const LIMIT_TRIGGER_STEPS: i32 = 14;
+const LIMIT_COUNT: usize = 15;
 /// SQLite raises a smaller SQLITE_LIMIT_LENGTH to this.
 const MIN_LENGTH: i32 = 30;
 
@@ -36,6 +39,9 @@ const MAXIMA: [i32; LIMIT_COUNT] = [
     250_000,
     1000,
     8,
+    2500,
+    10_000_000,
+    65_000,
 ];
 
 /// Initial values: the hard maxima, except worker threads (0).
@@ -52,6 +58,9 @@ const DEFAULTS: [i32; LIMIT_COUNT] = [
     250_000,
     1000,
     0,
+    2500,
+    10_000_000,
+    65_000,
 ];
 
 pub struct Limits([AtomicI32; LIMIT_COUNT]);

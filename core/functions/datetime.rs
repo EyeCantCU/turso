@@ -500,6 +500,45 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
             p.n_floor = 0;
             Ok(())
         }
+        'e' if z
+            .get(..7)
+            .is_some_and(|s| s.eq_ignore_ascii_case("end of ")) =>
+        {
+            // "end of day|month|year" (3.54): last millisecond of the period.
+            if !p.valid_jd && !p.valid_ymd && !p.valid_hms {
+                return Err(InvalidModifier(format!("Invalid end of: {z}")));
+            }
+            p.compute_ymd();
+            p.valid_hms = true;
+            p.h = 23;
+            p.min = 59;
+            p.s = 59.999;
+            p.raw_s = false;
+            p.tz = 0;
+            p.valid_jd = false;
+            let suffix = &z[7..];
+            if suffix.eq_ignore_ascii_case("month") {
+                p.d = 1;
+                p.m += 1;
+                if p.m > 12 {
+                    p.y += 1;
+                    p.m = 1;
+                }
+                p.compute_floor();
+                p.compute_jd();
+                p.i_jd -= (p.n_floor as i64 + 1) * JD_TO_MS;
+                p.clear_ymd_hms_tz();
+                Ok(())
+            } else if suffix.eq_ignore_ascii_case("year") {
+                p.m = 12;
+                p.d = 31;
+                Ok(())
+            } else if suffix.eq_ignore_ascii_case("day") {
+                Ok(())
+            } else {
+                Err(InvalidModifier(format!("Invalid end of: {z}")))
+            }
+        }
         'f' if z.eq_ignore_ascii_case("floor") => {
             p.compute_jd();
             if p.n_floor != 0 {
@@ -586,17 +625,23 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
             .get(..8)
             .is_some_and(|s| s.eq_ignore_ascii_case("weekday ")) =>
         {
+            // "weekday -N" (3.54) moves backwards to weekday N.
             if let Ok(val) = z[8..].trim().parse::<f64>() {
-                if (0.0..7.0).contains(&val) && (val as i64 as f64) == val {
-                    let n = val as i64;
+                if (-6.0..=6.0).contains(&val) && (val as i64 as f64) == val {
+                    let n = (val as i64).abs();
                     p.compute_ymd_hms();
                     p.valid_jd = false;
                     p.compute_jd();
-                    let mut z = ((p.i_jd + 129600000) / 86400000) % 7;
-                    if z > n {
-                        z -= 7;
+                    let mut wd = ((p.i_jd + 129600000) / 86400000) % 7;
+                    if wd != n {
+                        if wd > n {
+                            wd -= 7;
+                        }
+                        p.i_jd += (n - wd) * 86400000;
+                        if z[8..].contains('-') {
+                            p.i_jd -= 7 * 86400000;
+                        }
                     }
-                    p.i_jd += (n - z) * 86400000;
                     p.clear_ymd_hms_tz();
                     return Ok(());
                 }
@@ -2030,14 +2075,8 @@ mod tests {
 
     #[test]
     fn test_invalid_end_of_modifiers() {
-        let modifiers = [
-            "end of month",
-            "END OF MONTH",
-            "end of year",
-            "END OF YEAR",
-            "end of day",
-            "END OF DAY",
-        ];
+        // SQLite 3.54 accepts "end of day|month|year"; other units are invalid.
+        let modifiers = ["end of week", "end of", "end of  day", "end ofday"];
 
         for modifier in modifiers {
             let result = exec_datetime_full(
@@ -2064,6 +2103,43 @@ mod tests {
         assert_eq!(run("2023-01-01", "weekday 0"), "2023-01-01"); // No change
         assert_eq!(run("2023-01-01", "weekday 1"), "2023-01-02"); // Next Monday
         assert_eq!(run("2023-01-01", "WEEKDAY 6"), "2023-01-07"); // Next Saturday
+                                                                  // "weekday -N" (SQLite 3.54) goes back to the previous weekday N.
+        assert_eq!(run("2023-01-01", "weekday -6"), "2022-12-31");
+        assert_eq!(run("2023-01-04", "weekday -1"), "2023-01-02");
+        assert_eq!(run("2023-01-04", "weekday -3"), "2023-01-04");
+        assert_eq!(run("2023-01-04", "weekday -0"), "2023-01-01");
+        assert_eq!(
+            exec_date(
+                &DefaultClock,
+                vec![
+                    Value::build_text("2023-01-04".to_string()),
+                    Value::build_text("weekday -7".to_string()),
+                ]
+            ),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn test_end_of_modifier() {
+        let run = |start: &str, modifier: &str| -> String {
+            let args = vec![
+                Value::build_text(start.to_string()),
+                Value::build_text(modifier.to_string()),
+            ];
+            exec_datetime_full(&DefaultClock, args)
+                .to_text()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            run("2026-11-03 12:34:56", "end of day"),
+            "2026-11-03 23:59:59"
+        );
+        assert_eq!(run("2026-02-10", "end of month"), "2026-02-28 23:59:59");
+        assert_eq!(run("2024-02-10", "end of month"), "2024-02-29 23:59:59");
+        assert_eq!(run("2026-12-15", "END OF MONTH"), "2026-12-31 23:59:59");
+        assert_eq!(run("2026-06-15", "end of year"), "2026-12-31 23:59:59");
     }
 
     #[test]

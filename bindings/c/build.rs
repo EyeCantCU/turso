@@ -13,6 +13,10 @@ fn main() {
         .file("src/varargs.c")
         .compile("turso_sqlite3_varargs");
     emit_source_id();
+    println!("cargo:rerun-if-changed=src/sqlite354.c");
+    cc::Build::new()
+        .file("src/sqlite354.c")
+        .compile("turso_sqlite3_sqlite354");
     let profile_dir = target_profile_dir();
     println!("cargo:rustc-link-search=native={}", profile_dir.display());
 
@@ -49,7 +53,7 @@ fn emit_source_id() {
     ]);
     let source_id = match (date, id) {
         (Some(d), Some(h)) => format!("{d} {h:0<64}"),
-        _ => format!("2025-07-30 19:33:53 {:0<64}", ""),
+        _ => format!("2026-10-16 14:45:20 {:0<64}", ""),
     };
     println!("cargo:rustc-env=TURSO_SOURCE_ID={source_id}");
 }

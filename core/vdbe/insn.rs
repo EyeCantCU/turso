@@ -291,6 +291,14 @@ pub struct AddColumnData {
     pub sql: Option<String>,
 }
 
+/// Data for ReplaceTable instruction: the altered definition of a btree table.
+#[derive(Debug, Clone)]
+pub struct ReplaceTableData {
+    pub db: usize,
+    pub namespace: NamespaceId,
+    pub table: Arc<BTreeTable>,
+}
+
 /// Data for AlterColumn instruction (boxed to keep Insn small).
 #[derive(Debug, Clone)]
 pub struct AlterColumnData {
@@ -2155,6 +2163,10 @@ pub enum Insn {
     AlterColumn {
         data: Box<AlterColumnData>,
     },
+    /// Replace a btree table's in-memory definition (ALTER TABLE constraint edits).
+    ReplaceTable {
+        data: Box<ReplaceTableData>,
+    },
     /// Try to set the maximum page count for database P1 to the value in P3.
     /// Do not let the maximum page count fall below the current page count and
     /// do not change the maximum page count value if P3==0.
@@ -2604,6 +2616,7 @@ impl InsnVariants {
             InsnVariants::IntegrityCk => execute::op_integrity_check,
             InsnVariants::RenameTable => execute::op_rename_table,
             InsnVariants::DropColumn => execute::op_drop_column,
+            InsnVariants::ReplaceTable => execute::op_replace_table,
             InsnVariants::AddColumn => execute::op_add_column,
             InsnVariants::AlterColumn => execute::op_alter_column,
             InsnVariants::MaxPgcnt => execute::op_max_pgcnt,
@@ -2729,6 +2742,7 @@ impl Insn {
             | Self::DropColumn { .. }
             | Self::AddColumn { .. }
             | Self::AlterColumn { .. }
+            | Self::ReplaceTable { .. }
             | Self::JournalMode { .. }
             | Self::Vacuum { .. } => false,
             Self::MaxPgcnt { new_max, .. } => *new_max == 0,

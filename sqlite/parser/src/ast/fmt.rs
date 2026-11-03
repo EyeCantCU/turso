@@ -1715,6 +1715,49 @@ impl ToTokens for AlterTableBody {
                 s.append(TK_COLUMNKW, None)?;
                 name.to_tokens(s, context)
             }
+            Self::SetNotNull {
+                column,
+                conflict_clause,
+            } => {
+                s.append(TK_ALTER, None)?;
+                s.append(TK_COLUMNKW, None)?;
+                column.to_tokens(s, context)?;
+                s.append(TK_SET, None)?;
+                s.append(TK_NOT, None)?;
+                s.append(TK_NULL, None)?;
+                if let Some(conflict_clause) = conflict_clause {
+                    s.append(TK_ON, None)?;
+                    s.append(TK_CONFLICT, None)?;
+                    conflict_clause.to_tokens(s, context)?;
+                }
+                Ok(())
+            }
+            Self::DropNotNull(column) => {
+                s.append(TK_ALTER, None)?;
+                s.append(TK_COLUMNKW, None)?;
+                column.to_tokens(s, context)?;
+                s.append(TK_DROP, None)?;
+                s.append(TK_NOT, None)?;
+                s.append(TK_NULL, None)
+            }
+            Self::AddCheck {
+                constraint,
+                conflict_clause,
+            } => {
+                s.append(TK_ADD, None)?;
+                constraint.to_tokens(s, context)?;
+                if let Some(conflict_clause) = conflict_clause {
+                    s.append(TK_ON, None)?;
+                    s.append(TK_CONFLICT, None)?;
+                    conflict_clause.to_tokens(s, context)?;
+                }
+                Ok(())
+            }
+            Self::DropConstraint(name) => {
+                s.append(TK_DROP, None)?;
+                s.append(TK_CONSTRAINT, None)?;
+                name.to_tokens(s, context)
+            }
         }
     }
 }
@@ -2356,6 +2399,7 @@ impl ToTokens for TriggerCmd {
         match self {
             Self::Update {
                 or_conflict,
+                database,
                 tbl_name,
                 sets,
                 from,
@@ -2365,6 +2409,10 @@ impl ToTokens for TriggerCmd {
                 if let Some(or_conflict) = or_conflict {
                     s.append(TK_OR, None)?;
                     or_conflict.to_tokens(s, context)?;
+                }
+                if let Some(database) = database {
+                    database.to_tokens(s, context)?;
+                    s.append(TK_DOT, None)?;
                 }
                 tbl_name.to_tokens(s, context)?;
                 s.append(TK_SET, None)?;
@@ -2381,6 +2429,7 @@ impl ToTokens for TriggerCmd {
             }
             Self::Insert {
                 or_conflict,
+                database,
                 tbl_name,
                 col_names,
                 select,
@@ -2397,6 +2446,10 @@ impl ToTokens for TriggerCmd {
                     }
                 }
                 s.append(TK_INTO, None)?;
+                if let Some(database) = database {
+                    database.to_tokens(s, context)?;
+                    s.append(TK_DOT, None)?;
+                }
                 tbl_name.to_tokens(s, context)?;
                 if !col_names.is_empty() {
                     s.append(TK_LP, None)?;
@@ -2414,11 +2467,16 @@ impl ToTokens for TriggerCmd {
                 Ok(())
             }
             Self::Delete {
+                database,
                 tbl_name,
                 where_clause,
             } => {
                 s.append(TK_DELETE, None)?;
                 s.append(TK_FROM, None)?;
+                if let Some(database) = database {
+                    database.to_tokens(s, context)?;
+                    s.append(TK_DOT, None)?;
+                }
                 tbl_name.to_tokens(s, context)?;
                 if let Some(where_clause) = where_clause {
                     s.append(TK_WHERE, None)?;

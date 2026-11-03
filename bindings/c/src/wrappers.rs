@@ -154,7 +154,11 @@ pub unsafe extern "C" fn sqlite3_bind_text64(
         release(destructor, text.cast());
         return SQLITE_MISUSE;
     }
-    let enc = encoding as ffi::c_int;
+    // SQLITE_UTF8_ZT (16) is UTF-8 with a terminator.
+    let enc = match encoding as ffi::c_int {
+        16 => SQLITE_UTF8,
+        e => e,
+    };
     if !matches!(
         enc,
         SQLITE_UTF8 | SQLITE_UTF16LE | SQLITE_UTF16BE | SQLITE_UTF16
@@ -217,7 +221,11 @@ pub unsafe extern "C" fn sqlite3_result_text64(
     destroy: Option<Destructor>,
     encoding: ffi::c_uchar,
 ) {
-    let enc = encoding as ffi::c_int;
+    // SQLITE_UTF8_ZT (16) is UTF-8 with a terminator.
+    let enc = match encoding as ffi::c_int {
+        16 => SQLITE_UTF8,
+        e => e,
+    };
     if context.is_null() {
         release(destroy, text.cast());
         return;

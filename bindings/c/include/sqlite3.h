@@ -43,6 +43,20 @@
 
 #define SQLITE_CHECKPOINT_TRUNCATE 3
 
+/* Added in SQLite 3.51 - 3.54 */
+#define SQLITE_CHECKPOINT_NOOP -1
+#define SQLITE_EMPTY 16
+#define SQLITE_DBCONFIG_FP_DIGITS 1023
+#define SQLITE_DBSTATUS_TEMPBUF_SPILL 13
+#define SQLITE_LIMIT_PARSER_DEPTH 12
+#define SQLITE_LIMIT_SCHEMA 13
+#define SQLITE_LIMIT_TRIGGER_STEPS 14
+#define SQLITE_PREPARE_FROM_DDL 0x20
+#define SQLITE_UTF8_ZT 16
+#define SQLITE_COPY 0
+#define SQLITE_XFER 1
+#define SQLITE_FINISH 2
+
 #define SQLITE_OPEN_READONLY         0x00000001
 #define SQLITE_OPEN_READWRITE        0x00000002
 #define SQLITE_OPEN_CREATE           0x00000004
@@ -78,6 +92,25 @@ typedef int (*exec_callback)(void *context, int n_column, char **argv, char **co
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
+
+/* Added in SQLite 3.51 - 3.54 (and the sqlite3_str API they extend) */
+typedef struct sqlite3_str sqlite3_str;
+sqlite3_int64 sqlite3_incomplete(const char *sql);
+int sqlite3_complete16(const void *sql);
+int sqlite3_set_errmsg(sqlite3 *db, int errcode, const char *zErrMsg);
+int sqlite3_db_status64(sqlite3 *db, int op, sqlite3_int64 *pCur, sqlite3_int64 *pHiwtr, int resetFlg);
+sqlite3_str *sqlite3_str_new(sqlite3 *db);
+char *sqlite3_str_finish(sqlite3_str *p);
+void sqlite3_str_free(sqlite3_str *p);
+void sqlite3_str_appendf(sqlite3_str *p, const char *zFormat, ...);
+void sqlite3_str_append(sqlite3_str *p, const char *zIn, int N);
+void sqlite3_str_appendall(sqlite3_str *p, const char *zIn);
+void sqlite3_str_appendchar(sqlite3_str *p, int N, char C);
+void sqlite3_str_reset(sqlite3_str *p);
+void sqlite3_str_truncate(sqlite3_str *p, int N);
+int sqlite3_str_errcode(sqlite3_str *p);
+int sqlite3_str_length(sqlite3_str *p);
+char *sqlite3_str_value(sqlite3_str *p);
 
 int sqlite3_initialize(void);
 

@@ -1299,6 +1299,15 @@ void test_sqlite3_mprintf()
     assert(strcmp(p, "dup-inner-end") == 0);
     sqlite3_free(p);
 
+    /* SQLite 3.54: %J/%j JSON escapes, round-trip %!.17g, %n consumes an int*. */
+    {
+        int n = -1;
+        p = sqlite3_mprintf("%J|%j|%J|%n%!.17g|%d", "a\"b\n", "x\\y",
+                            (const char *)0, &n, 49.47, 7);
+        assert(strcmp(p, "\"a\\\"b\\n\"|x\\\\y|null|49.47|7") == 0);
+        sqlite3_free(p);
+    }
+
     assert(sqlite3_snprintf(sizeof buf, buf, "'%q'", "abcdefghij") == buf);
     assert(strcmp(buf, "'abcdef") == 0);
 

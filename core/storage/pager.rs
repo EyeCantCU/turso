@@ -3927,6 +3927,14 @@ impl Pager {
         self.pages_dirtied_count.load(Ordering::Relaxed)
     }
 
+    /// (frames in WAL, frames backfilled) as reported by SQLITE_CHECKPOINT_NOOP.
+    pub fn wal_noop_checkpoint_info(&self) -> Result<(u64, u64)> {
+        let Some(wal) = self.wal.as_ref() else {
+            return Err(LimboError::InternalError("database has no WAL".to_string()));
+        };
+        Ok((wal.get_max_frame_in_wal(), wal.backfill_frame()))
+    }
+
     pub fn wal_state(&self) -> Result<WalState> {
         let Some(wal) = self.wal.as_ref() else {
             turso_soft_unreachable!("wal_state() called on database without WAL");

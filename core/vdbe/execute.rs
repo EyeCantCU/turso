@@ -179,13 +179,14 @@ use crate::vdbe::vacuum::{
 #[cfg(feature = "json")]
 use crate::{
     function::JsonFunc, json, json::convert_dbtype_to_raw_jsonb, json::ensure_blob_arg_is_jsonb,
-    json::get_json, json::is_json_valid, json::json_array, json::json_array_length,
-    json::json_arrow_extract, json::json_arrow_shift_extract, json::json_error_position,
-    json::json_extract, json::json_from_raw_bytes_agg, json::json_insert, json::json_object,
-    json::json_patch, json::json_quote, json::json_remove, json::json_replace, json::json_set,
-    json::json_type, json::jsonb, json::jsonb_array, json::jsonb_extract, json::jsonb_insert,
-    json::jsonb_object, json::jsonb_patch, json::jsonb_remove, json::jsonb_replace,
-    json::jsonb_set, json::raw_jsonb_element_len, json::Conv,
+    json::get_json, json::is_json_valid, json::json_array, json::json_array_insert,
+    json::json_array_length, json::json_arrow_extract, json::json_arrow_shift_extract,
+    json::json_error_position, json::json_extract, json::json_from_raw_bytes_agg,
+    json::json_insert, json::json_object, json::json_patch, json::json_quote, json::json_remove,
+    json::json_replace, json::json_set, json::json_type, json::jsonb, json::jsonb_array,
+    json::jsonb_extract, json::jsonb_insert, json::jsonb_object, json::jsonb_patch,
+    json::jsonb_remove, json::jsonb_replace, json::jsonb_set, json::raw_jsonb_element_len,
+    json::Conv,
 };
 
 use super::{Program, ProgramState, Register};
@@ -580,6 +581,14 @@ pub fn op_checkpoint(
     }
     if !pager.has_wal() {
         set_not_in_wal_result(state, *dest);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    if matches!(checkpoint_mode, CheckpointMode::Noop) {
+        let (log, backfilled) = pager.wal_noop_checkpoint_info()?;
+        state.registers[*dest].set_int(0);
+        state.registers[*dest + 1].set_int(log as i64);
+        state.registers[*dest + 2].set_int(backfilled as i64);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -3693,6 +3702,8 @@ pub fn halt(
         // SqlError displays bare like sqlite3_errmsg and abort() doesn't apply
         // ON CONFLICT resolution to it.
         SQLITE_ERROR => Some(LimboError::SqlError(description.to_string())),
+        // Plain SQLITE_CONSTRAINT, e.g. an ALTER TABLE constraint edit failing on existing rows.
+        SQLITE_CONSTRAINT => Some(LimboError::Constraint(description.to_string())),
         _ => Some(LimboError::Constraint(format!(
             "undocumented halt error code {description}"
         ))),
@@ -7379,6 +7390,12 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
             payload.push(Value::from_i64(0));
             payload.push(Value::from_i64(0));
         }
+        AggFunc::Median
+        | AggFunc::Percentile
+        | AggFunc::PercentileContCall
+        | AggFunc::PercentileDiscCall => {
+            crate::functions::percentile::init(payload)?;
+        }
         AggFunc::PercentileCont | AggFunc::PercentileDisc => {
             payload.try_reserve_exact(3)?;
             // [0] = collation bits, [1] = count, [2] = fraction, [3..] = buffered values.
@@ -7754,6 +7771,12 @@ fn update_agg_payload(
                 payload[1] = Value::from_i64((count + 1) as i64);
                 payload.try_push(arg.try_clone()?)?;
             }
+        }
+        AggFunc::Median
+        | AggFunc::Percentile
+        | AggFunc::PercentileContCall
+        | AggFunc::PercentileDiscCall => {
+            crate::functions::percentile::step(func, arg, maybe_arg2, payload)?;
         }
         AggFunc::PercentileCont | AggFunc::PercentileDisc => {
             payload[0] = Value::from_i64(collation.to_bits() as i64);
@@ -8186,6 +8209,10 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
                 ordered_set_mode(&payload[2..2 + count], collation)
             }
         }
+        AggFunc::Median
+        | AggFunc::Percentile
+        | AggFunc::PercentileContCall
+        | AggFunc::PercentileDiscCall => crate::functions::percentile::finalize(func, payload),
         AggFunc::PercentileCont | AggFunc::PercentileDisc => {
             // payload: [0]=collation bits, [1]=count, [2]=fraction, [3..]=buffered values.
             // The fraction was range-checked in translate (pre-loop), so it is
@@ -8935,6 +8962,13 @@ pub fn op_agg_inverse(
         ))
         .into());
     };
+    if crate::functions::percentile::is_percentile(func) {
+        if let AggContext::Builtin(payload) = agg {
+            crate::functions::percentile::inverse(&arg, payload);
+        }
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
     let payload = agg.payload_mut();
     inverse_agg_payload(func, arg, payload)?;
 
@@ -9201,6 +9235,12 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
         AggFunc::External(_) => {
             unreachable!("planner rejects moving-start frames over external aggregates");
         }
+        AggFunc::Median
+        | AggFunc::Percentile
+        | AggFunc::PercentileContCall
+        | AggFunc::PercentileDiscCall => {
+            unreachable!("percentile inverse is handled in op_agg_inverse");
+        }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupObject
         | AggFunc::JsonbGroupObject
@@ -9447,7 +9487,11 @@ fn op_agg_step_slow(state: &mut ProgramState, data: &AggStepData) -> InsnResult 
                 AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
                     Some(state.registers[*delimiter].get_value().try_clone()?)
                 }
-                AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+                AggFunc::PercentileCont
+                | AggFunc::PercentileDisc
+                | AggFunc::Percentile
+                | AggFunc::PercentileContCall
+                | AggFunc::PercentileDiscCall => {
                     Some(state.registers[*delimiter].get_value().try_clone()?)
                 }
                 _ => None,
@@ -10249,6 +10293,17 @@ pub fn op_function(
                 let json = jsonb_insert(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
+                )?;
+                state.registers[*dest].set_value(json);
+            }
+            JsonFunc::JsonArrayInsert | JsonFunc::JsonbArrayInsert => {
+                if arg_count % 2 == 0 {
+                    bail_constraint_error!("json_array_insert() needs an odd number of arguments")
+                }
+                let json = json_array_insert(
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
+                    &state.json_cache,
+                    matches!(json_func, JsonFunc::JsonbArrayInsert),
                 )?;
                 state.registers[*dest].set_value(json);
             }
@@ -18501,6 +18556,25 @@ pub fn op_add_column(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_replace_table(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(ReplaceTable { data }, insn);
+    let conn = program.connection.clone();
+    let name = normalize_ident(data.table.name.as_str());
+    conn.with_database_schema_mut(data.db, |schema| {
+        let table_ref = schema
+            .table_mut(data.namespace, &name)
+            .expect("table being altered should be in schema");
+        *table_ref = Arc::new(crate::schema::Table::BTree(data.table.clone()));
+    })?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_alter_column(
     program: &Program,
     state: &mut ProgramState,
@@ -21821,6 +21895,8 @@ mod tests {
             AggFunc::Mode,
             AggFunc::PercentileCont,
             AggFunc::PercentileDisc,
+            AggFunc::Median,
+            AggFunc::Percentile,
             #[cfg(feature = "json")]
             AggFunc::JsonGroupObject,
             #[cfg(feature = "json")]

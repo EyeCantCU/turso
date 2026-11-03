@@ -490,6 +490,20 @@ impl PathOperation for DeleteOperation {
     }
 }
 
+/// Result of [`Jsonb::probe_path`].
+enum PathProbe {
+    Found(usize),
+    Insertable,
+    NotFound,
+}
+
+/// Outcome of [`Jsonb::array_insert`].
+pub enum ArrayInsert {
+    Done,
+    /// The path does not name an array element ("not an array element").
+    NotArray,
+}
+
 pub struct ReplaceOperation {
     value: Jsonb,
     mode: PathOperationMode,
@@ -2563,6 +2577,146 @@ impl Jsonb {
 
     pub fn data(self) -> ValueBlob {
         self.data
+    }
+
+    /// Walks `elements` without editing. `Insertable` means the walk stopped at a
+    /// missing object key or at the end of an array, where an insert would go.
+    fn probe_path(&self, elements: &[PathElement]) -> Result<PathProbe> {
+        let mut pos = 0;
+        for el in elements {
+            let (JsonbHeader(el_type, el_size), hdr) = self.read_header(pos)?;
+            let end = pos + hdr + el_size;
+            match el {
+                PathElement::Root() => continue,
+                PathElement::Key(key, is_raw) => {
+                    if el_type != ElementType::OBJECT {
+                        return Ok(PathProbe::NotFound);
+                    }
+                    let mut p = pos + hdr;
+                    let mut found = None;
+                    while p < end {
+                        let (JsonbHeader(key_type, key_len), key_hdr) = self.read_header(p)?;
+                        if !key_type.is_valid_key() {
+                            bail_parse_error!("malformed JSON");
+                        }
+                        let json_key = read_text_payload(&self.data, p + key_hdr, key_len)?;
+                        let value_pos = p + key_hdr + key_len;
+                        if compare((json_key, key_type), (key.as_bytes(), *is_raw)) {
+                            found = Some(value_pos);
+                            break;
+                        }
+                        p = self.skip_element(value_pos)?;
+                    }
+                    match found {
+                        Some(v) => pos = v,
+                        None => return Ok(PathProbe::Insertable),
+                    }
+                }
+                PathElement::ArrayLocator(idx) => {
+                    if el_type != ElementType::ARRAY {
+                        return Ok(PathProbe::NotFound);
+                    }
+                    let mut items = Vec::new();
+                    let mut p = pos + hdr;
+                    while p < end {
+                        items.push(p);
+                        p = self.skip_element(p)?;
+                    }
+                    let target = match idx {
+                        None => items.len() as i64,
+                        Some(i) => {
+                            let t = if *i < 0 {
+                                items.len() as i64 + *i as i64
+                            } else {
+                                *i as i64
+                            };
+                            if t < 0 {
+                                return Ok(PathProbe::NotFound);
+                            }
+                            t
+                        }
+                    };
+                    match (target as usize).cmp(&items.len()) {
+                        std::cmp::Ordering::Less => pos = items[target as usize],
+                        std::cmp::Ordering::Equal => return Ok(PathProbe::Insertable),
+                        std::cmp::Ordering::Greater => return Ok(PathProbe::NotFound),
+                    }
+                }
+                PathElement::BracketQuotedKey(_) => return Ok(PathProbe::NotFound),
+            }
+        }
+        Ok(PathProbe::Found(pos))
+    }
+
+    /// json_array_insert(): insert `value` before the array element named by
+    /// `path`, or append when it names the slot just past the end.
+    pub fn array_insert(&mut self, path: &JsonPath, value: Jsonb) -> Result<ArrayInsert> {
+        let elements = &path.elements;
+        let Some(last) = elements.last() else {
+            return Ok(ArrayInsert::Done);
+        };
+        if elements.len() == 1 {
+            return Ok(ArrayInsert::Done);
+        }
+        if !matches!(last, PathElement::ArrayLocator(_)) {
+            return Ok(match self.probe_path(elements)? {
+                PathProbe::NotFound => ArrayInsert::Done,
+                _ => ArrayInsert::NotArray,
+            });
+        }
+        let parent = &elements[..elements.len() - 1];
+        match self.probe_path(parent)? {
+            PathProbe::NotFound => Ok(ArrayInsert::Done),
+            PathProbe::Insertable => {
+                let mut op = InsertOperation::new(value);
+                let _ = self.operate_on_path(path, &mut op);
+                Ok(ArrayInsert::Done)
+            }
+            PathProbe::Found(pos) => {
+                let (JsonbHeader(el_type, el_size), hdr) = self.read_header(pos)?;
+                if el_type != ElementType::ARRAY {
+                    return Ok(ArrayInsert::Done);
+                }
+                let end = pos + hdr + el_size;
+                let mut items = Vec::new();
+                let mut p = pos + hdr;
+                while p < end {
+                    items.push(p);
+                    p = self.skip_element(p)?;
+                }
+                let PathElement::ArrayLocator(idx) = last else {
+                    unreachable!("checked above")
+                };
+                let target = match idx {
+                    None => items.len() as i64,
+                    Some(i) if *i < 0 => items.len() as i64 + *i as i64,
+                    Some(i) => *i as i64,
+                };
+                if target < 0 || target as usize > items.len() {
+                    return Ok(ArrayInsert::Done);
+                }
+                let at = items.get(target as usize).copied().unwrap_or(end);
+                let header =
+                    JsonbHeader::new(ElementType::ARRAY, el_size + value.data.len()).into_bytes();
+                let mut new_array =
+                    Vec::with_capacity(header.as_bytes().len() + el_size + value.data.len());
+                new_array.extend_from_slice(header.as_bytes());
+                new_array.extend_from_slice(&self.data[pos + hdr..at]);
+                new_array.extend_from_slice(&value.data);
+                new_array.extend_from_slice(&self.data[at..end]);
+                let new_array = Jsonb::from_raw_data(&new_array)?;
+                if parent.len() == 1 {
+                    self.data = new_array.data;
+                } else {
+                    let parent_path = JsonPath {
+                        elements: parent.to_vec(),
+                    };
+                    let mut op = ReplaceOperation::new(new_array);
+                    self.operate_on_path(&parent_path, &mut op)?;
+                }
+                Ok(ArrayInsert::Done)
+            }
+        }
     }
 
     pub fn element_type_at(&self, idx: usize) -> Result<ElementType> {

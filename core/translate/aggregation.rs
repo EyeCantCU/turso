@@ -686,6 +686,29 @@ pub fn translate_aggregation_step(
             });
             target_register
         }
+        AggFunc::Median
+        | AggFunc::Percentile
+        | AggFunc::PercentileContCall
+        | AggFunc::PercentileDiscCall => {
+            let func = func.clone();
+            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
+            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            let pct_reg = if num_args == 2 {
+                agg_arg_source.translate(program, referenced_tables, resolver, 1)?
+            } else {
+                0
+            };
+            program.emit_insn(Insn::AggStep {
+                data: Box::new(AggStepData {
+                    acc_reg: target_register,
+                    col: expr_reg,
+                    delimiter: pct_reg,
+                    func: AccumulatorFunc::Agg(func),
+                    collation: CollationSeq::BINARY,
+                }),
+            });
+            target_register
+        }
         AggFunc::StringAgg => {
             if num_args != 2 {
                 crate::bail_parse_error!("string_agg bad number of arguments");

@@ -963,7 +963,11 @@ fn resolve_effective_frame(
                 | AggFunc::Min
                 | AggFunc::Max
                 | AggFunc::GroupConcat
-                | AggFunc::StringAgg,
+                | AggFunc::StringAgg
+                | AggFunc::Median
+                | AggFunc::Percentile
+                | AggFunc::PercentileContCall
+                | AggFunc::PercentileDiscCall,
         ) | AccumulatorFunc::Window(
             WindowFunc::FirstValue | WindowFunc::NthValue | WindowFunc::LastValue
         )

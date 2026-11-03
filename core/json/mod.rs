@@ -7,8 +7,8 @@ pub(crate) mod vtab;
 
 use crate::json::error::Error as JsonError;
 pub use crate::json::ops::{
-    json_insert, json_patch, json_remove, json_replace, jsonb_insert, jsonb_patch, jsonb_remove,
-    jsonb_replace,
+    json_array_insert, json_insert, json_patch, json_remove, json_replace, jsonb_insert,
+    jsonb_patch, jsonb_remove, jsonb_replace,
 };
 use crate::json::path::{json_path, JsonPath, PathElement};
 use crate::numeric::{str_to_i64, Numeric};

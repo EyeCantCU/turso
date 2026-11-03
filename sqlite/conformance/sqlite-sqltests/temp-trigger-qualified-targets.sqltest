@@ -1,0 +1,67 @@
+# SQLite 3.53: the body of a TEMP trigger may modify tables in other schemas
+# through qualified names (main.x, temp.x). Other triggers still may not.
+
+@database :memory:
+
+test temp-trigger-modifies-main-table {
+    CREATE TABLE mm (y);
+    CREATE TEMP TABLE tt (x);
+    CREATE TEMP TRIGGER t3 AFTER INSERT ON tt BEGIN INSERT INTO main.mm VALUES (new.x); END;
+    CREATE TEMP TRIGGER t4 AFTER INSERT ON tt BEGIN UPDATE main.mm SET y = y * 10 WHERE y = 5; DELETE FROM main.mm WHERE y = 7; END;
+    INSERT INTO tt VALUES (5);
+    INSERT INTO tt VALUES (7);
+    SELECT y FROM mm ORDER BY y;
+}
+expect {
+    7
+    50
+}
+
+test temp-trigger-on-main-table-writes-temp-table {
+    CREATE TABLE m2 (z);
+    CREATE TEMP TABLE tt (x);
+    CREATE TEMP TRIGGER t6 AFTER INSERT ON main.m2 BEGIN INSERT INTO temp.tt VALUES (new.z + 100); END;
+    INSERT INTO m2 VALUES (1);
+    SELECT x FROM tt;
+}
+expect {
+    101
+}
+
+test temp-trigger-qualified-target-resolved-at-run-time {
+    CREATE TEMP TABLE tt (x);
+    CREATE TEMP TRIGGER t7 AFTER INSERT ON tt BEGIN INSERT INTO temp.tt2 VALUES (1); END;
+    INSERT INTO tt VALUES (5);
+}
+expect error {
+    no such table: temp.tt2
+}
+
+test temp-trigger-qualified-target-created-later {
+    CREATE TEMP TABLE tt (x);
+    CREATE TEMP TRIGGER t8 AFTER INSERT ON tt BEGIN INSERT INTO temp.tt2 VALUES (new.x); END;
+    CREATE TEMP TABLE tt2 (v);
+    INSERT INTO tt VALUES (9);
+    SELECT v FROM tt2;
+}
+expect {
+    9
+}
+
+test persistent-trigger-qualified-target-refused {
+    CREATE TABLE mm (y);
+    CREATE TABLE m2 (z);
+    CREATE TRIGGER t1 AFTER INSERT ON m2 BEGIN INSERT INTO main.mm VALUES (1); END;
+}
+expect error {
+    qualified table names are not allowed on INSERT, UPDATE, and DELETE statements within triggers
+}
+
+test persistent-trigger-qualified-delete-refused {
+    CREATE TABLE mm (y);
+    CREATE TABLE m2 (z);
+    CREATE TRIGGER t1 AFTER INSERT ON m2 BEGIN DELETE FROM main.mm; END;
+}
+expect error {
+    qualified table names are not allowed on INSERT, UPDATE, and DELETE statements within triggers
+}

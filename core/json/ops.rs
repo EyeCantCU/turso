@@ -1,7 +1,7 @@
 use super::{
     convert_dbtype_to_jsonb, curry_convert_dbtype_to_jsonb, json_document_to_db_type,
     json_edit_path, json_path_from_db_value, json_path_text,
-    jsonb::{DeleteOperation, InsertOperation, ReplaceOperation},
+    jsonb::{ArrayInsert, DeleteOperation, InsertOperation, ReplaceOperation},
     Conv, JsonCacheCell, OutputVariant,
 };
 use crate::{
@@ -263,6 +263,50 @@ where
     let el_type = json.element_type()?;
 
     json_document_to_db_type(json, el_type, OutputVariant::String)
+}
+
+/// json_array_insert(J, PATH, VALUE, ...) and jsonb_array_insert() (SQLite 3.53).
+pub fn json_array_insert<I, E, V>(
+    args: I,
+    json_cache: &JsonCacheCell,
+    binary: bool,
+) -> crate::Result<Value>
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    let mut args = args.into_iter();
+    let Some(first_arg) = args.next() else {
+        return Ok(Value::Null);
+    };
+    if matches!(first_arg.as_value_ref(), ValueRef::Null) {
+        return Ok(Value::Null);
+    }
+    let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
+    let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
+    while args.len() > 1 {
+        let (Some(path_arg), Some(value_arg)) = (args.next(), args.next()) else {
+            break;
+        };
+        if let Some(path) = json_edit_path(&path_arg, &value_arg)? {
+            let value = convert_dbtype_to_jsonb(&value_arg, Conv::SetValue)?;
+            if let ArrayInsert::NotArray = json.array_insert(&path, value)? {
+                let text = json_path_text(path_arg.as_value_ref()).unwrap_or_default();
+                crate::bail_parse_error!(
+                    "not an array element: '{}'",
+                    super::path::quote_path(&text)
+                );
+            }
+        }
+    }
+    let el_type = json.element_type()?;
+    let output = if binary {
+        OutputVariant::Binary
+    } else {
+        OutputVariant::String
+    };
+    json_document_to_db_type(json, el_type, output)
 }
 
 pub fn jsonb_insert<I, E, V>(args: I, json_cache: &JsonCacheCell) -> crate::Result<Value>

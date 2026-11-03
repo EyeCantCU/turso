@@ -133,7 +133,7 @@ public partial class SqliteConnection : DbConnection
     }
 
     // The SQLite version Turso tracks (SQLITE_VERSION in core/dialect/sqlite.rs).
-    public override string ServerVersion => "3.50.4";
+    public override string ServerVersion => "3.54.1";
 
     public override ConnectionState State => _managedConnection?.State
         ?? (_database is null ? ConnectionState.Closed : ConnectionState.Open);

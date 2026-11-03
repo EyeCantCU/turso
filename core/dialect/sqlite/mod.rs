@@ -21,10 +21,10 @@ use turso_ext::VTabKind;
 /// This is the source of truth for the SQLite version Turso tracks. Keep
 /// [`SQLITE_VERSION_NUMBER`], `scripts/install-sqlite3.sh`, README.md, and
 /// COMPAT.md in sync when bumping it.
-pub const SQLITE_VERSION: &str = "3.50.4";
+pub const SQLITE_VERSION: &str = "3.54.1";
 
 /// Integer form of [`SQLITE_VERSION`] used by `sqlite3_libversion_number()`.
-pub const SQLITE_VERSION_NUMBER: i32 = 3_050_004;
+pub const SQLITE_VERSION_NUMBER: i32 = 3_054_001;
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 use crate::function::FtsFunc;
@@ -192,6 +192,8 @@ pub fn register_builtin_catalog(
     {
         schema.register_internal_vtab(crate::json::vtab::JsonVirtualTable::json_each())?;
         schema.register_internal_vtab(crate::json::vtab::JsonVirtualTable::json_tree())?;
+        schema.register_internal_vtab(crate::json::vtab::JsonVirtualTable::jsonb_each())?;
+        schema.register_internal_vtab(crate::json::vtab::JsonVirtualTable::jsonb_tree())?;
     }
     #[cfg(feature = "cli_only")]
     {
@@ -300,6 +302,22 @@ pub(crate) fn resolve_builtin_function_name(
                 crate::bail_parse_error!("wrong number of arguments to function {}()", name)
             }
             Ok(Some(Func::Agg(AggFunc::Sum)))
+        }
+        "median" => {
+            if arg_count != 1 {
+                crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+            }
+            Ok(Some(Func::Agg(AggFunc::Median)))
+        }
+        "percentile" | "percentile_cont" | "percentile_disc" => {
+            if arg_count != 2 {
+                crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+            }
+            Ok(Some(Func::Agg(match name {
+                "percentile" => AggFunc::Percentile,
+                "percentile_cont" => AggFunc::PercentileContCall,
+                _ => AggFunc::PercentileDiscCall,
+            })))
         }
         "total" => {
             if arg_count != 1 {
@@ -488,6 +506,8 @@ pub(crate) fn resolve_builtin_function_name(
         "json_insert" => Ok(Some(Func::Json(JsonFunc::JsonInsert))),
         #[cfg(feature = "json")]
         "jsonb_insert" => Ok(Some(Func::Json(JsonFunc::JsonbInsert))),
+        "json_array_insert" => Ok(Some(Func::Json(JsonFunc::JsonArrayInsert))),
+        "jsonb_array_insert" => Ok(Some(Func::Json(JsonFunc::JsonbArrayInsert))),
         #[cfg(feature = "json")]
         "jsonb_replace" => Ok(Some(Func::Json(JsonFunc::JsonbReplace))),
         #[cfg(feature = "json")]
