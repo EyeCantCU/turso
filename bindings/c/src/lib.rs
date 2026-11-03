@@ -57,7 +57,8 @@ pub extern "C" fn turso_enable_experimental() {
 
 /// Build `DatabaseOpts` respecting the global experimental flag.
 fn default_db_opts() -> DatabaseOpts {
-    let mut opts = DatabaseOpts::new();
+    // ATTACH and VACUUM are always on: a libsqlite3 consumer cannot opt in.
+    let mut opts = DatabaseOpts::new().with_attach(true).with_vacuum(true);
     if EXPERIMENTAL_ENABLED.load(Ordering::Acquire) {
         opts = opts
             .with_vacuum(true)

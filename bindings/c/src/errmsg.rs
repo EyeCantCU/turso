@@ -22,16 +22,21 @@ fn is_id_char(c: char) -> bool {
 /// text runs through the identifier characters that follow it.
 fn unrecognized(token: &str, offset: usize, sql: Option<&str>, widen: bool) -> String {
     let mut text = token.to_string();
-    if let Some(sql) = sql {
-        if widen {
-            if let Some(rest) = sql.get(offset..) {
-                let end = rest
-                    .char_indices()
-                    .find(|&(_, c)| !(is_id_char(c) || c == '.'))
-                    .map_or(rest.len(), |(i, _)| i);
-                if end >= text.len() {
-                    text = rest[..end].to_string();
-                }
+    if let (true, Some(sql)) = (widen, sql) {
+        if let Some(head) = sql.get(..offset.min(sql.len())) {
+            let start = head
+                .char_indices()
+                .rev()
+                .take_while(|&(_, c)| is_id_char(c) || c == '.')
+                .last()
+                .map_or(head.len(), |(i, _)| i);
+            let rest = &sql[start..];
+            let end = rest
+                .char_indices()
+                .find(|&(_, c)| !(is_id_char(c) || c == '.'))
+                .map_or(rest.len(), |(i, _)| i);
+            if start + end > offset {
+                text = rest[..end].to_string();
             }
         }
     }

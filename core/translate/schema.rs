@@ -2173,6 +2173,9 @@ pub fn translate_drop_table(
     program.begin_write_on_database(database_id, schema_cookie)?;
 
     let Some(table) = resolver.with_schema(database_id, |s| s.get_table(namespace.id, name)) else {
+        if resolver.with_schema(database_id, |s| s.get_view(namespace.id, name).is_some()) {
+            bail_parse_error!("use DROP VIEW to delete view {name}");
+        }
         if if_exists {
             return Ok(());
         }
