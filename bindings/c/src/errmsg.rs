@@ -107,7 +107,10 @@ fn rewrite(msg: &str) -> String {
 }
 
 const REWRITES: &[(&str, &str)] = &[
-    ("Object name reserved for internal use", "object name reserved for internal use"),
+    (
+        "Object name reserved for internal use",
+        "object name reserved for internal use",
+    ),
     ("No such index", "no such index"),
 ];
 
@@ -115,6 +118,7 @@ const REWRITES: &[(&str, &str)] = &[
 pub fn message(err: &LimboError, sql: Option<&str>) -> String {
     match err {
         LimboError::ParseError(msg)
+        | LimboError::InternalError(msg)
         | LimboError::InvalidArgument(msg)
         | LimboError::SqlError(msg) => rewrite(msg),
         LimboError::ParseIntError(_)
