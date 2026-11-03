@@ -1091,7 +1091,7 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
             return TCL_OK;
         default: {
             int idx;
-            void *value = NULL;
+            sqlite3_value *value = NULL;
             if (objc != 4) {
                 Tcl_WrongNumArgs(interp, 3, objv, "INDEX");
                 return TCL_ERROR;
