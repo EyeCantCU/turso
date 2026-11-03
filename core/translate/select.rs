@@ -169,6 +169,8 @@ pub fn prepare_select_plan(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
+    // An IGNORE for SQLITE_SELECT is treated as OK.
+    crate::authorizer::check(resolver, crate::authorizer::SQLITE_SELECT, None, None, None)?;
     prepare_select_plan_from_arms(
         select.body.select,
         select.body.compounds,
@@ -830,6 +832,7 @@ fn prepare_one_select_plan(
 
                 validate_expr_correct_column_counts(&plan)?;
             }
+            crate::authorizer::authorize_unread_tables(resolver, &plan.table_references)?;
 
             // Return the unoptimized query plan
             Ok(plan)

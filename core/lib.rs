@@ -52,8 +52,10 @@ pub(crate) mod sync;
 pub(crate) mod thread;
 
 mod assert;
+pub mod authorizer;
 mod connection;
 mod connection_hooks;
+mod data_hooks;
 mod database;
 pub mod dialect;
 mod error;
@@ -127,6 +129,10 @@ pub use connection::SubqueryUnnestingMode;
 pub use connection::{resolve_ext_path, Connection, Row, StepResult, SymbolTable};
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 pub use connection_hooks::{ConnectionHooks, SavepointMemo};
+pub use data_hooks::{
+    CommitHookCallback, PreUpdateEvent, PreUpdateHookCallback, RollbackHookCallback,
+    UpdateHookCallback, UpdateHookOp, WalHookCallback,
+};
 pub use database::is_memory_like;
 #[cfg(feature = "simulator")]
 pub use database::{clear_database_registry, SharedWalTestingSnapshot};

@@ -225,6 +225,7 @@ const SQLITE_OPEN_URI: i32 = 0x00000040;
 
 mod config;
 mod stubs;
+mod hooks;
 
 mod tests {
     use super::*;

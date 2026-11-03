@@ -109,6 +109,9 @@ pub enum LimboError {
     /// The current role may not do what the statement needs.
     #[error("{0}")]
     PermissionDenied(Box<crate::security::permission::PermissionDenied>),
+    /// Refused by the `sqlite3_set_authorizer` callback (SQLITE_AUTH).
+    #[error("{0}")]
+    AuthDenied(String),
     #[error("{0}")]
     Constraint(String),
     #[error("{}", .0.message)]
@@ -121,6 +124,9 @@ pub enum LimboError {
     Raise(turso_parser::ast::ResolveType, String),
     #[error("RaiseIgnore")]
     RaiseIgnore,
+    /// The commit hook vetoed the commit; the transaction was rolled back.
+    #[error("constraint failed")]
+    CommitHookVeto,
     #[error("Extension error: {0}")]
     ExtensionError(String),
     #[error("integer overflow")]
@@ -236,7 +242,8 @@ impl LimboError {
             Self::Constraint(_)
             | Self::ConstraintViolation(_)
             | Self::ForeignKeyConstraint(_)
-            | Self::Raise(..) => 19,
+            | Self::Raise(..)
+            | Self::CommitHookVeto => 19,
             Self::Busy | Self::BusySnapshot | Self::StatementsInProgress(_) => 5,
             Self::TableLocked => 6,
             Self::ReadOnly => 8,
@@ -245,7 +252,7 @@ impl LimboError {
             Self::DatabaseFull | Self::SequenceExhausted { .. } => 13,
             Self::SchemaUpdated | Self::SchemaConflict => 17,
             Self::TooBig => 18,
-            Self::PermissionDenied(_) => 23,
+            Self::PermissionDenied(_) | Self::AuthDenied(_) => 23,
             Self::NotADB => 26,
             Self::BlobHandleExpired => 4,
             _ => 1,

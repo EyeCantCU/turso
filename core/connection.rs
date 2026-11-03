@@ -537,6 +537,10 @@ pub struct Connection {
     pub(super) busy_handler: RwLock<BusyHandler>,
     /// Step-based progress callback for SQLite-compatible cancellation hooks.
     pub(super) progress_handler: ProgressHandler,
+    /// SQLite-compatible commit/rollback/update/WAL hooks.
+    pub(crate) data_hooks: crate::data_hooks::DataChangeHooks,
+    /// `sqlite3_set_authorizer` callback, consulted while preparing.
+    pub(crate) authorizer: RwLock<Option<crate::authorizer::AuthorizerCallback>>,
     /// Maximum execution time for a single statement on this connection.
     /// `Duration::ZERO` means disabled.
     pub(super) query_timeout_ms: AtomicU64,
@@ -2519,6 +2523,7 @@ impl Connection {
         }
         self.closed.store(true, Ordering::SeqCst);
         let pager = self.pager.load();
+        let fire_rollback_hook = self.in_write_or_explicit_txn();
 
         match self.get_tx_state() {
             TransactionState::None => {
@@ -2542,6 +2547,9 @@ impl Connection {
                 self.rollback_attached_wal_txns();
                 self.set_tx_state(TransactionState::None);
             }
+        }
+        if fire_rollback_hook {
+            self.data_hooks.on_rollback();
         }
         self.index_methods_on_transaction_rolled_back();
         self.clear_mvcc_log_meta();
@@ -2586,8 +2594,16 @@ impl Connection {
     }
 
     pub(crate) fn set_wal_autocheckpoint(&self, frames: u32) {
+        // As in SQLite, the auto-checkpoint and a WAL hook replace each other.
+        self.data_hooks.set_wal(None);
         self.wal_autocheckpoint.store(frames, Ordering::SeqCst);
         self.bump_prepare_context_generation();
+    }
+
+    /// `sqlite3_wal_autocheckpoint()`: checkpoint after commits that leave at
+    /// least `frames` frames in the WAL (0 disables). Clears any WAL hook.
+    pub fn set_wal_autocheckpoint_frames(&self, frames: u32) {
+        self.set_wal_autocheckpoint(frames);
     }
 
     /// Publish the connection's current schema snapshot to the shared database
@@ -4646,6 +4662,48 @@ impl Connection {
         self.progress_handler.set(ops, handler);
     }
 
+    /// Install or clear the commit hook (`sqlite3_commit_hook`). The callback
+    /// runs before a write transaction commits; returning `true` turns the
+    /// commit into a rollback.
+    pub fn set_commit_hook(&self, hook: Option<crate::data_hooks::CommitHookCallback>) {
+        self.data_hooks.set_commit(hook);
+    }
+
+    /// Install or clear the rollback hook (`sqlite3_rollback_hook`).
+    pub fn set_rollback_hook(&self, hook: Option<crate::data_hooks::RollbackHookCallback>) {
+        self.data_hooks.set_rollback(hook);
+    }
+
+    /// Install or clear the row-change hook (`sqlite3_update_hook`).
+    pub fn set_update_hook(&self, hook: Option<crate::data_hooks::UpdateHookCallback>) {
+        self.data_hooks.set_update(hook);
+    }
+
+    /// Install or clear the pre-change hook (`sqlite3_preupdate_hook`).
+    pub fn set_preupdate_hook(&self, hook: Option<crate::data_hooks::PreUpdateHookCallback>) {
+        self.data_hooks.set_preupdate(hook);
+        // DELETE without WHERE must not use the truncate path while it is set.
+        self.bump_prepare_context_generation();
+    }
+
+    /// Install or clear the WAL commit hook (`sqlite3_wal_hook`). Like SQLite,
+    /// this replaces (and so disables) the automatic checkpoint.
+    pub fn set_wal_hook(&self, hook: Option<crate::data_hooks::WalHookCallback>) {
+        self.wal_autocheckpoint.store(0, Ordering::SeqCst);
+        self.data_hooks.set_wal(hook);
+    }
+
+    /// Install or clear the authorizer (`sqlite3_set_authorizer`). Prepared
+    /// statements are re-prepared so the new authorizer sees them.
+    pub fn set_authorizer(&self, auth: Option<crate::authorizer::AuthorizerCallback>) {
+        *self.authorizer.write() = auth;
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn authorizer(&self) -> Option<crate::authorizer::AuthorizerCallback> {
+        self.authorizer.read().clone()
+    }
+
     /// Configured progress-handler interval in VM steps; 0 when disabled.
     pub fn progress_ops(&self) -> u64 {
         self.progress_handler.ops()
@@ -5057,6 +5115,7 @@ impl Connection {
         pager: &Arc<Pager>,
         clear_attached_schemas: bool,
     ) {
+        let fire_rollback_hook = self.in_write_or_explicit_txn();
         if let Some(mv_store) = self.mv_store().as_ref() {
             if let Some(tx_id) = self.get_mv_tx_id() {
                 self.auto_commit.store(true, Ordering::SeqCst);
@@ -5081,6 +5140,19 @@ impl Connection {
         // view delta captured within it is void. Leaving them behind would
         // apply phantom changes to the views at the next successful commit.
         self.transaction_changes.clear();
+        if fire_rollback_hook {
+            self.data_hooks.on_rollback();
+        }
+    }
+
+    /// SQLite runs the rollback hook for a write or explicit (BEGIN)
+    /// transaction, not for a read-only autocommit one.
+    pub(crate) fn in_write_or_explicit_txn(&self) -> bool {
+        !self.auto_commit.load(Ordering::SeqCst)
+            || matches!(self.get_tx_state(), TransactionState::Write { .. })
+            || self.with_all_attached_pagers_with_index(|pagers| {
+                pagers.iter().any(|(_, pager)| pager.holds_write_lock())
+            })
     }
 
     /// Roll back transaction state for helpers that start a manual `BEGIN`

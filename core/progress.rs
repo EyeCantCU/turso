@@ -12,7 +12,7 @@ pub(crate) type ProgressHandlerCallback = Box<dyn Fn() -> bool + Send + Sync>;
 /// - a non-zero callback result interrupts the running operation
 #[derive(Default)]
 pub(crate) struct ProgressHandler {
-    callback: RwLock<Option<ProgressHandlerCallback>>,
+    callback: RwLock<Option<crate::sync::Arc<ProgressHandlerCallback>>>,
     ops: AtomicU64,
 }
 
@@ -40,7 +40,7 @@ impl ProgressHandler {
             self.ops.store(0, Ordering::SeqCst);
             return;
         }
-        *self.callback.write() = callback;
+        *self.callback.write() = callback.map(crate::sync::Arc::new);
         self.ops.store(ops, Ordering::SeqCst);
     }
 
@@ -65,8 +65,9 @@ impl ProgressHandler {
         if ops == 0 || prev_steps / ops == vm_steps / ops {
             return false;
         }
-        let callback = self.callback.read();
-        match callback.as_ref() {
+        // Call without the lock held: the callback may replace the handler.
+        let callback = self.callback.read().clone();
+        match callback {
             Some(callback) => callback(),
             None => false,
         }
