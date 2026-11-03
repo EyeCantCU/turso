@@ -2465,6 +2465,14 @@ impl Connection {
         // while statements are active — same rule as PRAGMA wal_checkpoint.
         // The guard also rejects new statements until the checkpoint finishes
         // and cleans up pager checkpoint state if we bail out mid-flight.
+        if matches!(mode, CheckpointMode::Noop) {
+            let pager = self.pager.load();
+            if !pager.has_wal() {
+                return Ok(CheckpointResult::new(0, 0, 0));
+            }
+            let (log, backfilled) = pager.wal_noop_checkpoint_info()?;
+            return Ok(CheckpointResult::new(log, backfilled, backfilled));
+        }
         let _checkpoint_guard = self.begin_explicit_checkpoint(self.pager.load().clone(), false)?;
         if let Some(mv_store) = self.mv_store().as_ref() {
             let mode = if self.experimental_mvcc_passive_checkpoint_enabled() {

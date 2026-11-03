@@ -172,6 +172,8 @@ pub enum CheckpointMode {
     /// Extra parameter can be set in order to perform conditional TRUNCATE: database will be checkpointed and truncated only if max_frames equals to the parameter value
     /// this behaviour used by sync-engine which consolidate WAL before checkpoint and needs to be sure that no frames will be missed
     Truncate { upper_bound_inclusive: Option<u64> },
+    /// Report the WAL state without checkpointing (SQLite 3.51 SQLITE_CHECKPOINT_NOOP).
+    Noop,
 }
 
 impl CheckpointMode {
@@ -1136,7 +1138,8 @@ impl WalCoordination for InProcessWalCoordination {
             return Err(LimboError::Busy);
         }
         match mode {
-            CheckpointMode::Passive { .. } => {
+            // Noop never reaches here (op_checkpoint answers it); lock like Passive.
+            CheckpointMode::Passive { .. } | CheckpointMode::Noop => {
                 if !self.try_read_mark_exclusive(0) {
                     self.unlock_checkpoint_lock();
                     tracing::trace!("CheckpointGuard: read0 lock failed, returning Busy");
@@ -2216,7 +2219,7 @@ impl WalCoordination for ShmWalCoordination {
             return Err(LimboError::Busy);
         }
         match mode {
-            CheckpointMode::Passive { .. } => {
+            CheckpointMode::Passive { .. } | CheckpointMode::Noop => {
                 if !self.fallback.try_read_mark_exclusive(0) {
                     self.fallback.unlock_checkpoint_lock();
                     if needs_writer {

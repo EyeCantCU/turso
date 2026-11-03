@@ -1001,12 +1001,15 @@ fn query_pragma(
             let passive_allowed = connection
                 .mv_store_for_db(database_id)
                 .is_none_or(|mv_store| mv_store.uses_passive_checkpoint());
-            let mode = match value {
+            // Like SQLite, an unrecognized mode name means the default mode.
+            let named_mode = match value {
                 Some(ast::Expr::Name(name)) => {
-                    let mode_name = normalize_ident(name.as_str());
-                    let mode = CheckpointMode::from_str(&mode_name).map_err(|e| {
-                        LimboError::ParseError(format!("Unknown Checkpoint Mode: {e}"))
-                    })?;
+                    CheckpointMode::from_str(&normalize_ident(name.as_str())).ok()
+                }
+                _ => None,
+            };
+            let mode = match named_mode {
+                Some(mode) => {
                     if matches!(mode, CheckpointMode::Passive { .. }) && !passive_allowed {
                         return Err(LimboError::InvalidArgument(
                             "PASSIVE checkpoint requires experimental_mvcc_passive_checkpoint"

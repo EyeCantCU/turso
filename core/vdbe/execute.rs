@@ -584,6 +584,14 @@ pub fn op_checkpoint(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
+    if matches!(checkpoint_mode, CheckpointMode::Noop) {
+        let (log, backfilled) = pager.wal_noop_checkpoint_info()?;
+        state.registers[*dest].set_int(0);
+        state.registers[*dest + 1].set_int(log as i64);
+        state.registers[*dest + 2].set_int(backfilled as i64);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
     if state.explicit_checkpoint_guard.is_none() {
         // No exemption for nested statements: nothing in the engine prepares
         // wal_checkpoint as a nested helper (VACUUM checkpoints through
