@@ -46,11 +46,11 @@ pub(crate) struct Writer<'a> {
 }
 
 impl<'a> Writer<'a> {
-    pub(crate) fn new(t: &'a Rtree, conn: &Arc<Connection>) -> Result<Self> {
-        let node_size = t.node_size(conn)?;
+    pub(crate) fn new(t: &'a Rtree, stmts: Stmts<{ sql::COUNT }>) -> Result<Self> {
+        let node_size = t.node_size(&stmts.conn)?;
         Ok(Self {
             t,
-            stmts: Stmts::new(conn.clone()),
+            stmts,
             node_size,
             nodes: Vec::new(),
             free: Vec::new(),
@@ -826,6 +826,10 @@ impl<'a> Writer<'a> {
         self.node_release(Some(root))
     }
 
+    pub(crate) fn into_stmts(self) -> Stmts<{ sql::COUNT }> {
+        self.stmts
+    }
+
     /// Inserts `cell` as a new leaf entry, choosing a rowid when it has none.
     pub(crate) fn insert(&mut self, cell: &mut Cell, have_rowid: bool) -> Result<i64> {
         if !have_rowid {
@@ -871,13 +875,12 @@ const ON_CONFLICT_REPLACE: u8 = 5;
 /// then the columns; a DELETE has just the old rowid and NULL.
 pub(crate) fn update(
     t: &Rtree,
-    conn: &Arc<Connection>,
+    w: &mut Writer,
     args: &[Value],
     on_conflict: u8,
 ) -> Result<Option<i64>> {
     debug_assert!(t.kind != RtreeKind::Geopoly);
     let n_data = if args.len() == 2 { 1 } else { args.len() };
-    let mut w = Writer::new(t, conn)?;
     let mut cell = Cell::default();
     let mut have_rowid = false;
     let result = (|| -> Result<Option<i64>> {
@@ -935,7 +938,9 @@ pub(crate) fn update(
     })();
     match result {
         // With OR IGNORE, SQLite skips a row that fails a constraint.
-        Err(LimboError::Constraint(_)) if on_conflict == ON_CONFLICT_IGNORE => Ok(None),
+        Err(LimboError::Constraint(_)) if on_conflict == ON_CONFLICT_IGNORE => {
+            Err(LimboError::RaiseIgnore)
+        }
         r => r,
     }
 }

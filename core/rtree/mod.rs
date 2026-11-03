@@ -411,7 +411,13 @@ impl VirtualTableModule for RtreeModule {
             t.create_shadow_tables(conn, node_size)?;
             t.node_size.store(node_size as i32, Ordering::Relaxed);
         }
-        Ok((RtreeTable { t: Arc::new(t) }, schema))
+        Ok((
+            RtreeTable {
+                t: Arc::new(t),
+                stmts: None,
+            },
+            schema,
+        ))
     }
 
     fn innocuous(&self) -> bool {
@@ -419,9 +425,17 @@ impl VirtualTableModule for RtreeModule {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct RtreeTable {
     t: Arc<Rtree>,
+    /// Shadow-table statements kept between xUpdate calls of a transaction,
+    /// with the schema version they were prepared for.
+    stmts: Option<(u32, shadow::Stmts<{ sql::COUNT }>)>,
+}
+
+impl std::fmt::Debug for RtreeTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RtreeTable").field("t", &self.t).finish()
+    }
 }
 
 impl VirtualTable for RtreeTable {
@@ -452,15 +466,37 @@ impl VirtualTable for RtreeTable {
         args: Vec<Value>,
         on_conflict: u8,
     ) -> Result<Box<dyn TableUpdate>> {
-        let rowid = if self.t.kind == RtreeKind::Geopoly {
-            geopoly::update(&self.t, connection, &args, on_conflict)?
-        } else {
-            tree::update(&self.t, connection, &args, on_conflict)?
+        let version = connection.schema.read().schema_version;
+        let stmts = match self.stmts.take() {
+            Some((v, stmts)) if v == version && Arc::ptr_eq(&stmts.conn, connection) => stmts,
+            _ => shadow::Stmts::new(connection.clone()),
         };
-        Ok(Box::new(DoneUpdate(rowid)))
+        let mut w = tree::Writer::new(&self.t, stmts)?;
+        let rowid = if self.t.kind == RtreeKind::Geopoly {
+            geopoly::update(&self.t, &mut w, &args, on_conflict)
+        } else {
+            tree::update(&self.t, &mut w, &args, on_conflict)
+        };
+        if connection.schema.read().schema_version == version {
+            self.stmts = Some((version, w.into_stmts()));
+        }
+        Ok(Box::new(DoneUpdate(rowid?)))
+    }
+
+    // The cached statements hold the connection, so they go at the end of
+    // every transaction.
+    fn commit(&mut self) -> Result<()> {
+        self.stmts = None;
+        Ok(())
+    }
+
+    fn rollback(&mut self) -> Result<()> {
+        self.stmts = None;
+        Ok(())
     }
 
     fn destroy_with_connection(&mut self, connection: &Arc<Connection>) -> Result<()> {
+        self.stmts = None;
         shadow::execute_batch(
             connection,
             &[
@@ -472,6 +508,7 @@ impl VirtualTable for RtreeTable {
     }
 
     fn rename_with_connection(&mut self, connection: &Arc<Connection>, name: &str) -> Result<()> {
+        self.stmts = None;
         let rename = |suffix: &str| {
             format!(
                 "ALTER TABLE {} RENAME TO {}",

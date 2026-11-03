@@ -2517,6 +2517,10 @@ impl Connection {
         if self.is_closed() {
             return Ok(());
         }
+        // Virtual tables still in a transaction get xRollback, as in SQLite.
+        if let Err(e) = crate::vdbe::execute::vtab_rollback_all(self) {
+            tracing::debug!("rolling back virtual tables on close: {e}");
+        }
         self.closed.store(true, Ordering::SeqCst);
         let pager = self.pager.load();
 

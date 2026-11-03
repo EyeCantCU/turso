@@ -1660,6 +1660,10 @@ pub fn op_vupdate(
             state.record_statement_change();
             state.pc += 1;
         }
+        // The module skipped the row under OR IGNORE: not a change.
+        Err(e) if matches!(*e, LimboError::RaiseIgnore) => {
+            state.pc += 1;
+        }
         Err(e)
             if matches!(
                 *e,

@@ -905,12 +905,11 @@ pub(crate) fn filter_constraints(idx_num: i32, arg: &Value) -> Result<Vec<Constr
 /// xUpdate of geopoly.c, with turso's argument layout.
 pub(crate) fn update(
     t: &Rtree,
-    conn: &Arc<Connection>,
+    w: &mut Writer,
     args: &[Value],
     on_conflict: u8,
 ) -> Result<Option<i64>> {
     let n_data = if args.len() == 2 { 1 } else { args.len() };
-    let mut w = Writer::new(t, conn)?;
     let old_valid = !matches!(args[0], Value::Null);
     let old_rowid = if old_valid { value_int64(&args[0]) } else { 0 };
     let new_valid = n_data > 1 && !matches!(args[1], Value::Null);
@@ -962,7 +961,7 @@ pub(crate) fn update(
         Ok(if old_valid { None } else { rowid })
     })();
     match result {
-        Err(LimboError::Constraint(_)) if on_conflict == 4 => Ok(None),
+        Err(LimboError::Constraint(_)) if on_conflict == 4 => Err(LimboError::RaiseIgnore),
         r => r,
     }
 }
