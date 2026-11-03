@@ -389,7 +389,7 @@ fn pid_is_alive(pid: u32) -> bool {
 }
 
 /// Serializable snapshot of the authoritative shared WAL coordination state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct SharedWalCoordinationHeader {
     pub max_frame: u64,
     pub nbackfills: u64,

@@ -1692,24 +1692,6 @@ impl ShmWalCoordination {
         self.sync_authority_frames_from_local();
     }
 
-    /// On an exclusive open, whether the WAL file is too short to hold the
-    /// frames the persisted authority claims.
-    fn wal_file_lacks_authority_frames(
-        &self,
-        authority_snapshot: SharedWalCoordinationHeader,
-    ) -> bool {
-        if self.authority.open_mode() != SharedWalCoordinationOpenMode::Exclusive
-            || authority_snapshot.max_frame == 0
-        {
-            return false;
-        }
-        let Ok(size) = self.fallback.wal_file().and_then(|file| file.size()) else {
-            return false;
-        };
-        let frame_size = WAL_FRAME_HEADER_SIZE as u64 + authority_snapshot.page_size as u64;
-        size < WAL_HEADER_SIZE as u64 + authority_snapshot.max_frame * frame_size
-    }
-
     fn local_scan_cannot_disprove_zero_frame_authority(
         authority_snapshot: SharedWalCoordinationHeader,
         local_snapshot: SharedWalCoordinationHeader,
@@ -1846,13 +1828,6 @@ impl ShmWalCoordination {
             .loaded_from_disk_scan
             .load(Ordering::Acquire);
         if Self::authority_is_uninitialized(snapshot) {
-            self.sync_authority_from_local();
-            self.sync_authority_frames_from_local();
-        } else if self.wal_file_lacks_authority_frames(snapshot) {
-            // The WAL was truncated or removed while no process had it open.
-            self.authority.repair_transient_state_for_exclusive_open();
-            self.authority
-                .discard_durable_frame_index_for_exclusive_rebuild();
             self.sync_authority_from_local();
             self.sync_authority_frames_from_local();
         } else if local_wal_view_loaded_from_disk
@@ -5884,6 +5859,19 @@ impl WalFileShared {
                     ?reason,
                     "rebuilding WAL state from disk because persisted authority is not provably reusable"
                 );
+                let frame_size = WAL_FRAME_HEADER_SIZE as u64 + snapshot.page_size as u64;
+                if authority.open_mode() == SharedWalCoordinationOpenMode::Exclusive
+                    && wal_size < WAL_HEADER_SIZE as u64 + snapshot.max_frame * frame_size
+                {
+                    // The WAL lost frames while no process had it open (e.g. it
+                    // was deleted): the persisted authority describes nothing
+                    // on disk, so let the WAL scan seed it afresh.
+                    authority.discard_durable_frame_index_for_exclusive_rebuild();
+                    authority.install_snapshot(SharedWalCoordinationHeader {
+                        reader_slot_count: snapshot.reader_slot_count,
+                        ..Default::default()
+                    });
+                }
                 return sqlite3_ondisk::build_shared_wal(&file, io);
             }
         }
