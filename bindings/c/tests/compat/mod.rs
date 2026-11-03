@@ -3986,4 +3986,77 @@ mod tests {
             );
         }
     }
+
+    /// Steps `sql` to completion; returns (rows, column count, first column of the first row).
+    unsafe fn av_run(db: *mut sqlite3, sql: &std::ffi::CStr) -> (i32, i32, i64) {
+        let mut stmt = ptr::null_mut();
+        assert_eq!(
+            sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut()),
+            SQLITE_OK,
+            "{sql:?}"
+        );
+        let (mut rows, mut first) = (0, 0);
+        loop {
+            match sqlite3_step(stmt) {
+                SQLITE_ROW => {
+                    if rows == 0 && sqlite3_column_count(stmt) > 0 {
+                        first = sqlite3_column_int(stmt, 0);
+                    }
+                    rows += 1;
+                }
+                rc => {
+                    assert_eq!(rc, SQLITE_DONE, "{sql:?}");
+                    break;
+                }
+            }
+        }
+        let columns = sqlite3_column_count(stmt);
+        assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+        (rows, columns, first)
+    }
+
+    #[test]
+    fn test_incremental_vacuum_returns_a_row_per_page() {
+        unsafe {
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+            av_run(db, c"PRAGMA auto_vacuum = INCREMENTAL");
+            av_run(db, c"CREATE TABLE t(x)");
+            av_run(
+                db,
+                c"WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 40) \
+                  INSERT INTO t SELECT randomblob(2000) FROM n",
+            );
+            av_run(db, c"DELETE FROM t");
+            assert_eq!(av_run(db, c"PRAGMA auto_vacuum").2, 2);
+            let free = av_run(db, c"PRAGMA freelist_count").2;
+            assert!(free > 3, "freelist_count {free}");
+
+            // One empty row per page given back.
+            assert_eq!(av_run(db, c"PRAGMA incremental_vacuum(3)"), (3, 0, 0));
+            assert_eq!(av_run(db, c"PRAGMA freelist_count").2, free - 3);
+            assert_eq!(av_run(db, c"PRAGMA incremental_vacuum").0 as i64, free - 3);
+            assert_eq!(av_run(db, c"PRAGMA freelist_count").2, 0);
+            assert_eq!(av_run(db, c"PRAGMA incremental_vacuum").0, 0);
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"PRAGMA integrity_check".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let text = std::ffi::CStr::from_ptr(sqlite3_column_text(stmt, 0));
+            assert_eq!(text.to_str().unwrap(), "ok");
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
 }
