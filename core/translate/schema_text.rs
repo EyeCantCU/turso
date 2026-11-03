@@ -263,10 +263,13 @@ fn significant_tokens(sql: &str) -> Option<Vec<Tok>> {
     (end == sql.len()).then_some(toks)
 }
 
-/// Where each column definition of a `CREATE TABLE` text starts, with the
-/// `,` before it, and the offset SQLite adds new columns at: the `,` before
-/// the table constraints, or else the closing `)`.
-fn column_layout(sql: &str) -> Option<(Vec<(usize, Option<usize>)>, usize)> {
+/// The start of a column definition, and of the `,` before it.
+type ColumnStart = (usize, Option<usize>);
+
+/// Where each column definition of a `CREATE TABLE` text starts, and the
+/// offset SQLite adds new columns at: the `,` before the table constraints,
+/// or else the closing `)`.
+fn column_layout(sql: &str) -> Option<(Vec<ColumnStart>, usize)> {
     let toks = significant_tokens(sql)?;
     let lp = toks.iter().position(|t| t.ty == TokenType::TK_LP)?;
     let mut columns = vec![(toks.get(lp + 1)?.start, None)];

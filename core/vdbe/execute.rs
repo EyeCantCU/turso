@@ -12376,7 +12376,7 @@ pub fn op_function(
             if let (Some(new_sql), "table") = (&new_sql, entry_type.as_str()) {
                 state
                     .altered_table_sql
-                    .push((name_for_sql_cache.clone(), new_sql.clone()));
+                    .push((name_for_sql_cache, new_sql.clone()));
             }
 
             state.registers[*dest].set_value(r#type.clone());
