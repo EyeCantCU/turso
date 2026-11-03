@@ -132,545 +132,521 @@ pub fn bind_and_rewrite_expr<'a>(
             result_columns,
             resolver,
             binding_behavior,
-            None,
         );
     }
-    // With an authorizer, ask once per column reference, as SQLite does
-    // while resolving names.
+    // With an authorizer, ask once per column reference this binding
+    // resolved, as SQLite does while resolving names.
+    let before = crate::authorizer::column_refs(top_level_expr);
     let mut referenced_tables = referenced_tables;
-    let mut bound = Vec::new();
     bind_and_rewrite_expr_inner(
         top_level_expr,
         referenced_tables.as_deref_mut(),
         result_columns,
         resolver,
         binding_behavior,
-        Some(&mut bound),
     )?;
     if let Some(tables) = referenced_tables {
+        let bound = crate::authorizer::new_column_refs(&before, top_level_expr);
         crate::authorizer::authorize_column_reads(resolver, tables, top_level_expr, &bound)?;
     }
     Ok(())
 }
 
-/// `bound` collects the columns each name was bound to, in order.
 fn bind_and_rewrite_expr_inner<'a>(
     top_level_expr: &mut ast::Expr,
     mut referenced_tables: Option<&'a mut TableReferences>,
     result_columns: Option<&'a [ResultSetColumn]>,
     resolver: &Resolver<'_>,
     binding_behavior: BindingBehavior,
-    mut bound: Option<&mut Vec<(ast::TableInternalId, Option<usize>)>>,
 ) -> Result<()> {
     walk_expr_mut(
         top_level_expr,
         &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
-            let names_column = bound.is_some()
-                && matches!(
-                    expr,
-                    Expr::Id(_) | Expr::Qualified(..) | Expr::DoublyQualified(..)
-                );
-            let control = (|expr: &mut ast::Expr| -> Result<WalkControl> {
-                match expr {
-                    Expr::Id(id) => {
-                        crate::stack::trace_stack!("bind_id");
-                        let Some(referenced_tables) = &mut referenced_tables else {
-                            if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
-                                return Ok(WalkControl::Continue);
-                            }
-                            crate::bail_parse_error!("no such column: {}", id.as_str());
-                        };
-                        let normalized_id = normalize_ident(id.as_str());
+            match expr {
+                Expr::Id(id) => {
+                    crate::stack::trace_stack!("bind_id");
+                    let Some(referenced_tables) = &mut referenced_tables else {
+                        if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
+                            return Ok(WalkControl::Continue);
+                        }
+                        crate::bail_parse_error!("no such column: {}", id.as_str());
+                    };
+                    let normalized_id = normalize_ident(id.as_str());
 
-                        if binding_behavior == BindingBehavior::TryResultColumnsFirst {
-                            if let Some(result_columns) = result_columns {
-                                for result_column in result_columns.iter() {
-                                    if let Some(alias) = &result_column.alias {
-                                        if alias.eq_ignore_ascii_case(&normalized_id) {
-                                            *expr = result_column.expr.clone();
-                                            return Ok(WalkControl::Continue);
-                                        }
+                    if binding_behavior == BindingBehavior::TryResultColumnsFirst {
+                        if let Some(result_columns) = result_columns {
+                            for result_column in result_columns.iter() {
+                                if let Some(alias) = &result_column.alias {
+                                    if alias.eq_ignore_ascii_case(&normalized_id) {
+                                        *expr = result_column.expr.clone();
+                                        return Ok(WalkControl::Continue);
                                     }
                                 }
                             }
-                        }
-                        let joined_tables = referenced_tables.joined_tables();
-                        // First check joined tables
-                        if let Some(resolved_column) =
-                            resolve_unqualified_column(joined_tables, id.as_str())?
-                        {
-                            *expr = resolved_column.expr;
-                            // FULL JOIN can make the merged value read several table columns.
-                            for (table_id, column_index) in resolved_column.source_columns {
-                                referenced_tables.mark_column_used(table_id, column_index);
-                            }
-                            return Ok(WalkControl::Continue);
-                        }
-
-                        // No real column matched. SQLite now tries rowid names before outer scopes.
-                        for joined_table in joined_tables.iter() {
-                            if let Table::BTree(btree) = &joined_table.table {
-                                if let Some(row_id_expr) = parse_row_id(
-                                    &normalized_id,
-                                    joined_tables[0].internal_id,
-                                    || joined_tables.len() != 1,
-                                )? {
-                                    if !btree.has_rowid {
-                                        crate::bail_parse_error!("no such column: {}", id.as_str());
-                                    }
-                                    *expr = row_id_expr;
-                                    return Ok(WalkControl::Continue);
-                                }
-                            } else if let Table::Virtual(_) = &joined_table.table {
-                                if let Some(row_id_expr) = parse_row_id(
-                                    &normalized_id,
-                                    joined_tables[0].internal_id,
-                                    || joined_tables.len() != 1,
-                                )? {
-                                    *expr = row_id_expr;
-                                    return Ok(WalkControl::Continue);
-                                }
-                            }
-                        }
-
-                        // Then check outer query references, if we still didn't find something.
-                        // Normally finding multiple matches for a non-qualified column is an error (column x is ambiguous)
-                        // but in the case of subqueries, the inner query takes precedence.
-                        // For example:
-                        // SELECT * FROM t WHERE x = (SELECT x FROM t2)
-                        // In this case, there is no ambiguity:
-                        // - x in the outer query refers to t.x,
-                        // - x in the inner query refers to t2.x.
-                        //
-                        // Ambiguity is only checked within the same scope depth. Once a match
-                        // is found at depth N, deeper scopes (N+1, N+2, ...) are not checked.
-                        if let Some(resolved_column) =
-                            resolve_unqualified_outer_column(referenced_tables, &normalized_id)?
-                        {
-                            *expr = resolved_column.expr;
-                            for (table_id, column_index) in resolved_column.source_columns {
-                                referenced_tables.mark_column_used(table_id, column_index);
-                            }
-                            return Ok(WalkControl::Continue);
-                        }
-
-                        if binding_behavior == BindingBehavior::TryCanonicalColumnsFirst {
-                            if let Some(result_columns) = result_columns {
-                                for result_column in result_columns.iter() {
-                                    if let Some(alias) = &result_column.alias {
-                                        if alias.eq_ignore_ascii_case(&normalized_id) {
-                                            *expr = result_column.expr.clone();
-                                            return Ok(WalkControl::Continue);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // SQLite DQS misfeature: double-quoted identifiers fall back to string literals
-                        // only when DQS is enabled for DML statements
-                        if id.quoted_with('"') && resolver.dqs_dml.is_enabled() {
-                            *expr = Expr::Literal(ast::Literal::String(id.as_literal()));
-                            return Ok(WalkControl::Continue);
-                        } else {
-                            crate::bail_parse_error!("no such column: {}", id.as_str())
                         }
                     }
-                    Expr::Qualified(tbl, id) => {
-                        crate::stack::trace_stack!("bind_qualified");
-                        // In SQLite, a qualifier without the requested column does
-                        // not hide a matching column in an outer scope.
-                        tracing::debug!("bind_and_rewrite_expr({:?}, {:?})", tbl, id);
-                        let Some(referenced_tables) = &mut referenced_tables else {
-                            if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
+                    let joined_tables = referenced_tables.joined_tables();
+                    // First check joined tables
+                    if let Some(resolved_column) =
+                        resolve_unqualified_column(joined_tables, id.as_str())?
+                    {
+                        *expr = resolved_column.expr;
+                        // FULL JOIN can make the merged value read several table columns.
+                        for (table_id, column_index) in resolved_column.source_columns {
+                            referenced_tables.mark_column_used(table_id, column_index);
+                        }
+                        return Ok(WalkControl::Continue);
+                    }
+
+                    // No real column matched. SQLite now tries rowid names before outer scopes.
+                    for joined_table in joined_tables.iter() {
+                        if let Table::BTree(btree) = &joined_table.table {
+                            if let Some(row_id_expr) =
+                                parse_row_id(&normalized_id, joined_tables[0].internal_id, || {
+                                    joined_tables.len() != 1
+                                })?
+                            {
+                                if !btree.has_rowid {
+                                    crate::bail_parse_error!("no such column: {}", id.as_str());
+                                }
+                                *expr = row_id_expr;
                                 return Ok(WalkControl::Continue);
                             }
+                        } else if let Table::Virtual(_) = &joined_table.table {
+                            if let Some(row_id_expr) =
+                                parse_row_id(&normalized_id, joined_tables[0].internal_id, || {
+                                    joined_tables.len() != 1
+                                })?
+                            {
+                                *expr = row_id_expr;
+                                return Ok(WalkControl::Continue);
+                            }
+                        }
+                    }
+
+                    // Then check outer query references, if we still didn't find something.
+                    // Normally finding multiple matches for a non-qualified column is an error (column x is ambiguous)
+                    // but in the case of subqueries, the inner query takes precedence.
+                    // For example:
+                    // SELECT * FROM t WHERE x = (SELECT x FROM t2)
+                    // In this case, there is no ambiguity:
+                    // - x in the outer query refers to t.x,
+                    // - x in the inner query refers to t2.x.
+                    //
+                    // Ambiguity is only checked within the same scope depth. Once a match
+                    // is found at depth N, deeper scopes (N+1, N+2, ...) are not checked.
+                    if let Some(resolved_column) =
+                        resolve_unqualified_outer_column(referenced_tables, &normalized_id)?
+                    {
+                        *expr = resolved_column.expr;
+                        for (table_id, column_index) in resolved_column.source_columns {
+                            referenced_tables.mark_column_used(table_id, column_index);
+                        }
+                        return Ok(WalkControl::Continue);
+                    }
+
+                    if binding_behavior == BindingBehavior::TryCanonicalColumnsFirst {
+                        if let Some(result_columns) = result_columns {
+                            for result_column in result_columns.iter() {
+                                if let Some(alias) = &result_column.alias {
+                                    if alias.eq_ignore_ascii_case(&normalized_id) {
+                                        *expr = result_column.expr.clone();
+                                        return Ok(WalkControl::Continue);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // SQLite DQS misfeature: double-quoted identifiers fall back to string literals
+                    // only when DQS is enabled for DML statements
+                    if id.quoted_with('"') && resolver.dqs_dml.is_enabled() {
+                        *expr = Expr::Literal(ast::Literal::String(id.as_literal()));
+                        return Ok(WalkControl::Continue);
+                    } else {
+                        crate::bail_parse_error!("no such column: {}", id.as_str())
+                    }
+                }
+                Expr::Qualified(tbl, id) => {
+                    crate::stack::trace_stack!("bind_qualified");
+                    // In SQLite, a qualifier without the requested column does
+                    // not hide a matching column in an outer scope.
+                    tracing::debug!("bind_and_rewrite_expr({:?}, {:?})", tbl, id);
+                    let Some(referenced_tables) = &mut referenced_tables else {
+                        if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
+                            return Ok(WalkControl::Continue);
+                        }
+                        crate::bail_parse_error!(
+                            "no such column: {}.{}",
+                            tbl.as_str(),
+                            id.as_str()
+                        );
+                    };
+                    let normalized_table_name = normalize_ident(tbl.as_str());
+                    let normalized_id = normalize_ident(id.as_str());
+
+                    let qualified_match = resolve_qualified_name(
+                        referenced_tables,
+                        resolver,
+                        None,
+                        &normalized_table_name,
+                        &normalized_id,
+                    )?;
+
+                    // --- Error reporting. ---
+                    if matches!(qualified_match, QualifiedNameMatch::NoTable) {
+                        // No scope contains a table with this identifier. Normally we
+                        // report "no such table", but there is one case where SQLite
+                        // reports "no such column" instead: when the identifier names a
+                        // CTE that was preplanned for subquery FROM visibility and kept
+                        // as a definition-only outer ref. The CTE *name* is valid in
+                        // principle; it's the column access through it that isn't,
+                        // because the CTE hasn't been brought into this scope's FROM.
+                        // The `cte_id`/`cte_select` check restricts this to real CTE
+                        // definition refs so any other future use of `cte_definition_only`
+                        // still falls through to "no such table".
+                        let is_definition_only_cte = referenced_tables
+                            .find_outer_query_ref_by_identifier(&normalized_table_name)
+                            .is_some_and(|outer_ref| {
+                                outer_ref.cte_definition_only
+                                    && (outer_ref.cte_id.is_some()
+                                        || outer_ref.cte_select.is_some())
+                            });
+                        if is_definition_only_cte {
                             crate::bail_parse_error!(
                                 "no such column: {}.{}",
                                 tbl.as_str(),
                                 id.as_str()
                             );
-                        };
-                        let normalized_table_name = normalize_ident(tbl.as_str());
-                        let normalized_id = normalize_ident(id.as_str());
+                        }
+                        // Dot-notation fallback for struct/union field access (DuckDB-style precedence).
+                        //
+                        // For `a.b`, resolution order is:
+                        //   1. a=table, b=column       (handled above — if we're here, this failed)
+                        //   2. a=column, b=struct field (handled below)
+                        //
+                        // This means table references always win over struct field access.
+                        // If a table `t` has a struct column also named `t` with field `x`,
+                        // `t.x` resolves as table.column, not column.field. The user can
+                        // disambiguate with an alias: `SELECT s.t.x FROM t AS s`.
+                        //
+                        // We do NOT reject ambiguous schemas at CREATE TABLE time because
+                        // the combinatorial explosion (CREATE TYPE, CREATE TABLE, ALTER TABLE)
+                        // makes that impractical. Deterministic precedence is sufficient.
+                        let field_name = normalize_ident(id.as_str());
+                        if let Some(m) = find_custom_type_column(
+                            referenced_tables,
+                            &normalized_table_name,
+                            resolver,
+                        )? {
+                            *expr = make_field_access_expr(
+                                m.table_id,
+                                m.col_idx,
+                                m.is_rowid_alias,
+                                &field_name,
+                                m.type_def,
+                            );
+                            referenced_tables.mark_column_used(m.table_id, m.col_idx);
+                            return Ok(WalkControl::Continue);
+                        }
+                        crate::bail_parse_error!("no such table: {}", normalized_table_name);
+                    }
+                    match qualified_match {
+                        QualifiedNameMatch::Found(table_id, column) => {
+                            bind_qualified_name(expr, referenced_tables, table_id, column)
+                        }
+                        QualifiedNameMatch::Ambiguous => crate::bail_parse_error!(
+                            "ambiguous column name: {}.{}",
+                            tbl.as_str(),
+                            id.as_str()
+                        ),
+                        QualifiedNameMatch::NoColumn => crate::bail_parse_error!(
+                            "no such column: {}.{}",
+                            tbl.as_str(),
+                            id.as_str()
+                        ),
+                        QualifiedNameMatch::NoTable => unreachable!("handled above"),
+                    }
+                    return Ok(WalkControl::Continue);
+                }
+                Expr::DoublyQualified(db_name, tbl_name, col_name) => {
+                    crate::stack::trace_stack!("bind_doubly_qualified");
+                    // Clone the names upfront so we can reassign *expr later
+                    // without lifetime conflicts.
+                    let db_name_str = db_name.as_str().to_string();
+                    let tbl_name_str = tbl_name.as_str().to_string();
+                    let col_name_str = col_name.as_str().to_string();
+                    let tbl_name_clone = tbl_name.clone();
+                    let db_name_clone = db_name.clone();
 
-                        let qualified_match = resolve_qualified_name(
+                    let Some(referenced_tables) = &mut referenced_tables else {
+                        if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
+                            return Ok(WalkControl::Continue);
+                        }
+                        crate::bail_parse_error!(
+                            "no such column: {}.{}.{}",
+                            db_name_str,
+                            tbl_name_str,
+                            col_name_str
+                        );
+                    };
+                    let normalized_col_name = normalize_ident(&col_name_str);
+
+                    // DoublyQualified: `a.b.c` — DuckDB-style precedence:
+                    //   1. a=database, b=table, c=column     (tried first)
+                    //   2. a=table,    b=column, c=struct field  (fallback)
+                    //
+                    // Same principle as Qualified: schema-level references always win.
+                    let qualified_name = ast::QualifiedName {
+                        namespace: Some(db_name_clone),
+                        name: tbl_name_clone,
+                        alias: None,
+                    };
+                    let db_resolution = resolver.resolve_namespace(&qualified_name);
+
+                    if let Ok(namespace) = db_resolution.as_ref() {
+                        match resolve_qualified_name(
                             referenced_tables,
                             resolver,
-                            None,
-                            &normalized_table_name,
-                            &normalized_id,
-                        )?;
-
-                        // --- Error reporting. ---
-                        if matches!(qualified_match, QualifiedNameMatch::NoTable) {
-                            // No scope contains a table with this identifier. Normally we
-                            // report "no such table", but there is one case where SQLite
-                            // reports "no such column" instead: when the identifier names a
-                            // CTE that was preplanned for subquery FROM visibility and kept
-                            // as a definition-only outer ref. The CTE *name* is valid in
-                            // principle; it's the column access through it that isn't,
-                            // because the CTE hasn't been brought into this scope's FROM.
-                            // The `cte_id`/`cte_select` check restricts this to real CTE
-                            // definition refs so any other future use of `cte_definition_only`
-                            // still falls through to "no such table".
-                            let is_definition_only_cte = referenced_tables
-                                .find_outer_query_ref_by_identifier(&normalized_table_name)
-                                .is_some_and(|outer_ref| {
-                                    outer_ref.cte_definition_only
-                                        && (outer_ref.cte_id.is_some()
-                                            || outer_ref.cte_select.is_some())
-                                });
-                            if is_definition_only_cte {
-                                crate::bail_parse_error!(
-                                    "no such column: {}.{}",
-                                    tbl.as_str(),
-                                    id.as_str()
-                                );
-                            }
-                            // Dot-notation fallback for struct/union field access (DuckDB-style precedence).
-                            //
-                            // For `a.b`, resolution order is:
-                            //   1. a=table, b=column       (handled above — if we're here, this failed)
-                            //   2. a=column, b=struct field (handled below)
-                            //
-                            // This means table references always win over struct field access.
-                            // If a table `t` has a struct column also named `t` with field `x`,
-                            // `t.x` resolves as table.column, not column.field. The user can
-                            // disambiguate with an alias: `SELECT s.t.x FROM t AS s`.
-                            //
-                            // We do NOT reject ambiguous schemas at CREATE TABLE time because
-                            // the combinatorial explosion (CREATE TYPE, CREATE TABLE, ALTER TABLE)
-                            // makes that impractical. Deterministic precedence is sufficient.
-                            let field_name = normalize_ident(id.as_str());
-                            if let Some(m) = find_custom_type_column(
-                                referenced_tables,
-                                &normalized_table_name,
-                                resolver,
-                            )? {
-                                *expr = make_field_access_expr(
-                                    m.table_id,
-                                    m.col_idx,
-                                    m.is_rowid_alias,
-                                    &field_name,
-                                    m.type_def,
-                                );
-                                referenced_tables.mark_column_used(m.table_id, m.col_idx);
-                                return Ok(WalkControl::Continue);
-                            }
-                            crate::bail_parse_error!("no such table: {}", normalized_table_name);
-                        }
-                        match qualified_match {
+                            Some(*namespace),
+                            &tbl_name_str,
+                            &normalized_col_name,
+                        )? {
                             QualifiedNameMatch::Found(table_id, column) => {
-                                bind_qualified_name(expr, referenced_tables, table_id, column)
-                            }
-                            QualifiedNameMatch::Ambiguous => crate::bail_parse_error!(
-                                "ambiguous column name: {}.{}",
-                                tbl.as_str(),
-                                id.as_str()
-                            ),
-                            QualifiedNameMatch::NoColumn => crate::bail_parse_error!(
-                                "no such column: {}.{}",
-                                tbl.as_str(),
-                                id.as_str()
-                            ),
-                            QualifiedNameMatch::NoTable => unreachable!("handled above"),
-                        }
-                        return Ok(WalkControl::Continue);
-                    }
-                    Expr::DoublyQualified(db_name, tbl_name, col_name) => {
-                        crate::stack::trace_stack!("bind_doubly_qualified");
-                        // Clone the names upfront so we can reassign *expr later
-                        // without lifetime conflicts.
-                        let db_name_str = db_name.as_str().to_string();
-                        let tbl_name_str = tbl_name.as_str().to_string();
-                        let col_name_str = col_name.as_str().to_string();
-                        let tbl_name_clone = tbl_name.clone();
-                        let db_name_clone = db_name.clone();
-
-                        let Some(referenced_tables) = &mut referenced_tables else {
-                            if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
+                                bind_qualified_name(expr, referenced_tables, table_id, column);
                                 return Ok(WalkControl::Continue);
                             }
-                            crate::bail_parse_error!(
+                            QualifiedNameMatch::NoColumn => crate::bail_parse_error!(
                                 "no such column: {}.{}.{}",
                                 db_name_str,
                                 tbl_name_str,
                                 col_name_str
-                            );
-                        };
-                        let normalized_col_name = normalize_ident(&col_name_str);
-
-                        // DoublyQualified: `a.b.c` — DuckDB-style precedence:
-                        //   1. a=database, b=table, c=column     (tried first)
-                        //   2. a=table,    b=column, c=struct field  (fallback)
-                        //
-                        // Same principle as Qualified: schema-level references always win.
-                        let qualified_name = ast::QualifiedName {
-                            namespace: Some(db_name_clone),
-                            name: tbl_name_clone,
-                            alias: None,
-                        };
-                        let db_resolution = resolver.resolve_namespace(&qualified_name);
-
-                        if let Ok(namespace) = db_resolution.as_ref() {
-                            match resolve_qualified_name(
-                                referenced_tables,
-                                resolver,
-                                Some(*namespace),
-                                &tbl_name_str,
-                                &normalized_col_name,
-                            )? {
-                                QualifiedNameMatch::Found(table_id, column) => {
-                                    bind_qualified_name(expr, referenced_tables, table_id, column);
-                                    return Ok(WalkControl::Continue);
-                                }
-                                QualifiedNameMatch::NoColumn => crate::bail_parse_error!(
-                                    "no such column: {}.{}.{}",
-                                    db_name_str,
-                                    tbl_name_str,
-                                    col_name_str
-                                ),
-                                QualifiedNameMatch::Ambiguous => crate::bail_parse_error!(
-                                    "ambiguous column name: {}.{}.{}",
-                                    db_name_str,
-                                    tbl_name_str,
-                                    col_name_str
-                                ),
-                                QualifiedNameMatch::NoTable => {}
-                            }
+                            ),
+                            QualifiedNameMatch::Ambiguous => crate::bail_parse_error!(
+                                "ambiguous column name: {}.{}.{}",
+                                db_name_str,
+                                tbl_name_str,
+                                col_name_str
+                            ),
+                            QualifiedNameMatch::NoTable => {}
                         }
+                    }
 
-                        // Try db.table.column interpretation first. If database resolves AND
-                        // the table+column exist, use that. Otherwise fall through to
-                        // table.column.field for struct/union field access.
-                        let mut resolved_as_db_table_col = false;
-                        if let Ok(namespace) = db_resolution {
-                            let table = resolver.with_schema(namespace.database_id, |schema| {
-                                schema.get_table(namespace.id, &tbl_name_str)
+                    // Try db.table.column interpretation first. If database resolves AND
+                    // the table+column exist, use that. Otherwise fall through to
+                    // table.column.field for struct/union field access.
+                    let mut resolved_as_db_table_col = false;
+                    if let Ok(namespace) = db_resolution {
+                        let table = resolver.with_schema(namespace.database_id, |schema| {
+                            schema.get_table(namespace.id, &tbl_name_str)
+                        });
+
+                        if let Some(table) = table {
+                            let col_idx = table.columns().iter().position(|c| {
+                                c.name.as_ref().is_some_and(|name| {
+                                    name.eq_ignore_ascii_case(&normalized_col_name)
+                                })
                             });
 
-                            if let Some(table) = table {
-                                let col_idx = table.columns().iter().position(|c| {
-                                    c.name.as_ref().is_some_and(|name| {
-                                        name.eq_ignore_ascii_case(&normalized_col_name)
-                                    })
-                                });
+                            if let Some(col_idx) = col_idx {
+                                let col = table.columns().get(col_idx).unwrap();
+                                let is_rowid_alias = col.is_rowid_alias();
+                                let normalized_tbl_name = normalize_ident(&tbl_name_str);
+                                let matching_tbl = referenced_tables
+                                    .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
 
-                                if let Some(col_idx) = col_idx {
-                                    let col = table.columns().get(col_idx).unwrap();
-                                    let is_rowid_alias = col.is_rowid_alias();
-                                    let normalized_tbl_name = normalize_ident(&tbl_name_str);
-                                    let matching_tbl = referenced_tables
-                                        .find_table_and_internal_id_by_identifier(
-                                            &normalized_tbl_name,
-                                        );
-
-                                    if let Some((tbl_id, _)) = matching_tbl {
-                                        *expr = Expr::Column {
-                                            database: None,
-                                            table: tbl_id,
-                                            column: col_idx,
-                                            is_rowid_alias,
-                                        };
-                                        referenced_tables.mark_column_used(tbl_id, col_idx);
-                                        resolved_as_db_table_col = true;
-                                    } else {
-                                        // Table exists in database but not in FROM clause
-                                        return Err(LimboError::ParseError(format!(
+                                if let Some((tbl_id, _)) = matching_tbl {
+                                    *expr = Expr::Column {
+                                        database: None,
+                                        table: tbl_id,
+                                        column: col_idx,
+                                        is_rowid_alias,
+                                    };
+                                    referenced_tables.mark_column_used(tbl_id, col_idx);
+                                    resolved_as_db_table_col = true;
+                                } else {
+                                    // Table exists in database but not in FROM clause
+                                    return Err(LimboError::ParseError(format!(
                                         "table {normalized_tbl_name} is not in FROM clause — \
                                          cross-database column references require the table to be explicitly joined"
                                     )));
-                                    }
                                 }
                             }
                         }
-                        if !resolved_as_db_table_col {
-                            // db.table.column failed — try table.column.field for struct/union
-                            let normalized_tbl_name = normalize_ident(&db_name_str);
-                            let normalized_col = normalize_ident(&tbl_name_str);
-                            let field_name = normalize_ident(&col_name_str);
-                            let matching_tbl = referenced_tables
-                                .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
-                            if let Some((tbl_id, tbl)) = matching_tbl {
-                                let col_idx = tbl.columns().iter().position(|c| {
-                                    c.name
-                                        .as_ref()
-                                        .is_some_and(|n| n.eq_ignore_ascii_case(&normalized_col))
-                                });
-                                if let Some(col_idx) = col_idx {
-                                    let col = &tbl.columns()[col_idx];
-                                    let type_def =
-                                        resolver.schema().get_type_def_unchecked(&col.ty_str);
-                                    let is_struct_or_union = type_def
-                                        .map(|td| td.is_struct() || td.is_union())
-                                        .unwrap_or(false);
-                                    if is_struct_or_union {
-                                        *expr = make_field_access_expr(
-                                            tbl_id,
-                                            col_idx,
-                                            col.is_rowid_alias(),
-                                            &field_name,
-                                            type_def.unwrap(),
-                                        );
-                                        referenced_tables.mark_column_used(tbl_id, col_idx);
-                                        return Ok(WalkControl::Continue);
-                                    } else {
-                                        // Column exists but is not a struct/union type
-                                        return Err(LimboError::ParseError(format!(
+                    }
+                    if !resolved_as_db_table_col {
+                        // db.table.column failed — try table.column.field for struct/union
+                        let normalized_tbl_name = normalize_ident(&db_name_str);
+                        let normalized_col = normalize_ident(&tbl_name_str);
+                        let field_name = normalize_ident(&col_name_str);
+                        let matching_tbl = referenced_tables
+                            .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
+                        if let Some((tbl_id, tbl)) = matching_tbl {
+                            let col_idx = tbl.columns().iter().position(|c| {
+                                c.name
+                                    .as_ref()
+                                    .is_some_and(|n| n.eq_ignore_ascii_case(&normalized_col))
+                            });
+                            if let Some(col_idx) = col_idx {
+                                let col = &tbl.columns()[col_idx];
+                                let type_def =
+                                    resolver.schema().get_type_def_unchecked(&col.ty_str);
+                                let is_struct_or_union = type_def
+                                    .map(|td| td.is_struct() || td.is_union())
+                                    .unwrap_or(false);
+                                if is_struct_or_union {
+                                    *expr = make_field_access_expr(
+                                        tbl_id,
+                                        col_idx,
+                                        col.is_rowid_alias(),
+                                        &field_name,
+                                        type_def.unwrap(),
+                                    );
+                                    referenced_tables.mark_column_used(tbl_id, col_idx);
+                                    return Ok(WalkControl::Continue);
+                                } else {
+                                    // Column exists but is not a struct/union type
+                                    return Err(LimboError::ParseError(format!(
                                         "column '{normalized_col}' is not a STRUCT or UNION type; \
                                          cannot access field '{field_name}'"
                                     )));
-                                    }
                                 }
                             }
-                            // Fallback (3): column.field.subfield for nested struct/union access
-                            // Handles:
-                            //   data.telegram.chat_id — UNION column, variant with struct type
-                            //   data.sub.a            — STRUCT column, struct-typed field, sub-field
-                            let col_name_norm = normalize_ident(&db_name_str);
-                            let mid_name = normalize_ident(&tbl_name_str);
-                            let leaf_field = normalize_ident(&col_name_str);
-                            if let Some((nested_expr, tbl_id, col_idx)) =
-                                try_resolve_nested_field_access(
-                                    referenced_tables,
-                                    &col_name_norm,
-                                    &mid_name,
-                                    &leaf_field,
-                                    resolver,
-                                )?
-                            {
-                                *expr = nested_expr;
-                                referenced_tables.mark_column_used(tbl_id, col_idx);
-                            } else {
-                                return Err(LimboError::ParseError(format!(
-                                    "no such column: {db_name_str}.{tbl_name_str}.{col_name_str}"
-                                )));
-                            }
                         }
-                    }
-                    Expr::FunctionCallStar { name, filter_over } => {
-                        validate_function_tail(
-                            name.as_str(),
-                            0,
-                            filter_over,
-                            false,
-                            &resolver.catalog,
-                        )?;
-                        if crate::authorizer::check_function(resolver, name.as_str())?
-                            == crate::authorizer::Auth::Ignore
+                        // Fallback (3): column.field.subfield for nested struct/union access
+                        // Handles:
+                        //   data.telegram.chat_id — UNION column, variant with struct type
+                        //   data.sub.a            — STRUCT column, struct-typed field, sub-field
+                        let col_name_norm = normalize_ident(&db_name_str);
+                        let mid_name = normalize_ident(&tbl_name_str);
+                        let leaf_field = normalize_ident(&col_name_str);
+                        if let Some((nested_expr, tbl_id, col_idx)) =
+                            try_resolve_nested_field_access(
+                                referenced_tables,
+                                &col_name_norm,
+                                &mid_name,
+                                &leaf_field,
+                                resolver,
+                            )?
                         {
-                            *expr = Expr::Literal(ast::Literal::Null);
-                            return Ok(WalkControl::SkipChildren);
-                        }
-                        // For functions that need star expansion (json_object, jsonb_object),
-                        // expand the * to all columns from the referenced tables as key-value pairs
-                        // This needs to happen during bind/rewrite so WHERE clauses can use these functions
-                        if let Some(referenced_tables) = &mut referenced_tables {
-                            if let Ok(Some(func)) = Func::resolve_function(name.as_str(), 0) {
-                                if func.needs_star_expansion() {
-                                    // Only expand if there are actual tables - otherwise leave as
-                                    // FunctionCallStar so translate_expr can generate the error
-                                    let joined_tables = referenced_tables.joined_tables();
-                                    if !joined_tables.is_empty() {
-                                        // Mark all columns as used so the optimizer doesn't
-                                        // create partial covering indexes that would miss columns
-                                        let joined_tables = referenced_tables.joined_tables_mut();
-                                        for table in joined_tables.iter_mut() {
-                                            for col_idx in 0..table.columns().len() {
-                                                table.mark_column_used(col_idx);
-                                            }
-                                        }
-
-                                        // Build arguments: alternating column_name (as string literal), column_value (as column reference)
-                                        let mut args: Vec<Box<ast::Expr>> = Vec::new();
-
-                                        let joined_tables = referenced_tables.joined_tables();
-                                        for table in joined_tables.iter() {
-                                            for (col_idx, col) in table.columns().iter().enumerate()
-                                            {
-                                                // Skip hidden columns (like rowid in some cases)
-                                                if col.hidden() {
-                                                    continue;
-                                                }
-
-                                                // Add column name as a string literal
-                                                let col_name =
-                                                    col.name.clone().unwrap_or_else(|| {
-                                                        format!("column{}", col_idx + 1)
-                                                    });
-                                                let quoted_col_name = format!("'{col_name}'");
-                                                args.push(Box::new(ast::Expr::Literal(
-                                                    ast::Literal::String(quoted_col_name),
-                                                )));
-
-                                                // Add column reference using Expr::Column
-                                                args.push(Box::new(ast::Expr::Column {
-                                                    database: None,
-                                                    table: table.internal_id,
-                                                    column: col_idx,
-                                                    is_rowid_alias: col.is_rowid_alias(),
-                                                }));
-                                            }
-                                        }
-
-                                        // Replace FunctionCallStar with expanded FunctionCall
-                                        *expr = ast::Expr::FunctionCall {
-                                            name: name.clone(),
-                                            distinctness: None,
-                                            args,
-                                            filter_over: filter_over.clone(),
-                                            order_by: vec![],
-                                            within_group: vec![],
-                                        };
-                                    }
-                                }
-                            }
+                            *expr = nested_expr;
+                            referenced_tables.mark_column_used(tbl_id, col_idx);
+                        } else {
+                            return Err(LimboError::ParseError(format!(
+                                "no such column: {db_name_str}.{tbl_name_str}.{col_name_str}"
+                            )));
                         }
                     }
-                    // Validate struct/union function calls at bind time.
-                    // Principle: compile-time checks belong in the earliest phase that
-                    // has enough context. Binding has the resolver (for custom-types
-                    // gate) and the raw AST args (for arity and literal checks).
-                    // Catching errors here avoids wasting optimizer and translation
-                    // cycles on invalid queries, and keeps the translate_expr match
-                    // arms focused on code generation.
-                    Expr::FunctionCall {
-                        name,
-                        args,
+                }
+                Expr::FunctionCallStar { name, filter_over } => {
+                    validate_function_tail(
+                        name.as_str(),
+                        0,
                         filter_over,
-                        order_by,
-                        ..
-                    } => {
-                        validate_function_tail(
-                            name.as_str(),
-                            args.len(),
-                            filter_over,
-                            !order_by.is_empty(),
-                            &resolver.catalog,
-                        )?;
-                        validate_custom_type_function_call(name.as_str(), args, resolver)?;
-                        if crate::authorizer::check_function(resolver, name.as_str())?
-                            == crate::authorizer::Auth::Ignore
-                        {
-                            *expr = Expr::Literal(ast::Literal::Null);
-                            return Ok(WalkControl::SkipChildren);
+                        false,
+                        &resolver.catalog,
+                    )?;
+                    if crate::authorizer::check_function(resolver, name.as_str())?
+                        == crate::authorizer::Auth::Ignore
+                    {
+                        *expr = Expr::Literal(ast::Literal::Null);
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                    // For functions that need star expansion (json_object, jsonb_object),
+                    // expand the * to all columns from the referenced tables as key-value pairs
+                    // This needs to happen during bind/rewrite so WHERE clauses can use these functions
+                    if let Some(referenced_tables) = &mut referenced_tables {
+                        if let Ok(Some(func)) = Func::resolve_function(name.as_str(), 0) {
+                            if func.needs_star_expansion() {
+                                // Only expand if there are actual tables - otherwise leave as
+                                // FunctionCallStar so translate_expr can generate the error
+                                let joined_tables = referenced_tables.joined_tables();
+                                if !joined_tables.is_empty() {
+                                    // Mark all columns as used so the optimizer doesn't
+                                    // create partial covering indexes that would miss columns
+                                    let joined_tables = referenced_tables.joined_tables_mut();
+                                    for table in joined_tables.iter_mut() {
+                                        for col_idx in 0..table.columns().len() {
+                                            table.mark_column_used(col_idx);
+                                        }
+                                    }
+
+                                    // Build arguments: alternating column_name (as string literal), column_value (as column reference)
+                                    let mut args: Vec<Box<ast::Expr>> = Vec::new();
+
+                                    let joined_tables = referenced_tables.joined_tables();
+                                    for table in joined_tables.iter() {
+                                        for (col_idx, col) in table.columns().iter().enumerate() {
+                                            // Skip hidden columns (like rowid in some cases)
+                                            if col.hidden() {
+                                                continue;
+                                            }
+
+                                            // Add column name as a string literal
+                                            let col_name = col.name.clone().unwrap_or_else(|| {
+                                                format!("column{}", col_idx + 1)
+                                            });
+                                            let quoted_col_name = format!("'{col_name}'");
+                                            args.push(Box::new(ast::Expr::Literal(
+                                                ast::Literal::String(quoted_col_name),
+                                            )));
+
+                                            // Add column reference using Expr::Column
+                                            args.push(Box::new(ast::Expr::Column {
+                                                database: None,
+                                                table: table.internal_id,
+                                                column: col_idx,
+                                                is_rowid_alias: col.is_rowid_alias(),
+                                            }));
+                                        }
+                                    }
+
+                                    // Replace FunctionCallStar with expanded FunctionCall
+                                    *expr = ast::Expr::FunctionCall {
+                                        name: name.clone(),
+                                        distinctness: None,
+                                        args,
+                                        filter_over: filter_over.clone(),
+                                        order_by: vec![],
+                                        within_group: vec![],
+                                    };
+                                }
+                            }
                         }
                     }
-                    _ => {}
                 }
-                Ok(WalkControl::Continue)
-            })(expr)?;
-            if names_column {
-                if let Some(bound) = bound.as_deref_mut() {
-                    match expr {
-                        Expr::Column { table, column, .. } => bound.push((*table, Some(*column))),
-                        Expr::RowId { table, .. } => bound.push((*table, None)),
-                        _ => {}
+                // Validate struct/union function calls at bind time.
+                // Principle: compile-time checks belong in the earliest phase that
+                // has enough context. Binding has the resolver (for custom-types
+                // gate) and the raw AST args (for arity and literal checks).
+                // Catching errors here avoids wasting optimizer and translation
+                // cycles on invalid queries, and keeps the translate_expr match
+                // arms focused on code generation.
+                Expr::FunctionCall {
+                    name,
+                    args,
+                    filter_over,
+                    order_by,
+                    ..
+                } => {
+                    validate_function_tail(
+                        name.as_str(),
+                        args.len(),
+                        filter_over,
+                        !order_by.is_empty(),
+                        &resolver.catalog,
+                    )?;
+                    validate_custom_type_function_call(name.as_str(), args, resolver)?;
+                    if crate::authorizer::check_function(resolver, name.as_str())?
+                        == crate::authorizer::Auth::Ignore
+                    {
+                        *expr = Expr::Literal(ast::Literal::Null);
+                        return Ok(WalkControl::SkipChildren);
                     }
                 }
+                _ => {}
             }
-            Ok(control)
+            Ok(WalkControl::Continue)
         },
     )?;
     Ok(())

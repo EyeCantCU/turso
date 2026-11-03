@@ -158,13 +158,45 @@ pub(crate) fn check_column_read(
     check_read(resolver, &btree.name, &name, database_id)
 }
 
+type ColumnRef = (ast::TableInternalId, Option<usize>);
+
+/// The column references in `expr`, in walk order.
+pub(crate) fn column_refs(expr: &mut ast::Expr) -> Vec<ColumnRef> {
+    use crate::translate::expr::{walk_expr_mut, WalkControl};
+    let mut refs = Vec::new();
+    let _ = walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
+        match e {
+            ast::Expr::Column { table, column, .. } => refs.push((*table, Some(*column))),
+            ast::Expr::RowId { table, .. } => refs.push((*table, None)),
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    });
+    refs
+}
+
+/// The references in `expr` that were not in `before` (by multiplicity).
+pub(crate) fn new_column_refs(before: &[ColumnRef], expr: &mut ast::Expr) -> Vec<ColumnRef> {
+    let mut seen: Vec<ColumnRef> = before.to_vec();
+    column_refs(expr)
+        .into_iter()
+        .filter(|r| match seen.iter().position(|s| s == r) {
+            Some(i) => {
+                seen.swap_remove(i);
+                false
+            }
+            None => true,
+        })
+        .collect()
+}
+
 /// SQLITE_READ for each name just bound to a column (`bound`, in order);
 /// columns the authorizer ignores read as NULL in `expr`.
 pub(crate) fn authorize_column_reads(
     resolver: &Resolver,
     tables: &crate::translate::plan::TableReferences,
     expr: &mut ast::Expr,
-    bound: &[(ast::TableInternalId, Option<usize>)],
+    bound: &[ColumnRef],
 ) -> Result<()> {
     use crate::translate::expr::{walk_expr_mut, WalkControl};
     let mut ignored = Vec::new();
