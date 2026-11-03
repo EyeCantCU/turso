@@ -226,7 +226,14 @@ fn func_param(v: &Value) -> std::result::Result<Option<GeoPoly>, ()> {
                 Ok(None)
             }
         }
-        Value::Text(t) => parse_json(t.as_str().as_bytes()).map(Some).ok_or(()),
+        Value::Text(t) => {
+            let z = t.as_str().as_bytes();
+            // Text that does not open with '[' is not an error in SQLite.
+            if z.iter().copied().find(|&c| !is_space(c)) != Some(b'[') {
+                return Ok(None);
+            }
+            parse_json(z).map(Some).ok_or(())
+        }
         _ => Err(()),
     }
 }

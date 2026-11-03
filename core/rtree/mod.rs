@@ -231,6 +231,25 @@ impl Rtree {
         Ok((t, schema))
     }
 
+    /// A copy of this table under a new name.
+    fn renamed(&self, name: &str) -> Self {
+        let mut t = Rtree {
+            kind: self.kind,
+            db: self.db.clone(),
+            name: name.to_string(),
+            n_dim: self.n_dim,
+            n_dim2: self.n_dim2,
+            bytes_per_cell: self.bytes_per_cell,
+            n_aux: self.n_aux,
+            n_aux_not_null: self.n_aux_not_null,
+            columns: self.columns.clone(),
+            node_size: AtomicI32::new(self.node_size.load(Ordering::Relaxed)),
+            sql: Vec::new(),
+        };
+        t.sql = t.build_sql();
+        t
+    }
+
     fn table(&self, suffix: &str) -> String {
         format!(
             "{}.{}",
@@ -463,7 +482,9 @@ impl VirtualTable for RtreeTable {
         shadow::execute_batch(
             connection,
             &[rename("_node"), rename("_parent"), rename("_rowid")],
-        )
+        )?;
+        self.t = Arc::new(self.t.renamed(name));
+        Ok(())
     }
 }
 
