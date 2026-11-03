@@ -8897,6 +8897,15 @@ pub fn op_agg_inverse(
     }
     let func = func.expect_agg();
 
+    if let AggFunc::External(ext_func) = func {
+        return_if_io!(
+            state,
+            ext_func.inverse_aggregate(&mut state.registers, *acc_reg, *col)
+        );
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
     // Run xInverse to undo a prior xStep when a row leaves the frame
     // from the left. min/max are handled separately using SQLite's
     // sorted-index strategy.
@@ -9488,10 +9497,18 @@ pub fn op_agg_final(
     let func = func.expect_agg();
 
     if let AggFunc::External(ext_func) = func {
-        let value = return_if_io!(
-            state,
-            ext_func.finalize_aggregate(&mut state.registers[acc_reg])
-        );
+        // AggValue reads a window aggregate without consuming its state.
+        let value = if matches!(insn, Insn::AggValue { .. }) && ext_func.is_window_capable() {
+            return_if_io!(
+                state,
+                ext_func.value_aggregate(&mut state.registers[acc_reg])
+            )
+        } else {
+            return_if_io!(
+                state,
+                ext_func.finalize_aggregate(&mut state.registers[acc_reg])
+            )
+        };
         value.check_length_limit()?;
         state.registers[dest_reg].set_value(value);
         state.pc += 1;

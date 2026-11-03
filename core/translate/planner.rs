@@ -799,14 +799,19 @@ fn link_with_window(
     if distinctness.is_distinct() {
         crate::bail_parse_error!("DISTINCT is not supported for window functions");
     }
-    if let AccumulatorFunc::Agg(AggFunc::External(_)) = &func {
-        let name = match expr {
-            Expr::FunctionCall { name, .. } | Expr::FunctionCallStar { name, .. } => name.as_str(),
-            _ => "extension aggregate",
-        };
-        crate::bail_parse_error!(
-            "{name}() is an extension aggregate and cannot be used as a window function"
-        );
+    if let AccumulatorFunc::Agg(AggFunc::External(ext)) = &func {
+        // Only aggregates registered with xValue/xInverse can be windowed.
+        if !ext.is_window_capable() {
+            let name = match expr {
+                Expr::FunctionCall { name, .. } | Expr::FunctionCallStar { name, .. } => {
+                    name.as_str()
+                }
+                _ => "extension aggregate",
+            };
+            crate::bail_parse_error!(
+                "{name}() is an extension aggregate and cannot be used as a window function"
+            );
+        }
     }
     // FILTER decides which input rows contribute to a running aggregate, so
     // it is only meaningful for aggregating window functions. Non-aggregate
@@ -963,6 +968,9 @@ fn resolve_effective_frame(
             WindowFunc::FirstValue | WindowFunc::NthValue | WindowFunc::LastValue
         )
     );
+    // External window aggregates provide xInverse.
+    let supports_sliding = supports_sliding
+        || matches!(func, AccumulatorFunc::Agg(AggFunc::External(ext)) if ext.is_window_capable());
     #[cfg(feature = "json")]
     let supports_sliding = supports_sliding
         || matches!(

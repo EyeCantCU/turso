@@ -96,6 +96,13 @@ impl Deterministic for ExternalFunc {
     }
 }
 
+/// Window-function callbacks of an external aggregate (SQLite's xValue and xInverse).
+#[derive(Debug, Clone, Copy)]
+pub struct ExternalWindowCallbacks {
+    pub value: FinalizeFunction,
+    pub inverse: StepFunction,
+}
+
 #[derive(Debug, Clone)]
 pub enum ExtFunc {
     Scalar {
@@ -117,6 +124,8 @@ pub enum ExtFunc {
         aggregate_destructor: Option<ContextDestructor>,
         value_destructor: Option<ValueDestructor>,
         context_owner: Arc<ExternalContext>,
+        /// xValue/xInverse; present when usable as a window function.
+        window: Option<ExternalWindowCallbacks>,
     },
     NativeScalar {
         arity: crate::native_ext::FunctionArity,
@@ -186,6 +195,17 @@ impl ExtFunc {
         }
     }
 
+    /// Whether this is an external aggregate that also has xValue/xInverse.
+    pub fn is_window_capable(&self) -> bool {
+        matches!(
+            self,
+            Self::Aggregate {
+                window: Some(_),
+                ..
+            }
+        )
+    }
+
     pub fn is_aggregate(&self) -> bool {
         matches!(self, Self::Aggregate { .. } | Self::NativeAggregate { .. })
     }
@@ -201,6 +221,7 @@ impl ExtFunc {
                 aggregate_destructor,
                 value_destructor,
                 context_owner,
+                window,
                 ..
             } => Self::Aggregate {
                 context: *context,
@@ -212,6 +233,7 @@ impl ExtFunc {
                 aggregate_destructor: *aggregate_destructor,
                 value_destructor: *value_destructor,
                 context_owner: context_owner.clone(),
+                window: *window,
             },
             Self::NativeAggregate { function, .. } => Self::NativeAggregate {
                 argc: arg_count as i32,
@@ -269,8 +291,17 @@ impl ExternalFunc {
                 aggregate_destructor,
                 value_destructor,
                 context_owner: ExternalContext::new(context, context_destructor),
+                window: None,
             },
         })
+    }
+
+    /// Makes an external aggregate usable as a window function.
+    pub fn with_window_callbacks(mut self, window: ExternalWindowCallbacks) -> Self {
+        if let ExtFunc::Aggregate { window: w, .. } = &mut self.func {
+            *w = Some(window);
+        }
+        self
     }
 
     pub(crate) fn validate_arg_count(argc: i32) -> crate::Result<()> {

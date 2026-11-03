@@ -841,7 +841,7 @@ impl Value {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct ExternalAggState {
     pub context: usize,
     pub state: *mut AggCtx,
@@ -850,6 +850,41 @@ pub struct ExternalAggState {
     pub finalize_fn: FinalizeFunction,
     pub aggregate_destructor: Option<ContextDestructor>,
     pub value_destructor: Option<ValueDestructor>,
+}
+
+/// The `Copy` parts of an `ExternalAggState` needed to invoke its callbacks.
+#[derive(Clone, Copy)]
+pub struct ExternalAggCall {
+    pub context: usize,
+    pub state: *mut AggCtx,
+    pub argc: usize,
+    pub step_fn: StepFunction,
+    pub finalize_fn: FinalizeFunction,
+    pub value_destructor: Option<ValueDestructor>,
+}
+
+impl ExternalAggState {
+    pub fn call_info(&self) -> ExternalAggCall {
+        ExternalAggCall {
+            context: self.context,
+            state: self.state,
+            argc: self.argc,
+            step_fn: self.step_fn,
+            finalize_fn: self.finalize_fn,
+            value_destructor: self.value_destructor,
+        }
+    }
+}
+
+impl Drop for ExternalAggState {
+    fn drop(&mut self) {
+        if self.state.is_null() {
+            return;
+        }
+        if let Some(destructor) = self.aggregate_destructor {
+            unsafe { destructor(self.state as usize) };
+        }
+    }
 }
 
 /// Please use Display trait for all limbo output so we have single origin of truth
@@ -1095,9 +1130,7 @@ impl AggContext {
             } else {
                 unsafe { final_value.__free_internal_type() };
             }
-            if let Some(aggregate_destructor) = ext_state.aggregate_destructor {
-                unsafe { aggregate_destructor(ext_state.state as usize) };
-            }
+            // Dropping `self` runs the aggregate destructor.
             value
         } else {
             panic!("AggContext::compute_external() expected External, found {self:?}");
