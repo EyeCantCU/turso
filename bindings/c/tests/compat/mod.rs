@@ -1,3 +1,4 @@
+#![allow(clashing_extern_declarations)]
 #![allow(non_camel_case_types)]
 #![allow(dead_code)]
 #![allow(unused_imports)]
@@ -222,6 +223,7 @@ const SQLITE_OPEN_CREATE: i32 = 0x00000004;
 const SQLITE_OPEN_URI: i32 = 0x00000040;
 
 mod config;
+mod errmsg;
 mod misc;
 
 mod tests {
