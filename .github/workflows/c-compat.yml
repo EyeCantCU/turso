@@ -73,6 +73,13 @@ jobs:
         if: runner.os == 'Windows'
         run: cargo test --locked -p turso_sqlite3 --test compat -- --test-threads=1
 
+      - name: Check the drop-in profile unwinds panics
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --locked --profile release-capi -p turso_sqlite3
+          cc bindings/c/tests/panic_unwind.c -o /tmp/panic_unwind -ldl
+          /tmp/panic_unwind target/release-capi/libturso_sqlite3.so
+
       - name: Run C compat C tests linking against real SQLite
         if: runner.os == 'Linux'
         working-directory: bindings/c/tests

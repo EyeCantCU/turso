@@ -1114,6 +1114,33 @@ fn emit_ctas_insert(
     Ok(())
 }
 
+/// True for `CREATE TABLE IF NOT EXISTS` on an existing table or view: a
+/// no-op that needs no write transaction, so it works on read-only databases.
+pub(crate) fn create_table_is_noop(
+    resolver: &Resolver,
+    temporary: bool,
+    if_not_exists: bool,
+    tbl_name: &ast::QualifiedName,
+) -> bool {
+    if !if_not_exists {
+        return false;
+    }
+    let namespace = if temporary {
+        NamespaceRef::root_of(crate::TEMP_DB_ID)
+    } else {
+        match resolver.resolve_namespace_for_create(tbl_name) {
+            Ok(ns) => ns,
+            Err(_) => return false,
+        }
+    };
+    let name = normalize_ident(tbl_name.name.as_str());
+    matches!(
+        resolver.with_schema(namespace.database_id, |s| s
+            .get_object_type(namespace.id, &name)),
+        Some(SchemaObjectType::Table | SchemaObjectType::View)
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn translate_create_table(
     tbl_name: ast::QualifiedName,
@@ -1157,9 +1184,14 @@ pub fn translate_create_table(
         resolver.resolve_namespace_for_create(&tbl_name)?
     };
     let database_id = namespace.database_id;
+    let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
+    if create_table_is_noop(resolver, temporary, if_not_exists, &tbl_name) {
+        // SQLite still reports such a statement as not read-only.
+        program.flags.set_readonly(false);
+        return Ok(());
+    }
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
-    let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
     let mangled_tbl_name = resolver.mangle_name(namespace, &normalized_tbl_name);
     let tbl_name_in_sql = ast::QualifiedName {
         namespace: None,

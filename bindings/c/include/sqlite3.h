@@ -93,10 +93,29 @@ int sqlite3_close_v2(sqlite3 *db);
 
 const char *sqlite3_db_filename(sqlite3 *db, const char *db_name);
 
-int sqlite3_trace_v2(sqlite3 *_db,
-                     unsigned int _mask,
-                     void (*_callback)(unsigned int, void*, void*, void*),
-                     void *_context);
+#define SQLITE_TRACE_STMT 0x01
+#define SQLITE_TRACE_PROFILE 0x02
+#define SQLITE_TRACE_ROW 0x04
+#define SQLITE_TRACE_CLOSE 0x08
+
+int sqlite3_trace_v2(sqlite3 *db,
+                     unsigned int mask,
+                     int (*callback)(unsigned int, void*, void*, void*),
+                     void *context);
+
+void *sqlite3_trace(sqlite3 *db, void (*xTrace)(void*, const char*), void *context);
+
+void *sqlite3_profile(sqlite3 *db, void (*xProfile)(void*, const char*, uint64_t), void *context);
+
+int sqlite3_collation_needed(sqlite3 *db,
+                             void *context,
+                             void (*callback)(void*, sqlite3*, int, const char*));
+
+int sqlite3_collation_needed16(sqlite3 *db,
+                               void *context,
+                               void (*callback)(void*, sqlite3*, int, const void*));
+
+int sqlite3_open16(const void *filename, sqlite3 **db_out);
 
 void sqlite3_progress_handler(sqlite3 *_db, int _n, int (*_callback)(void *), void *_context);
 
@@ -234,7 +253,20 @@ sqlite3 *sqlite3_db_handle(sqlite3_stmt *_stmt);
 
 void sqlite3_sleep(int _ms);
 
-int sqlite3_limit(sqlite3 *_db, int _id, int _new_value);
+#define SQLITE_LIMIT_LENGTH 0
+#define SQLITE_LIMIT_SQL_LENGTH 1
+#define SQLITE_LIMIT_COLUMN 2
+#define SQLITE_LIMIT_EXPR_DEPTH 3
+#define SQLITE_LIMIT_COMPOUND_SELECT 4
+#define SQLITE_LIMIT_VDBE_OP 5
+#define SQLITE_LIMIT_FUNCTION_ARG 6
+#define SQLITE_LIMIT_ATTACHED 7
+#define SQLITE_LIMIT_LIKE_PATTERN_LENGTH 8
+#define SQLITE_LIMIT_VARIABLE_NUMBER 9
+#define SQLITE_LIMIT_TRIGGER_DEPTH 10
+#define SQLITE_LIMIT_WORKER_THREADS 11
+
+int sqlite3_limit(sqlite3 *db, int id, int new_value);
 
 void *sqlite3_malloc64(int _n);
 
@@ -360,6 +392,8 @@ int sqlite3_blob_read(void *_blob, void *_data, int _n, int _offset);
 
 int sqlite3_blob_write(void *_blob, const void *_data, int _n, int _offset);
 
+int sqlite3_blob_reopen(void *blob, int64_t rowid);
+
 int sqlite3_blob_bytes(void *_blob);
 
 int sqlite3_blob_close(void *_blob);
@@ -464,6 +498,51 @@ int sqlite3_table_column_metadata(
 ** Enable all Turso experimental features for subsequently opened databases.
 */
 void turso_enable_experimental(void);
+
+/* ---- config / file control / status / VFS / extensions ---- */
+typedef struct sqlite3_vfs sqlite3_vfs;
+
+#define SQLITE_CONFIG_SINGLETHREAD  1
+#define SQLITE_CONFIG_MULTITHREAD   2
+#define SQLITE_CONFIG_SERIALIZED    3
+#define SQLITE_CONFIG_MEMSTATUS     9
+#define SQLITE_CONFIG_LOG          16
+#define SQLITE_CONFIG_URI          17
+
+/* File-control opcodes honoured by sqlite3_file_control(); others return
+** SQLITE_NOTFOUND. */
+#define SQLITE_FCNTL_LAST_ERRNO           4
+#define SQLITE_FCNTL_SIZE_HINT            5
+#define SQLITE_FCNTL_CHUNK_SIZE           6
+#define SQLITE_FCNTL_PERSIST_WAL         10
+#define SQLITE_FCNTL_VFSNAME             12
+#define SQLITE_FCNTL_POWERSAFE_OVERWRITE 13
+#define SQLITE_FCNTL_TEMPFILENAME        16
+#define SQLITE_FCNTL_MMAP_SIZE           18
+#define SQLITE_FCNTL_HAS_MOVED           20
+#define SQLITE_FCNTL_DATA_VERSION        35
+#define SQLITE_FCNTL_SIZE_LIMIT          36
+#define SQLITE_FCNTL_RESERVE_BYTES       38
+#define SQLITE_FCNTL_RESET_CACHE         42
+
+extern char *sqlite3_temp_directory;
+
+int sqlite3_config(int op, ...);
+int sqlite3_test_control(int op, ...);
+int sqlite3_file_control(sqlite3 *db, const char *zDbName, int op, void *pArg);
+int sqlite3_status(int op, int *pCurrent, int *pHighwater, int resetFlag);
+int sqlite3_status64(int op, sqlite3_int64 *pCurrent, sqlite3_int64 *pHighwater, int resetFlag);
+int sqlite3_db_status(sqlite3 *db, int op, int *pCurrent, int *pHighwater, int resetFlag);
+void *sqlite3_db_mutex(sqlite3 *db);
+int sqlite3_unlock_notify(sqlite3 *db, void (*xNotify)(void **apArg, int nArg), void *pArg);
+int sqlite3_auto_extension(void (*xEntryPoint)(void));
+int sqlite3_cancel_auto_extension(void (*xEntryPoint)(void));
+void sqlite3_reset_auto_extension(void);
+int sqlite3_enable_load_extension(sqlite3 *db, int onoff);
+int sqlite3_load_extension(sqlite3 *db, const char *zFile, const char *zProc, char **pzErrMsg);
+sqlite3_vfs *sqlite3_vfs_find(const char *zVfsName);
+int sqlite3_vfs_register(sqlite3_vfs *pVfs, int makeDflt);
+int sqlite3_vfs_unregister(sqlite3_vfs *pVfs);
 
 #ifdef __cplusplus
 }  // extern "C"

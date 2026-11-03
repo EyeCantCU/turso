@@ -217,6 +217,8 @@ pub struct Statement {
     /// explicit checkpoints can subtract it — an open blob handle must not
     /// block checkpointing for its whole lifetime.
     is_blob_handle: bool,
+    /// A blob handle opened for writing (see `ProgramState::is_blob_handle`).
+    is_blob_writer: bool,
     /// True if this statement called `Connection::start_nested()` during
     /// construction and therefore must call `end_nested()` on drop.
     nested_guard_active: bool,
@@ -304,6 +306,7 @@ impl Statement {
             origin,
             counted_as_active_root: false,
             is_blob_handle: false,
+            is_blob_writer: false,
             nested_guard_active,
             analyze_refresh: None,
             reprepare_cmd: None,
@@ -314,12 +317,15 @@ impl Statement {
     /// Mark this statement as the parked backing statement of an incremental
     /// blob handle. Must be called before the first `step()` so the blob
     /// accounting stays in lockstep with the root-statement count.
-    pub(crate) fn mark_as_blob_handle(&mut self) {
+    pub(crate) fn mark_as_blob_handle(&mut self, read_write: bool) {
         turso_assert!(
             !self.counted_as_active_root,
             "blob handle marked after its statement started executing"
         );
         self.is_blob_handle = true;
+        self.is_blob_writer = read_write;
+        self.state.is_blob_handle = true;
+        self.state.is_blob_writer = read_write;
     }
 
     pub fn tail_offset(&self) -> usize {
@@ -461,6 +467,12 @@ impl Statement {
                     .connection
                     .n_active_blob_statements
                     .fetch_sub(1, Ordering::SeqCst);
+                if self.is_blob_writer {
+                    self.program
+                        .connection
+                        .n_active_blob_writers
+                        .fetch_sub(1, Ordering::SeqCst);
+                }
             }
             let previous = self
                 .program
@@ -558,6 +570,12 @@ impl Statement {
                     .connection
                     .n_active_blob_statements
                     .fetch_add(1, Ordering::SeqCst);
+                if self.is_blob_writer {
+                    self.program
+                        .connection
+                        .n_active_blob_writers
+                        .fetch_add(1, Ordering::SeqCst);
+                }
             }
         }
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
@@ -733,7 +751,7 @@ impl Statement {
                 // connection-level n_active_writes counter needs to be
                 // decremented first or the retry will see a spurious "writer
                 // already active" error at Insn::Transaction.
-                if self.state.is_active_write {
+                if self.state.is_active_write && !self.state.is_blob_handle {
                     let prev = self
                         .program
                         .connection
@@ -1630,7 +1648,7 @@ impl Statement {
         // Safety net: if end_statement wasn't reached (e.g. statement dropped
         // mid-execution), ensure n_active_writes is decremented before reset
         // clears the flag.
-        if self.state.is_active_write {
+        if self.state.is_active_write && !self.state.is_blob_handle {
             let previous = self
                 .program
                 .connection

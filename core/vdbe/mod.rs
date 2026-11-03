@@ -1218,6 +1218,12 @@ pub struct ProgramState {
     uses_subjournal: bool,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
+    /// The statement backs an incremental blob handle. A read-write handle
+    /// holds the write transaction but does not take the connection's single
+    /// writer slot, so other statements can write while it is open.
+    pub(crate) is_blob_handle: bool,
+    /// The blob handle was opened for writing.
+    pub(crate) is_blob_writer: bool,
     /// Write activity on the main database when this statement became an
     /// active write; abort() compares against it to tell whether the
     /// statement wrote anything before failing.
@@ -1329,6 +1335,8 @@ impl ProgramState {
             ephemeral_temp_files: HashMap::default(),
             uses_subjournal: false,
             is_active_write: false,
+            is_blob_handle: false,
+            is_blob_writer: false,
             tx_read_only_at_start: false,
             write_baseline: WriteBaseline::None,
             has_stmt_transaction: false,
@@ -1558,12 +1566,17 @@ impl ProgramState {
             active_writers <= 1,
             "n_active_writes must be 0 or 1, got {active_writers}"
         );
-        if self.is_active_write {
+        if self.is_active_write && !self.is_blob_handle {
             turso_assert!(
                 active_writers == 1,
                 "active writer state without an active writer count"
             );
         }
+        // A write handle keeps the transaction open for its own writes; the
+        // statements that join it leave the commit to the handle's close.
+        let other_blob_writers = connection.n_active_blob_writers.load(Ordering::SeqCst)
+            - i32::from(self.is_blob_writer);
+        let blob_writer_open = other_blob_writers > 0;
         if self.mv_store(connection).is_some() {
             // MVCC keeps one tx id on the connection. A writer waits for
             // sibling readers, and a reader waits for sibling readers/writers.
@@ -1571,6 +1584,9 @@ impl ProgramState {
                 && connection.n_active_root_statements.load(Ordering::SeqCst)
                     == i32::from(self_counted)
                 && (self.is_active_write || active_writers == 0);
+        }
+        if blob_writer_open {
+            return false;
         }
         if self.auto_txn_cleanup == TxnCleanup::RollbackTxn && self.is_active_write {
             // Pager/WAL writers can finish while sibling readers remain
@@ -1816,7 +1832,7 @@ impl ProgramState {
         end_statement: EndStatement,
     ) -> Result<()> {
         let ends_write_statement = self.is_active_write;
-        if self.is_active_write {
+        if self.is_active_write && !self.is_blob_handle {
             let previous = connection.n_active_writes.fetch_sub(1, Ordering::SeqCst);
             turso_assert!(
                 previous == 1,

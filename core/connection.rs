@@ -50,6 +50,14 @@ use std::path::Path;
 #[cfg(not(target_family = "wasm"))]
 use tempfile::TempDir;
 use tracing::{instrument, Level};
+
+/// Loader behind the SQL function `load_extension(file[, entry])`: `Err`
+/// carries the error message.
+pub type ExtensionLoader =
+    Arc<dyn Fn(&str, Option<&str>) -> std::result::Result<(), String> + Send + Sync>;
+
+/// Callback for [`Connection::set_trigger_trace`].
+pub type TriggerTraceCallback = Arc<dyn Fn(&str) + Send + Sync>;
 use turso_macros::{turso_assert_ne, AtomicEnum};
 
 #[cfg(feature = "simulator")]
@@ -537,6 +545,12 @@ pub struct Connection {
     pub(super) busy_handler: RwLock<BusyHandler>,
     /// Step-based progress callback for SQLite-compatible cancellation hooks.
     pub(super) progress_handler: ProgressHandler,
+    /// `sqlite3_limit` values.
+    pub(super) limits: crate::limits::Limits,
+    /// Called with `-- TRIGGER <name>` whenever a trigger program starts.
+    pub(super) trigger_trace: RwLock<Option<TriggerTraceCallback>>,
+    /// Replaces the built-in extension loader when set (`sqlite3_load_extension`).
+    pub(super) extension_loader: RwLock<Option<ExtensionLoader>>,
     /// Maximum execution time for a single statement on this connection.
     /// `Duration::ZERO` means disabled.
     pub(super) query_timeout_ms: AtomicU64,
@@ -572,6 +586,8 @@ pub struct Connection {
     /// handles; a handle re-positions on its next blob operation after the
     /// checkpoint's cache clear).
     pub(crate) n_active_blob_statements: AtomicI32,
+    /// How many of those are open for writing.
+    pub(crate) n_active_blob_writers: AtomicI32,
     /// Prevents root statements and explicit checkpoints from overlapping on this connection.
     pub(crate) statement_activity: Arc<Mutex<StatementActivity>>,
     /// Whether pragma ignore_check_constraints=ON for this connection
@@ -1153,6 +1169,9 @@ impl Connection {
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
+            if origin == StatementOrigin::Root {
+                self.limits.check_cmd(&cmd)?;
+            }
             let (program, pager, mode) = self.compile_cmd(cmd, input, origin)?;
 
             Ok(Statement::new_with_origin(
@@ -4638,6 +4657,41 @@ impl Connection {
     /// Get a reference to the busy handler.
     pub fn get_busy_handler(&self) -> crate::sync::RwLockReadGuard<'_, BusyHandler> {
         self.busy_handler.read()
+    }
+
+    /// Limit `id` (`SQLITE_LIMIT_*`), or `None` for an unknown id.
+    pub fn limit(&self, id: i32) -> Option<i32> {
+        self.limits.get(id)
+    }
+
+    /// Sets limit `id` and returns the old value; a negative `value` only
+    /// reads. `None` for an unknown id.
+    pub fn set_limit(&self, id: i32, value: i32) -> Option<i32> {
+        self.limits.set(id, value)
+    }
+
+    /// Routes the SQL function `load_extension()` to `loader`.
+    pub fn set_extension_loader(&self, loader: Option<ExtensionLoader>) {
+        *self.extension_loader.write() = loader;
+    }
+
+    #[cfg(all(feature = "fs", not(target_family = "wasm")))]
+    pub(crate) fn extension_loader(&self) -> Option<ExtensionLoader> {
+        self.extension_loader.read().clone()
+    }
+
+    /// Registers (or clears) the callback run when a trigger program starts.
+    pub fn set_trigger_trace(&self, callback: Option<TriggerTraceCallback>) {
+        *self.trigger_trace.write() = callback;
+    }
+
+    pub(crate) fn trace_trigger(&self, trigger: &Trigger) {
+        let callback = self.trigger_trace.read().clone();
+        if let Some(callback) = callback {
+            for line in crate::trigger_trace::trace_lines(trigger) {
+                callback(&line);
+            }
+        }
     }
 
     /// Sets a progress handler invoked approximately every `ops` VM steps.

@@ -40,6 +40,13 @@ pub fn translate_attach(
         ));
     }
 
+    let max_attached = connection.limit(crate::limits::LIMIT_ATTACHED).unwrap_or(0) as usize;
+    if connection.attached_database_names().len() >= max_attached {
+        return Err(crate::LimboError::SqlError(format!(
+            "too many attached databases - max {max_attached}"
+        )));
+    }
+
     // SQLite treats ATTACH as a function call to sqlite_attach(filename, dbname, key)
     // We'll allocate registers for the arguments and call the function
     program.extend(&ProgramBuilderOpts::new(0, 10, 0));

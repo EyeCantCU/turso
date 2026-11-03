@@ -387,38 +387,49 @@ fn blob_survives_splits_from_other_row_inserts() {
 }
 
 #[test]
-fn blob_write_handle_blocks_other_writers_and_commits_on_close() {
-    // Divergence from sqlite's e_blobwrite 3.x: in SQLite a same-connection write
-    // statement can expire an open read-write handle, and writes made before the
-    // expiry persist. Turso permits one write statement per connection at a time,
-    // so while a read-write handle is open, other write statements fail with
-    // StatementsInProgress instead — a write handle can never be expired out from
-    // under its own connection. Its writes commit when the handle closes.
+fn blob_write_handle_allows_other_writers_and_commits_on_close() {
+    // Like sqlite's e_blobwrite 3.x: a same-connection write statement can run
+    // while a read-write handle is open and expires it when it touches the
+    // handle's row. Writes made before the expiry persist, committed at close.
     let conn = fresh_db();
     exec(
         &conn,
         "CREATE TABLE t(id INTEGER PRIMARY KEY, x, data BLOB)",
     );
-    exec(&conn, "INSERT INTO t VALUES (1, 0, zeroblob(8))");
+    exec(
+        &conn,
+        "INSERT INTO t VALUES (1, 0, zeroblob(8)), (2, 0, zeroblob(8))",
+    );
     let mut blob = conn.blob_open("t", "data", 1, true).unwrap();
     blob.write(0, &[0xAA, 0xBB]).unwrap();
-    assert!(matches!(
-        conn.execute("UPDATE t SET x = 7 WHERE id = 1"),
-        Err(LimboError::StatementsInProgress(_))
-    ));
-    blob.close().unwrap();
-    // After close the write statement slot frees up and the blob write is durable.
+    // Another row: the handle survives. Own row: the handle expires.
+    exec(&conn, "UPDATE t SET x = 5 WHERE id = 2");
+    blob.write(2, &[0xCC]).unwrap();
     exec(&conn, "UPDATE t SET x = 7 WHERE id = 1");
+    assert!(matches!(
+        blob.write(3, &[0xDD]),
+        Err(LimboError::BlobHandleExpired)
+    ));
+    // Two handles can be open for writing at once, one on a missing row.
+    let second = conn.blob_open("t", "data", 2, true).unwrap();
+    assert!(conn.blob_open("t", "data", 99, true).is_err());
+    second.close().unwrap();
+    // A second read-write handle can be opened meanwhile.
+    let other = conn.blob_open("t", "data", 2, true).unwrap();
+    other.close().unwrap();
+    blob.close().unwrap();
     let mut q = conn
-        .query("SELECT substr(data, 1, 2), x FROM t WHERE id = 1")
+        .query("SELECT substr(data, 1, 3), x FROM t WHERE id = 1")
         .unwrap()
         .unwrap();
     let got = q.run_collect_rows().unwrap();
-    assert_eq!(blob_bytes(&got[0][0]), vec![0xAA, 0xBB]);
+    assert_eq!(blob_bytes(&got[0][0]), vec![0xAA, 0xBB, 0xCC]);
     assert!(matches!(
         got[0][1],
         Value::Numeric(crate::Numeric::Integer(7))
     ));
+    // Everything is committed: a new write works and nothing is pending.
+    exec(&conn, "UPDATE t SET x = 8 WHERE id = 1");
 }
 
 #[test]
@@ -845,4 +856,29 @@ fn blob_boundary_read_write_sweep() {
         );
     }
     blob.close().unwrap();
+}
+
+#[test]
+#[ignore = "known gap: a second read-write handle inside an explicit transaction returns Busy"]
+fn blob_write_handles_inside_an_explicit_transaction() {
+    // Python's sqlite3 module opens handles inside the transaction its INSERT began.
+    let conn = fresh_db();
+    exec(&conn, "CREATE TABLE t(b BLOB)");
+    exec(&conn, "BEGIN");
+    exec(&conn, "INSERT INTO t VALUES (zeroblob(8)), (zeroblob(8))");
+    let mut first = conn.blob_open("t", "b", 1, true).unwrap();
+    first.write(0, &[1, 2]).unwrap();
+    let second = conn.blob_open("t", "b", 2, true).unwrap();
+    assert!(conn.blob_open("t", "b", 9, true).is_err());
+    second.close().unwrap();
+    exec(&conn, "UPDATE t SET b = zeroblob(8) WHERE rowid = 2");
+    first.write(2, &[3]).unwrap();
+    first.close().unwrap();
+    exec(&conn, "COMMIT");
+    let mut q = conn
+        .query("SELECT substr(b, 1, 3) FROM t WHERE rowid = 1")
+        .unwrap()
+        .unwrap();
+    let got = q.run_collect_rows().unwrap();
+    assert_eq!(blob_bytes(&got[0][0]), vec![1, 2, 3]);
 }

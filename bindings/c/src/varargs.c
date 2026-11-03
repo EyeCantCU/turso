@@ -98,3 +98,54 @@ char *turso_sqlite3_snprintf_va(int n, char *buf, const char *fmt, ...) {
     sqlite3_free(s);
     return buf;
 }
+
+/*
+** sqlite3_config() argument shapes, by op (SQLite 3.5x):
+**   SINGLETHREAD(1) MULTITHREAD(2) SERIALIZED(3)        no arguments
+**   MEMSTATUS(9) URI(17) COVERING_INDEX_SCAN(20)
+**   STMTJRNL_SPILL(26) SMALL_MALLOC(27) SORTERREF_SIZE(28)   (int)
+**   LOOKASIDE(13)                                       (int, int)
+**   LOG(16)                                             (void(*)(void*,int,const char*), void*)
+**   MMAP_SIZE(22)                                       (sqlite3_int64, sqlite3_int64)
+**   PMASZ(25)                                           (unsigned int)
+**   MEMDB_MAXSIZE(29)                                   (sqlite3_int64)
+** Only these ops are decoded. Any other op is forwarded without touching the
+** va_list; the Rust side rejects it.
+*/
+extern int turso_sqlite3_config_apply(int op, long long i1, long long i2,
+                                      void *p1, void *p2);
+
+int turso_sqlite3_config_va(int op, ...) {
+    va_list ap;
+    long long i1 = 0, i2 = 0;
+    void *p1 = 0, *p2 = 0;
+
+    va_start(ap, op);
+    switch (op) {
+    case 9: case 17: case 20: case 26: case 27: case 28:
+        i1 = va_arg(ap, int);
+        break;
+    case 13:
+        i1 = va_arg(ap, int);
+        i2 = va_arg(ap, int);
+        break;
+    case 16:
+        p1 = va_arg(ap, void *);
+        p2 = va_arg(ap, void *);
+        break;
+    case 22:
+        i1 = va_arg(ap, long long);
+        i2 = va_arg(ap, long long);
+        break;
+    case 25:
+        i1 = va_arg(ap, unsigned int);
+        break;
+    case 29:
+        i1 = va_arg(ap, long long);
+        break;
+    default:
+        break;
+    }
+    va_end(ap);
+    return turso_sqlite3_config_apply(op, i1, i2, p1, p2);
+}
