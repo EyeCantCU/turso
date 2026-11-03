@@ -43,7 +43,7 @@ Turso 同时也是一台虚拟机。与 SQLite 一样，它把 SQL 编译成这�
 
 ## 特性与路线图
 
-* **SQLite 兼容性**：兼容 SQL 方言、文件格式和 C API，跟踪 SQLite 3.50.4 版本，详见[兼容性文档](COMPAT.md)
+* **SQLite 兼容性**：兼容 SQL 方言、文件格式和 C API，跟踪 SQLite 3.54.1 版本，详见[兼容性文档](COMPAT.md)
 * **`BEGIN CONCURRENT`**：使用多版本并发控制（MVCC）提升写入吞吐量。
 * **变更数据捕获（CDC）**：实时跟踪数据库变更。
 * **多语言支持**：

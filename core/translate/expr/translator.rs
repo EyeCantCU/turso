@@ -1006,7 +1006,9 @@ fn translate_function_call_expr(
             | JsonFunc::JsonbReplace
             | JsonFunc::JsonbRemove
             | JsonFunc::JsonInsert
-            | JsonFunc::JsonbInsert => translate_function(
+            | JsonFunc::JsonbInsert
+            | JsonFunc::JsonArrayInsert
+            | JsonFunc::JsonbArrayInsert => translate_function(
                 program,
                 args,
                 referenced_tables,

@@ -2,7 +2,7 @@
 
 Turso is a re-implementation of SQLite in Rust. This document describes the
 current state of compatibility between the two. Turso tracks **SQLite version
-3.50.4**: that is the version reported by `sqlite_version()` and
+3.54.1**: that is the version reported by `sqlite_version()` and
 `sqlite3_libversion()`, and the version used for differential testing. Any
 deviation from SQLite behavior that is not explicitly documented as an opt-in
 extension is considered a bug.
@@ -788,8 +788,8 @@ Modifiers:
 
 | Interface              | Status  | Comment |
 |------------------------|---------|---------|
-| sqlite3_libversion     | ✅ Yes     | Returns "3.50.4" |
-| sqlite3_libversion_number | ✅ Yes  | Returns 3050004 |
+| sqlite3_libversion     | ✅ Yes     | Returns "3.54.1" |
+| sqlite3_libversion_number | ✅ Yes  | Returns 3054001 |
 | sqlite3_sourceid       | ❌ No      |         |
 | sqlite3_threadsafe     | ✅ Yes     | Returns 1 |
 | sqlite3_complete       | ❌ No      | Stub    |

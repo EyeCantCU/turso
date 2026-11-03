@@ -11,6 +11,10 @@ fn main() {
     cc::Build::new()
         .file("src/varargs.c")
         .compile("turso_sqlite3_varargs");
+    println!("cargo:rerun-if-changed=src/sqlite354.c");
+    cc::Build::new()
+        .file("src/sqlite354.c")
+        .compile("turso_sqlite3_sqlite354");
     let profile_dir = target_profile_dir();
     println!("cargo:rustc-link-search=native={}", profile_dir.display());
 

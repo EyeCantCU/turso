@@ -320,6 +320,8 @@ pub enum JsonFunc {
     JsonbReplace,
     JsonInsert,
     JsonbInsert,
+    JsonArrayInsert,
+    JsonbArrayInsert,
     JsonPretty,
     JsonSet,
     JsonbSet,
@@ -344,6 +346,7 @@ impl JsonFunc {
             | Self::JsonRemove
             | Self::JsonReplace
             | Self::JsonInsert
+            | Self::JsonArrayInsert
             | Self::JsonSet
             | Self::JsonPretty
             | Self::JsonQuote
@@ -355,6 +358,7 @@ impl JsonFunc {
             | Self::JsonbRemove
             | Self::JsonbReplace
             | Self::JsonbInsert
+            | Self::JsonbArrayInsert
             | Self::JsonbSet => Some(ReturnType::Blob),
             Self::JsonArrayLength | Self::JsonErrorPosition | Self::JsonValid => {
                 Some(ReturnType::Integer)
@@ -396,6 +400,8 @@ impl Display for JsonFunc {
                 Self::JsonbReplace => "jsonb_replace",
                 Self::JsonInsert => "json_insert",
                 Self::JsonbInsert => "jsonb_insert",
+                Self::JsonArrayInsert => "json_array_insert",
+                Self::JsonbArrayInsert => "jsonb_array_insert",
                 Self::JsonPretty => "json_pretty",
                 Self::JsonSet => "json_set",
                 Self::JsonbSet => "jsonb_set",
@@ -573,6 +579,14 @@ pub enum AggFunc {
     #[cfg(feature = "json")]
     JsonGroupObject,
     ArrayAgg,
+    /// SQLite's percentile family (SQLITE_ENABLE_PERCENTILE): median(Y).
+    Median,
+    /// percentile(Y, P) with P in 0..=100.
+    Percentile,
+    /// percentile_cont(Y, P) with P in 0..=1 (function-call form).
+    PercentileContCall,
+    /// percentile_disc(Y, P) with P in 0..=1 (function-call form).
+    PercentileDiscCall,
     /// `mode() WITHIN GROUP (ORDER BY x)` — most frequent value of `x`.
     /// Stored args (post-planning): `[value]`.
     #[strum(disabled)]
@@ -834,6 +848,10 @@ impl PartialEq for AggFunc {
             | (Self::Total, Self::Total)
             | (Self::ArrayAgg, Self::ArrayAgg)
             | (Self::Mode, Self::Mode)
+            | (Self::Median, Self::Median)
+            | (Self::Percentile, Self::Percentile)
+            | (Self::PercentileContCall, Self::PercentileContCall)
+            | (Self::PercentileDiscCall, Self::PercentileDiscCall)
             | (Self::PercentileCont, Self::PercentileCont)
             | (Self::PercentileDisc, Self::PercentileDisc) => true,
             (Self::External(a), Self::External(b)) => Arc::ptr_eq(a, b),
@@ -866,6 +884,8 @@ impl AggFunc {
             Self::Sum => 1,
             Self::Total => 1,
             Self::ArrayAgg => 1,
+            Self::Median => 1,
+            Self::Percentile | Self::PercentileContCall | Self::PercentileDiscCall => 2,
             // Ordered-set aggregates: args are rewritten by the planner to
             // `[value]` (mode) or `[value, fraction]` (percentiles).
             Self::Mode => 1,
@@ -895,6 +915,8 @@ impl AggFunc {
             Self::Sum => &[1],
             Self::Total => &[1],
             Self::ArrayAgg => &[1],
+            Self::Median => &[1],
+            Self::Percentile | Self::PercentileContCall | Self::PercentileDiscCall => &[2],
             Self::Mode => &[1],
             Self::PercentileCont | Self::PercentileDisc => &[2],
             #[cfg(feature = "json")]
@@ -917,6 +939,10 @@ impl AggFunc {
             Self::Sum => "sum",
             Self::Total => "total",
             Self::ArrayAgg => "array_agg",
+            Self::Median => "median",
+            Self::Percentile => "percentile",
+            Self::PercentileContCall => "percentile_cont",
+            Self::PercentileDiscCall => "percentile_disc",
             Self::Mode => "mode",
             Self::PercentileCont => "percentile_cont",
             Self::PercentileDisc => "percentile_disc",

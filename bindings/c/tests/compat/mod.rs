@@ -13,6 +13,8 @@ struct sqlite3_stmt {
     _private: [u8; 0],
 }
 
+mod sqlite354;
+
 #[cfg_attr(
     all(not(feature = "sqlite3"), not(target_os = "windows")),
     link(name = "turso_sqlite3")
@@ -230,7 +232,7 @@ mod tests {
             let version = sqlite3_libversion();
             assert!(!version.is_null());
             #[cfg(not(feature = "sqlite3"))]
-            assert_eq!(std::ffi::CStr::from_ptr(version), c"3.50.4");
+            assert_eq!(std::ffi::CStr::from_ptr(version), c"3.54.1");
         }
     }
 
@@ -241,7 +243,7 @@ mod tests {
             #[cfg(feature = "sqlite3")]
             assert!(version_num > 0);
             #[cfg(not(feature = "sqlite3"))]
-            assert_eq!(version_num, 3050004);
+            assert_eq!(version_num, 3054001);
         }
     }
 

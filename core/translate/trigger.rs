@@ -188,6 +188,29 @@ pub fn translate_create_trigger(
     program.begin_write_on_database(database_id, schema_cookie)?;
     program.begin_write_operation()?;
 
+    // SQLite 3.53: only TEMP triggers may qualify INSERT/UPDATE/DELETE targets.
+    if database_id != crate::TEMP_DB_ID
+        && commands.iter().any(|cmd| {
+            matches!(
+                cmd,
+                ast::TriggerCmd::Insert {
+                    database: Some(_),
+                    ..
+                } | ast::TriggerCmd::Update {
+                    database: Some(_),
+                    ..
+                } | ast::TriggerCmd::Delete {
+                    database: Some(_),
+                    ..
+                }
+            )
+        })
+    {
+        bail_parse_error!(
+            "qualified table names are not allowed on INSERT, UPDATE, and DELETE statements within triggers"
+        );
+    }
+
     // Temp-backed triggers follow SQLite's looser name-resolution rules and may
     // access objects across schemas. Ordinary triggers stay schema-local.
     if database_id != crate::TEMP_DB_ID {

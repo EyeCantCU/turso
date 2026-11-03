@@ -1961,6 +1961,7 @@ pub fn visit_trigger<V: AstVisitor>(trigger: &Trigger, visitor: &mut V) -> Resul
 fn visit_trigger_cmd<V: AstVisitor>(cmd: &ast::TriggerCmd, visitor: &mut V) -> Result<()> {
     match cmd {
         ast::TriggerCmd::Update {
+            database,
             tbl_name,
             sets,
             from,
@@ -1968,7 +1969,7 @@ fn visit_trigger_cmd<V: AstVisitor>(cmd: &ast::TriggerCmd, visitor: &mut V) -> R
             ..
         } => {
             if visitor.report_target_tables() {
-                visitor.table(&ast::QualifiedName::single(tbl_name.clone()))?;
+                visitor.table(&trigger_target_name(database, tbl_name))?;
             }
             // Name resolution sees the FROM clause before the SET expressions.
             if visitor.resolve_from_before_columns() {
@@ -1989,6 +1990,7 @@ fn visit_trigger_cmd<V: AstVisitor>(cmd: &ast::TriggerCmd, visitor: &mut V) -> R
             }
         }
         ast::TriggerCmd::Insert {
+            database,
             tbl_name,
             select,
             upsert,
@@ -1996,18 +1998,19 @@ fn visit_trigger_cmd<V: AstVisitor>(cmd: &ast::TriggerCmd, visitor: &mut V) -> R
             ..
         } => {
             if visitor.report_target_tables() {
-                visitor.table(&ast::QualifiedName::single(tbl_name.clone()))?;
+                visitor.table(&trigger_target_name(database, tbl_name))?;
             }
             visit_select(select, visitor)?;
             visit_upsert(upsert.as_deref(), visitor)?;
             visit_result_columns(returning, visitor)?;
         }
         ast::TriggerCmd::Delete {
+            database,
             tbl_name,
             where_clause,
         } => {
             if visitor.report_target_tables() {
-                visitor.table(&ast::QualifiedName::single(tbl_name.clone()))?;
+                visitor.table(&trigger_target_name(database, tbl_name))?;
             }
             if let Some(where_clause) = where_clause {
                 visit_expr_with_subqueries(where_clause, visitor)?;
@@ -2016,6 +2019,15 @@ fn visit_trigger_cmd<V: AstVisitor>(cmd: &ast::TriggerCmd, visitor: &mut V) -> R
         ast::TriggerCmd::Select(select) => visit_select(select, visitor)?,
     }
     Ok(())
+}
+
+/// The target of a trigger INSERT/UPDATE/DELETE as a qualified name.
+fn trigger_target_name(database: &Option<ast::Name>, tbl_name: &ast::Name) -> ast::QualifiedName {
+    ast::QualifiedName {
+        namespace: database.clone(),
+        name: tbl_name.clone(),
+        alias: None,
+    }
 }
 
 fn visit_upsert<V: AstVisitor>(mut upsert: Option<&ast::Upsert>, visitor: &mut V) -> Result<()> {
@@ -4286,6 +4298,7 @@ pub fn rewrite_trigger_cmd_table_refs(cmd: &mut ast::TriggerCmd, old_tbl: &str, 
         ast::TriggerCmd::Delete {
             tbl_name,
             where_clause,
+            ..
         } => {
             if tbl_name.as_str().eq_ignore_ascii_case(old_tbl) {
                 *tbl_name = ast::Name::exact(new_tbl.to_owned());

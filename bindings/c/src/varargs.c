@@ -35,18 +35,25 @@ extern int turso_db_config_int(sqlite3 *db, int op, int value, int *p_out);
 #define DBCONFIG_BOOL_FIRST 1002 /* SQLITE_DBCONFIG_ENABLE_FKEY */
 #define DBCONFIG_BOOL_LAST  1017 /* SQLITE_DBCONFIG_TRUSTED_SCHEMA */
 
+#define DBCONFIG_FP_DIGITS  1023 /* SQLITE_DBCONFIG_FP_DIGITS, (int, int*) */
+extern int turso_db_config_fp_digits(sqlite3 *db, int value, int *p_out);
+
 int turso_sqlite3_db_config_va(sqlite3 *db, int op, ...) {
     va_list ap;
     int value;
     int *p_out;
 
-    if (op < DBCONFIG_BOOL_FIRST || op > DBCONFIG_BOOL_LAST) {
+    if (op != DBCONFIG_FP_DIGITS
+        && (op < DBCONFIG_BOOL_FIRST || op > DBCONFIG_BOOL_LAST)) {
         return SQLITE_ERROR;
     }
     va_start(ap, op);
     value = va_arg(ap, int);
     p_out = va_arg(ap, int *);
     va_end(ap);
+    if (op == DBCONFIG_FP_DIGITS) {
+        return turso_db_config_fp_digits(db, value, p_out);
+    }
     return turso_db_config_int(db, op, value, p_out);
 }
 
