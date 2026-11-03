@@ -987,6 +987,43 @@ impl Statement {
         self.reprepare_cmd = Some(cmd);
     }
 
+    /// True once the program has started executing (until the next reset).
+    pub fn has_started(&self) -> bool {
+        !matches!(
+            self.state.execution_state,
+            vdbe::ProgramExecutionState::Init
+        )
+    }
+
+    /// Re-translates the statement in another mode (normal, EXPLAIN or
+    /// EXPLAIN QUERY PLAN), keeping its bindings. Must not be running.
+    pub fn set_query_mode(&mut self, mode: QueryMode) -> Result<()> {
+        if mode == self.query_mode {
+            return Ok(());
+        }
+        let cmd = match &self.reprepare_cmd {
+            Some(cmd) => cmd.clone(),
+            None => {
+                let (cmd, _) = self.program.connection.parse_sql(&self.program.sql)?;
+                cmd.expect("Same SQL string should be able to be parsed")
+            }
+        };
+        let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) = cmd;
+        let cmd = match mode {
+            QueryMode::Normal => Cmd::Stmt(stmt),
+            QueryMode::Explain => Cmd::Explain(stmt),
+            QueryMode::ExplainQueryPlan { format } => Cmd::ExplainQueryPlan { stmt, format },
+        };
+        let prev_mode = std::mem::replace(&mut self.query_mode, mode);
+        let prev_cmd = self.reprepare_cmd.replace(cmd);
+        if let Err(err) = self.reprepare() {
+            self.query_mode = prev_mode;
+            self.reprepare_cmd = prev_cmd;
+            return Err(err);
+        }
+        Ok(())
+    }
+
     fn reprepare(&mut self) -> Result<()> {
         tracing::trace!("repreparing statement");
         let conn = self.program.connection.clone();
@@ -1165,6 +1202,33 @@ impl Statement {
                 .table_references
                 .find_table_by_internal_id(*table)
                 .map(|(_, table_ref)| Cow::Borrowed(table_ref.get_name())),
+            _ => None,
+        }
+    }
+
+    /// Returns the name of the underlying table column of a result column
+    /// (`sqlite3_column_origin_name`), or None for expressions.
+    pub fn get_column_origin_name(&self, idx: usize) -> Option<String> {
+        if matches!(
+            self.query_mode,
+            QueryMode::Explain | QueryMode::ExplainQueryPlan { .. }
+        ) {
+            return None;
+        }
+        let column = self.program.result_columns.get(idx)?;
+        match &column.expr {
+            turso_parser::ast::Expr::Column {
+                table,
+                column: column_idx,
+                ..
+            } => {
+                let (_, table_ref) = self
+                    .program
+                    .table_references
+                    .find_table_by_internal_id(*table)?;
+                let table_column = table_ref.get_column_at(*column_idx)?;
+                table_column.name.clone()
+            }
             _ => None,
         }
     }
