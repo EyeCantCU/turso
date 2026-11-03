@@ -59,8 +59,11 @@ impl SqliteShmInterlock {
         turso_peers_live: impl Fn() -> bool,
     ) -> Result<Self> {
         let shm = io.open_shared_wal_file(&format!("{db_path}-shm"))?;
-        // Read access is all a shared lock needs, and the file may be read-only.
-        let db = io.open_file(db_path, crate::io::OpenFlags::ReadOnly, false)?;
+        // Writable for locking_mode=EXCLUSIVE's write lock; a shared lock
+        // needs only read access, for read-only files.
+        let db = io
+            .open_file(db_path, crate::io::OpenFlags::NoLock, false)
+            .or_else(|_| io.open_file(db_path, crate::io::OpenFlags::ReadOnly, false))?;
         for attempt in 1..=ATTEMPTS {
             if Self::try_lock(&shm, &db, &turso_peers_live)? {
                 if shm.shared_wal_try_lock_byte(SHM_RECOVER_LOCK, true, KIND)?
