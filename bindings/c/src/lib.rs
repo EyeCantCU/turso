@@ -12,6 +12,7 @@ use turso_core::{CheckpointMode, ConnectOpts, DatabaseOpts, LimboError, Value};
 use turso_ext::ScalarFunction;
 use turso_ext::Value as ExtValue;
 
+mod rtree;
 mod vtab;
 
 /// Global flag: when set, all subsequently opened databases enable experimental features.
