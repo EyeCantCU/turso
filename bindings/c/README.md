@@ -103,3 +103,36 @@ When adding new features or fixing bugs:
 ## Status
 
 This is an ongoing implementation. Some functions are marked with `stub!()` macro, indicating they're not yet implemented. Check individual function documentation for implementation status. 
+## Building a drop-in `libsqlite3`
+
+The workspace `release` profile sets `panic = "abort"`. With it a Rust panic
+inside any exported `sqlite3_*` function aborts the host process, and the
+panic guard on the C entry points (`catch_unwind`) never runs. Build the
+library that is shipped as `libsqlite3.so.0` with the dedicated profile
+instead, which inherits `release` and only switches to `panic = "unwind"`:
+
+```bash
+cargo build --profile release-capi -p turso_sqlite3
+# -> target/release-capi/libturso_sqlite3.{so,dylib,a}
+```
+
+`tests/panic_unwind.c` checks that the built library turns an injected panic
+into `SQLITE_INTERNAL` instead of aborting (CI runs it on this profile). The
+global `release` profile is unchanged.
+
+## Connection limits and tracing
+
+`sqlite3_limit` is per connection, with SQLite's defaults and hard maxima
+(`SQLITE_LIMIT_LENGTH` cannot go below 30). Enforced: `LENGTH` (bind and
+result values), `SQL_LENGTH`, `COLUMN`, `EXPR_DEPTH`, `COMPOUND_SELECT`,
+`FUNCTION_ARG`, `VARIABLE_NUMBER`, `ATTACHED`, `LIKE_PATTERN_LENGTH` and
+`TRIGGER_DEPTH`. Not enforced: `VDBE_OP` and `WORKER_THREADS` (stored and
+returned only), and `LENGTH` for values built inside SQL (`zeroblob`, `||`,
+`printf`). Limit ids above 11 are unknown and read as -1.
+
+`sqlite3_trace_v2` reports `SQLITE_TRACE_STMT`, `PROFILE`, `ROW` and `CLOSE`.
+Statements run inside a trigger are reported as `-- TRIGGER name` followed by
+one `-- <step text>` per step, all when the trigger starts (SQLite reports a
+step just before it runs). `SQLITE_TRACE_CLOSE` is reported by
+`sqlite3_close`/`sqlite3_close_v2` itself, also when `close_v2` leaves a
+zombie handle behind.
