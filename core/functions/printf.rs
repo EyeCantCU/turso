@@ -1350,6 +1350,33 @@ pub fn printf_c_arg_plan(format: &str) -> Vec<PrintfCArg> {
 /// and the C API's sqlite3_mprintf/sqlite3_snprintf bridge so there is a
 /// single formatting implementation.
 pub fn exec_printf_values(format: &Value, args: &[&Value]) -> crate::Result<Value> {
+    let raw = |v: &Value| matches!(v, Value::Text(t) if !t.is_utf8());
+    if raw(format) || args.iter().any(|a| raw(a)) {
+        return exec_printf_raw(format, args);
+    }
+    exec_printf_utf8(format, args)
+}
+
+/// printf() with text that is not UTF-8: the texts are escaped into private
+/// code points, formatted, and restored, so %s/%q/%Q/%w keep their bytes.
+#[cold]
+fn exec_printf_raw(format: &Value, args: &[&Value]) -> crate::Result<Value> {
+    let escape = |v: &Value| match v {
+        Value::Text(t) => Value::build_text(crate::text_bytes::escape_bytes(t.as_bytes()).0),
+        other => other.clone(),
+    };
+    let format = escape(format);
+    let owned: Vec<Value> = args.iter().map(|a| escape(a)).collect();
+    let refs: Vec<&Value> = owned.iter().collect();
+    Ok(match exec_printf_utf8(&format, &refs)? {
+        Value::Text(t) => Value::Text(crate::types::Text::from_bytes(
+            crate::text_bytes::unescape_str(t.as_str()),
+        )),
+        other => other,
+    })
+}
+
+fn exec_printf_utf8(format: &Value, args: &[&Value]) -> crate::Result<Value> {
     // SQLite converts the format argument to text if not already text.
     let fmt_owned: String;
     let format_str = match format {

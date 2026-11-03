@@ -27,8 +27,17 @@ pub fn emit_literal(
             Ok(target_register)
         }
         ast::Literal::String(s) => {
+            let value = sanitize_string(s);
+            // A literal from SQL text with bytes that are not UTF-8 keeps them.
+            if crate::text_bytes::translating_raw_sql() && crate::text_bytes::has_escapes(&value) {
+                program.emit_insn(Insn::RawString {
+                    value: crate::text_bytes::unescape_str(&value),
+                    dest: target_register,
+                });
+                return Ok(target_register);
+            }
             program.emit_insn(Insn::String8 {
-                value: sanitize_string(s),
+                value,
                 dest: target_register,
             });
             Ok(target_register)

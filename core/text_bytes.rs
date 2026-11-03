@@ -465,6 +465,120 @@ pub(crate) fn binary_cmp_utf8_in(enc: DbEncoding, a: &[u8], b: &[u8]) -> std::cm
     }
 }
 
+const ESCAPE_BASE: u32 = 0x10FF00;
+
+/// Escapes bytes into a `String`: bytes that are not part of valid UTF-8, and
+/// characters in U+10FF00..=U+10FFFF, become one code point U+10FF00 + byte
+/// each. Returns whether anything was escaped. [`unescape_str`] reverses it.
+pub fn escape_bytes(bytes: &[u8]) -> (String, bool) {
+    let mut out = String::with_capacity(bytes.len());
+    let mut escaped = false;
+    let push = |out: &mut String, b: u8| {
+        out.push(char::from_u32(ESCAPE_BASE + b as u32).expect("valid code point"));
+    };
+    for chunk in bytes.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            if (c as u32) >= ESCAPE_BASE {
+                let mut buf = [0u8; 4];
+                for &b in c.encode_utf8(&mut buf).as_bytes() {
+                    push(&mut out, b);
+                }
+                escaped = true;
+            } else {
+                out.push(c);
+            }
+        }
+        for &b in chunk.invalid() {
+            push(&mut out, b);
+            escaped = true;
+        }
+    }
+    (out, escaped)
+}
+
+/// Reverses [`escape_bytes`].
+pub fn unescape_str(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    for c in s.chars() {
+        let v = c as u32;
+        if v >= ESCAPE_BASE {
+            out.push((v - ESCAPE_BASE) as u8);
+        } else {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+    out
+}
+
+/// Marks SQL text produced by [`encode_raw_sql`]. A comment, so the parser skips it.
+const RAW_SQL_MARKER: &str = "/*\u{10FFFF}*/";
+
+/// SQL text as given to sqlite3_prepare, which may contain bytes that are not
+/// UTF-8 (in string literals, as SQLite stores them byte for byte). Valid
+/// UTF-8 is returned unchanged; otherwise the text is escaped and marked.
+pub fn encode_raw_sql(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        if !s.starts_with(RAW_SQL_MARKER) {
+            return std::borrow::Cow::Borrowed(s);
+        }
+    }
+    let (escaped, _) = escape_bytes(bytes);
+    std::borrow::Cow::Owned(format!("{RAW_SQL_MARKER}{escaped}"))
+}
+
+/// The original bytes of SQL text from [`encode_raw_sql`].
+pub fn decode_raw_sql(sql: &str) -> std::borrow::Cow<'_, [u8]> {
+    match sql.strip_prefix(RAW_SQL_MARKER) {
+        Some(rest) => std::borrow::Cow::Owned(unescape_str(rest)),
+        None => std::borrow::Cow::Borrowed(sql.as_bytes()),
+    }
+}
+
+/// Maps a byte offset in SQL text from [`encode_raw_sql`] to the original bytes.
+pub fn raw_sql_offset(sql: &str, offset: usize) -> usize {
+    match sql.strip_prefix(RAW_SQL_MARKER) {
+        Some(rest) => {
+            let off = offset.saturating_sub(RAW_SQL_MARKER.len()).min(rest.len());
+            let mut off = off;
+            while !rest.is_char_boundary(off) {
+                off -= 1;
+            }
+            unescape_str(&rest[..off]).len()
+        }
+        None => offset,
+    }
+}
+
+thread_local! {
+    static RAW_SQL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the SQL being translated came from [`encode_raw_sql`] with escapes.
+pub(crate) fn translating_raw_sql() -> bool {
+    RAW_SQL.with(|r| r.get())
+}
+
+/// Marks, until dropped, whether the SQL being translated is escaped.
+pub(crate) struct RawSqlGuard(bool);
+
+impl RawSqlGuard {
+    pub(crate) fn set(input: &str) -> Self {
+        Self(RAW_SQL.with(|r| r.replace(input.starts_with(RAW_SQL_MARKER))))
+    }
+}
+
+impl Drop for RawSqlGuard {
+    fn drop(&mut self) {
+        RAW_SQL.with(|r| r.set(self.0));
+    }
+}
+
+/// Whether an escaped string holds any escape.
+pub(crate) fn has_escapes(s: &str) -> bool {
+    s.chars().any(|c| c as u32 >= ESCAPE_BASE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,6 +625,24 @@ mod tests {
         assert_eq!(sqlite_instr(b"xxx\xfayyy", b"z"), 0);
         assert_eq!(replace_bytes(b"a\xfab\xfa", b"\xfa", b"--"), b"a--b--");
         assert_eq!(quote_bytes(b"it's\xfa"), b"'it''s\xfa'");
+    }
+
+    #[test]
+    fn raw_sql_round_trips_and_maps_offsets() {
+        for raw in [&b"plain"[..], b"a\xfab", "\u{10FF41}".as_bytes(), b"\xc3"] {
+            let (s, _) = escape_bytes(raw);
+            assert_eq!(unescape_str(&s), raw);
+        }
+        assert!(!escape_bytes(b"plain").1);
+        assert!(matches!(
+            encode_raw_sql(b"SELECT 1"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let sql = b"SELECT '\xff'; SELECT 2";
+        let enc = encode_raw_sql(sql);
+        assert_eq!(decode_raw_sql(&enc), &sql[..]);
+        let semi = enc.find(';').unwrap() + 1;
+        assert_eq!(raw_sql_offset(&enc, semi), 11);
     }
 
     #[test]
@@ -644,6 +776,24 @@ mod sql_tests {
         assert_eq!(q("SELECT ?1 = 'xxx' || x'fa' || 'yyy'"), Value::from_i64(1));
         assert_eq!(q("SELECT ?1 < 'xxx' || x'fb'"), Value::from_i64(1));
         assert_eq!(bytes(&q("SELECT group_concat(?1, x'ff')")), b"xxx\xfayyy");
+        // printf and the JSON functions keep the bytes (expected values from SQLite 3.54).
+        let hex = |sql: &str| one(&conn, &format!("SELECT hex({sql})"), &[raw(b"a\xfab")]);
+        assert_eq!(hex("json_quote(?1)"), Value::build_text("2261FA6222"));
+        assert_eq!(hex("json(json_quote(?1))"), Value::build_text("2261FA6222"));
+        assert_eq!(
+            hex("json_extract('[\"' || ?1 || '\"]', '$[0]')"),
+            Value::build_text("61FA62")
+        );
+        assert_eq!(
+            hex("json_object('k', ?1)"),
+            Value::build_text("7B226B223A2261FA62227D")
+        );
+        let p = one(
+            &conn,
+            "SELECT hex(printf('%s|%q', ?1, ?1))",
+            &[raw(b"a\xfa'")],
+        );
+        assert_eq!(p, Value::build_text("61FA277C61FA2727"));
         // Concatenating halves of a character yields valid UTF-8.
         let e = one(
             &conn,

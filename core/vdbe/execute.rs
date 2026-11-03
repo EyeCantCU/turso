@@ -6189,6 +6189,18 @@ pub fn op_string8(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_raw_string(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(RawString { value, dest }, insn);
+    state.registers[*dest].set_text(Text::from_bytes(value.clone()))?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_blob(
     _program: &Program,
     state: &mut ProgramState,

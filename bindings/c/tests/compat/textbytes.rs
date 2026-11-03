@@ -4,6 +4,7 @@ use super::*;
 use std::ffi::{CStr, CString};
 
 extern "C" {
+    fn sqlite3_sql(stmt: *mut sqlite3_stmt) -> *const libc::c_char;
     fn sqlite3_create_collation_v2(
         db: *mut sqlite3,
         name: *const libc::c_char,
@@ -452,6 +453,40 @@ fn test_collation_receives_its_declared_encoding() {
             None,
         );
         assert_eq!(rc, SQLITE_MISUSE);
+        sqlite3_close(db);
+    }
+}
+
+#[test]
+fn test_sql_text_with_invalid_utf8_literals() {
+    unsafe {
+        let db = open_memory();
+        let sql = b"SELECT hex('\x80'), 'a\xffb', length('x\xfay'); SELECT 2";
+        let mut stmt = ptr::null_mut();
+        let mut tail = ptr::null();
+        let rc = sqlite3_prepare_v2(
+            db,
+            sql.as_ptr().cast(),
+            sql.len() as i32,
+            &mut stmt,
+            &mut tail,
+        );
+        assert_eq!(rc, SQLITE_OK);
+        let consumed = (tail as usize) - (sql.as_ptr() as usize);
+        assert_eq!(consumed, sql.iter().position(|&b| b == b';').unwrap() + 1);
+        let text = CStr::from_ptr(sqlite3_sql(stmt)).to_bytes();
+        assert_eq!(text, &sql[..consumed]);
+        assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+        assert_eq!(column_bytes(stmt, 0), b"80");
+        assert_eq!(column_bytes(stmt, 1), b"a\xffb");
+        assert_eq!(sqlite3_column_int64(stmt, 2), 3);
+        sqlite3_finalize(stmt);
+
+        exec(db, "CREATE TABLE t(x)");
+        let ins = CString::new(&b"INSERT INTO t VALUES ('\xfe\xff')"[..]).unwrap();
+        let rc = sqlite3_exec(db, ins.as_ptr(), None, ptr::null_mut(), ptr::null_mut());
+        assert_eq!(rc, SQLITE_OK);
+        assert_eq!(one_text(db, "SELECT hex(x) FROM t"), "FEFF");
         sqlite3_close(db);
     }
 }

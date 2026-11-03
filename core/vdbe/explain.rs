@@ -1174,6 +1174,15 @@ pub fn insn_to_row(
                 0,
                 format!("r[{dest}]='{value}'"),
             ),
+            Insn::RawString { value, dest } => (
+                "String8",
+                0,
+                *dest as i64,
+                0,
+                Value::Text(crate::types::Text::from_bytes(value.clone())),
+                0,
+                format!("r[{dest}]='{}'", String::from_utf8_lossy(value)),
+            ),
             Insn::Blob { value, dest } => (
                 "Blob",
                 0,

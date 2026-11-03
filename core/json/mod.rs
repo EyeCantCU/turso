@@ -204,7 +204,8 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                 // Like SQLite, text parsed as a JSON document stops at
                 // the first NUL; a text value converted to a string
                 // literal keeps it (Conv::ToString stringifies below).
-                let str = text.as_str();
+                let input = json_input(&text);
+                let str = &*input;
                 let str = if matches!(strict, Conv::ToString) {
                     str
                 } else {
@@ -214,7 +215,7 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
             } else {
                 // Handle as a string literal otherwise
                 // Escape backslashes first, then double quotes
-                let mut str = text.as_str().replace('\\', "\\\\").replace('"', "\\\"");
+                let mut str = json_input(&text).replace('\\', "\\\\").replace('"', "\\\"");
                 // Quote the string to make it a JSON string
                 str.insert(0, '"');
                 str.push('"');
@@ -621,6 +622,26 @@ where
 ///   - If it is `OutputVariant::ElementType` and the `element_type` is text, the result has a subtype of `TextSubtype::Text`, with the outer quotes removed.
 ///   - If it is `OutputVariant::String` and the `element_type` is text, the result has a subtype of `TextSubtype::Text`.
 ///   - If the `element_type` is not text, the flag is ignored.
+/// Text going into the JSON code, which works on `&str`: bytes that are not
+/// UTF-8 are escaped into private code points (text_bytes::escape_bytes).
+fn json_input<'a>(text: &crate::types::TextRef<'a>) -> Cow<'a, str> {
+    if text.is_utf8() && !text.as_bytes().contains(&0xF4) {
+        return Cow::Borrowed(text.as_str());
+    }
+    Cow::Owned(crate::text_bytes::escape_bytes(&text.utf8_bytes()).0)
+}
+
+/// Text coming out of the JSON code, with escaped bytes restored.
+fn json_output(s: String, subtype: TextSubtype) -> Value {
+    let mut text = if s.as_bytes().contains(&0xF4) && crate::text_bytes::has_escapes(&s) {
+        Text::from_bytes(crate::text_bytes::unescape_str(&s))
+    } else {
+        Text::new(s)
+    };
+    text.subtype = subtype;
+    Value::Text(text)
+}
+
 pub fn json_string_to_db_type(
     json: Jsonb,
     element_type: ElementType,
@@ -641,18 +662,18 @@ pub fn json_string_to_db_type(
             OutputVariant::ElementType | OutputVariant::ElementTypePlain
         )
     {
-        return Ok(Value::Text(Text::new(json.scalar_string_value()?)));
+        return Ok(json_output(json.scalar_string_value()?, TextSubtype::Text));
     }
     let mut json_string = json.to_string()?;
     if matches!(flag, OutputVariant::String) {
-        return Ok(Value::Text(Text::json(json_string)));
+        return Ok(json_output(json_string, TextSubtype::Json));
     }
     match element_type {
         ElementType::ARRAY | ElementType::OBJECT => {
             if matches!(flag, OutputVariant::ElementTypePlain) {
-                Ok(Value::Text(Text::new(json_string)))
+                Ok(json_output(json_string, TextSubtype::Text))
             } else {
-                Ok(Value::Text(Text::json(json_string)))
+                Ok(json_output(json_string, TextSubtype::Json))
             }
         }
         ElementType::TEXT | ElementType::TEXT5 | ElementType::TEXTJ | ElementType::TEXTRAW => {
@@ -662,9 +683,12 @@ pub fn json_string_to_db_type(
             ) {
                 json_string.remove(json_string.len() - 1);
                 json_string.remove(0);
-                Ok(Value::Text(Text::new(unescape_string(&json_string))))
+                Ok(json_output(
+                    unescape_string(&json_string),
+                    TextSubtype::Text,
+                ))
             } else {
-                Ok(Value::Text(Text::new(json_string)))
+                Ok(json_output(json_string, TextSubtype::Text))
             }
         }
         ElementType::FLOAT5 | ElementType::FLOAT => {
@@ -1079,10 +1103,10 @@ pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
                 return Ok(value.to_owned()?);
             }
 
-            let mut escaped_value = String::with_capacity(t.as_str().len() + 4);
+            let mut escaped_value = String::with_capacity(t.as_bytes().len() + 4);
             escaped_value.push('"');
 
-            for c in t.as_str().chars() {
+            for c in json_input(t).chars() {
                 match c {
                     '"' | '\\' => {
                         escaped_value.push('\\');
@@ -1101,7 +1125,7 @@ pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
             }
             escaped_value.push('"');
 
-            Ok(Value::Text(Text::json(escaped_value)))
+            Ok(json_output(escaped_value, TextSubtype::Json))
         }
         // Numbers are unquoted in json, but must be returned as TEXT
         ValueRef::Numeric(n) => match n {
