@@ -2394,15 +2394,15 @@ mod tests {
         assert_eq!(input.exec_quote(), expected);
 
         let input = Value::from_f64(std::f64::consts::PI);
-        let expected = Value::build_text("3.141592653589793116e+00");
+        let expected = Value::build_text("3.1415926535897931");
         assert_eq!(input.exec_quote(), expected);
 
         let input = Value::from_f64(
-            crate::numeric::str_to_f64("2.042747795102219097e+05")
+            crate::numeric::str_to_f64("204274.77951022191")
                 .map(f64::from)
                 .unwrap(),
         );
-        let expected = Value::build_text("2.042747795102219097e+05");
+        let expected = Value::build_text("204274.77951022191");
         assert_eq!(input.exec_quote(), expected);
 
         let input = blob(&[0xDE, 0xAD, 0xBE, 0xEF]);

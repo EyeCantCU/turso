@@ -766,154 +766,80 @@ pub fn round_half_away_from_zero_tie(f: f64, precision: usize) -> Option<f64> {
     Some(result)
 }
 
-enum FloatParts {
-    Special(String),
-    Normal {
-        negative: bool,
-        digits: Vec<u8>,
-        exp: i32,
-    },
-}
-
-fn decompose_float(v: f64, precision: usize) -> FloatParts {
-    if v.is_nan() {
-        return FloatParts::Special("".to_string());
-    }
-
-    if v.is_infinite() {
-        return FloatParts::Special(if v.is_sign_negative() { "-Inf" } else { "Inf" }.to_string());
-    }
-
-    if v == 0.0 {
-        return FloatParts::Special("0.0".to_string());
-    }
-
-    let negative = v < 0.0;
-    let mut d = DoubleDouble(v.abs(), 0.0);
-    let mut exp = 0;
-
-    if d.0 > 9.223_372_036_854_775e18 {
-        while d.0 > 9.223_372_036_854_774e118 {
-            exp += 100;
-            d *= DoubleDouble::NEG_E100;
-        }
-        while d.0 > 9.223_372_036_854_774e28 {
-            exp += 10;
-            d *= DoubleDouble::NEG_E10;
-        }
-        while d.0 > 9.223_372_036_854_775e18 {
-            exp += 1;
-            d *= DoubleDouble::NEG_E1;
-        }
+/// Shortest of 15 or 17 significant digits that round-trips, as (digits, exp10).
+fn float_digits(v: f64) -> (Vec<u8>, i32) {
+    let parse = |s: &str| {
+        let (m, e) = s.split_once('e').unwrap();
+        let digits: Vec<u8> = m.bytes().filter(u8::is_ascii_digit).collect();
+        (digits, e.parse::<i32>().unwrap())
+    };
+    let s15 = format!("{v:.14e}");
+    // SQLite always uses 17 digits for deep subnormals.
+    let s = if v >= 1e-310 && s15.parse::<f64>() == Ok(v) {
+        s15
     } else {
-        while d.0 < 9.223_372_036_854_775e-83 {
-            exp -= 100;
-            d *= DoubleDouble::E100;
-        }
-        while d.0 < 9.223_372_036_854_775e7 {
-            exp -= 10;
-            d *= DoubleDouble::E10;
-        }
-        while d.0 < 9.223_372_036_854_775e17 {
-            exp -= 1;
-            d *= DoubleDouble::E1;
-        }
-    }
-
-    let mut digits = u64::from(d).to_string().into_bytes();
-    let mut decimal_pos = digits.len() as i32 + exp;
-
-    'out: {
-        if digits.len() > precision {
-            let round_up = digits[precision] >= b'5';
-            digits.truncate(precision);
-
-            if round_up {
-                for i in (0..precision).rev() {
-                    if digits[i] < b'9' {
-                        digits[i] += 1;
-                        break 'out;
-                    }
-                    digits[i] = b'0';
-                }
-
-                digits.insert(0, b'1');
-                decimal_pos += 1;
-            }
-        }
-    }
-
-    while digits.len() > 1 && digits[digits.len() - 1] == b'0' {
+        format!("{v:.16e}")
+    };
+    let (mut digits, exp) = parse(&s);
+    while digits.len() > 1 && digits.last() == Some(&b'0') {
         digits.pop();
     }
-
-    FloatParts::Normal {
-        negative,
-        digits,
-        exp: decimal_pos - 1,
-    }
+    (digits, exp)
 }
 
-fn format_float_scientific(v: f64, precision: usize) -> String {
-    match decompose_float(v, precision) {
-        FloatParts::Special(s) => s,
-        FloatParts::Normal {
-            negative,
-            digits,
-            exp,
-        } => {
-            let first = digits.first().cloned().unwrap_or(b'0') as char;
-            let rest = digits
-                .get(1..)
-                .filter(|v| !v.is_empty())
-                .map(|v| unsafe { str::from_utf8_unchecked(v) })
-                .unwrap_or("0");
-            format!(
-                "{}{}.{}e{}{:0width$}",
-                if negative { "-" } else { "" },
-                first,
-                rest,
-                if exp >= 0 { "+" } else { "-" },
-                exp.abs(),
-                width = if exp.abs() > 99 { 3 } else { 2 }
-            )
-        }
-    }
-}
-
+/// Renders a REAL like SQLite's text conversion (sqlite3VdbeMemStringify):
+/// "%!.15g" with a 17-digit fallback, decimal up to 1e16.
 pub fn format_float(v: f64) -> String {
-    match decompose_float(v, 15) {
-        FloatParts::Special(s) => s,
-        FloatParts::Normal {
-            negative,
-            digits,
-            exp,
-        } => {
-            let decimal_pos = exp + 1;
-            if (-4..=14).contains(&exp) {
-                format!(
-                    "{}{}.{}{}",
-                    if negative { "-" } else { Default::default() },
-                    if decimal_pos > 0 {
-                        let zeroes = (decimal_pos - digits.len() as i32).max(0) as usize;
-                        let digits = digits
-                            .get(0..(decimal_pos.min(digits.len() as i32) as usize))
-                            .unwrap();
-                        (unsafe { str::from_utf8_unchecked(digits) }).to_owned()
-                            + &"0".repeat(zeroes)
-                    } else {
-                        "0".to_string()
-                    },
-                    "0".repeat(decimal_pos.min(0).unsigned_abs() as usize),
-                    digits
-                        .get((decimal_pos.max(0) as usize)..)
-                        .filter(|v| !v.is_empty())
-                        .map(|v| unsafe { str::from_utf8_unchecked(v) })
-                        .unwrap_or("0")
-                )
-            } else {
-                format_float_scientific(v, 15)
-            }
+    format_float_with(v, 16, float_digits)
+}
+
+/// Renders a REAL like plain "%!.15g", as sqlite3_expanded_sql does.
+pub fn format_float_g15(v: f64) -> String {
+    format_float_with(v, 14, |a| {
+        let s = format!("{a:.14e}");
+        let (m, e) = s.split_once('e').unwrap();
+        let mut d: Vec<u8> = m.bytes().filter(u8::is_ascii_digit).collect();
+        while d.len() > 1 && d.last() == Some(&b'0') {
+            d.pop();
+        }
+        (d, e.parse().unwrap())
+    })
+}
+
+fn format_float_with(
+    v: f64,
+    max_decimal_exp: i32,
+    digits_of: impl Fn(f64) -> (Vec<u8>, i32),
+) -> String {
+    if v.is_nan() {
+        return String::new();
+    }
+    if v.is_infinite() {
+        return if v < 0.0 { "-Inf" } else { "Inf" }.to_string();
+    }
+    if v == 0.0 {
+        return "0.0".to_string();
+    }
+    let (digits, exp) = digits_of(v.abs());
+    let digits = unsafe { str::from_utf8_unchecked(&digits) };
+    let sign = if v < 0.0 { "-" } else { "" };
+    if !(-4..=max_decimal_exp).contains(&exp) {
+        let rest = if digits.len() > 1 { &digits[1..] } else { "0" };
+        return format!(
+            "{sign}{}.{rest}e{}{:02}",
+            &digits[..1],
+            if exp >= 0 { '+' } else { '-' },
+            exp.abs()
+        );
+    }
+    if exp < 0 {
+        format!("{sign}0.{}{digits}", "0".repeat((-exp - 1) as usize))
+    } else {
+        let int_len = exp as usize + 1;
+        if digits.len() <= int_len {
+            format!("{sign}{digits}{}.0", "0".repeat(int_len - digits.len()))
+        } else {
+            format!("{sign}{}.{}", &digits[..int_len], &digits[int_len..])
         }
     }
 }
@@ -929,22 +855,51 @@ pub fn format_float_for_quote(v: f64) -> String {
             "9.0e+999".to_string()
         };
     }
-    let default = format_float(v);
-    if str_to_f64(&default).map(f64::from) == Some(v) {
-        return default;
-    }
-    format_float_scientific(v, 19)
+    format_float(v)
 }
 
 #[test]
 fn test_decode_float() {
-    assert_eq!(format_float(9.93e-322), "9.93071948140905e-322");
+    assert_eq!(format_float(9.93e-322), "9.9307194814090555e-322");
     assert_eq!(format_float(9.93), "9.93");
     assert_eq!(format_float(0.093), "0.093");
     assert_eq!(format_float(-0.093), "-0.093");
     assert_eq!(format_float(0.0), "0.0");
-    assert_eq!(format_float(4.94e-322), "4.94065645841247e-322");
+    assert_eq!(format_float(4.94e-322), "4.9406564584124654e-322");
     assert_eq!(format_float(-20228007.0), "-20228007.0");
+}
+
+#[test]
+fn test_format_float_sqlite_rules() {
+    for (v, want) in [
+        (1e14, "100000000000000.0"),
+        (1e15, "1000000000000000.0"),
+        (1e16, "10000000000000000.0"),
+        (1e17, "1.0e+17"),
+        (-1e15, "-1000000000000000.0"),
+        (99999999999999990.0, "99999999999999984.0"),
+        (1.2345678901234567e17, "1.2345678901234566e+17"),
+        (0.0001, "0.0001"),
+        (0.00001, "1.0e-05"),
+        (0.1 + 0.2, "0.30000000000000004"),
+        (999999999999999.9, "999999999999999.88"),
+        (1e100, "1.0e+100"),
+        (5e-324, "4.9406564584124654e-324"),
+        (-0.0, "0.0"),
+        (f64::INFINITY, "Inf"),
+        (f64::NEG_INFINITY, "-Inf"),
+    ] {
+        assert_eq!(format_float(v), want, "{v:e}");
+    }
+}
+
+#[test]
+fn test_format_float_g15() {
+    assert_eq!(format_float_g15(1e14), "100000000000000.0");
+    assert_eq!(format_float_g15(1e15), "1.0e+15");
+    assert_eq!(format_float_g15(0.1 + 0.2), "0.3");
+    assert_eq!(format_float_g15(-1.5e-7), "-1.5e-07");
+    assert_eq!(format_float_g15(0.0001), "0.0001");
 }
 
 #[test]

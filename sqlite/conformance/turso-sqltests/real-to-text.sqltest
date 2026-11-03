@@ -1,0 +1,52 @@
+@database :memory:
+
+# REAL to TEXT follows SQLite's "%!.15g" with a 17-digit fallback.
+
+test real-text-integral-below-1e17 {
+    SELECT CAST(1e14 AS TEXT), CAST(1e15 AS TEXT), CAST(1e16 AS TEXT), CAST(-1e15 AS TEXT);
+}
+expect {
+    100000000000000.0|1000000000000000.0|10000000000000000.0|-1000000000000000.0
+}
+
+test real-text-scientific {
+    SELECT CAST(1e17 AS TEXT), CAST(-1e17 AS TEXT), CAST(1e100 AS TEXT), CAST(1e-5 AS TEXT), CAST(1e-300 AS TEXT);
+}
+expect {
+    1.0e+17|-1.0e+17|1.0e+100|1.0e-05|1.0e-300
+}
+
+test real-text-small-decimal {
+    SELECT CAST(0.0001 AS TEXT), CAST(0.1 AS TEXT), CAST(3.14159 AS TEXT), CAST(100.0 AS TEXT);
+}
+expect {
+    0.0001|0.1|3.14159|100.0
+}
+
+test real-text-17-digit-fallback {
+    SELECT CAST(0.1 + 0.2 AS TEXT), CAST(999999999999999.9 AS TEXT), CAST(5e-324 AS TEXT), CAST(1.2345678901234567e17 AS TEXT);
+}
+expect {
+    0.30000000000000004|999999999999999.88|4.9406564584124654e-324|1.2345678901234566e+17
+}
+
+test real-text-concat {
+    SELECT 1e15 || '', 1e16 || 'x', 1e17 || '', 2e15 || '|';
+}
+expect {
+    1000000000000000.0|10000000000000000.0x|1.0e+17|2000000000000000.0|
+}
+
+test real-text-printf-s {
+    SELECT printf('%s', 1e15), printf('%s', 1e17), printf('%s', 0.1 + 0.2);
+}
+expect {
+    1000000000000000.0|1.0e+17|0.30000000000000004
+}
+
+test real-text-negative-zero {
+    SELECT CAST(0.0 * -1 AS TEXT);
+}
+expect {
+    0.0
+}

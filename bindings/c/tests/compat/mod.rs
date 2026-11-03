@@ -730,6 +730,48 @@ mod tests {
     }
 
     #[test]
+    fn column_text_of_real_values() {
+        let cases = [
+            ("1e15", "1000000000000000.0"),
+            ("1e16", "10000000000000000.0"),
+            ("1e17", "1.0e+17"),
+            ("-1e15", "-1000000000000000.0"),
+            ("0.1", "0.1"),
+            ("0.1 + 0.2", "0.30000000000000004"),
+            ("0.0001", "0.0001"),
+            ("0.00001", "1.0e-05"),
+            ("100.0", "100.0"),
+            ("1e100", "1.0e+100"),
+            ("5e-324", "4.9406564584124654e-324"),
+            ("999999999999999.9", "999999999999999.88"),
+            ("1.2345678901234567e17", "1.2345678901234566e+17"),
+            ("1e999", "Inf"),
+            ("-1e999", "-Inf"),
+        ];
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            for (expr, want) in cases {
+                let sql = std::ffi::CString::new(format!("SELECT {expr}")).unwrap();
+                let mut stmt = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut()),
+                    SQLITE_OK
+                );
+                assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+                assert_eq!(sqlite3_column_type(stmt, 0), SQLITE_FLOAT);
+                let p = sqlite3_column_text(stmt, 0);
+                assert!(!p.is_null());
+                let got = std::ffi::CStr::from_ptr(p as *const _).to_str().unwrap();
+                assert_eq!(got, want, "column_text of {expr}");
+                assert_eq!(sqlite3_column_bytes(stmt, 0) as usize, want.len());
+                assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            }
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
     fn test_sqlite3_bind_text() {
         unsafe {
             let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();

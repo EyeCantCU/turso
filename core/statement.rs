@@ -1702,6 +1702,10 @@ fn append_expanded_literal(out: &mut String, value: &Value) {
             }
             out.push('\'');
         }
+        // sqlite3_expanded_sql renders REALs with plain "%!.15g".
+        Value::Numeric(crate::Numeric::Float(f)) => {
+            out.push_str(&crate::numeric::format_float_g15(f64::from(*f)))
+        }
         other => {
             let _ = write!(out, "{other}");
         }
