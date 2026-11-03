@@ -578,14 +578,12 @@ unsafe fn unique_columns(tab: &str, p: &mut ApplyCtx) -> Result<Vec<u8>, i32> {
             if info.col_int(5) == 0 {
                 continue;
             }
-            for ii in 0..p.n_col {
+            for (u, name) in unique.iter_mut().zip(&p.cols) {
                 if partial
                     || cid == -2
-                    || col
-                        .as_deref()
-                        .is_some_and(|c| c.eq_ignore_ascii_case(&p.cols[ii]))
+                    || col.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(name))
                 {
-                    unique[ii] = 1;
+                    *u = 1;
                 }
             }
         }
@@ -607,14 +605,14 @@ unsafe fn update_to_update(tab: &str, p: &mut ApplyCtx, up: &ChangesetIter) -> R
     let mut randset = String::new();
     let mut upset = String::new();
     let mut whr = String::new();
-    for ii in 0..p.n_col {
+    for (ii, is_unique) in unique.iter().enumerate() {
         if p.pk[ii] != 0 {
             if !whr.is_empty() {
                 whr.push_str(" AND ");
             }
             whr.push_str(&format!("{} IS ?{}", ident(&p.cols[ii]), ii + 1));
         } else if let Some(new) = up.new_val(ii) {
-            if unique[ii] != 0 {
+            if *is_unique != 0 {
                 let rand = match new {
                     Val::Null => "NULL",
                     Val::Text(_) => "CAST(random() AS TEXT)",
@@ -882,9 +880,11 @@ unsafe fn changeset_apply(
                 let n_min_col = p.pk.iter().rposition(|x| *x != 0).map_or(0, |i| i + 1);
                 let it_pk = &(*it_ptr).pk;
                 // SQLite logs each mismatch with sqlite3_log and skips the table.
-                if p.n_col == 0 || p.n_col < n_col {
-                    schema_mismatch = true;
-                } else if n_col < n_min_col || p.pk[..n_col] != it_pk[..n_col] {
+                if p.n_col == 0
+                    || p.n_col < n_col
+                    || n_col < n_min_col
+                    || p.pk[..n_col] != it_pk[..n_col]
+                {
                     schema_mismatch = true;
                 } else {
                     p.n_col = n_col;

@@ -6,7 +6,11 @@ use libc::{c_char, c_int, c_void};
 use std::ffi::{CStr, CString};
 use std::ptr;
 
-use super::{sqlite3, sqlite3_close, sqlite3_errmsg, sqlite3_exec, sqlite3_free, sqlite3_open};
+use super::{
+    sqlite3, sqlite3_close, sqlite3_column_count, sqlite3_column_text, sqlite3_column_type,
+    sqlite3_errmsg, sqlite3_exec, sqlite3_finalize, sqlite3_free, sqlite3_open, sqlite3_prepare_v2,
+    sqlite3_step, sqlite3_stmt,
+};
 
 const SQLITE_OK: c_int = 0;
 const SQLITE_ABORT: c_int = 4;
@@ -102,6 +106,12 @@ extern "C" {
     fn sqlite3session_changeset_size(p: *mut sqlite3_session) -> i64;
     fn sqlite3session_object_config(p: *mut sqlite3_session, op: c_int, arg: *mut c_void) -> c_int;
     fn sqlite3session_config(op: c_int, arg: *mut c_void) -> c_int;
+    fn sqlite3session_diff(
+        p: *mut sqlite3_session,
+        from: *const c_char,
+        tbl: *const c_char,
+        err: *mut *mut c_char,
+    ) -> c_int;
     fn sqlite3changeset_start(
         pp: *mut *mut sqlite3_changeset_iter,
         n: c_int,
@@ -234,24 +244,29 @@ extern "C" {
         discard: c_int,
         err: *mut *mut c_char,
     ) -> c_int;
+    fn sqlite3rebaser_create(pp: *mut *mut c_void) -> c_int;
+    fn sqlite3rebaser_configure(p: *mut c_void, n: c_int, rb: *const c_void) -> c_int;
+    fn sqlite3rebaser_rebase(
+        p: *mut c_void,
+        n: c_int,
+        input: *const c_void,
+        pn: *mut c_int,
+        pp: *mut *mut c_void,
+    ) -> c_int;
+    fn sqlite3rebaser_rebase_strm(
+        p: *mut c_void,
+        xi: Option<XInput>,
+        p_in: *mut c_void,
+        xo: Option<XOutput>,
+        p_out: *mut c_void,
+    ) -> c_int;
+    fn sqlite3rebaser_delete(p: *mut c_void);
     fn sqlite3_value_type(v: *mut c_void) -> c_int;
     fn sqlite3_value_int64(v: *mut c_void) -> i64;
     fn sqlite3_value_double(v: *mut c_void) -> f64;
     fn sqlite3_value_bytes(v: *mut c_void) -> c_int;
     fn sqlite3_value_blob(v: *mut c_void) -> *const c_void;
-    fn sqlite3_value_text(v: *mut c_void) -> *const u8;
-    fn sqlite3_prepare_v2(
-        db: *mut sqlite3,
-        sql: *const c_char,
-        n: c_int,
-        stmt: *mut *mut c_void,
-        tail: *mut *const c_char,
-    ) -> c_int;
-    fn sqlite3_step(stmt: *mut c_void) -> c_int;
-    fn sqlite3_finalize(stmt: *mut c_void) -> c_int;
-    fn sqlite3_column_count(stmt: *mut c_void) -> c_int;
-    fn sqlite3_column_type(stmt: *mut c_void, i: c_int) -> c_int;
-    fn sqlite3_column_text(stmt: *mut c_void, i: c_int) -> *const c_char;
+    fn sqlite3_value_text(v: *mut c_void) -> *const c_char;
 }
 
 #[cfg(not(feature = "sqlite3"))]
@@ -276,7 +291,7 @@ unsafe fn exec(db: *mut sqlite3, sql: &str) {
 
 /// Rows joined with '|'.
 unsafe fn query(db: *mut sqlite3, sql: &str) -> Vec<String> {
-    let mut stmt = ptr::null_mut();
+    let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
     let rc = sqlite3_prepare_v2(db, c(sql).as_ptr(), -1, &mut stmt, ptr::null_mut());
     assert_eq!(rc, SQLITE_OK, "{sql}: {}", errmsg(db));
     let mut rows = Vec::new();
@@ -351,7 +366,7 @@ unsafe fn val(v: *mut c_void) -> String {
         3 | 4 => {
             let n = sqlite3_value_bytes(v) as usize;
             let p = if sqlite3_value_type(v) == 3 {
-                sqlite3_value_text(v)
+                sqlite3_value_text(v) as *const u8
             } else {
                 sqlite3_value_blob(v) as *const u8
             };
@@ -1207,5 +1222,376 @@ fn test_session_changegroup() {
         assert_eq!(hex(&out_buf(n, p, rc)), GROUP_CHANGES);
         sqlite3changegroup_delete(g);
         sqlite3_close(db);
+    }
+}
+
+const REBASED_OMIT: &str = "54030100007200170001000000000000000103025231000003024c310009000100000000000000020302523201000000000000000212000100000000000000030305746872656501000000000000001e17000100000000000000040302523401000000000000000401000000000000000403024c34010000000000000004";
+const REBASED_REPLACE: &str = "54030100007200090001000000000000000203025232010000000000000002";
+
+#[test]
+fn test_session_rebaser() {
+    unsafe {
+        let dir = tempfile::tempdir().unwrap();
+        let setup = "CREATE TABLE r(a INTEGER PRIMARY KEY, b, c);\
+                     INSERT INTO r VALUES(1,'one',1),(2,'two',2),(3,'three',3);";
+        let capture = |name: &str, sql: &str| {
+            let db = open(&dir.path().join(name));
+            exec(db, setup);
+            let mut s = ptr::null_mut();
+            sqlite3session_create(db, c("main").as_ptr(), &mut s);
+            sqlite3session_attach(s, ptr::null());
+            exec(db, sql);
+            let cs = changeset(s);
+            sqlite3session_delete(s);
+            sqlite3_close(db);
+            cs
+        };
+        let mut local = capture(
+            "l.db",
+            "UPDATE r SET b='L1' WHERE a=1; DELETE FROM r WHERE a=2; \
+             INSERT INTO r VALUES(4,'L4',4); UPDATE r SET c=30 WHERE a=3;",
+        );
+        let mut remote = capture(
+            "r.db",
+            "UPDATE r SET b='R1' WHERE a=1; UPDATE r SET b='R2' WHERE a=2; \
+             INSERT INTO r VALUES(4,'R4',4); DELETE FROM r WHERE a=3;",
+        );
+        for (answer, expected) in [
+            (SQLITE_CHANGESET_OMIT, REBASED_OMIT),
+            (SQLITE_CHANGESET_REPLACE, REBASED_REPLACE),
+        ] {
+            let db = open(&dir.path().join(format!("m{answer}.db")));
+            exec(db, setup);
+            let mut st = Conflicts::default();
+            let ctx = &mut st as *mut Conflicts as *mut c_void;
+            sqlite3changeset_apply(
+                db,
+                local.len() as c_int,
+                local.as_mut_ptr() as *mut c_void,
+                None,
+                Some(x_conflict),
+                ctx,
+            );
+            st.answer = answer;
+            let (mut nrb, mut rb) = (0, ptr::null_mut());
+            let rc = sqlite3changeset_apply_v2(
+                db,
+                remote.len() as c_int,
+                remote.as_mut_ptr() as *mut c_void,
+                None,
+                Some(x_conflict),
+                ctx,
+                &mut rb,
+                &mut nrb,
+                0,
+            );
+            assert_eq!(rc, SQLITE_OK);
+            let rb = take(nrb, rb);
+            let mut r = ptr::null_mut();
+            assert_eq!(sqlite3rebaser_create(&mut r), SQLITE_OK);
+            assert_eq!(
+                sqlite3rebaser_configure(r, rb.len() as c_int, rb.as_ptr() as *const c_void),
+                SQLITE_OK
+            );
+            let (mut n, mut p) = (0, ptr::null_mut());
+            let rc = sqlite3rebaser_rebase(
+                r,
+                local.len() as c_int,
+                local.as_ptr() as *const c_void,
+                &mut n,
+                &mut p,
+            );
+            let rebased = out_buf(n, p, rc);
+            assert_eq!(hex(&rebased), expected);
+            let mut input = Buf(local.clone(), 0, 5);
+            let mut out = Buf(Vec::new(), 0, 0);
+            let rc = sqlite3rebaser_rebase_strm(
+                r,
+                Some(x_input),
+                &mut input as *mut Buf as *mut c_void,
+                Some(x_output),
+                &mut out as *mut Buf as *mut c_void,
+            );
+            assert_eq!(rc, SQLITE_OK);
+            assert_eq!(out.0, rebased);
+            let ps = unhex(PATCHSET);
+            assert_eq!(
+                sqlite3rebaser_rebase(
+                    r,
+                    ps.len() as c_int,
+                    ps.as_ptr() as *const c_void,
+                    &mut n,
+                    &mut p
+                ),
+                1
+            );
+            sqlite3rebaser_delete(r);
+            sqlite3_close(db);
+        }
+    }
+}
+
+#[test]
+fn test_session_diff() {
+    unsafe {
+        #[cfg(not(feature = "sqlite3"))]
+        turso_enable_experimental();
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(&dir.path().join("a.db"));
+        exec(db, SCHEMA);
+        let aux = dir.path().join("aux.db");
+        let other = open(&aux);
+        exec(other, SCHEMA);
+        exec(other, CHANGES);
+        sqlite3_close(other);
+        exec(db, &format!("ATTACH '{}' AS aux", aux.display()));
+        let mut s = ptr::null_mut();
+        sqlite3session_create(db, c("main").as_ptr(), &mut s);
+        let mut err = ptr::null_mut();
+        for t in ["t1", "t2"] {
+            assert_eq!(
+                sqlite3session_diff(s, c("aux").as_ptr(), c(t).as_ptr(), &mut err),
+                SQLITE_OK
+            );
+        }
+        // Applying the diff to aux makes it equal to main.
+        assert_eq!(
+            describe(&changeset(s)),
+            [
+                "t1 DELETE pk=100 old=(10,'four',4)",
+                "t1 UPDATE pk=100 old=(1,'ONE',-) new=(-,'one',-)",
+                "t1 UPDATE pk=100 old=(2,-,22) new=(-,-,NULL)",
+                "t1 INSERT pk=100 new=(3,x'0102',3)",
+                "t2 UPDATE pk=210 old=('a',1,9.0) new=(-,-,1.0)",
+                "t2 INSERT pk=210 new=('b',2,2.0)",
+                "t2 DELETE pk=210 old=('c',3,3.5)",
+            ]
+        );
+        assert_eq!(
+            sqlite3session_diff(s, c("aux").as_ptr(), c("nosuch").as_ptr(), &mut err),
+            SQLITE_OK
+        );
+        assert_eq!(
+            sqlite3session_diff(s, c("nodb").as_ptr(), c("t1").as_ptr(), &mut err),
+            SQLITE_SCHEMA
+        );
+        assert_eq!(
+            CStr::from_ptr(err).to_str().unwrap(),
+            "no such table: nodb.t1"
+        );
+        sqlite3_free(err as *mut c_void);
+        sqlite3session_delete(s);
+        sqlite3_close(db);
+    }
+}
+
+/// The session API of another libsqlite3, loaded at run time.
+#[cfg(target_os = "linux")]
+struct OtherLib {
+    open: unsafe extern "C" fn(*const c_char, *mut *mut sqlite3) -> c_int,
+    close: unsafe extern "C" fn(*mut sqlite3) -> c_int,
+    exec: unsafe extern "C" fn(
+        *mut sqlite3,
+        *const c_char,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+    ) -> c_int,
+    prepare: unsafe extern "C" fn(
+        *mut sqlite3,
+        *const c_char,
+        c_int,
+        *mut *mut c_void,
+        *mut c_void,
+    ) -> c_int,
+    step: unsafe extern "C" fn(*mut c_void) -> c_int,
+    column_text: unsafe extern "C" fn(*mut c_void, c_int) -> *const c_char,
+    finalize: unsafe extern "C" fn(*mut c_void) -> c_int,
+    free: unsafe extern "C" fn(*mut c_void),
+    create: unsafe extern "C" fn(*mut sqlite3, *const c_char, *mut *mut sqlite3_session) -> c_int,
+    attach: unsafe extern "C" fn(*mut sqlite3_session, *const c_char) -> c_int,
+    changeset: unsafe extern "C" fn(*mut sqlite3_session, *mut c_int, *mut *mut c_void) -> c_int,
+    delete: unsafe extern "C" fn(*mut sqlite3_session),
+    apply: unsafe extern "C" fn(
+        *mut sqlite3,
+        c_int,
+        *mut c_void,
+        *mut c_void,
+        Option<XConflict>,
+        *mut c_void,
+    ) -> c_int,
+}
+
+/// A function pointer from dlsym.
+#[cfg(target_os = "linux")]
+unsafe fn fnptr<T: Copy>(p: *mut c_void) -> T {
+    std::mem::transmute_copy::<*mut c_void, T>(&p)
+}
+
+#[cfg(target_os = "linux")]
+impl OtherLib {
+    /// Real SQLite, from LIBSQLITE3_PATH or the default search path.
+    unsafe fn load() -> Option<OtherLib> {
+        let path =
+            std::env::var("LIBSQLITE3_PATH").unwrap_or_else(|_| "libsqlite3.so.0".to_string());
+        // RTLD_DEEPBIND: its internal calls must not resolve to the library under test.
+        let h = libc::dlopen(
+            c(&path).as_ptr(),
+            libc::RTLD_NOW | libc::RTLD_LOCAL | libc::RTLD_DEEPBIND,
+        );
+        if h.is_null() {
+            return None;
+        }
+        let sym = |n: &str| {
+            let p = libc::dlsym(h, c(n).as_ptr());
+            assert!(!p.is_null(), "{n} missing from {path}");
+            p
+        };
+        Some(OtherLib {
+            open: fnptr(sym("sqlite3_open")),
+            close: fnptr(sym("sqlite3_close")),
+            exec: fnptr(sym("sqlite3_exec")),
+            prepare: fnptr(sym("sqlite3_prepare_v2")),
+            step: fnptr(sym("sqlite3_step")),
+            column_text: fnptr(sym("sqlite3_column_text")),
+            finalize: fnptr(sym("sqlite3_finalize")),
+            free: fnptr(sym("sqlite3_free")),
+            create: fnptr(sym("sqlite3session_create")),
+            attach: fnptr(sym("sqlite3session_attach")),
+            changeset: fnptr(sym("sqlite3session_changeset")),
+            delete: fnptr(sym("sqlite3session_delete")),
+            apply: fnptr(sym("sqlite3changeset_apply")),
+        })
+    }
+
+    unsafe fn exec(&self, db: *mut sqlite3, sql: &str) {
+        let rc = (self.exec)(
+            db,
+            c(sql).as_ptr(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        );
+        assert_eq!(rc, SQLITE_OK, "{sql}");
+    }
+
+    /// One text column per row.
+    unsafe fn query(&self, db: *mut sqlite3, sql: &str) -> Vec<String> {
+        let mut stmt = ptr::null_mut();
+        assert_eq!(
+            (self.prepare)(db, c(sql).as_ptr(), -1, &mut stmt, ptr::null_mut()),
+            SQLITE_OK
+        );
+        let mut rows = Vec::new();
+        while (self.step)(stmt) == SQLITE_ROW {
+            let p = (self.column_text)(stmt, 0);
+            rows.push(if p.is_null() {
+                "NULL".to_string()
+            } else {
+                CStr::from_ptr(p).to_string_lossy().into_owned()
+            });
+        }
+        (self.finalize)(stmt);
+        rows
+    }
+}
+
+const INTEROP_SCHEMA: &str = "CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c);\
+    CREATE TABLE t2(x TEXT, y INT, z REAL, PRIMARY KEY(y, x));\
+    INSERT INTO t1 VALUES(1,'one',1.5),(2,'two',NULL),(3,'three',x'00ff'),(4,'four',4);\
+    INSERT INTO t2 VALUES('a',1,1.25),('b',2,2.5);";
+
+const INTEROP_CHANGES: &str = "INSERT INTO t1 VALUES(10,'ten',10),(11,NULL,x'');\
+    UPDATE t1 SET b='ONE', c=1e300 WHERE a=1;\
+    UPDATE t1 SET c=-9223372036854775808 WHERE a=2;\
+    DELETE FROM t1 WHERE a=3; UPDATE t1 SET a=40 WHERE a=4;\
+    UPDATE t2 SET z=99.5 WHERE x='a'; DELETE FROM t2 WHERE x='b';\
+    INSERT INTO t2 VALUES('\u{e9}', 9, 3.14159);";
+
+const INTEROP_DUMP: &str = "SELECT group_concat(r, ';') FROM (\
+    SELECT 't1:' || a || ',' || quote(b) || ',' || quote(c) AS r FROM t1 \
+    UNION ALL SELECT 't2:' || quote(x) || ',' || y || ',' || quote(z) FROM t2 ORDER BY 1)";
+
+unsafe extern "C" fn count_conflict(
+    ctx: *mut c_void,
+    _e: c_int,
+    _it: *mut sqlite3_changeset_iter,
+) -> c_int {
+    *(ctx as *mut c_int) += 1;
+    SQLITE_CHANGESET_OMIT
+}
+
+/// A changeset made by real SQLite applies here, and one made here applies
+/// on real SQLite, with equal results.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_session_cross_engine_interop() {
+    unsafe {
+        let Some(other) = OtherLib::load() else {
+            eprintln!("libsqlite3.so.0 not found; skipping the cross-engine test");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = |n: &str| c(dir.path().join(n).to_str().unwrap());
+        // Reference: CHANGES applied directly.
+        let reference = open(&dir.path().join("ref.db"));
+        exec(reference, INTEROP_SCHEMA);
+        exec(reference, INTEROP_CHANGES);
+        let expected = query(reference, INTEROP_DUMP);
+
+        // SQLite -> this library.
+        let mut odb = ptr::null_mut();
+        (other.open)(path("o1.db").as_ptr(), &mut odb);
+        other.exec(odb, INTEROP_SCHEMA);
+        let mut s = ptr::null_mut();
+        (other.create)(odb, c("main").as_ptr(), &mut s);
+        (other.attach)(s, ptr::null());
+        other.exec(odb, INTEROP_CHANGES);
+        let (mut n, mut p) = (0, ptr::null_mut());
+        assert_eq!((other.changeset)(s, &mut n, &mut p), SQLITE_OK);
+        (other.delete)(s);
+        assert_eq!(other.query(odb, INTEROP_DUMP), expected);
+        let db = open(&dir.path().join("t1.db"));
+        exec(db, INTEROP_SCHEMA);
+        let mut conflicts = 0;
+        let ctx = &mut conflicts as *mut c_int as *mut c_void;
+        assert_eq!(
+            sqlite3changeset_apply(db, n, p, None, Some(count_conflict), ctx),
+            SQLITE_OK
+        );
+        assert_eq!(conflicts, 0);
+        assert_eq!(query(db, INTEROP_DUMP), expected);
+        let theirs = std::slice::from_raw_parts(p as *const u8, n as usize).to_vec();
+        (other.free)(p);
+
+        // This library -> SQLite.
+        let db2 = open(&dir.path().join("t2.db"));
+        exec(db2, INTEROP_SCHEMA);
+        let mut s = ptr::null_mut();
+        sqlite3session_create(db2, c("main").as_ptr(), &mut s);
+        sqlite3session_attach(s, ptr::null());
+        exec(db2, INTEROP_CHANGES);
+        let mut ours = changeset(s);
+        sqlite3session_delete(s);
+        assert_eq!(ours, theirs, "the two libraries made different changesets");
+        let mut odb2 = ptr::null_mut();
+        (other.open)(path("o2.db").as_ptr(), &mut odb2);
+        other.exec(odb2, INTEROP_SCHEMA);
+        let rc = (other.apply)(
+            odb2,
+            ours.len() as c_int,
+            ours.as_mut_ptr() as *mut c_void,
+            ptr::null_mut(),
+            Some(count_conflict),
+            ctx,
+        );
+        assert_eq!(rc, SQLITE_OK);
+        assert_eq!(conflicts, 0);
+        assert_eq!(other.query(odb2, INTEROP_DUMP), expected);
+        (other.close)(odb);
+        (other.close)(odb2);
+        for d in [reference, db, db2] {
+            sqlite3_close(d);
+        }
     }
 }

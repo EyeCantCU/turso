@@ -204,10 +204,8 @@ fn change_merge(
         });
     }
     let op1 = exist.op;
-    if (op1 == SQLITE_INSERT && op2 == SQLITE_INSERT)
-        || (op1 == SQLITE_UPDATE && op2 == SQLITE_INSERT)
-        || (op1 == SQLITE_DELETE && op2 == SQLITE_UPDATE)
-        || (op1 == SQLITE_DELETE && op2 == SQLITE_DELETE)
+    if (op2 == SQLITE_INSERT && (op1 == SQLITE_INSERT || op1 == SQLITE_UPDATE))
+        || (op1 == SQLITE_DELETE && (op2 == SQLITE_UPDATE || op2 == SQLITE_DELETE))
     {
         // Unsupported combinations: the second change is discarded.
         return Some(exist);
@@ -591,8 +589,8 @@ unsafe fn invert(
                     Val::serialize(v.as_ref(), &mut s_out);
                 }
                 // New new.*: old.* values, PK undefined.
-                for i in 0..n_col {
-                    let v = if is_pk(i) { None } else { vals[i].as_ref() };
+                for (i, v) in vals[..n_col].iter().enumerate() {
+                    let v = if is_pk(i) { None } else { v.as_ref() };
                     Val::serialize(v, &mut s_out);
                 }
             }

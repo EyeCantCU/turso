@@ -4,8 +4,6 @@
 //! the hash-table order matches, so output is byte-identical to SQLite's.
 
 #![allow(clippy::too_many_arguments)]
-// Parts are used by a later stage (diff).
-#![allow(dead_code)]
 
 use std::ffi::{self, CStr, CString};
 use std::ptr;
@@ -21,8 +19,10 @@ use crate::{
 };
 
 pub(crate) mod apply;
+pub(crate) mod diff;
 pub(crate) mod group;
 pub(crate) mod iter;
+pub(crate) mod rebase;
 
 pub(crate) const SQLITE_OK: i32 = 0;
 pub(crate) const SQLITE_ERROR: i32 = 1;
@@ -1486,12 +1486,12 @@ pub(crate) unsafe fn select_bind(
 ) -> i32 {
     let mut off = 0;
     let mut rc = SQLITE_OK;
-    for i in 0..n_col {
+    for (i, is_pk) in pk.iter().take(n_col).enumerate() {
         if rc != SQLITE_OK {
             break;
         }
         let n = serial_len(&rec[off.min(rec.len())..]);
-        if pk[i] != 0 {
+        if *is_pk != 0 {
             if let Some(v) = Val::deserialize(&rec[off..]) {
                 if v != Val::Null {
                     rc = v.bind(stmt, i as i32 + 1);
