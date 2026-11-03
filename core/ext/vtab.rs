@@ -1,4 +1,4 @@
-use crate::native_ext::{ExtensionState, ModuleFactory, NativeCursor, NativeTable};
+use crate::native_ext::{ConnectInfo, ExtensionState, ModuleFactory, NativeCursor, NativeTable};
 use crate::sync::Arc;
 use crate::types::IOResultOr;
 use crate::vtab::{ExtVirtualTable, ExtVirtualTableCursor, VirtualTableType};
@@ -19,15 +19,19 @@ impl ModuleImplementation {
         }
     }
 
-    pub(crate) fn create(&self, args: Vec<Value>) -> Result<(VirtualTableType, String)> {
+    pub(crate) fn create(
+        &self,
+        info: &ConnectInfo,
+        args: Vec<Value>,
+    ) -> Result<(VirtualTableType, String)> {
         let (table, schema) = match self {
             Self::C(module) => {
                 let (table, schema) = ExtVirtualTable::create(module.clone(), args)?;
                 (ExtensionTable::C(table), schema)
             }
             Self::Native(module) => {
-                let schema = module.schema(&args)?;
-                (ExtensionTable::Native(module.create(&args)?), schema)
+                let (table, schema) = module.connect(info, &args)?;
+                (ExtensionTable::Native(table), schema)
             }
         };
         Ok((VirtualTableType::External(table), schema))
@@ -42,11 +46,12 @@ impl ModuleImplementation {
 }
 
 pub(crate) fn create_virtual_table(
-    module_name: &str,
+    info: &ConnectInfo,
     module: Option<&Arc<super::VTabImpl>>,
     args: Vec<Value>,
     kind: VTabKind,
 ) -> Result<(VirtualTableType, String)> {
+    let module_name = info.module_name;
     let module = module.ok_or_else(|| {
         LimboError::ExtensionError(format!("Virtual table module not found: {module_name}"))
     })?;
@@ -59,7 +64,7 @@ pub(crate) fn create_virtual_table(
             "{module_name} is not a {expected} module"
         )));
     }
-    module.implementation.create(args)
+    module.implementation.create(info, args)
 }
 
 #[derive(Clone, Debug)]
@@ -98,10 +103,23 @@ impl ExtensionTable {
         &self,
         args: &[Value],
         state: &mut ExtensionState,
+        on_conflict: u8,
     ) -> IOResultOr<Option<i64>> {
         match self {
             Self::C(table) => table.update(args).map(IOResult::Done).map_err(Into::into),
-            Self::Native(table) => table.update(state, args),
+            Self::Native(table) => table.update(state, args, on_conflict),
+        }
+    }
+
+    /// Savepoint hooks (`xSavepoint`, `xRelease`, `xRollbackTo`); `op` is 0, 1 or 2.
+    pub(crate) fn savepoint_op(&self, op: u8, level: usize) -> Result<()> {
+        match self {
+            Self::C(_) => Ok(()),
+            Self::Native(table) => match op {
+                0 => table.savepoint(level),
+                1 => table.release(level),
+                _ => table.rollback_to(level),
+            },
         }
     }
 

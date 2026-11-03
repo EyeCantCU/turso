@@ -120,8 +120,7 @@ use crate::translate::collate::{key_collation, CollationSeq, TextCollation};
 use crate::translate::expr::expr_type::ExprType;
 use crate::translate::plan::{BitSet, ColumnMask, Plan, TableReferences};
 use crate::util::{
-    column_declared_type, is_rowid_alias_type, module_args_from_sql, module_name_from_sql,
-    type_from_name, UnparsedFromSqlIndex,
+    column_declared_type, is_rowid_alias_type, type_from_name, UnparsedFromSqlIndex,
 };
 use crate::Result;
 use crate::{bail_parse_error, LimboError, MvCursor, Pager, SymbolTable, ValueRef, VirtualTable};
@@ -3797,26 +3796,37 @@ impl Schema {
                 // Classify on the root page before touching the SQL text so
                 // only the B-tree arm needs to parse the row's stored SQL.
                 if root_page == 0 {
-                    match Parser::new(sql.as_bytes()).next_cmd()? {
-                        Some(Cmd::Stmt(Stmt::CreateVirtualTable(_))) => {}
+                    let create_vtab = match Parser::new(sql.as_bytes()).next_cmd()? {
+                        Some(Cmd::Stmt(Stmt::CreateVirtualTable(create_vtab))) => create_vtab,
                         other => {
                             return Err(LimboError::Corrupt(format!(
                                 "sqlite_schema table row {name} with root page 0 has unexpected SQL {sql:?}: parsed as {other:?}"
                             )));
                         }
-                    }
+                    };
 
                     // a virtual table is found in the sqlite_schema, but it's no
                     // longer in the in-memory schema. We need to recreate it if
                     // the module is loaded in the symbol table.
                     let vtab = if let Some(vtab) = syms.vtabs.get(name) {
                         vtab.clone()
+                    } else if syms.vtab_module(create_vtab.module_name.as_str()).is_none() {
+                        // As in SQLite, an unregistered module does not stop the
+                        // schema from loading; the table appears once it is registered.
+                        tracing::debug!("virtual table {name}: module not registered");
+                        return Ok(());
                     } else {
-                        let mod_name = module_name_from_sql(sql)?;
+                        // Same argument text as VCreate passed; the trailing
+                        // `/*name(cols)*/` comment confuses module_args_from_sql.
+                        let args = create_vtab
+                            .args
+                            .iter()
+                            .map(|a| crate::Value::from_text(a.to_string()))
+                            .collect();
                         crate::VirtualTable::table(
                             Some(name),
-                            mod_name,
-                            module_args_from_sql(sql)?,
+                            create_vtab.module_name.as_str(),
+                            args,
                             syms,
                         )?
                     };
@@ -9826,8 +9836,8 @@ mod tests {
         let mut schema = Schema::new();
 
         // Root page 0 must route to virtual-table handling; with no such
-        // module registered, that path fails module resolution instead of
-        // creating a B-tree table with an invalid root page.
+        // module registered the row is skipped (as SQLite loads it) instead
+        // of creating a B-tree table with an invalid root page.
         let result = schema.handle_schema_row(
             "table",
             "v1",
@@ -9843,7 +9853,7 @@ mod tests {
             &|_| None,
             &crate::dialect::SqliteDialect,
         );
-        assert!(result.is_err());
+        assert!(result.is_ok());
         assert!(schema.get_table(NamespaceId::ROOT, "v1").is_none());
     }
 

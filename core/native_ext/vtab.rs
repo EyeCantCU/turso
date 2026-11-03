@@ -6,11 +6,27 @@ use crate::{Connection, IOResult, LimboError, Result, Value};
 use std::fmt::Debug;
 use turso_ext::ResultCode;
 
+/// Identifies the table a module instance is being created for.
+#[derive(Debug, Clone, Copy)]
+pub struct ConnectInfo<'a> {
+    pub module_name: &'a str,
+    pub schema_name: &'a str,
+    pub table_name: &'a str,
+    /// `true` for `CREATE VIRTUAL TABLE`, `false` when attaching to an existing table.
+    pub create: bool,
+}
+
 pub trait VirtualTableModule: Debug + Send + Sync {
     type Table: VirtualTable + 'static;
 
     fn schema(&self, args: &[Value]) -> Result<String>;
     fn create(&self, args: &[Value]) -> Result<Self::Table>;
+    /// Builds a table and its schema in one call. Modules that need the table
+    /// name or create-vs-connect override this; the default uses `schema` and `create`.
+    fn connect(&self, _info: &ConnectInfo, args: &[Value]) -> Result<(Self::Table, String)> {
+        let schema = self.schema(args)?;
+        Ok((self.create(args)?, schema))
+    }
     /// Whether triggers can read tables created by this module.
     /// Defaults to `false` because a trigger can call extension code as part
     /// of an unrelated write.
@@ -35,6 +51,29 @@ pub trait VirtualTable: Debug + Send + Sync {
     }
     fn create_update(&mut self, _args: Vec<Value>) -> Result<Box<dyn TableUpdate>> {
         Err(LimboError::ReadOnly)
+    }
+    /// Like `create_update`, with the statement's ON CONFLICT action
+    /// (`ResolveType::bit_value`, 0 when none was given).
+    fn create_update_on_conflict(
+        &mut self,
+        args: Vec<Value>,
+        _on_conflict: u8,
+    ) -> Result<Box<dyn TableUpdate>> {
+        self.create_update(args)
+    }
+    /// Whether `CREATE VIRTUAL TABLE` enlists the new table in the
+    /// transaction, so `commit` (or `rollback`) runs without a `begin`.
+    fn commits_after_create(&self) -> bool {
+        false
+    }
+    fn savepoint(&mut self, _level: usize) -> Result<()> {
+        Ok(())
+    }
+    fn release(&mut self, _level: usize) -> Result<()> {
+        Ok(())
+    }
+    fn rollback_to(&mut self, _level: usize) -> Result<()> {
+        Ok(())
     }
     fn begin(&mut self) -> Result<()> {
         Ok(())
@@ -66,7 +105,7 @@ pub trait TableUpdate: Send + Sync {
 
 pub(crate) trait ModuleFactory: Debug + Send + Sync {
     fn schema(&self, args: &[Value]) -> Result<String>;
-    fn create(&self, args: &[Value]) -> Result<NativeTable>;
+    fn connect(&self, info: &ConnectInfo, args: &[Value]) -> Result<(NativeTable, String)>;
     fn innocuous(&self) -> bool;
 }
 
@@ -75,10 +114,9 @@ impl<M: VirtualTableModule> ModuleFactory for M {
         VirtualTableModule::schema(self, args)
     }
 
-    fn create(&self, args: &[Value]) -> Result<NativeTable> {
-        Ok(NativeTable(Arc::new(RwLock::new(Box::new(
-            VirtualTableModule::create(self, args)?,
-        )))))
+    fn connect(&self, info: &ConnectInfo, args: &[Value]) -> Result<(NativeTable, String)> {
+        let (table, schema) = VirtualTableModule::connect(self, info, args)?;
+        Ok((NativeTable(Arc::new(RwLock::new(Box::new(table)))), schema))
     }
 
     fn innocuous(&self) -> bool {
@@ -113,13 +151,18 @@ impl NativeTable {
         &self,
         state: &mut ExtensionState,
         args: &[Value],
+        on_conflict: u8,
     ) -> IOResultOr<Option<i64>> {
         if matches!(state, ExtensionState::None) {
             let args = args
                 .iter()
                 .map(Value::try_clone)
                 .collect::<Result<Vec<_>, _>>()?;
-            *state = ExtensionState::TableUpdate(self.0.write().create_update(args)?);
+            *state = ExtensionState::TableUpdate(
+                self.0
+                    .write()
+                    .create_update_on_conflict(args, on_conflict)?,
+            );
         }
         let ExtensionState::TableUpdate(update) = state else {
             unreachable!("update instruction requires table update state");
@@ -147,6 +190,22 @@ impl NativeTable {
         self.0.write().rename(name)
     }
 
+    pub(crate) fn commits_after_create(&self) -> bool {
+        self.0.read().commits_after_create()
+    }
+
+    pub(crate) fn savepoint(&self, level: usize) -> Result<()> {
+        self.0.write().savepoint(level)
+    }
+
+    pub(crate) fn release(&self, level: usize) -> Result<()> {
+        self.0.write().release(level)
+    }
+
+    pub(crate) fn rollback_to(&self, level: usize) -> Result<()> {
+        self.0.write().rollback_to(level)
+    }
+
     pub(crate) fn destroy(&self) -> Result<()> {
         self.0.write().destroy()
     }
@@ -160,7 +219,15 @@ trait TableInstance: Debug + Send + Sync {
         order_by: &[OrderByInfo],
     ) -> Result<IndexInfo, ResultCode>;
     fn readonly(&self) -> bool;
-    fn create_update(&mut self, args: Vec<Value>) -> Result<Box<dyn TableUpdate>>;
+    fn create_update_on_conflict(
+        &mut self,
+        args: Vec<Value>,
+        on_conflict: u8,
+    ) -> Result<Box<dyn TableUpdate>>;
+    fn commits_after_create(&self) -> bool;
+    fn savepoint(&mut self, level: usize) -> Result<()>;
+    fn release(&mut self, level: usize) -> Result<()>;
+    fn rollback_to(&mut self, level: usize) -> Result<()>;
     fn begin(&mut self) -> Result<()>;
     fn commit(&mut self) -> Result<()>;
     fn rollback(&mut self) -> Result<()>;
@@ -185,8 +252,28 @@ impl<T: VirtualTable> TableInstance for T {
         VirtualTable::readonly(self)
     }
 
-    fn create_update(&mut self, args: Vec<Value>) -> Result<Box<dyn TableUpdate>> {
-        VirtualTable::create_update(self, args)
+    fn create_update_on_conflict(
+        &mut self,
+        args: Vec<Value>,
+        on_conflict: u8,
+    ) -> Result<Box<dyn TableUpdate>> {
+        VirtualTable::create_update_on_conflict(self, args, on_conflict)
+    }
+
+    fn commits_after_create(&self) -> bool {
+        VirtualTable::commits_after_create(self)
+    }
+
+    fn savepoint(&mut self, level: usize) -> Result<()> {
+        VirtualTable::savepoint(self, level)
+    }
+
+    fn release(&mut self, level: usize) -> Result<()> {
+        VirtualTable::release(self, level)
+    }
+
+    fn rollback_to(&mut self, level: usize) -> Result<()> {
+        VirtualTable::rollback_to(self, level)
     }
 
     fn begin(&mut self) -> Result<()> {

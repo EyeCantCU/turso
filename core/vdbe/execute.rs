@@ -1472,8 +1472,17 @@ pub fn op_vcreate(
         vec![]
     };
     let conn = program.connection.clone();
-    let table =
-        crate::VirtualTable::table(Some(&table_name), &module_name, args, &conn.syms.read())?;
+    let table = crate::VirtualTable::table_for(
+        Some(&table_name),
+        &module_name,
+        args,
+        &conn.syms.read(),
+        true,
+    )?;
+    // A table that asks for it joins the transaction, as in SQLite (commit, no begin).
+    if table.commits_after_create() {
+        conn.vtab_txn_states.write().insert(table.id());
+    }
     {
         conn.syms.write().vtabs.insert(table_name, table);
     }
@@ -1623,14 +1632,14 @@ pub fn op_vupdate(
             unreachable!("sqlite_dbpage writes require cli_only feature");
         }
     } else {
-        virtual_table.update(&argv, &mut state.extension_state)
+        virtual_table.update(&argv, &mut state.extension_state, *conflict_action as u8)
     };
     match result {
         Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
         Ok(IOResult::Done(Some(new_rowid))) => {
             state.record_rows_written(1);
-            if *conflict_action == 5 {
-                // ResolveType::Replace
+            // As SQLite, a row inserted into a virtual table sets last_insert_rowid.
+            if matches!(argv[0], Value::Null) {
                 program.connection.update_last_rowid(new_rowid);
             }
             state.pc += 1;
@@ -1639,6 +1648,17 @@ pub fn op_vupdate(
             // no-op or successful update without rowid return
             state.record_rows_written(1);
             state.pc += 1;
+        }
+        Err(e)
+            if matches!(
+                *e,
+                LimboError::Constraint(_)
+                    | LimboError::ConstraintViolation(_)
+                    | LimboError::ReadOnly
+            ) =>
+        {
+            mark_unlikely();
+            return Err(e);
         }
         Err(e) => {
             // virtual table update failed
@@ -1688,7 +1708,19 @@ pub fn op_vdestroy(
     load_insn!(VDestroy { db: _, table_name }, insn);
     let conn = program.connection.clone();
     {
-        let Some(vtab) = conn.syms.write().vtabs.remove(table_name) else {
+        let created = conn.syms.write().vtabs.remove(table_name);
+        // A table loaded from sqlite_schema is only in the schema.
+        let vtab = created.or_else(|| {
+            let table = conn
+                .schema
+                .read()
+                .get_table(crate::namespace::NamespaceId::ROOT, table_name)?;
+            match table.as_ref() {
+                crate::schema::Table::Virtual(vtab) => Some(vtab.clone()),
+                _ => None,
+            }
+        });
+        let Some(vtab) = vtab else {
             mark_unlikely();
             return Err(crate::LimboError::InternalError(
                 "Could not find Virtual Table to Destroy".to_string(),
@@ -1717,12 +1749,14 @@ pub fn op_vbegin(
     let mut states = program.connection.vtab_txn_states.write();
     if states.insert(vtab_id) {
         // Only begin a new transaction if one is not already active for this virtual table module
-        let vtabs = &program.connection.syms.read().vtabs;
-        let vtab = vtabs
-            .iter()
-            .find(|p| p.1.id().eq(&vtab_id))
-            .expect("Could not find virtual table for VBegin");
-        vtab.1.begin()?;
+        let vtab = program.connection.syms.read().vtab_by_id(vtab_id);
+        let Some(vtab) = vtab else {
+            return Err(LimboError::InternalError(
+                "Could not find virtual table for VBegin".to_string(),
+            )
+            .into());
+        };
+        vtab.begin()?;
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -1744,16 +1778,16 @@ pub fn op_vrename(
     let name = state.registers[*new_name_reg].get_value().to_string();
     let cursor = state.get_cursor(*cursor_id);
     let cursor = cursor.as_virtual_mut();
-    let vtabs = &program.connection.syms.read().vtabs;
-    let vtab = vtabs
-        .iter()
-        .find(|p| {
-            p.1.id().eq(&cursor
-                .vtab_id()
-                .expect("non ext-virtual table used in VRollback"))
-        })
-        .expect("Could not find virtual table for VRollback");
-    vtab.1.rename(&name)?;
+    let vtab = cursor
+        .vtab_id()
+        .and_then(|id| program.connection.syms.read().vtab_by_id(id));
+    let Some(vtab) = vtab else {
+        return Err(LimboError::InternalError(
+            "Could not find virtual table for VRename".to_string(),
+        )
+        .into());
+    };
+    vtab.rename(&name)?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -3951,13 +3985,12 @@ pub(crate) fn vtab_commit_all(conn: &Connection) -> crate::Result<()> {
     if set.is_empty() {
         return Ok(());
     }
-    let reg = &conn.syms.read().vtabs;
+    let syms = conn.syms.read();
     for id in set.drain() {
-        let vtab = reg
-            .iter()
-            .find(|(_, vtab)| vtab.id() == id)
-            .expect("vtab must exist");
-        vtab.1.commit()?;
+        // A table can be dropped (or its module replaced) mid-transaction.
+        if let Some(vtab) = syms.vtab_by_id(id) {
+            vtab.commit()?;
+        }
     }
     Ok(())
 }
@@ -4178,19 +4211,41 @@ fn has_index_method_work(state: &ProgramState) -> bool {
             .any(|cursor| matches!(cursor, Some(Cursor::IndexMethod(_))))
 }
 
+fn named_savepoint_level(conn: &Connection, name: &str) -> Option<usize> {
+    conn.named_savepoints
+        .read()
+        .iter()
+        .rposition(|savepoint| savepoint.name == name)
+}
+
+/// Runs a savepoint hook (0 = savepoint, 1 = release, 2 = rollback to) on
+/// every virtual table in the current transaction.
+fn vtab_savepoint_all(conn: &Connection, op: u8, level: usize) -> crate::Result<()> {
+    let ids: Vec<u64> = conn.vtab_txn_states.read().iter().copied().collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let syms = conn.syms.read();
+    for id in ids {
+        if let Some(vtab) = syms.vtab_by_id(id) {
+            vtab.savepoint_op(op, level)?;
+        }
+    }
+    Ok(())
+}
+
 /// Rollback all virtual tables that are part of the current transaction.
 pub(crate) fn vtab_rollback_all(conn: &Connection) -> crate::Result<()> {
     let mut set = conn.vtab_txn_states.write();
     if set.is_empty() {
         return Ok(());
     }
-    let reg = &conn.syms.read().vtabs;
+    let syms = conn.syms.read();
     for id in set.drain() {
-        let vtab = reg
-            .iter()
-            .find(|(_, vtab)| vtab.id() == id)
-            .expect("vtab must exist");
-        vtab.1.rollback()?;
+        // A table can be dropped (or its module replaced) mid-transaction.
+        if let Some(vtab) = syms.vtab_by_id(id) {
+            vtab.rollback()?;
+        }
     }
     Ok(())
 }
@@ -5605,6 +5660,8 @@ pub fn op_savepoint(
                         return Err(mirror_err);
                     }
                     conn.push_named_savepoint(frame);
+                    let level = conn.named_savepoints.read().len() - 1;
+                    vtab_savepoint_all(&conn, 0, level)?;
                     if starts_transaction {
                         turso_assert!(
                             !conn.tx_is_poisoned(),
@@ -5640,6 +5697,9 @@ pub fn op_savepoint(
                     return Err(LimboError::TxError(format!("no such savepoint: {name}")).into());
                 }
                 SavepointResult::Release => {
+                    if let Some(level) = named_savepoint_level(&conn, name) {
+                        vtab_savepoint_all(&conn, 1, level)?;
+                    }
                     let _ = conn.release_named_savepoint_frame(name);
                     mirror_named_savepoint_to_active_non_main_databases(
                         &conn,
@@ -5674,6 +5734,9 @@ pub fn op_savepoint(
                 mark_unlikely();
                 return Err(LimboError::TxError(format!("no such savepoint: {name}")).into());
             };
+            if let Some(level) = named_savepoint_level(&conn, name) {
+                vtab_savepoint_all(&conn, 2, level)?;
+            }
             let frame_info = conn.rollback_named_savepoint_frame(name);
             mirror_named_savepoint_to_active_non_main_databases(
                 &conn,

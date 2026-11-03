@@ -7,7 +7,7 @@ pub use function::{
     Aggregate, AggregateFunction, FunctionArity, ScalarCall, ScalarFunction, ScalarReturn,
 };
 pub use turso_ext::{ConstraintInfo, ConstraintUsage, IndexInfo, OrderByInfo, VTabKind};
-pub use vtab::{TableUpdate, VirtualTable, VirtualTableCursor, VirtualTableModule};
+pub use vtab::{ConnectInfo, TableUpdate, VirtualTable, VirtualTableCursor, VirtualTableModule};
 
 pub use function::AggregateState;
 pub(crate) use function::{
@@ -37,6 +37,7 @@ impl OpenOptions {
         let module = Arc::new(crate::ext::VTabImpl {
             module_kind: kind,
             implementation: crate::ext::ModuleImplementation::Native(Arc::new(module)),
+            eponymous: None,
         });
         self.native_extensions.modules.push((name, module));
         self

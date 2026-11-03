@@ -36,6 +36,14 @@ impl VirtualTable {
     pub(crate) fn id(&self) -> u64 {
         self.vtab_id
     }
+    pub(crate) fn commits_after_create(&self) -> bool {
+        matches!(
+            &self.vtab_type,
+            VirtualTableType::External(crate::ext::ExtensionTable::Native(table))
+                if table.commits_after_create()
+        )
+    }
+
     pub(crate) fn readonly(&self) -> bool {
         match &self.vtab_type {
             VirtualTableType::Pragma(_) => true,
@@ -86,10 +94,16 @@ impl VirtualTable {
     }
 
     pub(crate) fn function(name: &str, syms: &SymbolTable) -> crate::Result<Arc<VirtualTable>> {
-        let module = syms.vtab_modules.get(name);
+        let module = syms.vtab_module(name);
+        let info = crate::native_ext::ConnectInfo {
+            module_name: name,
+            schema_name: "main",
+            table_name: name,
+            create: false,
+        };
         let (vtab_type, schema) = if module.is_some() {
             crate::ext::create_virtual_table(
-                name,
+                &info,
                 module,
                 Vec::new(),
                 VTabKind::TableValuedFunction,
@@ -118,9 +132,26 @@ impl VirtualTable {
         args: Vec<Value>,
         syms: &SymbolTable,
     ) -> crate::Result<Arc<VirtualTable>> {
-        let module = syms.vtab_modules.get(module_name);
+        Self::table_for(tbl_name, module_name, args, syms, false)
+    }
+
+    /// Like [`Self::table`]; `create` is true when run for `CREATE VIRTUAL TABLE`.
+    pub(crate) fn table_for(
+        tbl_name: Option<&str>,
+        module_name: &str,
+        args: Vec<Value>,
+        syms: &SymbolTable,
+        create: bool,
+    ) -> crate::Result<Arc<VirtualTable>> {
+        let module = syms.vtab_module(module_name);
+        let info = crate::native_ext::ConnectInfo {
+            module_name,
+            schema_name: "main",
+            table_name: tbl_name.unwrap_or(module_name),
+            create,
+        };
         let (vtab_type, schema) =
-            crate::ext::create_virtual_table(module_name, module, args, VTabKind::VirtualTable)?;
+            crate::ext::create_virtual_table(&info, module, args, VTabKind::VirtualTable)?;
         let vtab = VirtualTable {
             name: tbl_name.unwrap_or(module_name).to_owned(),
             columns: Self::resolve_columns(schema)?,
@@ -131,6 +162,55 @@ impl VirtualTable {
             innocuous: module.is_some_and(|module| module.implementation.innocuous()),
         };
         Ok(Arc::new(vtab))
+    }
+
+    /// Connects a stored table of `module` without consulting the symbol table.
+    pub(crate) fn from_module(
+        tbl_name: &str,
+        module_name: &str,
+        args: Vec<Value>,
+        module: &Arc<crate::ext::VTabImpl>,
+    ) -> crate::Result<Arc<VirtualTable>> {
+        let info = crate::native_ext::ConnectInfo {
+            module_name,
+            schema_name: "main",
+            table_name: tbl_name,
+            create: false,
+        };
+        let (vtab_type, schema) =
+            crate::ext::create_virtual_table(&info, Some(module), args, VTabKind::VirtualTable)?;
+        Ok(Arc::new(VirtualTable {
+            name: tbl_name.to_owned(),
+            columns: Self::resolve_columns(schema)?,
+            kind: VTabKind::VirtualTable,
+            vtab_type,
+            vtab_id: VTAB_ID_COUNTER.fetch_add(1, Ordering::Acquire),
+            is_droppable: true,
+            innocuous: module.implementation.innocuous(),
+        }))
+    }
+
+    /// Connects the eponymous table of `module` (named after the module).
+    pub(crate) fn eponymous(
+        name: &str,
+        module: &crate::ext::VTabImpl,
+    ) -> crate::Result<Arc<VirtualTable>> {
+        let info = crate::native_ext::ConnectInfo {
+            module_name: name,
+            schema_name: "main",
+            table_name: name,
+            create: false,
+        };
+        let (vtab_type, schema) = module.implementation.create(&info, Vec::new())?;
+        Ok(Arc::new(VirtualTable {
+            name: name.to_owned(),
+            columns: Self::resolve_columns(schema)?,
+            kind: VTabKind::TableValuedFunction,
+            vtab_type,
+            vtab_id: VTAB_ID_COUNTER.fetch_add(1, Ordering::Acquire),
+            is_droppable: false,
+            innocuous: module.implementation.innocuous(),
+        }))
     }
 
     pub(crate) fn resolve_columns(schema: String) -> crate::Result<Vec<Column>> {
@@ -178,10 +258,11 @@ impl VirtualTable {
         &self,
         args: &[Value],
         state: &mut crate::native_ext::ExtensionState,
+        on_conflict: u8,
     ) -> IOResultOr<Option<i64>> {
         match &self.vtab_type {
             VirtualTableType::Pragma(_) => Err(LimboError::ReadOnly.into()),
-            VirtualTableType::External(table) => table.update(args, state),
+            VirtualTableType::External(table) => table.update(args, state, on_conflict),
             VirtualTableType::Internal(_) => Err(LimboError::ReadOnly.into()),
         }
     }
@@ -239,6 +320,14 @@ impl VirtualTable {
             VirtualTableType::Internal(_) => Err(LimboError::ExtensionError(
                 "Internal virtual tables currently do not support transactions".to_string(),
             )),
+        }
+    }
+
+    /// Runs a savepoint hook (0 = savepoint, 1 = release, 2 = rollback to).
+    pub(crate) fn savepoint_op(&self, op: u8, level: usize) -> crate::Result<()> {
+        match &self.vtab_type {
+            VirtualTableType::External(table) => table.savepoint_op(op, level),
+            _ => Ok(()),
         }
     }
 
