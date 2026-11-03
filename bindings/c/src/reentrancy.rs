@@ -36,14 +36,17 @@ impl StepScope {
 
     fn enter(stmt: &sqlite3_stmt, push: bool) -> Self {
         let db = Arc::as_ptr(&stmt.db) as usize;
-        let inside_step = STEPPING.with(|s| s.borrow().contains(&db));
+        // TLS may already be destroyed when called from an atexit handler.
+        let inside_step = STEPPING
+            .try_with(|s| s.borrow().contains(&db))
+            .unwrap_or(false);
         let conn = &stmt.stmt.get_program().connection;
         let nested = (inside_step && conn.has_active_write()).then(|| {
             conn.start_nested();
             conn.clone()
         });
         if push {
-            STEPPING.with(|s| s.borrow_mut().push(db));
+            let _ = STEPPING.try_with(|s| s.borrow_mut().push(db));
         }
         Self {
             db,
@@ -56,7 +59,7 @@ impl StepScope {
 impl Drop for StepScope {
     fn drop(&mut self) {
         if self.pushed {
-            STEPPING.with(|s| {
+            let _ = STEPPING.try_with(|s| {
                 let mut s = s.borrow_mut();
                 if let Some(i) = s.iter().rposition(|&d| d == self.db) {
                     s.remove(i);

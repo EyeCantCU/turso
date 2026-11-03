@@ -46,7 +46,7 @@ impl Drop for UdfScope {
 }
 
 fn forget(addr: usize) {
-    BUFS.with(|b| b.borrow_mut().retain(|(a, _), _| *a != addr));
+    let _ = BUFS.try_with(|b| b.borrow_mut().retain(|(a, _), _| *a != addr));
 }
 
 /// The bytes of the value as text or blob, or None for NULL.

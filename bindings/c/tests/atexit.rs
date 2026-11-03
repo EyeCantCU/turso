@@ -17,9 +17,19 @@ type Exec = unsafe extern "C" fn(
 type Open = unsafe extern "C" fn(*const c_char, *mut *mut c_void) -> c_int;
 
 static DB: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static STMT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static FINALIZE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static CLOSE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 extern "C" fn at_exit() {
+    // A statement left mid-step must also finalize without touching TLS.
+    let finalize: unsafe extern "C" fn(*mut c_void) -> c_int =
+        unsafe { std::mem::transmute(FINALIZE.load(Ordering::SeqCst)) };
+    let rc = unsafe { finalize(STMT.load(Ordering::SeqCst)) };
+    if rc != 0 {
+        eprintln!("sqlite3_finalize from atexit returned {rc}");
+        unsafe { libc::_exit(3) };
+    }
     let close: Close = unsafe { std::mem::transmute(CLOSE.load(Ordering::SeqCst)) };
     let rc = unsafe { close(DB.load(Ordering::SeqCst)) };
     if rc != 0 {
@@ -67,6 +77,24 @@ fn main() {
             let (arg, err) = (std::ptr::null_mut(), std::ptr::null_mut());
             assert_eq!(exec(db, sql.as_ptr(), std::ptr::null(), arg, err), 0);
         }
+        let prepare: unsafe extern "C" fn(
+            *mut c_void,
+            *const c_char,
+            c_int,
+            *mut *mut c_void,
+            *mut *const c_char,
+        ) -> c_int = std::mem::transmute(sym(lib, c"sqlite3_prepare_v2"));
+        let step: unsafe extern "C" fn(*mut c_void) -> c_int =
+            std::mem::transmute(sym(lib, c"sqlite3_step"));
+        FINALIZE.store(sym(lib, c"sqlite3_finalize"), Ordering::SeqCst);
+        let mut stmt = std::ptr::null_mut();
+        let sql = c"SELECT x FROM t";
+        assert_eq!(
+            prepare(db, sql.as_ptr(), -1, &mut stmt, std::ptr::null_mut()),
+            0
+        );
+        assert_eq!(step(stmt), 100);
+        STMT.store(stmt, Ordering::SeqCst);
         DB.store(db, Ordering::SeqCst);
         libc::atexit(at_exit);
     }
