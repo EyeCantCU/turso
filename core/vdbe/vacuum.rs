@@ -1896,12 +1896,10 @@ fn vacuum_in_place_step(
                 // 4. Resolve source database mode.
                 let source_db = connection.get_source_database(db);
                 let source_mvcc_enabled = source_db.mvcc_enabled();
-                // 5. Reject in-memory databases.
+                // 5. In-memory databases have nothing to compact.
+                // SQLite accepts VACUUM on an in-memory database and does nothing.
                 if source_db.is_in_memory_db() {
-                    return Err(LimboError::InternalError(
-                        "cannot VACUUM an in-memory database".to_string(),
-                    )
-                    .into());
+                    return Ok(IOResult::Done(()));
                 }
                 reject_unsupported_vacuum_auto_vacuum_mode(source_pager.get_auto_vacuum_mode())?;
                 // 6. Reject non-WAL pagers.
