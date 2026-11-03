@@ -259,3 +259,131 @@ mod pointer_maps {
         sqlite_ok(&db, &conn);
     }
 }
+
+/// savepoint6.test in miniature: random inserts, deletes and incremental
+/// vacuums under nested savepoints, checked against SQLite after every step.
+#[test]
+fn auto_vacuum_savepoint_fuzz() {
+    use crate::common::{limbo_exec_rows, sqlite_exec_rows, TempDatabase};
+    use rand::{Rng, SeedableRng};
+    let seed: u64 = std::env::var("AV_FUZZ_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(7);
+    let steps: usize = std::env::var("AV_FUZZ_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(150);
+    for mode in ["INCREMENTAL", "FULL"] {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+        let db = TempDatabase::new_empty();
+        let conn = db.connect_limbo();
+        let lite = rusqlite::Connection::open_in_memory().unwrap();
+        let schema = format!(
+            "PRAGMA auto_vacuum = {mode}; CREATE TABLE t1(x, y); \
+             CREATE UNIQUE INDEX i1 ON t1(x); CREATE INDEX i2 ON t1(y);"
+        );
+        for sql in schema.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            conn.execute(sql).unwrap();
+        }
+        lite.execute_batch(&schema).unwrap();
+        let run = |sql: &str, log: &mut Vec<String>| {
+            log.push(sql.to_string());
+            let a = conn.execute(sql).is_ok();
+            let b = lite.execute_batch(sql).is_ok();
+            assert_eq!(a, b, "{mode}: `{sql}` succeeded on one side only");
+        };
+        let mut log = Vec::new();
+        let names = ["one", "two", "three", "four", "five"];
+        for step in 0..steps {
+            let n = names[rng.random_range(0..names.len())];
+            match rng.random_range(0..6) {
+                0 | 1 => run(&format!("SAVEPOINT {n}"), &mut log),
+                2 => run(&format!("RELEASE {n}"), &mut log),
+                3 => run(&format!("ROLLBACK TO {n}"), &mut log),
+                _ => {}
+            }
+            for _ in 0..2 {
+                if rng.random_bool(0.5) {
+                    for _ in 0..rng.random_range(1..60) {
+                        let x = rng.random_range(0..1000);
+                        let len = rng.random_range(250..500);
+                        let y: String = format!("{x}.").repeat(len)[..len].to_string();
+                        run(
+                            &format!("INSERT OR REPLACE INTO t1 VALUES({x}, '{y}')"),
+                            &mut log,
+                        );
+                    }
+                } else {
+                    for _ in 0..rng.random_range(1..60) {
+                        let x = rng.random_range(0..1000);
+                        run(&format!("DELETE FROM t1 WHERE x = {x}"), &mut log);
+                    }
+                    if rng.random_bool(0.3) {
+                        run("PRAGMA incremental_vacuum", &mut log);
+                    }
+                }
+            }
+            let q = "SELECT x, length(y) FROM t1 ORDER BY x";
+            let a = limbo_exec_rows(&conn, q);
+            let b = sqlite_exec_rows(&lite, q);
+            if a != b {
+                let tail = log.len().saturating_sub(40);
+                panic!(
+                    "{mode} seed {seed} step {step}: {} rows vs {} in SQLite\nlast statements:\n{}",
+                    a.len(),
+                    b.len(),
+                    log[tail..].join("\n")
+                );
+            }
+            let check = limbo_exec_rows(&conn, "PRAGMA integrity_check");
+            assert_eq!(
+                check,
+                vec![vec![rusqlite::types::Value::Text("ok".into())]],
+                "{mode} seed {seed} step {step}"
+            );
+        }
+    }
+}
+
+/// Replays a SQL log (one statement per line, `AV_REPLAY=<file>`) on turso and
+/// SQLite and reports the first statement after which they differ.
+#[test]
+#[ignore]
+fn auto_vacuum_replay() {
+    use crate::common::{limbo_exec_rows, sqlite_exec_rows, TempDatabase};
+    let path = std::env::var("AV_REPLAY").expect("AV_REPLAY");
+    let text = std::fs::read_to_string(path).unwrap();
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    let lite = rusqlite::Connection::open_in_memory().unwrap();
+    let check_every: usize = std::env::var("AV_CHECK_EVERY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    for (i, line) in text.lines().enumerate() {
+        let sql = line.trim().trim_end_matches(';').trim();
+        if sql.is_empty() {
+            continue;
+        }
+        let a = conn.execute(sql).map_err(|e| e.to_string());
+        let b = lite.execute_batch(sql).map_err(|e| e.to_string());
+        if a.is_ok() != b.is_ok() {
+            panic!("line {}: `{sql}`: turso {a:?} sqlite {b:?}", i + 1);
+        }
+        let boundary = ["SAVEPOINT", "RELEASE", "ROLLBACK", "PRAGMA incremental"]
+            .iter()
+            .any(|p| sql.starts_with(p));
+        if (i % check_every == 0 && i > 10) || boundary {
+            eprintln!("check after line {}: {sql}", i + 1);
+            let q = "SELECT x, length(y) FROM t1 ORDER BY x";
+            if limbo_exec_rows(&conn, q) != sqlite_exec_rows(&lite, q) {
+                panic!("line {}: contents differ after `{sql}`", i + 1);
+            }
+            let check = limbo_exec_rows(&conn, "PRAGMA integrity_check");
+            if check != vec![vec![rusqlite::types::Value::Text("ok".into())]] {
+                panic!("line {}: integrity after `{sql}`: {check:?}", i + 1);
+            }
+        }
+    }
+}
