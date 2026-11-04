@@ -3,6 +3,7 @@
 #![allow(unused_imports)]
 use std::ptr;
 
+mod cli;
 mod rtree;
 mod vtab;
 mod vtab_plan;
