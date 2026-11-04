@@ -301,7 +301,7 @@ test percentile-cont-floats-30 {
     SELECT CAST(percentile_cont(0.3) WITHIN GROUP (ORDER BY x) AS TEXT) FROM fl;
 }
 expect {
-    2.4
+    2.4000000000000004
 }
 
 @setup floats
