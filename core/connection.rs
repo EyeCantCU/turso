@@ -598,11 +598,13 @@ pub struct Connection {
     /// for its own rules. Only a Rust API caller (the sync engine's row
     /// replay) can set it.
     pub(super) triggers_enabled: AtomicBool,
-    /// Number of active top-level write statements on this connection.
-    ///
-    /// This is currently only 0 or 1. We return Busy instead of allowing a
-    /// second same-connection writer to start.
+    /// Number of active top-level write statements on this connection
+    /// (SQLite's `db->nVdbeWrite`). Several may be active at once outside
+    /// MVCC; they share the connection's transaction.
     pub(crate) n_active_writes: AtomicI32,
+    /// Active write statements whose last step returned IO, i.e. that are
+    /// suspended inside an instruction.
+    pub(crate) n_suspended_writes: AtomicI32,
     /// Number of active root statements currently executing on this connection.
     /// This is Turso's equivalent of SQLite's top-level active-VDBE count
     /// (`db->nVdbeActive`) for user statements, excluding internal helpers and
@@ -1025,6 +1027,18 @@ impl Connection {
     /// True while a top-level write statement is running on this connection.
     pub fn has_active_write(&self) -> bool {
         self.n_active_writes.load(Ordering::SeqCst) > 0
+    }
+    /// Whether a write statement starting now needs a statement savepoint:
+    /// inside an explicit transaction, or while other root statements are
+    /// active (SQLite: `db->autoCommit==0 || db->nVdbeRead>1`).
+    pub(crate) fn statement_needs_savepoint(&self) -> bool {
+        !self.auto_commit.load(Ordering::SeqCst)
+            || (!self.is_nested_stmt() && self.n_active_root_statements.load(Ordering::SeqCst) > 1)
+    }
+    /// Whether another write statement is suspended in the middle of a step
+    /// (returned IO). No other write may run until it resumes.
+    pub(crate) fn has_suspended_write(&self) -> bool {
+        self.n_suspended_writes.load(Ordering::SeqCst) > 0
     }
     /// starts nested program execution
     pub fn start_nested(&self) {

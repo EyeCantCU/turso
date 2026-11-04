@@ -1185,7 +1185,7 @@ pub struct ProgramState {
     /// Dropping removes the temp file from disk.
     ephemeral_temp_files: HashMap<usize, TempFile>,
     /// Attached pagers that have open savepoints for statement rollback.
-    attached_savepoint_pagers: Vec<Arc<Pager>>,
+    attached_savepoint_pagers: Vec<(Arc<Pager>, u64)>,
     /// Pending error to return after FAIL mode commit completes.
     /// When a constraint error occurs with FAIL resolve type in autocommit mode,
     /// we need to commit partial changes before returning the error.
@@ -1229,10 +1229,11 @@ pub struct ProgramState {
     /// the statement subtransactionwill roll back.
     fk_immediate_violations_during_stmt: AtomicIsize,
     fk_immediate_violation: Option<LimboError>,
-    uses_subjournal: bool,
     /// Level of the statement savepoint announced to virtual tables, so it
     /// is released or rolled back with the statement.
     pub(crate) vtab_stmt_level: Option<usize>,
+    /// The main pager statement savepoint this statement opened.
+    stmt_savepoint: Option<u64>,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
     /// The statement backs an incremental blob handle. A read-write handle
@@ -1354,7 +1355,7 @@ impl ProgramState {
             bloom_filters: HashMap::default(),
             hash_tables: HashMap::default(),
             ephemeral_temp_files: HashMap::default(),
-            uses_subjournal: false,
+            stmt_savepoint: None,
             vtab_stmt_level: None,
             is_active_write: false,
             is_blob_handle: false,
@@ -1562,8 +1563,8 @@ impl ProgramState {
         if !self.ephemeral_temp_files.is_empty() {
             self.ephemeral_temp_files.clear();
         }
-        self.uses_subjournal = false;
         self.vtab_stmt_level = None;
+        self.stmt_savepoint = None;
         self.is_active_write = false;
         self.tx_read_only_at_start = false;
         self.write_baseline = WriteBaseline::None;
@@ -1616,13 +1617,9 @@ impl ProgramState {
             return true;
         }
         let active_writers = connection.n_active_writes.load(Ordering::SeqCst);
-        turso_assert!(
-            active_writers <= 1,
-            "n_active_writes must be 0 or 1, got {active_writers}"
-        );
         if self.is_active_write && !self.is_blob_handle {
             turso_assert!(
-                active_writers == 1,
+                active_writers >= 1,
                 "active writer state without an active writer count"
             );
         }
@@ -1647,7 +1644,8 @@ impl ProgramState {
             // active, like SQLite commits when the halting statement is the
             // only writer (the nVdbeWrite check in sqlite3VdbeHalt). The
             // readers keep their cursors and release them when they finish.
-            return true;
+            // With other writers still active, the last of them finishes.
+            return active_writers == 1;
         }
         // Non-main pagers keep their transaction state on the pager itself,
         // like SQLite keeps it on the Btree handle (Btree.inTrans), and the
@@ -1827,9 +1825,11 @@ impl ProgramState {
     /// Attached DB savepoints are opened per-DB in `op_transaction_inner`
     /// when each DB's Transaction opcode is executed.
     ///
-    /// Pager/MVCC savepoints are only opened for write statements inside an
-    /// explicit transaction. In autocommit mode, a statement abort is a
-    /// transaction abort, so savepoints are unnecessary.
+    /// Pager/MVCC savepoints are opened for write statements inside an
+    /// explicit transaction, or while other statements are active, like
+    /// SQLite's OP_Transaction (`db->autoCommit==0 || db->nVdbeRead>1`).
+    /// Otherwise a statement abort is a transaction abort, so savepoints are
+    /// unnecessary.
     pub fn begin_statement(
         &mut self,
         connection: &Connection,
@@ -1843,20 +1843,22 @@ impl ProgramState {
                 if let Some(tx_id) = connection.get_mv_tx_id() {
                     mv_store.begin_savepoint(tx_id);
                 }
-            } else if !self.is_blob_handle {
-                // A blob handle outlives its statement and would hold the single
-                // subjournal; its writes are covered by the enclosing transaction.
-                // Non-MVCC mode: use pager savepoints
-                let db_size = return_if_io!(pager.with_header(|header| header.database_size.get()));
-                pager.open_subjournal()?;
-                pager.try_use_subjournal()?;
-                let result = pager.open_savepoint(db_size);
-                if result.is_err() {
-                    pager.stop_use_subjournal();
-                }
-                result?;
-                self.uses_subjournal = true;
             }
+        }
+        if write
+            && !self.is_blob_handle
+            && connection.mv_store().is_none()
+            && connection.statement_needs_savepoint()
+        {
+            // Non-MVCC mode: use pager savepoints
+            let db_size = return_if_io!(pager.with_header(|header| header.database_size.get()));
+            pager.open_subjournal()?;
+            pager.try_use_subjournal()?;
+            let result = pager.open_savepoint(db_size);
+            if result.is_err() {
+                pager.stop_use_subjournal();
+            }
+            self.stmt_savepoint = Some(result?);
         }
 
         self.has_stmt_transaction = true;
@@ -1891,7 +1893,7 @@ impl ProgramState {
         if self.is_active_write && !self.is_blob_handle {
             let previous = connection.n_active_writes.fetch_sub(1, Ordering::SeqCst);
             turso_assert!(
-                previous == 1,
+                previous >= 1,
                 "ending a writer with {previous} active writer(s)"
             );
             self.is_active_write = false;
@@ -1925,7 +1927,8 @@ impl ProgramState {
         }
 
         // Drain attached pagers upfront so we can clean them up regardless of path.
-        let attached_pagers: Vec<Arc<Pager>> = self.attached_savepoint_pagers.drain(..).collect();
+        let attached_pagers: Vec<(Arc<Pager>, u64)> =
+            self.attached_savepoint_pagers.drain(..).collect();
         let result = match end_statement {
             EndStatement::ReleaseSavepoint => {
                 if let Some(mv_store) = connection.mv_store().as_ref() {
@@ -1937,16 +1940,16 @@ impl ProgramState {
                             attached_mv.release_savepoint(tx_id);
                         }
                     });
-                    for p in &attached_pagers {
-                        p.release_savepoint()?;
+                    for (p, id) in &attached_pagers {
+                        p.release_statement_savepoint(*id)?;
                     }
                     Ok(())
-                } else if self.uses_subjournal || !attached_pagers.is_empty() {
-                    if self.uses_subjournal {
-                        pager.release_savepoint()?;
+                } else if self.stmt_savepoint.is_some() || !attached_pagers.is_empty() {
+                    if let Some(id) = self.stmt_savepoint {
+                        pager.release_statement_savepoint(id)?;
                     }
-                    for p in &attached_pagers {
-                        p.release_savepoint()?;
+                    for (p, id) in &attached_pagers {
+                        p.release_statement_savepoint(*id)?;
                     }
                     Ok(())
                 } else {
@@ -1971,20 +1974,20 @@ impl ProgramState {
                             }
                         }
                     });
-                    for p in &attached_pagers {
-                        if let Err(e) = p.rollback_to_newest_savepoint() {
+                    for (p, id) in &attached_pagers {
+                        if let Err(e) = p.rollback_statement_savepoint(*id) {
                             if err.is_none() {
                                 err = Some(e);
                             }
                         }
                     }
                     err
-                } else if self.uses_subjournal {
-                    match pager.rollback_to_newest_savepoint() {
+                } else if let Some(id) = self.stmt_savepoint {
+                    match pager.rollback_statement_savepoint(id) {
                         Ok(_) => {
                             let mut err = None;
-                            for p in &attached_pagers {
-                                if let Err(e) = p.rollback_to_newest_savepoint() {
+                            for (p, id) in &attached_pagers {
+                                if let Err(e) = p.rollback_statement_savepoint(*id) {
                                     err = Some(e);
                                     break;
                                 }
@@ -1995,8 +1998,8 @@ impl ProgramState {
                     }
                 } else if !attached_pagers.is_empty() {
                     let mut err = None;
-                    for p in &attached_pagers {
-                        if let Err(e) = p.rollback_to_newest_savepoint() {
+                    for (p, id) in &attached_pagers {
+                        if let Err(e) = p.rollback_statement_savepoint(*id) {
                             err = Some(e);
                         }
                     }
@@ -2020,11 +2023,10 @@ impl ProgramState {
                 }
             }
         };
-        if self.uses_subjournal {
+        if self.stmt_savepoint.take().is_some() {
             pager.stop_use_subjournal();
-            self.uses_subjournal = false;
         }
-        for p in &attached_pagers {
+        for (p, _) in &attached_pagers {
             p.stop_use_subjournal();
         }
         // Virtual tables in the transaction follow the statement savepoint.
@@ -3836,7 +3838,11 @@ impl Program {
             let can_autocommit_now = !reader_outlived_autocommit
                 && state.can_autocommit_now(&self.connection, self_counted);
             let is_mvcc = state.mv_store(&self.connection).is_some();
-            let changed_shared_mvcc_auto_txn = !can_autocommit_now
+            // Outside MVCC, a writer that is not the last active one has a
+            // statement savepoint when it shares the transaction with other
+            // writers (see `BeginStatement`).
+            let changed_shared_mvcc_auto_txn = is_mvcc
+                && !can_autocommit_now
                 && state.auto_txn_cleanup == TxnCleanup::RollbackTxn
                 && state.n_change.load(Ordering::SeqCst) > 0;
             if changed_shared_mvcc_auto_txn {
@@ -4052,6 +4058,21 @@ impl Program {
                     TxnCleanup::RollbackTxn => {
                         if must_rollback_tx_if_needed {
                             self.rollback_current_txn(pager);
+                        } else if err.is_none() && unfinished_writer && !pager.is_checkpointing() {
+                            // An unfinished writer reset while other writers
+                            // still share the transaction: undo just its own
+                            // changes.
+                            if let Err(end_stmt_err) = state.end_statement(
+                                &self.connection,
+                                pager,
+                                EndStatement::RollbackSavepoint,
+                            ) {
+                                capture_abort_error(
+                                    &mut abort_error,
+                                    end_stmt_err,
+                                    "Failed to rollback statement savepoint during abort",
+                                );
+                            }
                         }
                     }
                     TxnCleanup::RollbackSavepoint => {
@@ -4140,9 +4161,8 @@ impl Program {
                 }
             }
         }
-        if state.uses_subjournal {
+        if state.stmt_savepoint.take().is_some() {
             pager.stop_use_subjournal();
-            state.uses_subjournal = false;
         }
         state.auto_txn_cleanup = TxnCleanup::None;
         if let Some(err) = abort_error {

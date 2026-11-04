@@ -2635,60 +2635,57 @@ unsafe extern "C" fn c_double(
 }
 
 /// Runs its SQL argument as a root statement on the calling connection, the
-/// way the C API runs a statement from inside a user function. With
-/// `nested`, it first enters nested mode while a writer is active.
+/// way the C API runs a statement from inside a user function. Returns the
+/// number of rows, or -1 if the statement failed (the error is swallowed).
 #[derive(Debug)]
-struct RunRoot {
-    nested: bool,
-}
+struct RunRoot;
 
 impl ScalarFunction for RunRoot {
     type Call = RunRootCall;
 
     fn create_call(&self) -> Result<Self::Call> {
-        Ok(RunRootCall {
-            nested: self.nested,
-        })
+        Ok(RunRootCall)
     }
 }
 
-struct RunRootCall {
-    nested: bool,
-}
+struct RunRootCall;
 
 impl ScalarCall for RunRootCall {
     type Output = Value;
 
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         let sql = args[0].get_value().to_text().unwrap().to_string();
-        let nested = self.nested && connection.has_active_write();
-        if nested {
-            connection.start_nested();
-        }
         let result = connection
             .prepare(sql)
             .and_then(|mut stmt| stmt.run_collect_rows());
-        if nested {
-            connection.end_nested();
-        }
-        Ok(IOResult::Done(Value::from_i64(result?.len() as i64)))
+        Ok(IOResult::Done(Value::from_i64(
+            result.map_or(-1, |rows| rows.len() as i64),
+        )))
     }
 }
 
+fn run_root_connection() -> Arc<Connection> {
+    connection(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+            ExternalFunc::new_native_scalar(
+                "run_root".into(),
+                FunctionArity::Exact(1),
+                false,
+                RunRoot,
+            )
+            .unwrap(),
+        ),
+    )
+}
+
+fn rows_of(conn: &Arc<Connection>, sql: &str) -> Vec<Vec<Value>> {
+    conn.prepare(sql).unwrap().run_collect_rows().unwrap()
+}
+
 #[test]
-fn root_statement_from_trigger_function_joins_the_outer_writer_when_nested() {
-    for nested in [false, true] {
-        let conn = connection(
-            OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
-                ExternalFunc::new_native_scalar(
-                    "run_root".into(),
-                    FunctionArity::Exact(1),
-                    false,
-                    RunRoot { nested },
-                )
-                .unwrap(),
-            ),
-        );
+fn root_statement_from_trigger_function_joins_the_outer_writer() {
+    for explicit in [false, true] {
+        let conn = run_root_connection();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
             .unwrap();
         conn.execute("CREATE TABLE log(x)").unwrap();
@@ -2698,27 +2695,103 @@ fn root_statement_from_trigger_function_joins_the_outer_writer_when_nested() {
         )
         .unwrap();
         conn.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+        if explicit {
+            conn.execute("BEGIN").unwrap();
+        }
         assert!(!conn.has_active_write());
-        let result = conn.execute("DELETE FROM t WHERE id = 1");
+        conn.execute("DELETE FROM t WHERE id = 1").unwrap();
         assert!(!conn.has_active_write());
         assert!(!conn.is_nested_stmt());
-        let log = conn
-            .prepare("SELECT x FROM log")
-            .unwrap()
-            .run_collect_rows()
-            .unwrap();
-        if nested {
-            result.unwrap();
-            // The nested insert ran inside the DELETE and saw its change.
-            assert_eq!(log, vec![vec![Value::from_i64(1)]]);
-        } else {
-            // A second top-level writer on the connection is refused.
-            assert!(matches!(
-                result.unwrap_err(),
-                LimboError::StatementsInProgress(_)
-            ));
-            assert!(log.is_empty());
+        // The second writer joined the DELETE's transaction and saw its change.
+        assert_eq!(
+            rows_of(&conn, "SELECT x FROM log"),
+            vec![vec![Value::from_i64(1)]]
+        );
+        if explicit {
+            conn.execute("ROLLBACK").unwrap();
+            assert!(rows_of(&conn, "SELECT x FROM log").is_empty());
         }
         assert!(conn.get_auto_commit());
     }
+}
+
+#[test]
+fn failed_root_statement_from_trigger_function_rolls_back_alone() {
+    for explicit in [false, true] {
+        let conn = run_root_connection();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("CREATE TABLE log(x UNIQUE)").unwrap();
+        conn.execute("INSERT INTO log VALUES (2)").unwrap();
+        // The trigger's statement writes 1, then fails on 2; the function
+        // swallows the error.
+        conn.execute(
+            "CREATE TRIGGER t_del AFTER DELETE ON t BEGIN \
+             SELECT run_root('INSERT INTO log VALUES (1), (2)'); END",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+        if explicit {
+            conn.execute("BEGIN").unwrap();
+        }
+        conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+        // Only the failed statement is undone; the DELETE is kept.
+        assert_eq!(
+            rows_of(&conn, "SELECT x FROM log"),
+            vec![vec![Value::from_i64(2)]]
+        );
+        assert_eq!(
+            rows_of(&conn, "SELECT id FROM t"),
+            vec![vec![Value::from_i64(2)]]
+        );
+        if explicit {
+            conn.execute("COMMIT").unwrap();
+        }
+        assert!(!conn.has_active_write());
+        assert!(conn.get_auto_commit());
+    }
+}
+
+#[test]
+fn interleaved_writers_share_the_autocommit_transaction() {
+    let conn = run_root_connection();
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 1), (2, 2)").unwrap();
+    let mut ins = conn
+        .prepare("INSERT INTO t(b) VALUES (10), (11) RETURNING b")
+        .unwrap();
+    let first = loop {
+        match ins.step().unwrap() {
+            StepResult::Row => break ins.row().unwrap().get_value(0).clone(),
+            StepResult::IO => ins._io().step().unwrap(),
+            other => panic!("unexpected {other:?}"),
+        }
+    };
+    assert_eq!(first, Value::from_i64(10));
+    // A second writer joins, and a failing one rolls back alone.
+    conn.execute("UPDATE t SET b = b + 100 WHERE a = 1")
+        .unwrap();
+    assert!(conn.execute("UPDATE t SET b = 5").is_err());
+    assert!(conn.has_active_write());
+    assert!(conn.get_auto_commit());
+    assert!(conn.execute("COMMIT").is_err());
+    // The transaction is still open until the RETURNING writer finishes.
+    let other = conn.db.connect(ConnectOpts::new()).unwrap();
+    assert_eq!(
+        rows_of(&other, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(2)]]
+    );
+    ins.run_collect_rows().unwrap();
+    drop(ins);
+    assert!(!conn.has_active_write());
+    assert_eq!(
+        rows_of(&other, "SELECT a, b FROM t"),
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(101)],
+            vec![Value::from_i64(2), Value::from_i64(2)],
+            vec![Value::from_i64(3), Value::from_i64(10)],
+            vec![Value::from_i64(4), Value::from_i64(11)],
+        ]
+    );
 }

@@ -421,8 +421,6 @@ unsafe impl Send for SqliteContext {}
 
 // ===== End custom function infrastructure =====
 
-mod reentrancy;
-
 static INIT_DONE: cli::InitState = cli::InitState::new();
 
 #[capi_guard]
@@ -1200,7 +1198,6 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> ffi::c_int
     compat_stubs::utf16_release_stmt(stmt);
     misc::stmt_end(stmt);
     let stmt_ref = &mut *stmt;
-    let _scope = reentrancy::StepScope::cleanup(stmt_ref);
 
     // first, finalize any execution if it was unfinished
     // (for example, many drivers can consume just one row and finalize statement after that, while there still can be work to do)
@@ -1251,7 +1248,6 @@ pub(crate) unsafe fn step_impl(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     // Nothing here needs the lock while stepping: core's Connection is
     // internally synchronized, and the statement itself was never protected
     // by the handle lock to begin with.
-    let _scope = reentrancy::StepScope::step(stmt);
     misc::clear_udf_code();
     let res = stmt.stmt.run_one_step_blocking(|| Ok(()), || Ok(()));
     let rc = match res {
@@ -1406,7 +1402,6 @@ pub unsafe extern "C" fn sqlite3_reset(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     }
     misc::stmt_end(stmt);
     let stmt = &mut *stmt;
-    let _scope = reentrancy::StepScope::cleanup(stmt);
     // first, finalize any execution if it was unfinished
     // (for example, many drivers can consume just one row and finalize statement after that, while there still can be work to do)
     // (this is necessary because queries like INSERT INTO t VALUES (1), (2), (3) RETURNING id return values within a transaction)

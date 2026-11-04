@@ -2428,3 +2428,66 @@ fn external_aggregate_context_lives_while_a_prepared_statement_uses_it() {
         "dropping the last statement releases the replaced registration"
     );
 }
+
+#[test]
+fn test_wal_returning_writers_interleave_and_last_one_commits() {
+    let env = SameConnectionWal::new(":memory:wal-interleaved-returning");
+    env.setup_rows_table();
+
+    let mut first = prepare_insert_returning(&env.conn, 1, "one");
+    assert_eq!(step_returning_id(&mut first), 1);
+    let mut second = prepare_insert_returning(&env.conn, 2, "two");
+    assert_eq!(step_returning_id(&mut second), 2);
+    env.conn
+        .execute("UPDATE rows SET v = 'uno' WHERE id = 1")
+        .unwrap();
+
+    drop(first);
+    assert_eq!(
+        ids_from_query(&env.observer, "SELECT id FROM rows ORDER BY id"),
+        Vec::<i64>::new()
+    );
+    drop(second);
+    assert_eq!(
+        ids_from_query(&env.observer, "SELECT id FROM rows ORDER BY id"),
+        vec![1, 2]
+    );
+    assert_eq!(
+        scalar_text(&env.observer, "SELECT v FROM rows WHERE id = 1"),
+        "uno"
+    );
+}
+
+#[test]
+fn test_wal_no_writer_runs_while_another_writer_is_suspended() {
+    let env = SameConnectionWal::new(":memory:wal-writer-suspended-guard");
+    env.setup_rows_table();
+    env.conn
+        .execute("INSERT INTO rows VALUES (10, 'ten'), (20, 'twenty')")
+        .unwrap();
+    env.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let mut returning = prepare_insert_returning(&env.conn, 1, "one");
+    assert_eq!(step_returning_id(&mut returning), 1);
+    // A second writer stops inside an instruction.
+    let mut writer = prepare_wal_update_yielding_on_table_read(&env, "updated");
+    expect_busy(
+        env.conn.execute("INSERT INTO rows VALUES (3, 'three')"),
+        "new writer while a writer is suspended",
+    );
+    // An active writer may not resume while another one is suspended.
+    assert!(matches!(returning.step().unwrap(), crate::StepResult::Busy));
+
+    finish_without_rows(&mut writer);
+    drop(writer);
+    assert!(matches!(returning.step().unwrap(), crate::StepResult::Done));
+    drop(returning);
+    assert_eq!(
+        ids_from_query(&env.observer, "SELECT id FROM rows ORDER BY id"),
+        vec![1, 10, 20]
+    );
+    assert_eq!(
+        scalar_text(&env.observer, "SELECT v FROM rows WHERE id = 10"),
+        "updated"
+    );
+}

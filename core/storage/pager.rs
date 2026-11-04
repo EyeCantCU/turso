@@ -1459,7 +1459,9 @@ enum HeaderRefState {
 
 #[derive(Debug, Clone)]
 enum SavepointKind {
-    Statement,
+    /// A statement journal, identified so that interleaved statements can
+    /// close it out of order.
+    Statement(u64),
     Named {
         name: String,
         starts_transaction: bool,
@@ -1645,6 +1647,8 @@ pub struct Pager {
     pages_dirtied_count: AtomicU64,
     subjournal: RwLock<Option<Subjournal>>,
     savepoints: Arc<RwLock<Vec<Savepoint>>>,
+    /// Source of statement savepoint ids.
+    next_statement_savepoint_id: AtomicU64,
     commit_info: RwLock<CommitInfo>,
     checkpoint_state: RwLock<CheckpointState>,
     syncing: Arc<AtomicBool>,
@@ -1966,6 +1970,7 @@ impl Pager {
             pages_dirtied_count: AtomicU64::new(0),
             subjournal: RwLock::new(None),
             savepoints: Arc::new(RwLock::new(Vec::new())),
+            next_statement_savepoint_id: AtomicU64::new(1),
             commit_info: RwLock::new(CommitInfo {
                 group: None,
                 completion_group: None,
@@ -2110,6 +2115,29 @@ impl Pager {
     /// Invalidate every cursor's page stack. Called from rollback — pinned
     /// pages may now hold pre-rollback bytes (cf. saveAllCursors in
     /// sqlite3BtreeRollback, btree.c:4485).
+    /// Save the position of every registered cursor so it re-seeks by key
+    /// on its next use, like SQLite's saveAllCursors. A position that cannot
+    /// be saved without I/O falls back to invalidation.
+    fn save_all_cursor_positions(&self) {
+        let snapshot: smallvec::SmallVec<[RegisteredCursor; 8]> = {
+            let registry = self.cursor_registry.lock();
+            registry.values().flat_map(|b| b.iter().copied()).collect()
+        };
+        for peer in snapshot {
+            // SAFETY: see RegisteredCursor's invariant.
+            let saved = unsafe { peer.as_mut().try_save_position_for_external_balance() };
+            if !matches!(
+                saved,
+                Ok(IOResult::Done(
+                    crate::storage::btree::SavePositionResult::Saved
+                ))
+            ) {
+                // SAFETY: see RegisteredCursor's invariant.
+                unsafe { peer.as_mut().invalidate_btree_cache() };
+            }
+        }
+    }
+
     pub(crate) fn invalidate_all_cursors(&self) {
         let snapshot: smallvec::SmallVec<[RegisteredCursor; 8]> = {
             let registry = self.cursor_registry.lock();
@@ -2353,24 +2381,41 @@ impl Pager {
         subjournal.in_use()
     }
 
-    pub fn open_savepoint(&self, db_size: u32) -> Result<()> {
-        self.open_savepoint_with_kind(SavepointKind::Statement, db_size, 0)
+    /// Opens a statement savepoint and returns its id.
+    pub fn open_savepoint(&self, db_size: u32) -> Result<u64> {
+        let id = self
+            .next_statement_savepoint_id
+            .fetch_add(1, Ordering::Relaxed);
+        self.open_savepoint_with_kind(SavepointKind::Statement(id), db_size, 0)?;
+        Ok(id)
     }
 
-    /// Release i.e. commit the current savepoint. This basically just means removing it.
-    pub fn release_savepoint(&self) -> Result<()> {
+    /// Stack index of statement savepoint `id`, if it is still open.
+    fn statement_savepoint_index(savepoints: &[Savepoint], id: u64) -> Option<usize> {
+        savepoints
+            .iter()
+            .rposition(|savepoint| matches!(savepoint.kind, SavepointKind::Statement(s) if s == id))
+    }
+
+    /// Release i.e. commit statement savepoint `id`, together with every
+    /// savepoint opened after it, like SQLite's sqlite3PagerSavepoint
+    /// (SAVEPOINT_RELEASE). A savepoint already released that way is a no-op.
+    pub fn release_statement_savepoint(&self, id: u64) -> Result<()> {
         let mut savepoints = self.savepoints.write();
-        if !matches!(
-            savepoints.last().map(|savepoint| &savepoint.kind),
-            Some(SavepointKind::Statement)
-        ) {
+        let Some(idx) = Self::statement_savepoint_index(&savepoints, id) else {
             return Ok(());
-        }
-        let savepoint = savepoints.pop().expect("savepoint must exist");
+        };
+        let journal_end_offset = savepoints
+            .last()
+            .map(|savepoint| savepoint.write_offset())
+            .expect("savepoint must exist");
+        let drained = savepoints.split_off(idx);
         if let Some(parent) = savepoints.last() {
-            parent.set_write_offset(savepoint.write_offset());
+            parent.set_write_offset(journal_end_offset);
             // See release_named_savepoint: the records now belong to the parent.
-            *parent.page_bitmap.write() |= &*savepoint.page_bitmap.read();
+            for savepoint in &drained {
+                *parent.page_bitmap.write() |= &*savepoint.page_bitmap.read();
+            }
         } else {
             let subjournal = self.subjournal.read();
             let Some(subjournal) = subjournal.as_ref() else {
@@ -2477,19 +2522,23 @@ impl Pager {
         Ok(())
     }
 
-    /// Rollback to the newest savepoint. This basically just means reading the subjournal from the start offset
+    /// Rollback to a statement savepoint. This basically just means reading the subjournal from the start offset
     /// of the savepoint to the end of the subjournal and restoring the page images to the page cache.
-    pub fn rollback_to_newest_savepoint(&self) -> Result<bool> {
+    ///
+    /// Statement savepoint `id` is rolled back and closed together with every
+    /// savepoint opened after it. A savepoint that is no longer open (an
+    /// older interleaved statement released it) is a no-op, as in SQLite.
+    pub fn rollback_statement_savepoint(&self, id: u64) -> Result<bool> {
         let mut savepoints = self.savepoints.write();
-        if !matches!(
-            savepoints.last().map(|savepoint| &savepoint.kind),
-            Some(SavepointKind::Statement)
-        ) {
+        let Some(idx) = Self::statement_savepoint_index(&savepoints, id) else {
             return Ok(false);
-        }
-        let savepoint = savepoints.pop().expect("savepoint must exist");
-        let journal_end_offset = savepoint.write_offset();
-        let savepoint = savepoint.snapshot();
+        };
+        let journal_end_offset = savepoints
+            .last()
+            .map(|savepoint| savepoint.write_offset())
+            .expect("savepoint must exist");
+        let savepoint = savepoints[idx].snapshot();
+        savepoints.truncate(idx);
 
         self.rollback_to_snapshot(&savepoint, journal_end_offset)?;
 
@@ -2592,6 +2641,8 @@ impl Pager {
         savepoint: &SavepointSnapshot,
         journal_end_offset: u64,
     ) -> Result<()> {
+        // Other statements' cursors re-seek to their saved keys afterwards.
+        self.save_all_cursor_positions();
         self.reset_internal_states();
 
         let subjournal = self.subjournal.read();
@@ -2649,7 +2700,8 @@ impl Pager {
             "memory IO should complete immediately"
         );
 
-        // saveAllCursors at sqlite3BtreeSavepoint (btree.c:4580).
+        // saveAllCursors at sqlite3BtreeSavepoint (btree.c:4580): positions
+        // were saved above, so dropping the page stacks keeps them.
         self.invalidate_all_cursors();
 
         // Discard all dirty pages allocated after the savepoint. These pages
@@ -3578,7 +3630,7 @@ impl Pager {
             self.clear_savepoints()
                 .expect("clear_savepoints should not fail for attached DB");
             wal.rollback(None);
-            self.discard_uncommitted_pages();
+            self.discard_uncommitted_pages(false);
             self.reset_internal_states();
             self.set_schema_cookie(None);
             wal.end_write_tx();
@@ -6268,7 +6320,10 @@ impl Pager {
             if let Some(wal) = self.wal.as_ref() {
                 wal.rollback(None);
             }
-            self.discard_uncommitted_pages();
+            // Like SQLite's sqlite3BtreeTripAllCursors with writeOnly: when
+            // the schema is unchanged, read cursors of other statements keep
+            // their positions and continue on the rolled-back contents.
+            self.discard_uncommitted_pages(!schema_did_change);
         } else {
             turso_assert!(
                 self.dirty_pages.read().is_empty(),
@@ -6295,7 +6350,7 @@ impl Pager {
         verify = "full",
         id = "wal_rollback_runs_before_cache_discard"
     )]
-    fn discard_uncommitted_pages(&self) {
+    fn discard_uncommitted_pages(&self, save_cursor_positions: bool) {
         // Without the write lock, another connection can commit frames with the
         // numbers this transaction used. A page tagged with such a frame looks
         // committed, so it would stay in the cache with uncommitted contents.
@@ -6303,6 +6358,9 @@ impl Pager {
             self.wal.as_ref().is_none_or(|wal| wal.holds_write_lock()),
             "rollback must discard pages while holding the WAL write lock"
         );
+        if save_cursor_positions {
+            self.save_all_cursor_positions();
+        }
         self.invalidate_all_cursors();
         let committed_max_frame = self.wal.as_ref().map_or(0, |wal| wal.get_max_frame());
         let mut dirty_pages = self.dirty_pages.write();
