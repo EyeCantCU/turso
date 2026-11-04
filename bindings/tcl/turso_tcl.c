@@ -787,7 +787,7 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
         data->script = objv[3];
         Tcl_IncrRefCount(data->script);
         int rc = sqlite3_create_collation_v2(
-            tdb->db, Tcl_GetString(objv[2]), 0, (void *)data,
+            tdb->db, Tcl_GetString(objv[2]), SQLITE_UTF8, (void *)data,
             (int (*)(void))tcl_collate_bridge,
             (void (*)(void))tcl_collate_destroy);
         if (rc != SQLITE_OK) {
