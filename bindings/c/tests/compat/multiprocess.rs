@@ -329,3 +329,39 @@ fn test_exclusive_locking_mode_locks_out_other_processes() {
         assert_eq!(sqlite3_close(db), SQLITE_OK);
     }
 }
+
+/// e_wal 1.x/2.x: EXCLUSIVE locking mode set before the first WAL access
+/// creates no `-shm` (SQLite keeps the wal-index in heap memory) and still
+/// locks other processes out; NORMAL mode creates it at the first access.
+#[test]
+fn test_exclusive_before_first_access_creates_no_shm() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("x.db").to_str().unwrap().to_string();
+    let shm = format!("{path}-shm");
+    unsafe {
+        let db = open(&path);
+        assert_eq!(query_text(db, "PRAGMA locking_mode=EXCLUSIVE"), "exclusive");
+        assert_eq!(query_text(db, "PRAGMA journal_mode=WAL"), "wal");
+        assert_eq!(exec(db, "CREATE TABLE t(p, i)"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT INTO t VALUES (-1, 0)"), SQLITE_OK);
+        assert!(!std::path::Path::new(&shm).exists());
+        assert!(std::path::Path::new(&format!("{path}-wal")).exists());
+        assert_eq!(finish(spawn("count", &path, "")).0, SQLITE_BUSY);
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+
+        // Reopened in EXCLUSIVE mode: still no -shm.
+        let db = open(&path);
+        assert_eq!(query_text(db, "PRAGMA locking_mode=EXCLUSIVE"), "exclusive");
+        assert_eq!(query_i64(db, "SELECT count(*) FROM t"), 1);
+        assert!(!std::path::Path::new(&shm).exists());
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+
+        // NORMAL mode creates it at the first access.
+        let db = open(&path);
+        assert_eq!(query_i64(db, "SELECT count(*) FROM t"), 1);
+        assert!(std::path::Path::new(&shm).exists());
+        let (rc, count) = finish(spawn("count", &path, ""));
+        assert_eq!((rc, count.as_deref()), (SQLITE_OK, Some("1")));
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}

@@ -19,6 +19,11 @@
 //! Conversely, a turso process that finds no other turso process but a held
 //! DMS lock knows SQLite has the database open and reports it busy.
 //!
+//! Like SQLite's wal-index, the interlock is set up at the first transaction,
+//! not at open. A connection in EXCLUSIVE locking mode at that point takes
+//! [`ExclusiveDbLock`] instead and creates no `-shm`, like SQLite's
+//! heap-memory wal-index.
+//!
 //! Locks are Linux open-file-description locks: they conflict with SQLite's
 //! POSIX locks, are released when the descriptor closes, and are not wiped
 //! when turso opens and closes other descriptors of the same file.
@@ -37,6 +42,10 @@ const SHM_DMS: u64 = 128;
 const SHM_PAGE_SIZE: u64 = 32768;
 const DB_SHARED_FIRST: u64 = 0x4000_0000 + 2;
 const KIND: SharedWalLockKind = SharedWalLockKind::LinuxOfd;
+
+/// A database's interlock, set at its first non-EXCLUSIVE transaction and
+/// shared with its WAL coordinations.
+pub(crate) type SqliteInterlockCell = Arc<std::sync::OnceLock<Arc<SqliteShmInterlock>>>;
 
 pub(crate) struct SqliteShmInterlock {
     _shm: Arc<dyn File>,
@@ -65,7 +74,7 @@ impl SqliteShmInterlock {
             .open_file(db_path, crate::io::OpenFlags::NoLock, false)
             .or_else(|_| io.open_file(db_path, crate::io::OpenFlags::ReadOnly, false))?;
         for attempt in 1..=ATTEMPTS {
-            if Self::try_lock(&shm, &db, &turso_peers_live)? {
+            if let Some(dms_free) = Self::try_lock(&shm, &db, &turso_peers_live)? {
                 if shm.shared_wal_try_lock_byte(SHM_RECOVER_LOCK, true, KIND)?
                     && shm.size()? < SHM_PAGE_SIZE
                 {
@@ -73,17 +82,16 @@ impl SqliteShmInterlock {
                     shm.shared_wal_set_len(SHM_PAGE_SIZE)?;
                 }
                 let index = SqliteWalIndex::new(shm.clone(), &format!("{db_path}-wal"))?;
-                let peers = turso_peers_live();
-                if !peers {
-                    // Stale contents from an earlier session must not be trusted
-                    // by a SQLite reader before the index is rebuilt.
+                if dms_free {
+                    // No peer maintains the index: stale contents from an
+                    // earlier session must not be trusted before the rebuild.
                     index.invalidate()?;
                 }
                 return Ok(Self {
                     _shm: shm,
                     _db: db,
                     index,
-                    index_ready: AtomicBool::new(peers),
+                    index_ready: AtomicBool::new(!dms_free),
                 });
             }
             if attempt < ATTEMPTS {
@@ -117,15 +125,17 @@ impl SqliteShmInterlock {
         self._db.shared_wal_lock_byte(DB_SHARED_FIRST, false, KIND)
     }
 
-    /// Take the shared locks; false on a conflict, with nothing left held.
+    /// Take the shared locks; None on a conflict, with nothing left held,
+    /// else whether DMS was free (no peer process maintains the index).
     fn try_lock(
         shm: &Arc<dyn File>,
         db: &Arc<dyn File>,
         turso_peers_live: &impl Fn() -> bool,
-    ) -> Result<bool> {
+    ) -> Result<Option<bool>> {
         // Any lock on DMS without a turso peer belongs to SQLite.
-        if !shm.shared_wal_probe_exclusive_byte(SHM_DMS, KIND)? && !turso_peers_live() {
-            return Ok(false);
+        let dms_free = shm.shared_wal_probe_exclusive_byte(SHM_DMS, KIND)?;
+        if !dms_free && !turso_peers_live() {
+            return Ok(None);
         }
         let mut held = Vec::with_capacity(3);
         for offset in [SHM_DMS, SHM_WRITE_LOCK, SHM_CKPT_LOCK] {
@@ -133,7 +143,7 @@ impl SqliteShmInterlock {
                 for offset in held {
                     shm.shared_wal_unlock_byte(offset, KIND)?;
                 }
-                return Ok(false);
+                return Ok(None);
             }
             held.push(offset);
         }
@@ -141,14 +151,39 @@ impl SqliteShmInterlock {
             for offset in held {
                 shm.shared_wal_unlock_byte(offset, KIND)?;
             }
-            return Ok(false);
+            return Ok(None);
         }
-        Ok(true)
+        Ok(Some(dms_free))
     }
 }
 
 impl std::fmt::Debug for SqliteShmInterlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SqliteShmInterlock").finish_non_exhaustive()
+    }
+}
+
+/// The database lock of EXCLUSIVE locking mode without a wal-index: the
+/// SHARED range locked exclusively, so no other process (turso or SQLite) can
+/// read the database while it is held.
+pub(crate) struct ExclusiveDbLock {
+    db: Arc<dyn File>,
+}
+
+impl ExclusiveDbLock {
+    /// None while another process has the database open.
+    pub(crate) fn try_acquire(io: &Arc<dyn IO>, db_path: &str) -> Result<Option<Self>> {
+        let db = io.open_file(db_path, crate::io::OpenFlags::NoLock, false)?;
+        if db.shared_wal_try_lock_byte(DB_SHARED_FIRST, true, KIND)? {
+            Ok(Some(Self { db }))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl Drop for ExclusiveDbLock {
+    fn drop(&mut self) {
+        let _ = self.db.shared_wal_unlock_byte(DB_SHARED_FIRST, KIND);
     }
 }

@@ -47,6 +47,23 @@ pub(crate) struct WalIndexHeader {
     pub big_endian_checksum: bool,
 }
 
+impl WalIndexHeader {
+    pub(crate) fn from_wal_header(
+        header: &crate::storage::sqlite3_ondisk::WalHeader,
+        max_frame: u64,
+        checksum: (u32, u32),
+    ) -> Self {
+        Self {
+            max_frame: max_frame as u32,
+            page_size: header.page_size,
+            salt_1: header.salt_1,
+            salt_2: header.salt_2,
+            checksum,
+            big_endian_checksum: header.magic & 1 == 1,
+        }
+    }
+}
+
 pub(crate) struct SqliteWalIndex {
     shm: Arc<dyn File>,
     wal: std::fs::File,

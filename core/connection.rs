@@ -2554,9 +2554,7 @@ impl Connection {
     /// Close a connection and checkpoint.
     pub fn close(&self) -> Result<()> {
         // Give back an EXCLUSIVE locking-mode hold.
-        let _ = self
-            .db
-            .apply_locking_mode(self as *const Self as usize, false, false);
+        let _ = self.db.release_locking_mode(self as *const Self as usize);
         if self.is_closed() {
             return Ok(());
         }

@@ -3332,3 +3332,32 @@ fn later_connection_keeps_checkpoint_progress() {
     let rows = get_rows(&conn3, "SELECT a, b FROM t1");
     assert_eq!(rows, vec![vec![Value::from_i64(1), Value::from_i64(2)]]);
 }
+
+/// Like SQLite's wal-index, `-shm` is set up at the first transaction, and
+/// not at all when the connection is in EXCLUSIVE locking mode by then.
+#[cfg(target_os = "linux")]
+#[test]
+fn sqlite_shm_is_created_at_first_non_exclusive_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lazy.db");
+    let path_str = path.to_str().unwrap();
+    let shm = std::path::PathBuf::from(format!("{path_str}-shm"));
+    {
+        let db = open_multiprocess_db(multiprocess_test_io(), path_str).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        assert!(!shm.exists());
+        conn.set_locking_mode_exclusive(true);
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        assert!(!shm.exists());
+        // Another connection is locked out until the hold is given back.
+        let other = db.connect(ConnectOpts::new()).unwrap();
+        assert!(matches!(
+            other.execute("SELECT * FROM t"),
+            Err(LimboError::Busy)
+        ));
+        conn.close().unwrap();
+        assert_eq!(get_rows(&other, "SELECT x FROM t").len(), 1);
+        assert!(shm.exists());
+    }
+}
