@@ -815,6 +815,12 @@ impl Database {
         crate::text_bytes::DbEncoding::from_u8(self.text_encoding.load(Ordering::Acquire))
     }
 
+    /// Sets the text encoding records are stored in.
+    pub(crate) fn set_text_encoding(&self, enc: crate::text_bytes::DbEncoding) {
+        crate::text_bytes::note_encoding(enc);
+        self.text_encoding.store(enc as u8, Ordering::Release);
+    }
+
     /// Returns true if this database is backed by MemoryIO.
     pub fn is_in_memory_db(&self) -> bool {
         is_memory_like(&self.path)
@@ -2155,10 +2161,9 @@ impl Database {
                     let header: HeaderRefMut = return_if_io!(HeaderRefMut::from_pager(pager));
                     let header_mut = header.borrow_mut();
 
-                    self.text_encoding.store(
-                        crate::text_bytes::DbEncoding::from_header(header_mut.text_encoding) as u8,
-                        Ordering::Release,
-                    );
+                    self.set_text_encoding(crate::text_bytes::DbEncoding::from_header(
+                        header_mut.text_encoding,
+                    ));
 
                     let (read_version, write_version) =
                         { (header_mut.read_version, header_mut.write_version) };

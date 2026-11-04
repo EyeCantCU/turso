@@ -316,6 +316,14 @@ impl TextCollation {
     fn compare_text(self, lhs: TextRef, rhs: TextRef) -> Ordering {
         match self {
             Self::Binary => crate::types::binary_cmp_text(lhs, rhs),
+            other => other.compare_text_non_binary(lhs, rhs),
+        }
+    }
+
+    #[inline(never)]
+    fn compare_text_non_binary(self, lhs: TextRef, rhs: TextRef) -> Ordering {
+        match self {
+            Self::Binary => crate::types::binary_cmp_text(lhs, rhs),
             // NOCASE and RTRIM work on UTF-8 in every database, as in SQLite.
             Self::NoCase => nocase_cmp(&lhs.utf8_bytes(), &rhs.utf8_bytes()),
             Self::Rtrim => rtrim_cmp(&lhs.utf8_bytes(), &rhs.utf8_bytes()),

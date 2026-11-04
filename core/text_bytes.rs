@@ -322,32 +322,58 @@ thread_local! {
     static DB_ENCODING: std::cell::Cell<DbEncoding> = const { std::cell::Cell::new(DbEncoding::Utf8) };
 }
 
+/// Set once any UTF-16 database is opened in the process. Until then the
+/// encoding is UTF-8 everywhere and the thread-local is never touched (a
+/// TLS access is a call in a shared library).
+static UTF16_IN_USE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Records that a database uses `enc`.
+pub(crate) fn note_encoding(enc: DbEncoding) {
+    if !enc.is_utf8() {
+        UTF16_IN_USE.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Whether any UTF-16 database has been opened in this process.
+#[inline(always)]
+pub(crate) fn utf16_in_use() -> bool {
+    UTF16_IN_USE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The record text encoding in effect on this thread.
 #[inline(always)]
 pub(crate) fn db_encoding() -> DbEncoding {
+    if !UTF16_IN_USE.load(std::sync::atomic::Ordering::Relaxed) {
+        return DbEncoding::Utf8;
+    }
     DB_ENCODING.with(|e| e.get())
 }
 
 /// Sets the record text encoding for this thread until dropped.
-pub(crate) struct EncodingGuard(DbEncoding);
+pub(crate) struct EncodingGuard(Option<DbEncoding>);
 
 impl EncodingGuard {
     #[inline]
     pub(crate) fn set(enc: DbEncoding) -> Self {
-        Self(DB_ENCODING.with(|e| e.replace(enc)))
+        if !UTF16_IN_USE.load(std::sync::atomic::Ordering::Acquire) {
+            return Self(None);
+        }
+        Self(Some(DB_ENCODING.with(|e| e.replace(enc))))
     }
 }
 
 impl Drop for EncodingGuard {
     #[inline]
     fn drop(&mut self) {
-        DB_ENCODING.with(|e| e.set(self.0));
+        if let Some(prev) = self.0 {
+            DB_ENCODING.with(|e| e.set(prev));
+        }
     }
 }
 
 /// UTF-16 to UTF-8, as sqlite3VdbeMemTranslate does it (an odd trailing byte
 /// is dropped; a surrogate always pairs with the next unit).
-pub(crate) fn utf16_to_utf8(bytes: &[u8], big_endian: bool) -> Vec<u8> {
+pub fn utf16_to_utf8(bytes: &[u8], big_endian: bool) -> Vec<u8> {
     let n = bytes.len() & !1;
     let mut out = Vec::with_capacity(n + n / 2);
     let unit = |i: usize| -> u32 {
@@ -389,7 +415,7 @@ pub(crate) fn utf16_to_utf8(bytes: &[u8], big_endian: bool) -> Vec<u8> {
 }
 
 /// UTF-8 (possibly invalid) to UTF-16, as sqlite3VdbeMemTranslate does it.
-pub(crate) fn utf8_to_utf16(bytes: &[u8], big_endian: bool) -> Vec<u8> {
+pub fn utf8_to_utf16(bytes: &[u8], big_endian: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len() * 2);
     let mut push = |u: u16| {
         let b = if big_endian {

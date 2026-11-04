@@ -189,7 +189,10 @@ pub use storage::{
     pager::{Page, PageRef, Pager},
     wal::{CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile, WalFileShared},
 };
-pub use text_bytes::{decode_raw_sql, encode_raw_sql, escape_bytes, raw_sql_offset, unescape_str};
+pub use text_bytes::{
+    decode_raw_sql, encode_raw_sql, escape_bytes, raw_sql_offset, unescape_str, utf16_to_utf8,
+    utf8_to_utf16,
+};
 pub use translate::expr::{walk_expr_mut, WalkControl};
 pub use turso_ext::ContextDestructor;
 pub use turso_macros::{

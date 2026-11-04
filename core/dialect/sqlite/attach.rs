@@ -545,9 +545,7 @@ impl Connection {
                     // A fresh attached database takes the main database's encoding.
                     let enc = self.db.text_encoding();
                     if pager.set_initial_text_encoding(enc.to_header())? {
-                        init.db
-                            .text_encoding
-                            .store(enc as u8, crate::sync::atomic::Ordering::Release);
+                        init.db.set_text_encoding(enc);
                     }
 
                     if self.mvcc_enabled() && !init.db.mvcc_enabled() {
