@@ -2434,7 +2434,7 @@ pub unsafe extern "C" fn sqlite3_column_blob(
         Some(Value::Null) | None => return std::ptr::null(),
         // In a UTF-16 database text reads as its stored UTF-16 bytes.
         Some(Value::Text(t)) if t.is_utf8() && (*stmt).stmt.text_encoding() != 1 => {
-            return sqlite3_value_blob(sqlite3_column_value(stmt, idx));
+            return value_conv::sqlite3_value_blob(sqlite3_column_value(stmt, idx));
         }
         _ => {}
     }

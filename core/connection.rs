@@ -5631,7 +5631,7 @@ pub type StepResult = vdbe::StepResult;
 #[derive(Default)]
 pub struct SymbolTable {
     pub functions: HashMap<String, Arc<function::ExternalFunc>>,
-    /// Functions registered through the SQLite C API.
+    pub user_functions: crate::user_function::UserFunctions,
     /// Custom collations by normalized name.
     /// Custom collations by normalized name: the version chosen for the
     /// database encoding.
