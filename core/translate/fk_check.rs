@@ -26,9 +26,11 @@ pub(crate) fn foreign_key_check_sql(
         .filter(|t| !t.foreign_keys.is_empty())
         .filter(|t| table.is_none_or(|name| t.name.eq_ignore_ascii_case(&normalize_ident(name))))
         .collect();
-    children.sort_by(|a, b| a.name.cmp(&b.name));
+    // SQLite walks its table hash, which for a small schema lists the most
+    // recently created table first.
+    children.sort_by_key(|t| std::cmp::Reverse(t.root_page));
     let mut selects = Vec::new();
-    for child in children {
+    for (ordinal, child) in children.into_iter().enumerate() {
         let rowid = if child.has_rowid { "rowid" } else { "NULL" };
         // foreign_key_list numbers the constraints from the last declared one.
         let mut fks: Vec<_> = child.foreign_keys.iter().collect();
@@ -45,6 +47,8 @@ pub(crate) fn foreign_key_check_sql(
             {
                 None => "1".to_string(),
                 Some(parent) => {
+                    // A parent key without a PRIMARY KEY or UNIQUE index is an error.
+                    schema.resolve_fk(namespace, fk, &child, &parent, true)?;
                     let parent_cols: Vec<String> = if !fk.parent_columns.is_empty() {
                         fk.parent_columns.to_vec()
                     } else if parent.primary_key_columns.is_empty() {
@@ -69,8 +73,8 @@ pub(crate) fn foreign_key_check_sql(
                 }
             };
             selects.push(format!(
-                "SELECT {} AS \"table\", {rowid} AS rowid, {} AS parent, {fkid} AS fkid \
-                 FROM {} WHERE {not_null} AND {missing_parent}",
+                "SELECT {ordinal} AS o, {} AS \"table\", {rowid} AS rowid, {} AS parent, \
+                 {fkid} AS fkid FROM {} WHERE {not_null} AND {missing_parent}",
                 literal(&child.name),
                 literal(&fk.parent_table),
                 quote(&child.name),
@@ -81,7 +85,7 @@ pub(crate) fn foreign_key_check_sql(
         return Ok(None);
     }
     Ok(Some(format!(
-        "SELECT * FROM ({}) ORDER BY 1, 2, 4",
+        "SELECT \"table\", rowid, parent, fkid FROM ({}) ORDER BY o, rowid, fkid",
         selects.join(" UNION ALL ")
     )))
 }
