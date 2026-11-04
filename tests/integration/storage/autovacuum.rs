@@ -413,3 +413,102 @@ fn auto_vacuum_replay() {
         }
     }
 }
+
+mod vacuum_and_hooks {
+    use crate::common::{limbo_exec_rows, rusqlite_integrity_check, TempDatabase};
+    use rusqlite::types::Value;
+    use std::sync::{Arc, Mutex};
+
+    fn int(conn: &Arc<turso_core::Connection>, sql: &str) -> i64 {
+        match limbo_exec_rows(conn, sql).first().and_then(|r| r.first()) {
+            Some(Value::Integer(n)) => *n,
+            other => panic!("{sql}: expected an integer, got {other:?}"),
+        }
+    }
+
+    fn ok(conn: &Arc<turso_core::Connection>) {
+        assert_eq!(
+            limbo_exec_rows(conn, "PRAGMA integrity_check"),
+            vec![vec![Value::Text("ok".into())]]
+        );
+    }
+
+    fn load(conn: &Arc<turso_core::Connection>, table: &str, rows: usize) {
+        conn.execute(format!("CREATE TABLE {table}(x)")).unwrap();
+        conn.execute(format!(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<{rows}) \
+             INSERT INTO {table} SELECT randomblob(1500) FROM n"
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn autovacuum_pages_callback_limits_commit_vacuum() {
+        let db = TempDatabase::new_empty();
+        let conn = db.connect_limbo();
+        conn.execute("PRAGMA auto_vacuum = FULL").unwrap();
+        load(&conn, "t", 80);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        conn.set_autovacuum_pages(Some(Arc::new(move |schema: &str, pages, free, size| {
+            seen.lock()
+                .unwrap()
+                .push((schema.to_string(), pages, free, size));
+            free / 2
+        })));
+        let pages = int(&conn, "PRAGMA page_count") as u32;
+        conn.execute("DELETE FROM t").unwrap();
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        let (schema, n_pages, free, size) = calls[0].clone();
+        assert_eq!((schema.as_str(), n_pages, size), ("main", pages, 4096));
+        // Half the free pages stay on the freelist.
+        assert_eq!(
+            int(&conn, "PRAGMA freelist_count"),
+            (free - free / 2) as i64
+        );
+        ok(&conn);
+        // Returning 0 keeps every free page; removing the callback frees them all.
+        conn.set_autovacuum_pages(Some(Arc::new(|_: &str, _, _, _| 0)));
+        load(&conn, "u", 20);
+        let before = int(&conn, "PRAGMA freelist_count");
+        conn.execute("DELETE FROM u").unwrap();
+        assert!(int(&conn, "PRAGMA freelist_count") > before);
+        conn.set_autovacuum_pages(None);
+        conn.execute("CREATE TABLE v(y)").unwrap();
+        assert_eq!(int(&conn, "PRAGMA freelist_count"), 0);
+        ok(&conn);
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        rusqlite_integrity_check(&db.path).unwrap();
+    }
+
+    #[test]
+    fn vacuum_attached_database() {
+        let db = TempDatabase::builder()
+            .with_opts(turso_core::DatabaseOpts::new().with_attach(true))
+            .build();
+        let conn = db.connect_limbo();
+        let dir = tempfile::TempDir::new().unwrap();
+        let aux = dir.path().join("aux.db");
+        conn.execute(format!("ATTACH '{}' AS aux", aux.display()))
+            .unwrap();
+        conn.execute("CREATE TABLE aux.t(x)").unwrap();
+        conn.execute(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<100) \
+             INSERT INTO aux.t SELECT randomblob(1500) FROM n",
+        )
+        .unwrap();
+        conn.execute("DELETE FROM aux.t WHERE rowid > 10").unwrap();
+        let before = int(&conn, "PRAGMA aux.page_count");
+        assert!(int(&conn, "PRAGMA aux.freelist_count") > 0);
+        conn.execute("VACUUM aux").unwrap();
+        assert_eq!(int(&conn, "PRAGMA aux.freelist_count"), 0);
+        assert!(int(&conn, "PRAGMA aux.page_count") < before);
+        assert_eq!(int(&conn, "SELECT count(*) FROM aux.t"), 10);
+        assert_eq!(
+            limbo_exec_rows(&conn, "PRAGMA aux.integrity_check"),
+            vec![vec![Value::Text("ok".into())]]
+        );
+        conn.execute("VACUUM temp").unwrap();
+    }
+}
