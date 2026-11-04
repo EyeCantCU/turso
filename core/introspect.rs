@@ -217,28 +217,67 @@ impl Connection {
         drop(tables);
     }
 
+    /// Disconnects the virtual tables created in the main schema, as
+    /// sqlite3_close does before it looks for open statements. They are
+    /// gone from the loaded schema until it is reloaded
+    /// (`force_reparse_schema`). Returns whether any were disconnected.
+    pub fn disconnect_created_vtabs(&self) -> Result<bool> {
+        let mut dropped: Vec<Arc<crate::schema::Table>> = Vec::new();
+        let created = |t: &crate::schema::Table| matches!(t, crate::schema::Table::Virtual(v) if v.is_droppable);
+        let mut take = |s: &mut crate::schema::Schema, dropped: &mut Vec<_>| {
+            let names: Vec<String> = s
+                .all_tables()
+                .filter(|t| created(t))
+                .map(|t| t.get_name().to_string())
+                .collect();
+            for name in &names {
+                if let Some(t) = s.get_table(crate::namespace::NamespaceId::ROOT, name) {
+                    dropped.push(t);
+                }
+                s.remove_table(crate::namespace::NamespaceId::ROOT, name);
+            }
+            !names.is_empty()
+        };
+        let vtabs: Vec<_> = self.syms.write().vtabs.drain().map(|(_, v)| v).collect();
+        let local = self.with_schema_mut(|s| take(s, &mut dropped))?;
+        // The database's shared schema holds them too.
+        self.db.with_schema_mut(|s| {
+            take(s, &mut dropped);
+            Ok(())
+        })?;
+        let any = local || !vtabs.is_empty();
+        // Dropped outside the locks: xDisconnect may call back in.
+        drop(vtabs);
+        drop(dropped);
+        Ok(any)
+    }
+
     /// Whether a function `name` taking `n_arg` arguments exists, as
     /// `sqlite3FindFunction` decides for `sqlite3_overload_function`
     /// (-1 matches only variadic functions).
-    pub fn function_exists(&self, name: &str, n_arg: i32) -> bool {
+    pub fn function_exists(self: &Arc<Self>, name: &str, n_arg: i32) -> bool {
         let user = self
             .get_syms_functions()
             .into_iter()
-            .any(|(n, _, argc, _)| n.eq_ignore_ascii_case(name) && argc == n_arg);
+            .any(|(n, _, argc, _)| {
+                n.eq_ignore_ascii_case(name) && (argc == n_arg || (argc == -1 && n_arg >= 0))
+            });
         if user {
             return true;
         }
-        let builtin = |n: usize| {
-            matches!(
-                crate::function::Func::resolve_function(name, n),
-                Ok(Some(_))
-            )
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return false;
+        }
+        // Whether a call with that many arguments compiles. A built-in that
+        // takes any count is variadic.
+        let compiles = |n: usize| {
+            let args = vec!["NULL"; n].join(",");
+            self.prepare(format!("SELECT {name}({args})")).is_ok()
         };
         if n_arg >= 0 {
-            builtin(n_arg as usize)
+            compiles(n_arg as usize)
         } else {
-            // A built-in that accepts any count is variadic.
-            builtin(1) && builtin(7)
+            compiles(1) && compiles(7)
         }
     }
 }

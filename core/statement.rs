@@ -491,6 +491,8 @@ impl Statement {
                 return Ok(result);
             }
         }
+        // Running counts as busy (sqlite3_stmt_busy inside its own step).
+        self.busy = true;
         let res = match self.query_mode {
             QueryMode::Normal => {
                 match self

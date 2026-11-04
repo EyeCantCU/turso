@@ -319,6 +319,7 @@ pub fn translate_insert(
     if let Some(virtual_table) = &table.virtual_table() {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie)?;
+        crate::sqlite_dbpage::begin_writes(program, resolver, connection, &table)?;
         translate_virtual_table_insert(
             program,
             virtual_table.clone(),

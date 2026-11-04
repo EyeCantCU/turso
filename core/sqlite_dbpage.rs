@@ -42,6 +42,29 @@ impl VirtualTableModule for DbpageModule {
     }
 }
 
+/// dbpageBeginTrans: a write to sqlite_dbpage may touch any database, so
+/// the statement opens a write transaction on all of them.
+pub(crate) fn begin_writes(
+    program: &mut crate::vdbe::builder::ProgramBuilder,
+    resolver: &crate::translate::emitter::Resolver,
+    connection: &Connection,
+    table: &crate::schema::Table,
+) -> Result<()> {
+    let Some(vt) = table.virtual_table() else {
+        return Ok(());
+    };
+    if !vt.name.eq_ignore_ascii_case(DBPAGE_MODULE_NAME) {
+        return Ok(());
+    }
+    for (id, _, _) in connection.list_all_databases() {
+        let cookie = resolver.with_schema(id, |s| s.schema_version);
+        program
+            .begin_write_on_database(id, cookie)
+            .map_err(|e| LimboError::InternalError(e.to_string()))?;
+    }
+    Ok(())
+}
+
 /// `sqlite3FindDbName`: database index and canonical name.
 pub(crate) fn find_db(conn: &Connection, name: &str) -> Option<(usize, String)> {
     conn.list_all_databases()
@@ -318,9 +341,6 @@ impl DbpageUpdate {
             }
             _ => return Err(fail("bad page value")),
         };
-        if db_id != crate::MAIN_DB_ID && !pager.holds_write_lock() {
-            return Err(fail("failed to open transaction"));
-        }
         let last = last_page(&pager)?;
         if pgno > last {
             // Writing past the end grows the file, as in SQLite.
