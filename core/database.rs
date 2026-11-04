@@ -3222,6 +3222,8 @@ impl Database {
                 64,
             )?)
         };
+        #[cfg(target_os = "linux")]
+        self.install_sqlite_interlock(authority.clone());
         let _ = self.shared_wal_coordination.set(authority.clone());
         Ok(Some(
             self.shared_wal_coordination
@@ -3715,6 +3717,7 @@ impl Database {
             match storage::sqlite_shm_interlock::ExclusiveDbLock::try_acquire(&self.io, &self.path)
             {
                 Ok(Some(lock)) => {
+                    self.sqlite_shm_interlock.set_exclusive_without_shm(true);
                     *self.exclusive_db_lock.lock() = Some(lock);
                     *holder = Some(conn);
                     return Ok(());
@@ -3749,10 +3752,10 @@ impl Database {
 
     fn release_exclusive_locked(&self, holder: &mut Option<usize>) -> Result<()> {
         #[cfg(all(host_shared_wal, target_os = "linux"))]
-        if self.exclusive_db_lock.lock().take().is_none() {
-            if let Some(interlock) = self.sqlite_shm_interlock.get() {
-                interlock.release_exclusive()?;
-            }
+        if self.exclusive_db_lock.lock().take().is_some() {
+            self.sqlite_shm_interlock.set_exclusive_without_shm(false);
+        } else if let Some(interlock) = self.sqlite_shm_interlock.get() {
+            interlock.release_exclusive()?;
         }
         *holder = None;
         Ok(())
@@ -3763,41 +3766,61 @@ impl Database {
     /// access. Busy while another process holds the database exclusively.
     fn ensure_sqlite_interlock(&self) -> Result<()> {
         #[cfg(all(host_shared_wal, target_os = "linux"))]
-        {
-            if self.sqlite_shm_interlock.get().is_some() {
-                return Ok(());
-            }
-            let Some(authority) = self.shared_wal_coordination.get().cloned() else {
-                return Ok(());
-            };
-            let interlock = match storage::sqlite_shm_interlock::SqliteShmInterlock::acquire(
-                &self.io,
-                &self.path,
-                || !authority.is_last_process_mapping(),
-            ) {
-                Ok(interlock) => interlock,
-                Err(LimboError::LockingError(_)) => return Err(LimboError::Busy),
-                // SQLite reports a wal-index it cannot open as SQLITE_CANTOPEN.
-                Err(LimboError::CompletionError(_)) => return Err(LimboError::CantOpen),
-                Err(err) => return Err(err),
-            };
-            if interlock.claim_index_rebuild() {
+        self.sqlite_shm_interlock.ensure()?;
+        Ok(())
+    }
+
+    /// How [`Self::ensure_sqlite_interlock`] sets the interlock up.
+    #[cfg(all(host_shared_wal, target_os = "linux"))]
+    fn install_sqlite_interlock(&self, authority: Arc<MappedSharedWalCoordination>) {
+        let io = self.io.clone();
+        let path = self.path.clone();
+        let shared_wal = self.shared_wal.clone();
+        self.sqlite_shm_interlock.install(Box::new(move || {
+            let build = |index: &storage::sqlite_wal_index::SqliteWalIndex| {
                 let snapshot = authority.snapshot();
+                // This process's WAL header may predate other processes'
+                // writes: the authority has the current generation.
+                let mut wal_header = *shared_wal.read().metadata.wal_header.lock();
+                if snapshot.page_size != 0 {
+                    wal_header.page_size = snapshot.page_size;
+                    wal_header.salt_1 = snapshot.salt_1;
+                    wal_header.salt_2 = snapshot.salt_2;
+                }
                 let header = storage::sqlite_wal_index::WalIndexHeader::from_wal_header(
-                    &self.shared_wal.read().metadata.wal_header.lock(),
+                    &wal_header,
                     snapshot.max_frame,
                     (snapshot.checksum_1, snapshot.checksum_2),
                 );
-                if let Err(err) = interlock
-                    .index()
-                    .rebuild(header, snapshot.nbackfills as u32)
+                index.rebuild(header, snapshot.nbackfills as u32)
+            };
+            let interlock =
+                match storage::sqlite_shm_interlock::SqliteShmInterlock::acquire(&io, &path, build)
                 {
-                    tracing::error!("building SQLite wal-index failed: {err}");
+                    Ok(interlock) => interlock,
+                    Err(LimboError::LockingError(_)) => return Err(LimboError::Busy),
+                    // SQLite reports a wal-index it cannot open as SQLITE_CANTOPEN.
+                    Err(LimboError::CompletionError(_)) => return Err(LimboError::CantOpen),
+                    Err(err) => return Err(err),
+                };
+            if interlock.claim_index_rebuild() {
+                // Under WAL_WRITE_LOCK so no SQLite recovery runs meanwhile;
+                // otherwise a SQLite process that joined recovers it.
+                let index = interlock.index();
+                if (0..1000).any(|_| {
+                    index.try_lock_write().unwrap_or(false) || {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        false
+                    }
+                }) {
+                    if let Err(err) = build(index) {
+                        tracing::error!("building SQLite wal-index failed: {err}");
+                    }
+                    index.unlock_write();
                 }
             }
-            let _ = self.sqlite_shm_interlock.set(Arc::new(interlock));
-        }
-        Ok(())
+            Ok(interlock)
+        }));
     }
 
     /// Whether another process has this multiprocess-WAL database open.
