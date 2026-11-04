@@ -10,8 +10,8 @@
 //! SQLite readers pick a read mark (READ(i), bytes 123..127) and hold it
 //! shared; turso checkpoints must not backfill past a held mark, must hold
 //! READ(0) exclusively while backfilling, and may restart the WAL only when
-//! READ(1..4) can all be taken exclusively. SQLite writers stay locked out
-//! (turso holds WAL_WRITE_LOCK shared), so turso is the only index writer.
+//! READ(1..4) can all be taken exclusively. Turso and SQLite writers both
+//! take WAL_WRITE_LOCK; turso imports SQLite's commits from this index.
 
 use crate::io::{File, SharedWalLockKind, SharedWalMappedRegion};
 use crate::sync::{Arc, Mutex};
@@ -186,18 +186,54 @@ impl SqliteWalIndex {
     }
 
     /// (frame, page) for each frame in `from..=to`, from the WAL frame headers.
+    /// Fails with SQLITE_BUSY if a frame carries other salts than `salts`.
     pub(crate) fn frame_pages(
         &self,
         from: u32,
         to: u32,
         page_size: u32,
+        salts: (u32, u32),
     ) -> Result<Vec<(u32, u32)>> {
+        let be = |b: &[u8]| u32::from_be_bytes(b.try_into().unwrap());
         (from..=to)
             .map(|frame| {
                 let hdr = self.read_frame_header(frame, page_size)?;
-                Ok((frame, u32::from_be_bytes(hdr[0..4].try_into().unwrap())))
+                if (be(&hdr[8..12]), be(&hdr[12..16])) != salts {
+                    return Err(crate::LimboError::Busy);
+                }
+                Ok((frame, be(&hdr[0..4])))
             })
             .collect()
+    }
+
+    /// WalCkptInfo.nBackfill.
+    pub(crate) fn backfill(&self) -> Result<u32> {
+        let mut state = self.state.lock();
+        let base = self.base(&mut state, 0)?;
+        Ok(Self::u32_at(base, CKPT_NBACKFILL).load(Ordering::Acquire))
+    }
+
+    /// Read the header and hold a read mark in 1..=4 so that no WAL restart
+    /// can overwrite its frames, re-reading until both agree, as
+    /// walTryBeginRead does. The mark is None for an empty WAL; Ok(None)
+    /// means try again later.
+    pub(crate) fn pin_header(&self) -> Result<Option<(Option<usize>, IndexSnapshot)>> {
+        for _ in 0..8 {
+            let Some(header) = self.read_header()? else {
+                return Ok(None);
+            };
+            if header.max_frame == 0 {
+                return Ok(Some((None, header)));
+            }
+            let Some(mark) = self.acquire_read_mark(header.max_frame as u64, 0)? else {
+                return Ok(None);
+            };
+            if self.read_header()? == Some(header) {
+                return Ok(Some((Some(mark), header)));
+            }
+            self.release_read_mark(mark);
+        }
+        Ok(None)
     }
 
     /// WAL_WRITE_LOCK exclusively: the one SQLite or turso writer.
