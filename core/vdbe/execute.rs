@@ -3988,7 +3988,9 @@ pub fn halt(
                 } else {
                     pager.rollback_tx(&program.connection);
                 }
-                program.connection.set_tx_state(TransactionState::None);
+                program
+                    .connection
+                    .set_tx_state(program.connection.tx_state_after_end(pager));
                 return Err(LimboError::ForeignKeyConstraint(
                     "FOREIGN KEY constraint failed".to_string(),
                 )
@@ -5596,7 +5598,11 @@ pub fn op_auto_commit(
                 if let Some(hooks) = conn.hooks() {
                     hooks.transaction_rolled_back(&conn);
                 }
-                conn.set_tx_state(TransactionState::None);
+                conn.set_tx_state(if mv_store.is_some() {
+                    TransactionState::None
+                } else {
+                    conn.tx_state_after_end(pager)
+                });
                 conn.auto_commit.store(true, Ordering::SeqCst);
                 conn.set_tx_read_only(false);
                 conn.set_cdc_transaction_id(-1);

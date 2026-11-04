@@ -596,3 +596,56 @@ fn test_write_while_incremental_vacuum_is_stepping() {
         sqlite3_close(db);
     }
 }
+
+/// The first row of `PRAGMA wal_checkpoint(TRUNCATE)`: busy, log, checkpointed.
+unsafe fn checkpoint_truncate(db: *mut sqlite3) -> String {
+    rows(db, "PRAGMA wal_checkpoint(TRUNCATE)").remove(0)
+}
+
+#[test]
+fn test_reader_snapshot_survives_end_of_transaction() {
+    unsafe {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(&dir);
+        exec(db, "CREATE TABLE t(a INTEGER PRIMARY KEY, b)");
+        exec(
+            db,
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 200) \
+             INSERT INTO t SELECT i, i FROM n",
+        );
+        let other = open_db(&dir);
+        for end in ["ROLLBACK", "COMMIT"] {
+            exec(db, "BEGIN");
+            exec(db, "UPDATE t SET b = b + 1 WHERE a = 1");
+            let sel = prepare(db, "SELECT b FROM t ORDER BY a");
+            let first = next(sel).unwrap();
+            // Ending the transaction keeps the reader's read transaction
+            // and its snapshot (btreeEndTransaction with nVdbeRead > 1).
+            exec(db, end);
+            exec(other, "UPDATE t SET b = b + 1000");
+            // The reader pins the WAL: a TRUNCATE checkpoint cannot finish.
+            assert!(checkpoint_truncate(other).starts_with("1:"), "{end}");
+            // New statements on the connection read the same snapshot.
+            let before = rows(db, "SELECT b FROM t WHERE a = 200");
+            assert_eq!(before, v(&["200"]), "{end}");
+            let rest = drain(sel);
+            assert_eq!(rest.len(), 199, "{end}");
+            assert!(
+                rest.iter().all(|b| b.parse::<i64>().unwrap() <= 200),
+                "{end}"
+            );
+            assert_eq!(sqlite3_finalize(sel), SQLITE_OK);
+            // With the reader gone, the connection sees the other writes.
+            assert_eq!(
+                rows(db, "SELECT b FROM t WHERE a = 200"),
+                v(&["1200"]),
+                "{end}"
+            );
+            assert_eq!(checkpoint_truncate(other), "0:0:0", "{end}");
+            exec(other, "UPDATE t SET b = b - 1000");
+            assert_eq!(first, "2", "{end}");
+        }
+        sqlite3_close(other);
+        sqlite3_close(db);
+    }
+}

@@ -1680,8 +1680,11 @@ impl ProgramState {
         if active_writers != 0 {
             return false;
         }
+        // A read transaction kept across the end of a transaction for other
+        // statements is ended by the last of them.
         self.auto_txn_cleanup == TxnCleanup::RollbackTxn
-            || (connection.get_auto_commit() && attached_txn_open())
+            || (connection.get_auto_commit()
+                && (attached_txn_open() || connection.get_tx_state() == TransactionState::Read))
     }
 
     /// The MvStore this statement runs against: the same answer as
@@ -3218,8 +3221,13 @@ impl Program {
                 self.connection
                     .add_total_changes(program_state.n_total_change.load(Ordering::SeqCst));
             }
+            // A read transaction kept for other active statements (see
+            // `Connection::keeps_read_tx`) does not hold the TEMP schema open.
             let transaction_finished = self.connection.auto_commit.load(Ordering::SeqCst)
-                && self.connection.get_tx_state() == TransactionState::None;
+                && matches!(
+                    self.connection.get_tx_state(),
+                    TransactionState::None | TransactionState::Read
+                );
             if transaction_finished {
                 // Finalize the in-memory TEMP schema only when the outer
                 // transaction actually finishes. Updating the committed temp
@@ -3284,6 +3292,11 @@ impl Program {
             match self.end_attached_write_txns(&connection, rollback)? {
                 IOResult::Done(_) => {
                     program_state.commit_state = CommitState::Ready;
+                    let kept_read_tx = connection.get_tx_state() == TransactionState::Read
+                        && connection.keeps_read_tx();
+                    if kept_read_tx {
+                        return Ok(IOResult::Done(()));
+                    }
                     if pager.holds_read_lock() {
                         pager.end_read_tx();
                     }
@@ -3296,6 +3309,18 @@ impl Program {
             match tx_state {
                 TransactionState::Write { .. } => {
                     self.step_end_write_txn(&pager, &connection, program_state, rollback)
+                }
+                TransactionState::Read if connection.keeps_read_tx() => {
+                    // Other active statements still read at this snapshot;
+                    // the last of them ends the read transaction.
+                    match self.end_attached_write_txns(&connection, rollback)? {
+                        IOResult::Done(_) => {}
+                        IOResult::IO(io) => {
+                            program_state.commit_state = CommitState::CommittingAttached;
+                            return Ok(IOResult::IO(io));
+                        }
+                    }
+                    Ok(IOResult::Done(()))
                 }
                 TransactionState::Read => {
                     connection.set_tx_state(TransactionState::None);
