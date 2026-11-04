@@ -228,6 +228,7 @@ fn where_suffix(where_clause: Option<&ast::Expr>) -> String {
 }
 
 /// DELETE FROM a view: fire its INSTEAD OF DELETE triggers for each matching row.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn translate_view_delete(
     program: &mut ProgramBuilder,
     resolver: &Resolver,

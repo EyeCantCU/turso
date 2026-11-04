@@ -8443,7 +8443,7 @@ impl Index {
                 .expect("unique index columns vector was preallocated");
         }
 
-        Ok(Index {
+        Index {
             name: normalize_ident(index_name.as_str()),
             table_name: table.name.clone(),
             root_page,
@@ -8457,7 +8457,7 @@ impl Index {
             on_conflict: conflict_clause,
             constraint_name,
         }
-        .with_without_rowid_pk(table)?)
+        .with_without_rowid_pk(table)
     }
 
     /// Given a column position in the table, return the position in the index.

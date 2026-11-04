@@ -236,7 +236,7 @@ impl<'a> InsertEmitCtx<'a> {
             conflict_pk_reg: if table.has_rowid {
                 0
             } else {
-                program.alloc_registers(super::without_rowid::pk_len(&table)?)
+                program.alloc_registers(super::without_rowid::pk_len(table)?)
             },
             cursor_id: 0, // set later in emit_source_emission
             halt_label: program.allocate_label(),

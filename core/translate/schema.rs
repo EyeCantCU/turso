@@ -1456,10 +1456,8 @@ pub fn translate_create_table(
 
     if let Some(index_regs) = index_regs {
         for (index_reg, number) in index_regs {
-            let index_name = format!(
-                "{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{}_{}",
-                mangled_tbl_name, number
-            );
+            let index_name =
+                format!("{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{mangled_tbl_name}_{number}");
             emit_schema_entry(
                 program,
                 resolver,

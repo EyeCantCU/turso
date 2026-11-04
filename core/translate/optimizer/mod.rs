@@ -4968,6 +4968,54 @@ fn build_seek_def(
     })
 }
 
+/// The b-tree of a WITHOUT ROWID table seen as a covering index: the primary
+/// key, then every other stored column, in record order.
+fn without_rowid_primary_key_scan_index(table: &BTreeTable) -> Result<Index> {
+    let mut columns = crate::alloc::Vec::new();
+    for col in table.without_rowid_pk_columns()? {
+        crate::alloc::TursoVecExt::try_push(&mut columns, col)?;
+    }
+    let n_key_col = columns.len();
+    let mut rest: std::vec::Vec<(usize, usize)> = table
+        .columns()
+        .iter()
+        .enumerate()
+        .filter(|(pos, c)| {
+            !c.is_virtual_generated() && !columns.iter().any(|k| k.pos_in_table == *pos)
+        })
+        .map(|(pos, _)| (table.logical_to_physical_column(pos), pos))
+        .collect();
+    rest.sort_unstable();
+    for (_, pos) in rest {
+        let column = &table.columns()[pos];
+        let mut index_column = IndexColumn::new(
+            column.name.as_deref().unwrap_or_default(),
+            pos,
+            column.collation(),
+        );
+        index_column.default.clone_from(&column.default);
+        crate::alloc::TursoVecExt::try_push(&mut columns, index_column)?;
+    }
+    Ok(Index {
+        name: WITHOUT_ROWID_PRIMARY_KEY_SCAN.to_string(),
+        table_name: table.name.clone(),
+        root_page: table.root_page,
+        n_key_col,
+        columns,
+        unique: true,
+        ephemeral: false,
+        has_rowid: false,
+        where_clause: None,
+        index_method: None,
+        on_conflict: None,
+        constraint_name: None,
+    })
+}
+
+/// Name of the index `without_rowid_primary_key_scan_index` builds; EXPLAIN
+/// QUERY PLAN shows it as SQLite's "PRIMARY KEY".
+pub(crate) const WITHOUT_ROWID_PRIMARY_KEY_SCAN: &str = "sqlite_without_rowid_primary_key";
+
 #[cfg(test)]
 mod tests {
     use super::{where_term_rejects_null_row, Optimizable};
@@ -5437,51 +5485,3 @@ mod tests {
         }
     }
 }
-
-/// The b-tree of a WITHOUT ROWID table seen as a covering index: the primary
-/// key, then every other stored column, in record order.
-fn without_rowid_primary_key_scan_index(table: &BTreeTable) -> Result<Index> {
-    let mut columns = crate::alloc::Vec::new();
-    for col in table.without_rowid_pk_columns()? {
-        crate::alloc::TursoVecExt::try_push(&mut columns, col)?;
-    }
-    let n_key_col = columns.len();
-    let mut rest: std::vec::Vec<(usize, usize)> = table
-        .columns()
-        .iter()
-        .enumerate()
-        .filter(|(pos, c)| {
-            !c.is_virtual_generated() && !columns.iter().any(|k| k.pos_in_table == *pos)
-        })
-        .map(|(pos, _)| (table.logical_to_physical_column(pos), pos))
-        .collect();
-    rest.sort();
-    for (_, pos) in rest {
-        let column = &table.columns()[pos];
-        let mut index_column = IndexColumn::new(
-            column.name.as_deref().unwrap_or_default(),
-            pos,
-            column.collation(),
-        );
-        index_column.default = column.default.clone();
-        crate::alloc::TursoVecExt::try_push(&mut columns, index_column)?;
-    }
-    Ok(Index {
-        name: WITHOUT_ROWID_PRIMARY_KEY_SCAN.to_string(),
-        table_name: table.name.clone(),
-        root_page: table.root_page,
-        n_key_col,
-        columns,
-        unique: true,
-        ephemeral: false,
-        has_rowid: false,
-        where_clause: None,
-        index_method: None,
-        on_conflict: None,
-        constraint_name: None,
-    })
-}
-
-/// Name of the index `without_rowid_primary_key_scan_index` builds; EXPLAIN
-/// QUERY PLAN shows it as SQLite's "PRIMARY KEY".
-pub(crate) const WITHOUT_ROWID_PRIMARY_KEY_SCAN: &str = "sqlite_without_rowid_primary_key";
