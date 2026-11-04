@@ -35,6 +35,158 @@ use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 
+/// Where the `.tshm` byte locks live when they move to the database file:
+/// below SQLite's lock bytes (PENDING_BYTE and up), which SQLite never locks.
+const DB_FILE_LOCK_BASE: u64 = 0x3000_0000;
+
+/// A `.tshm` file whose byte locks live on the database file, so the `.tshm`
+/// descriptor itself can be closed once mapped (mappings outlive it): one
+/// descriptor fewer per database, like SQLite's db + wal + shm. The data
+/// descriptor is reopened for the rare data operations (growing, mapping
+/// more frame-index blocks, syncing the backfill proof).
+struct LockRedirectFile {
+    locks: Arc<dyn File>,
+    /// The lock descriptor is read-only: exclusive locks cannot be had.
+    locks_readonly: bool,
+    io: Arc<dyn IO>,
+    path: String,
+    data: Mutex<Option<Arc<dyn File>>>,
+    keep_data: std::sync::atomic::AtomicBool,
+}
+
+impl LockRedirectFile {
+    /// Redirect `tshm`'s locks to the database file `<db>` of `<db>-tshm`
+    /// (`db` if the caller has it open), if that supports byte locks.
+    fn wrap(
+        io: &Arc<dyn IO>,
+        path: &Path,
+        tshm: Arc<dyn File>,
+        db: Option<Arc<dyn File>>,
+        kind: SharedWalLockKind,
+    ) -> Option<Arc<Self>> {
+        if !matches!(kind, SharedWalLockKind::LinuxOfd) {
+            return None;
+        }
+        let path_str = path.to_str()?;
+        let db_path = path_str.strip_suffix("-tshm")?;
+        let (locks, locks_readonly) = match db {
+            Some(db) => (db, false),
+            None => {
+                if !Path::new(db_path).is_file() {
+                    return None;
+                }
+                match io.open_file(db_path, OpenFlags::NoLock, false) {
+                    Ok(f) => (f, false),
+                    Err(_) => (
+                        io.open_file(db_path, OpenFlags::ReadOnly, false).ok()?,
+                        true,
+                    ),
+                }
+            }
+        };
+        // A VFS file without byte locks keeps the locks on the .tshm; a
+        // read-only descriptor can take shared locks only.
+        let probe = DB_FILE_LOCK_BASE + OPEN_LOCK_OFFSET + 1;
+        let (locks, locks_readonly) = match locks.shared_wal_try_lock_byte(probe, true, kind) {
+            Ok(_) => (locks, locks_readonly),
+            // Reader slots need exclusive locks: use a writable descriptor
+            // if the file allows one (a read-only open of a writable file).
+            Err(_) => match io.open_file(db_path, OpenFlags::NoLock, false) {
+                Ok(rw) if rw.shared_wal_try_lock_byte(probe, true, kind).is_ok() => (rw, false),
+                _ => {
+                    locks.shared_wal_try_lock_byte(probe, false, kind).ok()?;
+                    (locks, true)
+                }
+            },
+        };
+        let _ = locks.shared_wal_unlock_byte(probe, kind);
+        Some(Arc::new(Self {
+            locks,
+            locks_readonly,
+            io: io.clone(),
+            path: path_str.to_string(),
+            data: Mutex::new(Some(tshm)),
+            keep_data: std::sync::atomic::AtomicBool::new(true),
+        }))
+    }
+
+    /// From now on, close the `.tshm` descriptor after each data operation.
+    fn release_data(&self) {
+        self.keep_data.store(false, Ordering::Release);
+        *self.data.lock() = None;
+    }
+
+    fn with_data<T>(&self, f: impl FnOnce(&Arc<dyn File>) -> Result<T>) -> Result<T> {
+        let mut data = self.data.lock();
+        if data.is_none() {
+            *data = Some(self.io.open_shared_wal_file(&self.path)?);
+        }
+        let result = f(data.as_ref().expect("opened above"));
+        if !self.keep_data.load(Ordering::Acquire) {
+            *data = None;
+        }
+        result
+    }
+}
+
+impl File for LockRedirectFile {
+    fn lock_file(&self, _exclusive: bool) -> Result<()> {
+        Ok(())
+    }
+    fn unlock_file(&self) -> Result<()> {
+        Ok(())
+    }
+    fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+        self.with_data(|f| f.pread(pos, c))
+    }
+    fn pwrite(&self, pos: u64, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
+        self.with_data(|f| f.pwrite(pos, buffer, c))
+    }
+    fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
+        self.with_data(|f| f.sync(c, sync_type))
+    }
+    fn size(&self) -> Result<u64> {
+        self.with_data(|f| f.size())
+    }
+    fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+        self.with_data(|f| f.truncate(len, c))
+    }
+    fn shared_wal_set_len(&self, len: u64) -> Result<()> {
+        self.with_data(|f| f.shared_wal_set_len(len))
+    }
+    fn shared_wal_map(&self, offset: u64, len: usize) -> Result<Box<dyn SharedWalMappedRegion>> {
+        self.with_data(|f| f.shared_wal_map(offset, len))
+    }
+    fn shared_wal_lock_byte(
+        &self,
+        offset: u64,
+        exclusive: bool,
+        kind: SharedWalLockKind,
+    ) -> Result<()> {
+        if exclusive && self.locks_readonly {
+            return Err(LimboError::Busy);
+        }
+        self.locks
+            .shared_wal_lock_byte(DB_FILE_LOCK_BASE + offset, exclusive, kind)
+    }
+    fn shared_wal_try_lock_byte(
+        &self,
+        offset: u64,
+        exclusive: bool,
+        kind: SharedWalLockKind,
+    ) -> Result<bool> {
+        if exclusive && self.locks_readonly {
+            return Ok(false);
+        }
+        self.locks
+            .shared_wal_try_lock_byte(DB_FILE_LOCK_BASE + offset, exclusive, kind)
+    }
+    fn shared_wal_unlock_byte(&self, offset: u64, kind: SharedWalLockKind) -> Result<()> {
+        self.locks
+            .shared_wal_unlock_byte(DB_FILE_LOCK_BASE + offset, kind)
+    }
+}
+
 /// Durable file-format magic stored at the start of every `.tshm` mapping.
 const SHARED_WAL_COORDINATION_MAGIC: [u8; 8] = *b"TSHMWAL\0";
 /// Durable `.tshm` file-format version. Bump whenever persisted layout changes.
@@ -698,6 +850,8 @@ pub(crate) struct MappedSharedWalCoordination {
     /// exclusively (a read-only descriptor can only take it shared).
     open_lock_held: Mutex<bool>,
     open_lock_exclusive: bool,
+    /// Set when the byte locks live on the database file.
+    lock_redirect: Option<Arc<LockRedirectFile>>,
     /// Same-process serialization of [`Self::with_open_lock`].
     open_section: Mutex<()>,
     #[cfg(test)]
@@ -830,6 +984,7 @@ impl MappedSharedWalCoordination {
             opened_pid: std::process::id(),
             open_lock_held: Mutex::new(false),
             open_lock_exclusive: false,
+            lock_redirect: None,
             open_section: Mutex::new(()),
             #[cfg(test)]
             frame_index_blocks_scanned: AtomicU64::new(0),
@@ -914,6 +1069,7 @@ impl MappedSharedWalCoordination {
             path,
             reader_slot_count,
             Self::default_ownership_mode(),
+            None,
         )?;
         region.release_open_lock();
         Ok(region)
@@ -921,12 +1077,20 @@ impl MappedSharedWalCoordination {
 
     /// [`Self::create_or_open`], still holding the open lock: the caller seeds
     /// the authority, then calls [`Self::release_open_lock`].
+    /// `db`: the database's descriptor, which then also carries the locks.
     pub(crate) fn create_or_open_holding_open_lock(
         io: &Arc<dyn IO>,
         path: &Path,
         reader_slot_count: u32,
+        db: Option<Arc<dyn File>>,
     ) -> Result<Self> {
-        Self::create_or_open_with_mode(io, path, reader_slot_count, Self::default_ownership_mode())
+        Self::create_or_open_with_mode(
+            io,
+            path,
+            reader_slot_count,
+            Self::default_ownership_mode(),
+            db,
+        )
     }
 
     /// Open an already-existing `.tshm` file without creating or resizing it.
@@ -937,7 +1101,7 @@ impl MappedSharedWalCoordination {
         path: &Path,
         reader_slot_count: u32,
     ) -> Result<Option<Self>> {
-        let region = Self::open_existing_holding_open_lock(io, path, reader_slot_count)?;
+        let region = Self::open_existing_holding_open_lock(io, path, reader_slot_count, None)?;
         if let Some(region) = region.as_ref() {
             region.release_open_lock();
         }
@@ -949,8 +1113,15 @@ impl MappedSharedWalCoordination {
         io: &Arc<dyn IO>,
         path: &Path,
         reader_slot_count: u32,
+        db: Option<Arc<dyn File>>,
     ) -> Result<Option<Self>> {
-        Self::open_existing_with_mode(io, path, reader_slot_count, Self::default_ownership_mode())
+        Self::open_existing_with_mode(
+            io,
+            path,
+            reader_slot_count,
+            Self::default_ownership_mode(),
+            db,
+        )
     }
 
     #[cfg(test)]
@@ -964,6 +1135,7 @@ impl MappedSharedWalCoordination {
             path,
             reader_slot_count,
             SharedWalOwnershipMode::ProcessScopedFcntl,
+            None,
         )?;
         region.release_open_lock();
         Ok(region)
@@ -987,15 +1159,22 @@ impl MappedSharedWalCoordination {
         path: &Path,
         reader_slot_count: u32,
         ownership_mode: SharedWalOwnershipMode,
+        db: Option<Arc<dyn File>>,
     ) -> Result<Self> {
         let file = io.open_shared_wal_file(path.to_str().ok_or_else(|| {
             LimboError::InternalError("shared WAL coordination path is not valid UTF-8".into())
         })?)?;
         let lock_kind = Self::lock_kind_for_mode(ownership_mode);
+        let redirect = LockRedirectFile::wrap(io, path, file.clone(), db, lock_kind);
+        let file: Arc<dyn File> = match redirect.as_ref() {
+            Some(r) => r.clone(),
+            None => file,
+        };
         // Held until the caller has seeded the authority (release_open_lock).
         Self::wait_open_lock(&file, true, lock_kind)?;
         match Self::create_or_open_locked(file.clone(), path, reader_slot_count, ownership_mode) {
             Ok(mut region) => {
+                region.lock_redirect = redirect;
                 region.open_lock_exclusive = true;
                 *region.open_lock_held.get_mut() = true;
                 Ok(region)
@@ -1080,6 +1259,7 @@ impl MappedSharedWalCoordination {
         path: &Path,
         reader_slot_count: u32,
         ownership_mode: SharedWalOwnershipMode,
+        db: Option<Arc<dyn File>>,
     ) -> Result<Option<Self>> {
         turso_assert!(
             reader_slot_count >= 64 && reader_slot_count % 64 == 0,
@@ -1101,9 +1281,15 @@ impl MappedSharedWalCoordination {
             Err(err) => return Err(err),
         };
         let lock_kind = Self::lock_kind_for_mode(ownership_mode);
+        let redirect = LockRedirectFile::wrap(io, path, file.clone(), db, lock_kind);
+        let file: Arc<dyn File> = match redirect.as_ref() {
+            Some(r) => r.clone(),
+            None => file,
+        };
         Self::wait_open_lock(&file, false, lock_kind)?;
         match Self::open_existing_locked(file.clone(), path, reader_slot_count, ownership_mode) {
             Ok(mut region) => {
+                region.lock_redirect = redirect;
                 *region.open_lock_held.get_mut() = true;
                 Ok(Some(region))
             }
@@ -1217,6 +1403,9 @@ impl MappedSharedWalCoordination {
 
     /// Release the open lock once the opener's view is seeded.
     pub(crate) fn release_open_lock(&self) {
+        if let Some(redirect) = self.lock_redirect.as_ref() {
+            redirect.release_data();
+        }
         let mut held = self.open_lock_held.lock();
         if std::mem::take(&mut *held) {
             let _ = self
@@ -3311,6 +3500,7 @@ mod tests {
             &test_shared_wal_io(),
             &path,
             64,
+            None,
         )
         .unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -3333,6 +3523,43 @@ mod tests {
         // Seeding later connections takes the lock for its own duration only.
         assert_eq!(first.with_open_lock(|| 7), 7);
         create_mapping(&path);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tshm_locks_live_on_the_database_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("x.db");
+        std::fs::write(&db, b"").unwrap();
+        let path = dir.path().join("x.db-tshm");
+        let first = create_mapping(&path);
+        assert_eq!(first.open_mode(), SharedWalCoordinationOpenMode::Exclusive);
+        // The lifetime lock is on the database file, not the .tshm.
+        let io = test_shared_wal_io();
+        let db_file = io
+            .open_file(db.to_str().unwrap(), OpenFlags::NoLock, false)
+            .unwrap();
+        let kind = SharedWalLockKind::LinuxOfd;
+        assert!(!db_file
+            .shared_wal_try_lock_byte(DB_FILE_LOCK_BASE + PROCESS_LIFETIME_LOCK_OFFSET, true, kind)
+            .unwrap());
+        let tshm = io.open_shared_wal_file(path.to_str().unwrap()).unwrap();
+        assert!(tshm
+            .shared_wal_try_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, true, kind)
+            .unwrap());
+        tshm.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, kind)
+            .unwrap();
+        // A second mapping sees the first through those locks.
+        let second = create_mapping(&path);
+        assert_eq!(
+            second.open_mode(),
+            SharedWalCoordinationOpenMode::MultiProcess
+        );
+        assert!(!first.is_last_process_mapping());
+        drop(second);
+        assert!(first.is_last_process_mapping());
+        // Growing still works with the .tshm descriptor closed.
+        assert!(first.try_grow_frame_index_blocks(INITIAL_FRAME_INDEX_BLOCKS + 1));
     }
 
     fn create_mapping(path: &Path) -> MappedSharedWalCoordination {

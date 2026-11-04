@@ -1558,6 +1558,7 @@ impl ShmWalCoordination {
         sqlite: crate::storage::sqlite_shm_interlock::SqliteInterlockCell,
     ) -> Self {
         self.sqlite = sqlite;
+        self.sqlite.set_shared_wal(self.shared.clone());
         let authority = self.authority.clone();
         authority.with_open_lock(|| self.seed_with_sqlite_index());
         self
