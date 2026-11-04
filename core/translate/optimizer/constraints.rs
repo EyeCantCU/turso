@@ -1320,6 +1320,13 @@ pub fn constraints_from_where_clause(
                     if !constraint.index_column_can_serve(&index.columns[position_in_index]) {
                         continue;
                     }
+                    // The b-tree of a WITHOUT ROWID table is ordered only by its
+                    // primary key; its other columns cannot be sought.
+                    if index.name == super::WITHOUT_ROWID_PRIMARY_KEY_SCAN
+                        && position_in_index >= index.n_key_col
+                    {
+                        continue;
+                    }
                     if let Some(table_col_pos) = constraint.table_col_pos {
                         let constrained_column = &table_reference.table.columns()[table_col_pos];
                         if constrained_column.index_order_differs_from_value_order(
