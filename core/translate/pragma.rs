@@ -843,7 +843,11 @@ fn update_pragma(
                 connection.set_writable_schema(false);
                 connection.reload_schema()?;
             } else {
-                connection.set_writable_schema(parse_pragma_enabled(&value));
+                let on = parse_pragma_enabled(&value);
+                // Defensive mode refuses to turn it on, as in SQLite.
+                if !on || !connection.is_defensive() {
+                    connection.set_writable_schema(on);
+                }
             }
             Ok(TransactionMode::None)
         }

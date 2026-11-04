@@ -1180,6 +1180,13 @@ fn test_cli_header_fields_wal() {
             "00000000000000000000000300000004000000000000000000000001000000070000000000000063"
         );
         sqlite3_close(db);
+        // VACUUM continues the counter.
+        let db = open_file(&dir);
+        if exec(db, "VACUUM") == SQLITE_OK {
+            assert_eq!(header_fields(db), (4, 4, version, "020200000000".into()));
+            assert_eq!(query1(db, "PRAGMA user_version"), "7");
+        }
+        sqlite3_close(db);
     }
 }
 
@@ -1518,5 +1525,31 @@ fn test_cli_filename_database_block() {
             assert_eq!(p, base.add(start));
             assert_eq!(CStr::from_ptr(p).to_str().unwrap(), "/x/a.db");
         }
+    }
+}
+
+#[test]
+fn test_cli_writable_schema_defensive() {
+    unsafe {
+        extern "C" {
+            fn sqlite3_db_config(db: *mut sqlite3, op: c_int, ...) -> c_int;
+        }
+        let db = open();
+        exec_ok(db, "CREATE TABLE t(a)");
+        let mut out: c_int = -1;
+        // SQLITE_DBCONFIG_DEFENSIVE
+        sqlite3_db_config(db, 1010, 1 as c_int, &mut out as *mut c_int);
+        // The pragma cannot turn it on in defensive mode.
+        exec_ok(db, "PRAGMA writable_schema=ON");
+        assert_eq!(query1(db, "PRAGMA writable_schema"), "0");
+        // db_config sets it, but it has no effect while defensive.
+        sqlite3_db_config(db, 1011, 1 as c_int, &mut out as *mut c_int);
+        assert_eq!(query1(db, "PRAGMA writable_schema"), "1");
+        let msg = query_err(db, "UPDATE sqlite_schema SET sql=sql WHERE name='t'");
+        assert!(msg.ends_with("may not be modified"), "{msg}");
+        sqlite3_db_config(db, 1010, 0 as c_int, &mut out as *mut c_int);
+        exec_ok(db, "UPDATE sqlite_schema SET sql=sql WHERE name='t'");
+        exec_ok(db, "CREATE TABLE sqlite_y(a)");
+        sqlite3_close(db);
     }
 }

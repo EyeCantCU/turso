@@ -239,6 +239,8 @@ pub(crate) struct VacuumDbHeaderMeta {
     text_encoding: TextEncoding,
     user_version: i32,
     application_id: i32,
+    /// The rebuilt database continues the file change counter.
+    change_counter: u32,
 }
 
 impl VacuumDbHeaderMeta {
@@ -251,6 +253,7 @@ impl VacuumDbHeaderMeta {
             text_encoding: source.text_encoding,
             user_version: source.user_version.get(),
             application_id: source.application_id.get(),
+            change_counter: source.change_counter.get(),
         }
     }
 
@@ -262,6 +265,8 @@ impl VacuumDbHeaderMeta {
         header.text_encoding = self.text_encoding;
         header.user_version = self.user_version.into();
         header.application_id = self.application_id.into();
+        header.change_counter = self.change_counter.into();
+        header.version_valid_for = self.change_counter.into();
     }
 }
 
@@ -2901,6 +2906,7 @@ mod tests {
             text_encoding,
             user_version,
             application_id,
+            change_counter: _,
         } = VacuumDbHeaderMeta::from_source_header(&source);
 
         assert_eq!(read_version, source.read_version);
@@ -3051,6 +3057,7 @@ mod tests {
             text_encoding: TextEncoding::Utf8,
             user_version: 17,
             application_id: 29,
+            change_counter: 5,
         };
         match finalize_vacuum_target_header(&temp.conn, &header_meta)? {
             crate::IOResult::Done(()) => {}

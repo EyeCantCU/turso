@@ -202,17 +202,22 @@ impl Connection {
             .load(crate::sync::atomic::Ordering::SeqCst)
     }
 
+    /// sqlite3WritableSchema: the flag counts only outside defensive mode.
+    fn schema_writable(&self) -> bool {
+        self.writable_schema() && !self.is_defensive()
+    }
+
     /// `allow_user_dml` unless writable_schema unlocks the schema table.
     pub(crate) fn allows_user_dml(&self, table: &str) -> bool {
         crate::schema::allow_user_dml(table)
-            || (self.writable_schema() && is_schema_table_name(table))
+            || (self.schema_writable() && is_schema_table_name(table))
     }
 
     /// Whether a new object may not use `name` (sqlite3CheckObjectName);
     /// writable_schema permits `sqlite_` names.
     pub(crate) fn object_name_reserved(&self, name: &str) -> bool {
         crate::namespace::is_reserved_object_name(self.dialect().supports_namespaces(), name)
-            && !(self.writable_schema()
+            && !(self.schema_writable()
                 && name
                     .get(..7)
                     .is_some_and(|p| p.eq_ignore_ascii_case("sqlite_")))
