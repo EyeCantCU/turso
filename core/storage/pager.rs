@@ -3503,7 +3503,7 @@ impl Pager {
 
         let complete_commit = || {
             if update_transaction_state {
-                connection.set_tx_state(TransactionState::None);
+                connection.set_tx_state(connection.tx_state_after_end(self));
             }
             self.commit_wal_end();
         };
@@ -3549,7 +3549,10 @@ impl Pager {
                     };
 
                     wal.end_write_tx();
-                    wal.end_read_tx();
+                    // Other active statements keep reading at this snapshot.
+                    if !connection.keeps_read_tx() {
+                        wal.end_read_tx();
+                    }
 
                     tracing::debug!("commit_tx: schema_did_change={schema_did_change}");
                     if schema_did_change {
@@ -3570,7 +3573,7 @@ impl Pager {
                     // checkpoint finishes: a re-entered RELEASE must still find
                     // them (see release_named_savepoint).
                     if update_transaction_state {
-                        connection.set_tx_state(TransactionState::None);
+                        connection.set_tx_state(connection.tx_state_after_end(self));
                     }
                 }
             }
@@ -3603,7 +3606,11 @@ impl Pager {
         } else {
             self.rollback(schema_did_change, connection, is_write);
         }
-        wal.end_read_tx();
+        // Other active statements keep their snapshot, the one this
+        // transaction started from.
+        if !connection.keeps_read_tx() {
+            wal.end_read_tx();
+        }
     }
 
     pub(crate) fn cleanup_read_tx(&self) {

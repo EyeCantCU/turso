@@ -480,6 +480,18 @@ impl Statement {
     /// gated behind cheap flag tests and kept out of line. A row in the middle
     /// of a scan runs only the interpreter call and the result-row bookkeeping.
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        let top_level = self.origin.is_top_level();
+        if top_level {
+            stepping_root_statements(&self.program.connection, 1);
+        }
+        let res = self._step_tracked(waker);
+        if top_level {
+            stepping_root_statements(&self.program.connection, -1);
+        }
+        res
+    }
+
+    fn _step_tracked(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
         let conn = &self.program.connection;
         if !self.suspended_write && self.state.is_active_write && conn.has_suspended_write() {
             // Another writer stopped inside an instruction; this writer
@@ -1522,6 +1534,7 @@ impl Statement {
         }
 
         let mut reset_error: Option<LimboError> = None;
+        let _stepping = SteppingGuard::enter(&self.program.connection, self.origin.is_top_level());
 
         // Abandon an in-flight post-ANALYZE stats refresh. Its nested statement
         // is a read-only SELECT, so dropping it never has to block.
@@ -1741,6 +1754,35 @@ fn append_expanded_literal(out: &mut String, value: &Value) {
         }
         other => {
             let _ = write!(out, "{other}");
+        }
+    }
+}
+
+/// Moves `Connection::n_stepping_root_statements`, the top-level statements
+/// currently on the call stack.
+fn stepping_root_statements(connection: &Connection, delta: i32) {
+    connection
+        .n_stepping_root_statements
+        .fetch_add(delta, Ordering::SeqCst);
+}
+
+/// Counts a top-level statement as stepping while it is reset.
+struct SteppingGuard(Option<Arc<Connection>>);
+
+impl SteppingGuard {
+    fn enter(connection: &Arc<Connection>, top_level: bool) -> Self {
+        if !top_level {
+            return Self(None);
+        }
+        stepping_root_statements(connection, 1);
+        Self(Some(connection.clone()))
+    }
+}
+
+impl Drop for SteppingGuard {
+    fn drop(&mut self) {
+        if let Some(connection) = self.0.take() {
+            stepping_root_statements(&connection, -1);
         }
     }
 }

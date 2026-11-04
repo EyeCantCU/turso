@@ -2794,6 +2794,7 @@ impl Database {
             triggers_enabled: AtomicBool::new(true),
             n_active_writes: AtomicI32::new(0),
             n_suspended_writes: AtomicI32::new(0),
+            n_stepping_root_statements: AtomicI32::new(0),
             n_active_root_statements: AtomicI32::new(0),
             n_active_blob_statements: AtomicI32::new(0),
             statement_activity: Arc::new(Mutex::new(

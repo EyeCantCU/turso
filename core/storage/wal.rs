@@ -10786,7 +10786,9 @@ pub mod test {
         };
         assert_eq!(result1.wal_total_backfilled, r1_frame);
 
-        // finish reader‑1
+        // finish reader‑1: its statement first, since a COMMIT keeps the read
+        // transaction for statements that are still active, as in SQLite.
+        drop(_stmt);
         conn1.execute("COMMIT").unwrap();
 
         // passive checkpoint #2

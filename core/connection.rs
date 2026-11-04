@@ -561,6 +561,8 @@ pub struct Connection {
     /// Active write statements whose last step returned IO, i.e. that are
     /// suspended inside an instruction.
     pub(crate) n_suspended_writes: AtomicI32,
+    /// Top-level statements currently inside step, reset or finalize.
+    pub(crate) n_stepping_root_statements: AtomicI32,
     /// Number of active root statements currently executing on this connection.
     /// This is Turso's equivalent of SQLite's top-level active-VDBE count
     /// (`db->nVdbeActive`) for user statements, excluding internal helpers and
@@ -984,6 +986,31 @@ impl Connection {
                 attached.trip_cursors(write_only);
             }
         });
+    }
+    /// Whether a read transaction must outlive the end of the current write
+    /// or explicit transaction: other root statements besides the one
+    /// ending it are still active, like SQLite's btreeEndTransaction keeps
+    /// the read transaction while `db->nVdbeRead > 1`.
+    /// Only statements parked between steps count: the ones on the call
+    /// stack (the statement ending the transaction, a statement running it
+    /// from a callback) are finishing their work, not reading. Parked blob
+    /// handles re-position after a checkpoint and do not count either.
+    pub(crate) fn keeps_read_tx(&self) -> bool {
+        !self.is_nested_stmt()
+            && self.n_active_root_statements.load(Ordering::SeqCst)
+                - self.n_active_blob_statements.load(Ordering::SeqCst)
+                - self.n_stepping_root_statements.load(Ordering::SeqCst)
+                > 0
+            && self.mv_store().is_none()
+    }
+    /// The transaction state once a transaction ended on `pager`: Read when
+    /// the read lock was kept for still-active statements.
+    pub(crate) fn tx_state_after_end(&self, pager: &Pager) -> TransactionState {
+        if pager.holds_read_lock() {
+            TransactionState::Read
+        } else {
+            TransactionState::None
+        }
     }
     /// Whether the current transaction changed the schema.
     pub(crate) fn tx_schema_did_change(&self) -> bool {
@@ -5113,7 +5140,7 @@ impl Connection {
         }
         self.rollback_attached_wal_txns();
         self.index_methods_on_transaction_rolled_back();
-        self.set_tx_state(TransactionState::None);
+        self.set_tx_state(self.tx_state_after_end(pager));
         self.set_tx_read_only(false);
         self.clear_tx_poison();
         // The entire transaction is being rolled back, so every materialized

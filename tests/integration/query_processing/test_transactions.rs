@@ -155,14 +155,15 @@ fn test_deferred_transaction_no_restart(tmp_db: TempDatabase) {
     let result = conn2.execute("INSERT INTO test (id, value) VALUES (2, 'second')");
     assert!(matches!(result, Err(LimboError::BusySnapshot)), "Expected BusySnapshot because while write lock is free, the connection's snapshot is stale, got: {result:?}");
 
-    // T2 must rollback and start fresh
+    // T2 must rollback and start fresh. Its SELECT goes first: like SQLite,
+    // a ROLLBACK keeps the read snapshot for statements still active.
+    drop(stmt);
     conn2.execute("ROLLBACK").unwrap();
     conn2.execute("BEGIN").unwrap();
     conn2
         .execute("INSERT INTO test (id, value) VALUES (2, 'second')")
         .unwrap();
     conn2.execute("COMMIT").unwrap();
-    drop(stmt);
 
     let mut stmt = conn1.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
     if let StepResult::Row = stmt.step().unwrap() {
