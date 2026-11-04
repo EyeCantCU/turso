@@ -1715,6 +1715,9 @@ pub unsafe extern "C" fn turso_db_config_int(
         //   - PRAGMA journal_mode=OFF is unsupported and silently kept as-is
         //     (core/storage/journal_mode.rs, JournalMode::supported)
         SQLITE_DBCONFIG_DEFENSIVE => unsafe { vtab::db_config_defensive(db, value, p_out) },
+        SQLITE_DBCONFIG_WRITABLE_SCHEMA => unsafe {
+            cli::db_config_writable_schema(db, value, p_out)
+        },
         _ => SQLITE_ERROR,
     }
 }

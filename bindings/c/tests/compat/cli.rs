@@ -99,6 +99,7 @@ extern "C" {
     fn sqlite3_result_int64(ctx: *mut c_void, v: i64);
     fn sqlite3_result_null(ctx: *mut c_void);
     fn sqlite3_value_int64(v: *mut c_void) -> i64;
+    fn sqlite3_db_config(db: *mut sqlite3, op: c_int, ...) -> c_int;
 }
 
 #[cfg(not(feature = "sqlite3"))]
@@ -1089,6 +1090,159 @@ fn test_cli_open_empty_name_and_table_check() {
         assert_eq!(meta("t"), SQLITE_OK);
         assert_eq!(meta("nosuch"), SQLITE_ERROR);
         assert_eq!(meta("v"), SQLITE_ERROR);
+        sqlite3_close(db);
+    }
+}
+
+/// (change counter, version-valid-for, software version, header bytes
+/// 18..20 and 48..52 as hex) from page 1.
+unsafe fn header_fields(db: *mut sqlite3) -> (u32, u32, i64, String) {
+    let row = query1(
+        db,
+        "SELECT hex(substr(data, 25, 4)), hex(substr(data, 93, 4)),
+                hex(substr(data, 97, 4)), hex(substr(data, 19, 2)) || hex(substr(data, 49, 4))
+         FROM sqlite_dbpage WHERE pgno=1",
+    );
+    let f: Vec<&str> = row.split('|').collect();
+    let n = |s: &str| u32::from_str_radix(s, 16).unwrap();
+    (n(f[0]), n(f[1]), n(f[2]) as i64, f[3].to_string())
+}
+
+#[test]
+fn test_cli_header_fields_wal() {
+    unsafe {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_file(&dir);
+        let version = super::sqlite3_libversion_number() as i64;
+        assert_eq!(query1(db, "PRAGMA journal_mode=wal"), "wal");
+        // A commit that writes page 1 bumps the counter; others do not.
+        exec_ok(db, "CREATE TABLE t(x)");
+        assert_eq!(header_fields(db), (2, 2, version, "020200000000".into()));
+        exec_ok(db, "INSERT INTO t VALUES(1)");
+        exec_ok(db, "INSERT INTO t VALUES(2)");
+        assert_eq!(header_fields(db).0, 2);
+        exec_ok(db, "PRAGMA wal_checkpoint(TRUNCATE)");
+        assert_eq!(header_fields(db).0, 2);
+        // While page 1 stays cached the counter restarts from the value the
+        // connection loaded (SQLite's dbFileVers), so it stays at 2.
+        exec_ok(db, "CREATE TABLE u(x)");
+        assert_eq!(header_fields(db), (2, 2, version, "020200000000".into()));
+        exec_ok(db, "PRAGMA user_version=7; PRAGMA application_id=99");
+        assert_eq!(header_fields(db).0, 2);
+        sqlite3_close(db);
+        // A new connection loads 2 and writes 3.
+        let db = open_file(&dir);
+        assert_eq!(header_fields(db).0, 2);
+        exec_ok(db, "CREATE TABLE v(x)");
+        assert_eq!(header_fields(db), (3, 3, version, "020200000000".into()));
+        // Freelist trunk/count, schema cookie, format, cache size, autovacuum,
+        // encoding, user_version, incremental vacuum, application id.
+        assert_eq!(
+            query1(
+                db,
+                "SELECT hex(substr(data, 33, 40)) FROM sqlite_dbpage WHERE pgno=1"
+            ),
+            "00000000000000000000000300000004000000000000000000000001000000070000000000000063"
+        );
+        sqlite3_close(db);
+    }
+}
+
+#[test]
+fn test_cli_data_version() {
+    unsafe {
+        let dir = tempfile::tempdir().unwrap();
+        let a = open_file(&dir);
+        exec_ok(a, "PRAGMA journal_mode=wal; CREATE TABLE t(x)");
+        let b = open_file(&dir);
+        let dv = |db| query1(db, "PRAGMA data_version").parse::<i64>().unwrap();
+        let (a0, b0) = (dv(a), dv(b));
+        assert!(a0 > 0 && b0 > 0);
+        assert_eq!(dv(a), a0);
+        // Own commits leave it alone; another connection's change it.
+        exec_ok(a, "INSERT INTO t VALUES(1)");
+        assert_eq!(dv(a), a0);
+        let b1 = dv(b);
+        assert_ne!(b1, b0);
+        assert_eq!(dv(b), b1);
+        exec_ok(b, "INSERT INTO t VALUES(2)");
+        assert_eq!(dv(b), b1);
+        assert_ne!(dv(a), a0);
+        sqlite3_close(b);
+        sqlite3_close(a);
+    }
+}
+
+unsafe fn columns_of(db: *mut sqlite3, table: &str) -> String {
+    query(
+        db,
+        &format!("SELECT name FROM pragma_table_info('{table}')"),
+    )
+    .join(",")
+}
+
+#[test]
+fn test_cli_writable_schema() {
+    unsafe {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_file(&dir);
+        exec_ok(db, "CREATE TABLE t(a, b); INSERT INTO t VALUES(1, 2)");
+        assert_eq!(query1(db, "PRAGMA writable_schema"), "0");
+        let msg = query_err(db, "UPDATE sqlite_schema SET sql=sql WHERE name='t'");
+        assert!(msg.ends_with("may not be modified"), "{msg}");
+        let msg = query_err(db, "CREATE TABLE sqlite_x(a)");
+        assert!(
+            msg.to_lowercase()
+                .ends_with("object name reserved for internal use: sqlite_x"),
+            "{msg}"
+        );
+        // ON: sqlite_ names and sqlite_schema edits are allowed.
+        exec_ok(db, "PRAGMA writable_schema=ON");
+        assert_eq!(query1(db, "PRAGMA writable_schema"), "1");
+        exec_ok(
+            db,
+            "CREATE TABLE IF NOT EXISTS temp.sqlite_parameters(key TEXT PRIMARY KEY, value)",
+        );
+        exec_ok(db, "INSERT INTO temp.sqlite_parameters VALUES(':x', 2)");
+        exec_ok(
+            db,
+            "UPDATE sqlite_schema SET sql='CREATE TABLE t(a, b, c)' WHERE name='t'",
+        );
+        assert_eq!(
+            query1(db, "SELECT sql FROM sqlite_schema WHERE name='t'"),
+            "CREATE TABLE t(a, b, c)"
+        );
+        // The loaded schema keeps the old definition until RESET.
+        assert_eq!(columns_of(db, "t"), "a,b");
+        exec_ok(db, "PRAGMA writable_schema=RESET");
+        assert_eq!(query1(db, "PRAGMA writable_schema"), "0");
+        assert_eq!(columns_of(db, "t"), "a,b,c");
+        assert_eq!(query1(db, "SELECT a, b, c FROM t"), "1|2|NULL");
+        let msg = query_err(db, "DELETE FROM sqlite_schema WHERE name='t'");
+        assert!(msg.ends_with("may not be modified"), "{msg}");
+        // OFF after ON.
+        exec_ok(db, "PRAGMA writable_schema=1; PRAGMA writable_schema=OFF");
+        assert_eq!(query1(db, "PRAGMA writable_schema"), "0");
+        // SQLITE_DBCONFIG_WRITABLE_SCHEMA is the same switch.
+        let mut out: c_int = -1;
+        assert_eq!(
+            sqlite3_db_config(db, 1011, 1 as c_int, &mut out as *mut c_int),
+            SQLITE_OK
+        );
+        assert_eq!(out, 1);
+        assert_eq!(query1(db, "PRAGMA writable_schema"), "1");
+        assert_eq!(
+            sqlite3_db_config(db, 1011, 0 as c_int, &mut out as *mut c_int),
+            SQLITE_OK
+        );
+        assert_eq!(
+            (out, query1(db, "PRAGMA writable_schema").as_str()),
+            (0, "0")
+        );
+        sqlite3_close(db);
+        // A new connection reads the edited schema.
+        let db = open_file(&dir);
+        assert_eq!(columns_of(db, "t"), "a,b,c");
         sqlite3_close(db);
     }
 }

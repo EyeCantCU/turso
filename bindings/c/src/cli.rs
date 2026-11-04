@@ -159,6 +159,22 @@ pub(crate) unsafe fn disconnect_vtabs(db: *mut sqlite3) {
     conn.disconnect_eponymous_vtabs();
 }
 
+/// SQLITE_DBCONFIG_WRITABLE_SCHEMA: same switch as PRAGMA writable_schema.
+pub(crate) unsafe fn db_config_writable_schema(
+    db: *mut sqlite3,
+    value: c_int,
+    out: *mut c_int,
+) -> c_int {
+    let conn = (*db).inner.lock().unwrap().conn.clone();
+    if value >= 0 {
+        conn.set_writable_schema(value > 0);
+    }
+    if !out.is_null() {
+        *out = conn.writable_schema() as c_int;
+    }
+    SQLITE_OK
+}
+
 /// Runs the client-data destructors of a connection that is going away.
 pub(crate) fn on_close(conn: &Arc<Connection>) {
     let key = Arc::as_ptr(conn) as usize;
