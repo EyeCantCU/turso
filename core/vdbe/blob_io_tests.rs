@@ -387,13 +387,10 @@ fn blob_survives_splits_from_other_row_inserts() {
 }
 
 #[test]
-fn blob_write_handle_blocks_other_writers_and_commits_on_close() {
-    // Divergence from sqlite's e_blobwrite 3.x: in SQLite a same-connection write
-    // statement can expire an open read-write handle, and writes made before the
-    // expiry persist. Turso permits one write statement per connection at a time,
-    // so while a read-write handle is open, other write statements fail with
-    // StatementsInProgress instead — a write handle can never be expired out from
-    // under its own connection. Its writes commit when the handle closes.
+fn blob_write_handle_is_expired_by_same_connection_writer() {
+    // Like SQLite's e_blobwrite 3.x: a same-connection write statement that
+    // changes the handle's row expires the open read-write handle, and the
+    // writes made before the expiry persist when the handle closes.
     let conn = fresh_db();
     exec(
         &conn,
@@ -402,19 +399,15 @@ fn blob_write_handle_blocks_other_writers_and_commits_on_close() {
     exec(&conn, "INSERT INTO t VALUES (1, 0, zeroblob(8))");
     let mut blob = conn.blob_open("t", "data", 1, true).unwrap();
     blob.write(0, &[0xAA, 0xBB]).unwrap();
-    assert!(matches!(
-        conn.execute("UPDATE t SET x = 7 WHERE id = 1"),
-        Err(LimboError::StatementsInProgress(_))
-    ));
-    blob.close().unwrap();
-    // After close the write statement slot frees up and the blob write is durable.
     exec(&conn, "UPDATE t SET x = 7 WHERE id = 1");
+    assert!(blob.write(2, &[0xCC]).is_err());
+    blob.close().unwrap();
     let mut q = conn
-        .query("SELECT substr(data, 1, 2), x FROM t WHERE id = 1")
+        .query("SELECT substr(data, 1, 3), x FROM t WHERE id = 1")
         .unwrap()
         .unwrap();
     let got = q.run_collect_rows().unwrap();
-    assert_eq!(blob_bytes(&got[0][0]), vec![0xAA, 0xBB]);
+    assert_eq!(blob_bytes(&got[0][0]), vec![0xAA, 0xBB, 0x00]);
     assert!(matches!(
         got[0][1],
         Value::Numeric(crate::Numeric::Integer(7))

@@ -202,6 +202,9 @@ pub struct Statement {
     query_timeout_override: Option<Option<Duration>>,
     /// True once [Self::step] has returned a [Row].
     has_returned_row: bool,
+    /// Counted in `Connection::n_suspended_writes`: an active write whose
+    /// last step stopped inside an instruction.
+    suspended_write: bool,
     /// Byte offset in the original SQL string where this statement ends.
     /// Used by sqlite3_prepare_v2 to set the *pzTail output parameter.
     tail_offset: usize,
@@ -298,6 +301,7 @@ impl Statement {
             busy_handler_state: None,
             query_timeout_override: None,
             has_returned_row: false,
+            suspended_write: false,
             tail_offset,
             origin,
             counted_as_active_root: false,
@@ -476,6 +480,38 @@ impl Statement {
     /// gated behind cheap flag tests and kept out of line. A row in the middle
     /// of a scan runs only the interpreter call and the result-row bookkeeping.
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        let conn = &self.program.connection;
+        if !self.suspended_write && self.state.is_active_write && conn.has_suspended_write() {
+            // Another writer stopped inside an instruction; this writer
+            // must not change pages under it until it resumes.
+            return Ok(StepResult::Busy);
+        }
+        let res = self._step_inner(waker);
+        let suspended = self.state.is_active_write
+            && matches!(
+                res,
+                Ok(StepResult::IO
+                    | StepResult::Yield
+                    | StepResult::Sleep { .. }
+                    | StepResult::Busy)
+            );
+        self.set_suspended_write(suspended);
+        res
+    }
+
+    fn set_suspended_write(&mut self, suspended: bool) {
+        if suspended != self.suspended_write {
+            self.suspended_write = suspended;
+            let counter = &self.program.connection.n_suspended_writes;
+            if suspended {
+                counter.fetch_add(1, Ordering::SeqCst);
+            } else {
+                counter.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    fn _step_inner(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
         // ANALYZE already ran to Done; only its stats refresh is outstanding.
         // Checked first: the root-statement count was released at Done, so
         // `prepare_step` must not re-register this statement as a root.
@@ -736,7 +772,7 @@ impl Statement {
                         .connection
                         .n_active_writes
                         .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                    debug_assert_eq!(prev, 1, "writer count mismatch before statement restart");
+                    debug_assert!(prev >= 1, "writer count mismatch before statement restart");
                 }
                 self.state.reset(None, None);
             }
@@ -1616,6 +1652,7 @@ impl Statement {
                 );
             }
         }
+        self.set_suspended_write(false);
         // Safety net: if end_statement wasn't reached (e.g. statement dropped
         // mid-execution), ensure n_active_writes is decremented before reset
         // clears the flag.
@@ -1626,7 +1663,7 @@ impl Statement {
                 .n_active_writes
                 .fetch_sub(1, Ordering::SeqCst);
             turso_assert!(
-                previous == 1,
+                previous >= 1,
                 "resetting a writer with {previous} active writer(s)"
             );
             self.state.is_active_write = false;

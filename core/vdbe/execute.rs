@@ -4605,23 +4605,23 @@ pub fn op_transaction_inner(
                     return Err(LimboError::ReadOnly.into());
                 }
                 let active_writers = conn.n_active_writes.load(Ordering::SeqCst);
-                turso_assert!(
-                    active_writers <= 1,
-                    "n_active_writes must be 0 or 1, got {active_writers}"
-                );
-                // One connection may have many active readers, but only one
-                // top-level writer. A second writer on the same connection is
-                // rejected before it opens transaction or savepoint state.
-                //
-                // This is stricter than SQLite. SQLite can run overlapping
-                // write statements on one connection because sqlite3_step()
-                // does not return to the caller in the middle of built-in
-                // write opcodes. Turso can suspend there for async I/O, so a
-                // second writer would make reset/drop cleanup hard to get right.
+                // Like SQLite, several write statements may be active on one
+                // connection and share its transaction; each one that joins
+                // gets a statement savepoint (see `BeginStatement`). SQLite's
+                // sqlite3_step() never returns in the middle of a write
+                // opcode, but Turso can suspend there for async I/O, so a
+                // writer may not start while another one is suspended. MVCC
+                // keeps one writer per connection, and a writer may not join
+                // while another one still has materialized-view changes to
+                // apply.
                 if statement_writes_db
                     && !conn.is_nested_stmt()
                     && !state.is_active_write
                     && active_writers > 0
+                    && (mv_store.is_some()
+                        || conn.mv_store().is_some()
+                        || conn.has_suspended_write()
+                        || !conn.transaction_changes.is_empty())
                 {
                     return Err(
                         LimboError::StatementsInProgress("cannot start a write statement").into(),
@@ -5080,9 +5080,17 @@ pub fn op_transaction_inner(
                 *state.active_op_state.transaction() = OpTransactionState::BeginStatement;
             }
             OpTransactionState::BeginStatement => {
-                let needs_stmt_journal = program.needs_stmt_subtransactions.load(Ordering::Relaxed);
                 let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
                 let in_explicit_txn = !auto_commit;
+                // A writer that joins other active writers always gets a
+                // statement savepoint, so its abort or reset never has to
+                // touch their changes.
+                let joins_other_writers = statement_writes_db
+                    && !state.is_active_write
+                    && !program.connection.is_nested_stmt()
+                    && program.connection.n_active_writes.load(Ordering::SeqCst) > 0;
+                let needs_stmt_journal = program.needs_stmt_subtransactions.load(Ordering::Relaxed)
+                    || joins_other_writers;
                 if needs_stmt_journal {
                     if is_main_db {
                         let res = state.begin_statement(
@@ -5093,7 +5101,11 @@ pub fn op_transaction_inner(
                         if let IOResult::IO(io) = res {
                             return Ok(state.suspend_on_io(io));
                         }
-                    } else if statement_writes_db && in_explicit_txn {
+                    } else if statement_writes_db
+                        && (in_explicit_txn
+                            || (mv_store.is_none()
+                                && program.connection.statement_needs_savepoint()))
+                    {
                         if !state.has_stmt_transaction {
                             state.has_stmt_transaction = true;
                             state.fk_deferred_violations_when_stmt_started.store(
@@ -5125,8 +5137,9 @@ pub fn op_transaction_inner(
                             if result.is_err() {
                                 pager.stop_use_subjournal();
                             }
-                            result?;
-                            state.attached_savepoint_pagers.push(pager.clone());
+                            state
+                                .attached_savepoint_pagers
+                                .push((pager.clone(), result?));
                         }
                     }
                 }
@@ -5134,14 +5147,10 @@ pub fn op_transaction_inner(
                 let is_top_level_statement = !program.connection.is_nested_stmt();
                 if statement_writes_db && is_top_level_statement {
                     if !state.is_active_write {
-                        let previous = program
+                        program
                             .connection
                             .n_active_writes
                             .fetch_add(1, Ordering::SeqCst);
-                        turso_assert!(
-                            previous == 0,
-                            "starting a writer while {previous} writer(s) are already active"
-                        );
                         turso_assert!(
                             program.connection.transaction_changes.is_empty(),
                             "write statement started with view changes left by an earlier statement"

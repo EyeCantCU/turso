@@ -1454,7 +1454,9 @@ enum BtreeCreateVacuumFullState {
 
 #[derive(Debug, Clone)]
 enum SavepointKind {
-    Statement,
+    /// A statement journal, identified so that interleaved statements can
+    /// close it out of order.
+    Statement(u64),
     Named {
         name: String,
         starts_transaction: bool,
@@ -1640,6 +1642,8 @@ pub struct Pager {
     pages_dirtied_count: AtomicU64,
     subjournal: RwLock<Option<Subjournal>>,
     savepoints: Arc<RwLock<Vec<Savepoint>>>,
+    /// Source of statement savepoint ids.
+    next_statement_savepoint_id: AtomicU64,
     commit_info: RwLock<CommitInfo>,
     checkpoint_state: RwLock<CheckpointState>,
     syncing: Arc<AtomicBool>,
@@ -1949,6 +1953,7 @@ impl Pager {
             pages_dirtied_count: AtomicU64::new(0),
             subjournal: RwLock::new(None),
             savepoints: Arc::new(RwLock::new(Vec::new())),
+            next_statement_savepoint_id: AtomicU64::new(1),
             commit_info: RwLock::new(CommitInfo {
                 group: None,
                 completion_group: None,
@@ -2317,22 +2322,37 @@ impl Pager {
         subjournal.in_use()
     }
 
-    pub fn open_savepoint(&self, db_size: u32) -> Result<()> {
-        self.open_savepoint_with_kind(SavepointKind::Statement, db_size, 0)
+    /// Opens a statement savepoint and returns its id.
+    pub fn open_savepoint(&self, db_size: u32) -> Result<u64> {
+        let id = self
+            .next_statement_savepoint_id
+            .fetch_add(1, Ordering::Relaxed);
+        self.open_savepoint_with_kind(SavepointKind::Statement(id), db_size, 0)?;
+        Ok(id)
     }
 
-    /// Release i.e. commit the current savepoint. This basically just means removing it.
-    pub fn release_savepoint(&self) -> Result<()> {
+    /// Stack index of statement savepoint `id`, if it is still open.
+    fn statement_savepoint_index(savepoints: &[Savepoint], id: u64) -> Option<usize> {
+        savepoints
+            .iter()
+            .rposition(|savepoint| matches!(savepoint.kind, SavepointKind::Statement(s) if s == id))
+    }
+
+    /// Release i.e. commit statement savepoint `id`, together with every
+    /// savepoint opened after it, like SQLite's sqlite3PagerSavepoint
+    /// (SAVEPOINT_RELEASE). A savepoint already released that way is a no-op.
+    pub fn release_statement_savepoint(&self, id: u64) -> Result<()> {
         let mut savepoints = self.savepoints.write();
-        if !matches!(
-            savepoints.last().map(|savepoint| &savepoint.kind),
-            Some(SavepointKind::Statement)
-        ) {
+        let Some(idx) = Self::statement_savepoint_index(&savepoints, id) else {
             return Ok(());
-        }
-        let savepoint = savepoints.pop().expect("savepoint must exist");
+        };
+        let journal_end_offset = savepoints
+            .last()
+            .map(|savepoint| savepoint.write_offset())
+            .expect("savepoint must exist");
+        savepoints.truncate(idx);
         if let Some(parent) = savepoints.last() {
-            parent.set_write_offset(savepoint.write_offset());
+            parent.set_write_offset(journal_end_offset);
         } else {
             let subjournal = self.subjournal.read();
             let Some(subjournal) = subjournal.as_ref() else {
@@ -2429,19 +2449,23 @@ impl Pager {
         Ok(())
     }
 
-    /// Rollback to the newest savepoint. This basically just means reading the subjournal from the start offset
+    /// Rollback to a statement savepoint. This basically just means reading the subjournal from the start offset
     /// of the savepoint to the end of the subjournal and restoring the page images to the page cache.
-    pub fn rollback_to_newest_savepoint(&self) -> Result<bool> {
+    ///
+    /// Statement savepoint `id` is rolled back and closed together with every
+    /// savepoint opened after it. A savepoint that is no longer open (an
+    /// older interleaved statement released it) is a no-op, as in SQLite.
+    pub fn rollback_statement_savepoint(&self, id: u64) -> Result<bool> {
         let mut savepoints = self.savepoints.write();
-        if !matches!(
-            savepoints.last().map(|savepoint| &savepoint.kind),
-            Some(SavepointKind::Statement)
-        ) {
+        let Some(idx) = Self::statement_savepoint_index(&savepoints, id) else {
             return Ok(false);
-        }
-        let savepoint = savepoints.pop().expect("savepoint must exist");
-        let journal_end_offset = savepoint.write_offset();
-        let savepoint = savepoint.snapshot();
+        };
+        let journal_end_offset = savepoints
+            .last()
+            .map(|savepoint| savepoint.write_offset())
+            .expect("savepoint must exist");
+        let savepoint = savepoints[idx].snapshot();
+        savepoints.truncate(idx);
 
         self.rollback_to_snapshot(&savepoint, journal_end_offset)?;
 

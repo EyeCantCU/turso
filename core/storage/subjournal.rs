@@ -1,5 +1,5 @@
 use crate::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicUsize, Ordering},
     Arc,
 };
 use crate::{turso_assert, turso_assert_eq};
@@ -11,39 +11,32 @@ use crate::{
 #[derive(Clone)]
 pub struct Subjournal {
     file: Arc<dyn crate::io::File>,
-    in_use: Arc<AtomicBool>,
+    /// Statements holding a statement savepoint in this subjournal.
+    /// Interleaved write statements on one connection share it, like
+    /// SQLite's statement journal.
+    in_use: Arc<AtomicUsize>,
 }
 
 impl Subjournal {
     pub fn new(file: Arc<dyn crate::io::File>) -> Self {
         Self {
             file,
-            in_use: Arc::new(AtomicBool::new(false)),
+            in_use: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     pub fn try_use(&self) -> Result<()> {
-        let result = self
-            .in_use
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
-        if result.is_err() {
-            return Err(crate::LimboError::Busy);
-        }
+        self.in_use.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
     pub fn stop_use(&self) {
-        let result = self
-            .in_use
-            .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst);
-        turso_assert!(
-            result.is_ok(),
-            "try_start_use must succeed before stop_use call"
-        );
+        let previous = self.in_use.fetch_sub(1, Ordering::SeqCst);
+        turso_assert!(previous > 0, "try_use must succeed before stop_use call");
     }
 
     pub fn in_use(&self) -> bool {
-        self.in_use.load(Ordering::SeqCst)
+        self.in_use.load(Ordering::SeqCst) > 0
     }
 
     pub fn write_page(
