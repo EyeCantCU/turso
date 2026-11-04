@@ -16702,6 +16702,8 @@ pub fn op_read_cookie(
                 Cookie::LargestRootPageNumber => header.vacuum_mode_largest_root_page.get().into(),
                 Cookie::PageSize => header.page_size.get().into(),
                 Cookie::FreePageCount => header.freelist_pages.get().into(),
+                // Answered above; not a header field.
+                Cookie::DataVersion => 0,
                 cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
             },
         ) {

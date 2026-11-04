@@ -841,7 +841,7 @@ fn update_pragma(
             if reset {
                 // RESET: off, and the schema is read again from the file.
                 connection.set_writable_schema(false);
-                connection.force_reparse_schema()?;
+                connection.reload_schema()?;
             } else {
                 connection.set_writable_schema(parse_pragma_enabled(&value));
             }

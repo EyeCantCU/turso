@@ -180,6 +180,15 @@ impl Connection {
         }
     }
 
+    /// Reads the schema again from the file and makes it the database's
+    /// shared copy (PRAGMA writable_schema=RESET, vtab reconnects).
+    pub fn reload_schema(self: &Arc<Self>) -> Result<()> {
+        self.force_reparse_schema_without_publish()?;
+        let schema = self.schema.read().clone();
+        self.db.replace_schema(schema);
+        Ok(())
+    }
+
     /// PRAGMA writable_schema: sqlite_schema can be written and `sqlite_`
     /// names created.
     pub fn set_writable_schema(&self, on: bool) {
@@ -224,7 +233,7 @@ impl Connection {
     pub fn disconnect_created_vtabs(&self) -> Result<bool> {
         let mut dropped: Vec<Arc<crate::schema::Table>> = Vec::new();
         let created = |t: &crate::schema::Table| matches!(t, crate::schema::Table::Virtual(v) if v.is_droppable);
-        let mut take = |s: &mut crate::schema::Schema, dropped: &mut Vec<_>| {
+        let take = |s: &mut crate::schema::Schema, dropped: &mut Vec<_>| {
             let names: Vec<String> = s
                 .all_tables()
                 .filter(|t| created(t))

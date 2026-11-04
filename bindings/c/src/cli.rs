@@ -181,7 +181,7 @@ pub(crate) unsafe fn disconnect_vtabs(db: *mut sqlite3) {
     {
         // Close will fail: reconnect them for the handle's further use
         // (SQLite reconnects on next use).
-        let _ = conn.force_reparse_schema();
+        let _ = conn.reload_schema();
     }
 }
 
