@@ -529,6 +529,46 @@ fn fts5_prefix_colset_skips_empty_rows() {
     ]);
 }
 
+// Secure-delete edits leaf pages in place exactly as SQLite does, so the
+// shadow tables stay byte-identical in every detail mode.
+#[test]
+fn fts5_secure_delete_bytes_match() {
+    for detail in ["full", "column", "none"] {
+        let mut stmts = vec![
+            format!("CREATE VIRTUAL TABLE t USING fts5(a, b, detail={detail})"),
+            "INSERT INTO t(t, rank) VALUES('pgsz', 64)".to_string(),
+            "INSERT INTO t(t, rank) VALUES('secure-delete', 1)".to_string(),
+        ];
+        let mut rng = Rng(77);
+        for i in 1..=120 {
+            let doc = |r: &mut Rng| {
+                (0..1 + r.below(12))
+                    .map(|_| WORDS[r.below(WORDS.len())])
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let (a, b) = (doc(&mut rng), doc(&mut rng));
+            stmts.push(format!(
+                "INSERT INTO t(rowid, a, b) VALUES({i}, '{a}', '{b}')"
+            ));
+            if i % 3 == 0 {
+                let r = 1 + rng.below(i);
+                stmts.push(format!("DELETE FROM t WHERE rowid = {r}"));
+            }
+            if i % 5 == 0 {
+                let r = 1 + rng.below(i);
+                let a = doc(&mut rng);
+                stmts.push(format!("UPDATE t SET a = '{a}' WHERE rowid = {r}"));
+            }
+        }
+        stmts.push("SELECT id, hex(block) FROM t_data ORDER BY id".to_string());
+        stmts.push("SELECT segid, hex(term), pgno FROM t_idx ORDER BY 1, 2".to_string());
+        stmts.push("INSERT INTO t(t) VALUES('integrity-check')".to_string());
+        let refs: Vec<&str> = stmts.iter().map(|s| s.as_str()).collect();
+        compare_script(&refs);
+    }
+}
+
 #[test]
 fn fts5_external_content() {
     compare_script(&[

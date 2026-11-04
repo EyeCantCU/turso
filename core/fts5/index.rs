@@ -367,6 +367,24 @@ impl Leaf {
     }
 }
 
+/// Writes a varint at `a[off..]`, growing `a` if needed; returns its length.
+fn put_varint_at(a: &mut Vec<u8>, off: usize, v: u64) -> usize {
+    let mut tmp = Vec::with_capacity(9);
+    put_varint(&mut tmp, v);
+    if a.len() < off + tmp.len() {
+        a.resize(off + tmp.len(), 0);
+    }
+    a[off..off + tmp.len()].copy_from_slice(&tmp);
+    tmp.len()
+}
+
+fn set_byte(a: &mut Vec<u8>, off: usize, b: u8) {
+    if a.len() <= off {
+        a.resize(off + 1, 0);
+    }
+    a[off] = b;
+}
+
 fn read_leaf(store: &Store, id: i64) -> Result<Leaf> {
     let p = store.read_req(id)?;
     let szleaf = if p.len() >= 4 { get_u16(&p, 2) } else { 0 };
@@ -2204,8 +2222,8 @@ impl<'a> Index<'a> {
 
     // -------------------------------------------------------------- secure delete
 
-    /// Removes (term, rowid) from the newest segment holding it, by rewriting
-    /// that segment without the entry. Returns true if the entry was found.
+    /// fts5FlushSecureDelete: removes (term, rowid) in place from the newest
+    /// segment holding it. Returns true if the entry was found.
     fn secure_delete(&self, s: &mut Structure, term: &[u8], rowid: i64) -> Result<bool> {
         let detail = self.detail();
         // Set the version to the secure-delete format first.
@@ -2222,71 +2240,297 @@ impl<'a> Index<'a> {
             for iseg in (0..s.levels[ilvl].segs.len()).rev() {
                 let seg = s.levels[ilvl].segs[iseg].clone();
                 let mut it = SegIter::seek(&self.store, &seg, detail, term, false)?;
-                while !it.eof() && it.rowid < rowid {
+                while !it.eof() && it.term == term && it.rowid < rowid {
                     it.next()?;
                 }
-                if it.eof() || it.rowid != rowid {
+                if it.eof() || it.term != term || it.rowid != rowid {
                     continue;
                 }
-                self.rewrite_segment_without(s, ilvl, iseg, term, rowid)?;
+                self.do_secure_delete(&it)?;
                 return Ok(true);
             }
         }
         Ok(false)
     }
 
-    /// Rebuilds segment `iseg` of level `ilvl` without (term, rowid).
-    fn rewrite_segment_without(
-        &self,
-        s: &mut Structure,
-        ilvl: usize,
-        iseg: usize,
-        term: &[u8],
-        rowid: i64,
-    ) -> Result<()> {
-        let detail = self.detail();
-        let old = s.levels[ilvl].segs[iseg].clone();
-        let mut entries = Vec::new();
-        {
-            let mut it = SegIter::init(&self.store, &old, detail)?;
-            while !it.eof() {
-                if !(it.term == term && it.rowid == rowid) {
-                    entries.push((it.term.clone(), it.rowid, it.del, it.npos, it.poslist()?));
-                }
-                it.next()?;
-            }
+    /// fts5SecureDeleteIdxEntry: drops the %_idx row of a page (never page 1).
+    fn secure_delete_idx_entry(&self, segid: i32, pgno: i32) -> Result<()> {
+        if pgno == 1 {
+            return Ok(());
         }
-        self.store.remove_segment(&old)?;
-        let mut w = SegWriter::new(old.segid, self.vals.pgsz);
-        let mut last_term: Option<Vec<u8>> = None;
-        for (t, r, del, npos, pl) in entries {
-            if last_term.as_ref() != Some(&t) {
-                w.append_term(&self.store, &t)?;
-                last_term = Some(t);
+        sql::exec(
+            self.store.conn,
+            &format!(
+                "DELETE FROM {} WHERE segid=? AND (pgno/2)=?",
+                self.store.idx
+            ),
+            &[sql::int(segid as i64), sql::int(pgno as i64)],
+        )
+    }
+
+    /// fts5SecureDeleteOverflow: strips the part of a removed poslist that
+    /// continues on pages `first..`. Returns true if the removed entry was the
+    /// last of its doclist.
+    fn secure_delete_overflow(&self, seg: &Segment, first: i32) -> Result<bool> {
+        let none = self.detail() == Detail::None;
+        let mut last_in_doclist = true;
+        for pgno in first..=seg.pgno_last {
+            let id = segment_rowid(seg.segid, pgno);
+            let leaf = read_leaf(&self.store, id)?;
+            let (szleaf, nn) = (leaf.szleaf, leaf.nn());
+            let mut a = leaf.p;
+            let mut inext = get_u16(&a, 0);
+            if inext != 0 {
+                last_in_doclist = false;
             }
-            w.append_rowid(&self.store, r)?;
-            if detail == Detail::None {
-                if del {
-                    w.buf.push(0);
-                    if npos > 0 {
-                        w.buf.push(0);
+            if inext == 0 && szleaf < nn {
+                let mut o = szleaf;
+                inext = get_varint32(&a, &mut o) as usize;
+            }
+            if inext == 0 {
+                // Nothing but poslist data: the page becomes empty.
+                if !none {
+                    self.store.write(id, &[0, 0, 0, 4])?;
+                }
+                continue;
+            }
+            if none {
+                break;
+            }
+            if inext >= szleaf || inext < 4 {
+                return Err(corrupt());
+            }
+            let nshift = inext - 4;
+            let mut footer = Vec::new();
+            if nn > szleaf {
+                let mut i1 = szleaf;
+                let ifirst = get_varint32(&a, &mut i1) as usize;
+                if ifirst < inext {
+                    return Err(corrupt());
+                }
+                put_varint(&mut footer, (ifirst - nshift) as u64);
+                if i1 < nn {
+                    footer.extend_from_slice(&a[i1..nn]);
+                }
+            }
+            let npg = szleaf - nshift;
+            a.copy_within(4 + nshift..szleaf, 4);
+            a.truncate(npg);
+            put_u16(&mut a, 2, npg as u16);
+            if get_u16(&a, 0) != 0 {
+                put_u16(&mut a, 0, 4);
+            }
+            a.extend_from_slice(&footer);
+            self.store.write(id, &a)?;
+            break;
+        }
+        Ok(last_in_doclist)
+    }
+
+    /// fts5DoSecureDelete: removes the entry `it` points at by editing its
+    /// leaf page (and any overflow or term pages) in place.
+    fn do_secure_delete(&self, it: &SegIter) -> Result<()> {
+        let none = self.detail() == Detail::None;
+        let segid = it.seg.segid;
+        let leaf = it.leaf();
+        let npg = leaf.nn();
+        let mut pgidx = leaf.szleaf;
+        let footer: Vec<u8> = leaf.p[pgidx..].to_vec();
+        let nidx = footer.len();
+        let mut a = leaf.p.clone();
+        a.resize(npg + 32, 0);
+        let byte = |a: &[u8], i: usize| a.get(i).copied().unwrap_or(0);
+
+        // start: offset of the entry's rowid varint; next_off: the entry after
+        // it (past the page footer if its poslist overflows).
+        let mut start = if it.leaf_pgno == it.term_leaf_pgno {
+            it.term_leaf_offset
+        } else {
+            get_u16(&a, 0)
+        };
+        if start > npg {
+            return Err(corrupt());
+        }
+        let mut sop = start;
+        let mut delta = get_varint(&a, &mut sop);
+        let mut next_off;
+        if none {
+            while sop < it.leaf_offset {
+                if byte(&a, sop) == 0 {
+                    sop += 1;
+                }
+                if byte(&a, sop) == 0 {
+                    sop += 1;
+                }
+                start = sop;
+                delta = get_varint(&a, &mut sop);
+            }
+            next_off = sop;
+            for _ in 0..2 {
+                if next_off < it.end_of_doclist && byte(&a, next_off) == 0 {
+                    next_off += 1;
+                }
+            }
+        } else {
+            let mut np = get_varint32(&a, &mut sop) as usize;
+            while sop < it.leaf_offset {
+                start = sop + np / 2;
+                sop = start;
+                delta = get_varint(&a, &mut sop);
+                np = get_varint32(&a, &mut sop) as usize;
+            }
+            next_off = sop + it.npos;
+        }
+        if start > npg {
+            return Err(corrupt());
+        }
+        let mut off = start;
+        let mut last_in_doclist = false;
+        if next_off >= pgidx {
+            last_in_doclist = self.secure_delete_overflow(&it.seg, it.leaf_pgno + 1)?;
+            next_off = pgidx;
+        }
+
+        if !it.del {
+            if next_off != pgidx {
+                // The entry ends its doclist if a term starts right after it.
+                let (mut i, mut key_off) = (0, 0usize);
+                while i < nidx {
+                    key_off += get_varint32(&footer, &mut i) as usize;
+                    if key_off == next_off {
+                        last_in_doclist = true;
                     }
                 }
-            } else {
-                put_varint(&mut w.buf, (npos * 2 + del as usize) as u64);
-                w.append_poslist_data(&self.store, &pl)?;
+            }
+            if get_u16(&a, 0) == start && (last_in_doclist || next_off == pgidx) {
+                put_u16(&mut a, 0, 0);
             }
         }
-        let last = w.finish(&self.store)?;
-        if last == 0 {
-            s.levels[ilvl].segs.remove(iseg);
-        } else {
-            let seg = &mut s.levels[ilvl].segs[iseg];
-            seg.pgno_first = 1;
-            seg.pgno_last = last;
-            seg.npg_tombstone = 0;
+
+        let mut del_key_off = 0usize;
+        if it.del {
+            // Keep a bare delete marker.
+            off += put_varint_at(&mut a, off, delta);
+            set_byte(&mut a, off, 0x01);
+            off += 1;
+        } else if !last_in_doclist {
+            if next_off != pgidx {
+                // Fold the deleted rowid delta into the next entry's.
+                let nd = get_varint(&a, &mut next_off);
+                off += put_varint_at(&mut a, off, delta.wrapping_add(nd));
+            }
+        } else if it.leaf_pgno == it.term_leaf_pgno && start == it.term_leaf_offset {
+            // The only entry of its doclist: remove the term as well.
+            let (mut i, mut ikey, mut key_off) = (0, 0usize, 0usize);
+            while i < nidx {
+                let v = get_varint32(&footer, &mut i) as usize;
+                if key_off + v > start {
+                    break;
+                }
+                key_off += v;
+                ikey += 1;
+            }
+            del_key_off = key_off;
+            off = key_off;
+            if next_off != pgidx {
+                // Another term follows on this page: rewrite it in place of
+                // the removed one, re-expanding its shared prefix.
+                del_key_off = next_off;
+                let nprefix2 = get_varint(&a, &mut next_off);
+                let nsuffix2 = get_varint(&a, &mut next_off);
+                let mut ko = key_off;
+                let mut nprefix = 0u64;
+                if ikey != 1 {
+                    nprefix = get_varint(&a, &mut ko);
+                }
+                get_varint(&a, &mut ko);
+                let nprefix = nprefix.min(nprefix2);
+                let nsuffix = (nprefix2 + nsuffix2).wrapping_sub(nprefix);
+                if ko as u64 + nsuffix > pgidx as u64
+                    || next_off as u64 + nsuffix2 > pgidx as u64
+                    || nprefix2 > it.term.len() as u64
+                {
+                    return Err(corrupt());
+                }
+                if ikey != 1 {
+                    off += put_varint_at(&mut a, off, nprefix);
+                }
+                off += put_varint_at(&mut a, off, nsuffix);
+                let extra = &it.term[nprefix as usize..nprefix2 as usize];
+                a[off..off + extra.len()].copy_from_slice(extra);
+                off += extra.len();
+                let n2 = nsuffix2 as usize;
+                a.copy_within(next_off..next_off + n2, off);
+                off += n2;
+                next_off += n2;
+            }
+        } else if start == 4 {
+            // First thing on a later page: if every page back to the term's
+            // page is empty, the term ends its page and is removed there.
+            let mut pgno = it.leaf_pgno - 1;
+            while pgno > it.term_leaf_pgno {
+                let pg = self.store.read_req(segment_rowid(segid, pgno))?;
+                if pg.len() != 4 {
+                    break;
+                }
+                pgno -= 1;
+            }
+            if pgno == it.term_leaf_pgno {
+                let id = segment_rowid(segid, it.term_leaf_pgno);
+                let tl = read_leaf(&self.store, id)?;
+                if tl.szleaf == it.term_leaf_offset {
+                    let tidx = &tl.p[tl.szleaf..];
+                    let (mut ti, mut toff) = (0usize, 0usize);
+                    loop {
+                        let mut o = ti;
+                        toff += get_varint32(tidx, &mut o) as usize;
+                        if o >= tidx.len() {
+                            break;
+                        }
+                        ti = o;
+                    }
+                    if toff > tl.szleaf {
+                        return Err(corrupt());
+                    }
+                    let mut p = tl.p.clone();
+                    p.copy_within(tl.szleaf..tl.szleaf + ti, toff);
+                    put_u16(&mut p, 2, toff as u16);
+                    p.truncate(toff + ti);
+                    self.store.write(id, &p)?;
+                    if ti == 0 {
+                        self.secure_delete_idx_entry(segid, it.term_leaf_pgno)?;
+                    }
+                }
+            }
         }
-        Ok(())
+
+        // Close the gap [off, next_off) and rebuild the page footer.
+        if next_off < off || next_off > npg {
+            return Err(corrupt());
+        }
+        let nshift = next_off - off;
+        a.copy_within(next_off..npg, off);
+        pgidx -= nshift;
+        let mut nnew = pgidx;
+        put_u16(&mut a, 2, pgidx as u16);
+        let (mut i, mut key_in, mut prev_out) = (0, 0usize, 0usize);
+        while i < nidx {
+            key_in += get_varint32(&footer, &mut i) as usize;
+            if key_in > npg {
+                return Err(corrupt());
+            }
+            if key_in != del_key_off {
+                let key_out = key_in - if key_in > off { nshift } else { 0 };
+                let d = key_out.checked_sub(prev_out).ok_or_else(corrupt)?;
+                nnew += put_varint_at(&mut a, nnew, d as u64);
+                prev_out = key_out;
+            }
+        }
+        if pgidx == nnew && nidx > 0 && it.leaf_pgno != 1 {
+            self.secure_delete_idx_entry(segid, it.leaf_pgno)?;
+        }
+        a.truncate(nnew);
+        self.store.write(segment_rowid(segid, it.leaf_pgno), &a)
     }
 
     // -------------------------------------------------------------- integrity check
