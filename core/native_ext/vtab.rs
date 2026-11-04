@@ -320,20 +320,8 @@ impl NativeTable {
         self.0.write().hook(conn, hook)
     }
 
-    pub(crate) fn begin(&self) -> Result<()> {
-        self.0.write().begin()
-    }
-
-    pub(crate) fn commit(&self) -> Result<()> {
-        self.0.write().commit()
-    }
-
     pub(crate) fn rollback(&self) -> Result<()> {
         self.0.write().rollback()
-    }
-
-    pub(crate) fn rename(&self, connection: &Arc<Connection>, name: &str) -> Result<()> {
-        self.0.write().rename_with_connection(connection, name)
     }
 
     pub(crate) fn commits_after_create(&self) -> bool {
@@ -342,22 +330,6 @@ impl NativeTable {
 
     pub(crate) fn unique_scan(&self, idx_num: i32) -> bool {
         self.0.read().unique_scan(idx_num)
-    }
-
-    pub(crate) fn savepoint(&self, level: usize) -> Result<()> {
-        self.0.write().savepoint(level)
-    }
-
-    pub(crate) fn release(&self, level: usize) -> Result<()> {
-        self.0.write().release(level)
-    }
-
-    pub(crate) fn rollback_to(&self, level: usize) -> Result<()> {
-        self.0.write().rollback_to(level)
-    }
-
-    pub(crate) fn destroy(&self, connection: &Arc<Connection>) -> Result<()> {
-        self.0.write().destroy_with_connection(connection)
     }
 }
 
@@ -384,14 +356,7 @@ trait TableInstance: Debug + Send + Sync {
     fn commits_after_create(&self) -> bool;
     fn unique_scan(&self, idx_num: i32) -> bool;
     fn hook(&mut self, conn: &Arc<Connection>, hook: TableHook<'_>) -> Result<()>;
-    fn savepoint(&mut self, level: usize) -> Result<()>;
-    fn release(&mut self, level: usize) -> Result<()>;
-    fn rollback_to(&mut self, level: usize) -> Result<()>;
-    fn begin(&mut self) -> Result<()>;
-    fn commit(&mut self) -> Result<()>;
     fn rollback(&mut self) -> Result<()>;
-    fn rename_with_connection(&mut self, connection: &Arc<Connection>, name: &str) -> Result<()>;
-    fn destroy_with_connection(&mut self, connection: &Arc<Connection>) -> Result<()>;
 }
 
 impl<T: VirtualTable> TableInstance for T {
@@ -450,36 +415,8 @@ impl<T: VirtualTable> TableInstance for T {
         VirtualTable::hook(self, conn, hook)
     }
 
-    fn savepoint(&mut self, level: usize) -> Result<()> {
-        VirtualTable::savepoint(self, level)
-    }
-
-    fn release(&mut self, level: usize) -> Result<()> {
-        VirtualTable::release(self, level)
-    }
-
-    fn rollback_to(&mut self, level: usize) -> Result<()> {
-        VirtualTable::rollback_to(self, level)
-    }
-
-    fn begin(&mut self) -> Result<()> {
-        VirtualTable::begin(self)
-    }
-
-    fn commit(&mut self) -> Result<()> {
-        VirtualTable::commit(self)
-    }
-
     fn rollback(&mut self) -> Result<()> {
         VirtualTable::rollback(self)
-    }
-
-    fn rename_with_connection(&mut self, connection: &Arc<Connection>, name: &str) -> Result<()> {
-        VirtualTable::rename_with_connection(self, connection, name)
-    }
-
-    fn destroy_with_connection(&mut self, connection: &Arc<Connection>) -> Result<()> {
-        VirtualTable::destroy_with_connection(self, connection)
     }
 }
 

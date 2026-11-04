@@ -483,30 +483,6 @@ impl VirtualTable {
         self.find_function(n_arg, name).map(|(op, _)| op)
     }
 
-    pub(crate) fn begin(&self) -> crate::Result<()> {
-        match &self.vtab_type {
-            VirtualTableType::Pragma(_) => Err(LimboError::ExtensionError(
-                "Pragma virtual tables do not support transactions".to_string(),
-            )),
-            VirtualTableType::External(table) => table.begin(),
-            VirtualTableType::Internal(_) => Err(LimboError::ExtensionError(
-                "Internal virtual tables currently do not support transactions".to_string(),
-            )),
-        }
-    }
-
-    pub(crate) fn commit(&self) -> crate::Result<()> {
-        match &self.vtab_type {
-            VirtualTableType::Pragma(_) => Err(LimboError::ExtensionError(
-                "Pragma virtual tables do not support transactions".to_string(),
-            )),
-            VirtualTableType::External(table) => table.commit(),
-            VirtualTableType::Internal(_) => Err(LimboError::ExtensionError(
-                "Internal virtual tables currently do not support transactions".to_string(),
-            )),
-        }
-    }
-
     pub(crate) fn rollback(&self) -> crate::Result<()> {
         match &self.vtab_type {
             VirtualTableType::Pragma(_) => Err(LimboError::ExtensionError(
@@ -516,14 +492,6 @@ impl VirtualTable {
             VirtualTableType::Internal(_) => Err(LimboError::ExtensionError(
                 "Internal virtual tables currently do not support transactions".to_string(),
             )),
-        }
-    }
-
-    /// Runs a savepoint hook (0 = savepoint, 1 = release, 2 = rollback to).
-    pub(crate) fn savepoint_op(&self, op: u8, level: usize) -> crate::Result<()> {
-        match &self.vtab_type {
-            VirtualTableType::External(table) => table.savepoint_op(op, level),
-            _ => Ok(()),
         }
     }
 

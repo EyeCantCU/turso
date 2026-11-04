@@ -141,50 +141,10 @@ impl ExtensionTable {
         }
     }
 
-    /// Savepoint hooks (`xSavepoint`, `xRelease`, `xRollbackTo`); `op` is 0, 1 or 2.
-    pub(crate) fn savepoint_op(&self, op: u8, level: usize) -> Result<()> {
-        match self {
-            Self::C(_) => Ok(()),
-            Self::Native(table) => match op {
-                0 => table.savepoint(level),
-                1 => table.release(level),
-                _ => table.rollback_to(level),
-            },
-        }
-    }
-
-    pub(crate) fn begin(&self) -> Result<()> {
-        match self {
-            Self::C(table) => table.begin(),
-            Self::Native(table) => table.begin(),
-        }
-    }
-
-    pub(crate) fn commit(&self) -> Result<()> {
-        match self {
-            Self::C(table) => table.commit(),
-            Self::Native(table) => table.commit(),
-        }
-    }
-
     pub(crate) fn rollback(&self) -> Result<()> {
         match self {
             Self::C(table) => table.rollback(),
             Self::Native(table) => table.rollback(),
-        }
-    }
-
-    pub(crate) fn rename(&self, connection: &Arc<Connection>, name: &str) -> Result<()> {
-        match self {
-            Self::C(table) => table.rename(name),
-            Self::Native(table) => table.rename(connection, name),
-        }
-    }
-
-    pub(crate) fn destroy(&self, connection: &Arc<Connection>) -> Result<()> {
-        match self {
-            Self::C(table) => table.destroy(),
-            Self::Native(table) => table.destroy(connection),
         }
     }
 }
