@@ -788,20 +788,32 @@ impl AnyText for Text {
 
 /// BINARY order of two texts, as SQLite compares them: memcmp() of the
 /// stored form, which in a UTF-16 database is the UTF-16 encoding.
-#[inline]
+#[inline(always)]
 pub fn binary_cmp_text(a: TextRef, b: TextRef) -> Ordering {
-    if !a.is_utf16() && !b.is_utf16() {
-        let ord = a.as_bytes().cmp(b.as_bytes());
-        if ord.is_eq() {
-            return ord;
-        }
-        let enc = crate::text_bytes::db_encoding();
-        if enc.is_utf8() {
-            return ord;
-        }
-        return crate::text_bytes::binary_cmp_utf8_in(enc, a.as_bytes(), b.as_bytes());
+    let ord = a.as_bytes().cmp(b.as_bytes());
+    if !crate::text_bytes::utf16_in_use() {
+        return ord;
     }
-    binary_cmp_utf16(a, b)
+    binary_cmp_text_slow(a, b, ord)
+}
+
+#[cold]
+#[inline(never)]
+fn binary_cmp_text_slow(a: TextRef, b: TextRef, ord: Ordering) -> Ordering {
+    if a.is_utf16() || b.is_utf16() {
+        if a.repr == b.repr {
+            return ord;
+        }
+        return binary_cmp_utf16(a, b);
+    }
+    if ord.is_eq() {
+        return ord;
+    }
+    crate::text_bytes::binary_cmp_utf8_in(
+        crate::text_bytes::db_encoding(),
+        a.as_bytes(),
+        b.as_bytes(),
+    )
 }
 
 #[cold]

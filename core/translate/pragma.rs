@@ -419,10 +419,7 @@ fn update_pragma(
             // Only a database that has not been written yet changes encoding;
             // SQLite silently ignores the request afterwards.
             if pager.set_initial_text_encoding(enc.to_header())? {
-                connection
-                    .db
-                    .text_encoding
-                    .store(enc as u8, crate::sync::atomic::Ordering::Release);
+                connection.db.set_text_encoding(enc);
                 connection.bump_prepare_context_generation();
             }
             Ok(TransactionMode::None)
