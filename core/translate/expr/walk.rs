@@ -343,9 +343,13 @@ fn expr_contains_function(
         }
 
         let func = match e {
-            ast::Expr::FunctionCall { name, args, .. } => {
-                resolver.resolve_function(name.as_str(), args.len())?
-            }
+            // WITHIN GROUP's ORDER BY term is the value argument.
+            ast::Expr::FunctionCall {
+                name,
+                args,
+                within_group,
+                ..
+            } => resolver.resolve_function(name.as_str(), args.len() + within_group.len())?,
             ast::Expr::FunctionCallStar { name, .. } => {
                 resolver.resolve_function(name.as_str(), 0)?
             }

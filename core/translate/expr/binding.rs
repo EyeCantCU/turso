@@ -631,11 +631,13 @@ fn bind_and_rewrite_expr_inner<'a>(
                     args,
                     filter_over,
                     order_by,
+                    within_group,
                     ..
                 } => {
+                    // WITHIN GROUP's ORDER BY term is the value argument.
                     validate_function_tail(
                         name.as_str(),
-                        args.len(),
+                        args.len() + within_group.len(),
                         filter_over,
                         !order_by.is_empty(),
                         &resolver.catalog,

@@ -762,10 +762,13 @@ expect error {
 # percentile_disc takes a fraction. step() used to validate on [0, 100] while
 # finalize() indexed by fraction, so anything above 1.0 read past the end of
 # the sorted values.
+# SQLite 3.54's built-in percentile_disc() raises an error for a fraction
+# outside 0.0-1.0 (verified with sqlite3 3.54.1).
 test percentile_disc_rejects_percentage {
     SELECT percentile_disc(x, 100) FROM (SELECT 1 AS x UNION ALL SELECT 2);
 }
-expect {
+expect error {
+    the fraction argument to percentile_disc\(\) is not between 0.0 and 1.0
 }
 
 test percentile_disc_accepts_fraction {

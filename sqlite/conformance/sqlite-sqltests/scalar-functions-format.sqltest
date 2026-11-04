@@ -163,11 +163,13 @@ expect {
     character: t
 }
 
+# SQLite 3.54 emits a NUL byte for %c of an empty string (verified with
+# sqlite3 3.54.1); hex() shows it, plain text output would stop at it.
 test format-char-empty-string {
-    SELECT format('character: %c', '');
+    SELECT hex(format('character: %c', ''));
 }
-expect raw {
-character: 
+expect {
+    6368617261637465723A2000
 }
 
 test format-char-from-integer {
