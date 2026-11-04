@@ -877,7 +877,9 @@ pub(crate) fn best_index(constraints: &[ConstraintInfo]) -> IndexInfo {
 
 /// xBestIndex of geopoly.c: rowid=, then geopoly_overlap (2) or
 /// geopoly_within (3) through their function constraints, else a full scan.
-pub(crate) fn best_index_plan(req: &crate::native_ext::IndexRequest) -> crate::native_ext::IndexPlan {
+pub(crate) fn best_index_plan(
+    req: &crate::native_ext::IndexRequest,
+) -> crate::native_ext::IndexPlan {
     use crate::native_ext::{index_op, IndexPlan, INDEX_SCAN_UNIQUE};
     let mut plan = IndexPlan::new(req.constraints.len());
     let mut rowid_term = None;

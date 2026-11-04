@@ -306,7 +306,6 @@ impl NativeTable {
     pub(crate) fn destroy(&self, connection: &Arc<Connection>) -> Result<()> {
         self.0.write().destroy_with_connection(connection)
     }
-
 }
 
 trait TableInstance: Debug + Send + Sync {
@@ -419,7 +418,6 @@ impl<T: VirtualTable> TableInstance for T {
     fn destroy_with_connection(&mut self, connection: &Arc<Connection>) -> Result<()> {
         VirtualTable::destroy_with_connection(self, connection)
     }
-
 }
 
 pub(crate) struct NativeCursor {

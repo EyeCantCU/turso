@@ -205,7 +205,9 @@ std::thread_local! {
     /// The context of the nochange xColumn call in progress.
     static NOCHANGE_CTX: Cell<usize> = const { Cell::new(0) };
     /// Per table: columns of the current row left unset in a nochange read.
-    static NOCHANGE_COLS: RefCell<Vec<(usize, Vec<usize>)>> = const { RefCell::new(Vec::new()) };
+    /// Rows read with nochange, oldest first: table, cursor, row, unset columns.
+    /// UPDATE reads all rows before its xUpdate calls, which take them in order.
+    static NOCHANGE_COLS: RefCell<Vec<(usize, usize, u64, Vec<usize>)>> = const { RefCell::new(Vec::new()) };
     /// xUpdate arguments that are unchanged columns.
     static NOCHANGE_VALUES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
@@ -502,6 +504,7 @@ impl VirtualTable for CTable {
             cur,
             eof: true,
             idx_str: None,
+            row: 0,
         })
     }
 
@@ -873,6 +876,8 @@ struct CCursor {
     eof: bool,
     /// Decoded idxStr; kept alive for the module until the next xFilter.
     idx_str: Option<Vec<u8>>,
+    /// Counts the rows the cursor visits, to tell nochange reads apart.
+    row: u64,
 }
 
 unsafe impl Send for CCursor {}
@@ -940,6 +945,7 @@ impl VirtualTableCursor for CCursor {
                 bytes.as_ptr() as *const c_char
             }
         };
+        self.row += 1;
         let mut ext = ExtArgs::new(args);
         let mut ptrs = ext.ptrs();
         // An IN passed whole: a NULL argument that sqlite3_vtab_in_first knows.
@@ -979,6 +985,7 @@ impl VirtualTableCursor for CCursor {
     }
 
     fn next(&mut self) -> turso_core::types::IOResultOr<bool> {
+        self.row += 1;
         if let Some(f) = self.inner.methods().xNext {
             self.check(unsafe { f(self.cur) })?;
         }
@@ -1035,7 +1042,13 @@ impl CCursor {
             let unset = result
                 .to_error_details()
                 .is_some_and(|(_, m)| m.as_deref() == Some(NOCHANGE_UNSET));
-            set_unchanged(self.vtab() as usize, column, unset);
+            set_unchanged(
+                self.vtab() as usize,
+                self.cur as usize,
+                self.row,
+                column,
+                unset,
+            );
             if unset {
                 unsafe { result.__free_internal_type() };
                 if rc != SQLITE_OK {
@@ -1204,18 +1217,19 @@ pub unsafe extern "C" fn sqlite3_value_nochange(value: *mut c_void) -> c_int {
     (!value.is_null() && NOCHANGE_VALUES.with(|v| v.borrow().contains(&(value as usize)))) as c_int
 }
 
-/// Records whether `column` of the table's current row was left unset.
-fn set_unchanged(vtab: usize, column: usize, unset: bool) {
+/// Records whether `column` of the cursor's current row was left unset.
+fn set_unchanged(vtab: usize, cur: usize, row: u64, column: usize, unset: bool) {
     NOCHANGE_COLS.with(|m| {
         let mut m = m.borrow_mut();
-        let pos = m.iter().position(|(v, _)| *v == vtab);
-        let cols = match pos {
-            Some(i) => &mut m[i].1,
-            None => {
-                m.push((vtab, Vec::new()));
-                &mut m.last_mut().unwrap().1
+        let last = m.iter().rposition(|e| e.0 == vtab);
+        let i = match last {
+            Some(i) if m[i].1 == cur && m[i].2 == row => i,
+            _ => {
+                m.push((vtab, cur, row, Vec::new()));
+                m.len() - 1
             }
         };
+        let cols = &mut m[i].3;
         cols.retain(|c| *c != column);
         if unset {
             cols.push(column);
@@ -1223,11 +1237,12 @@ fn set_unchanged(vtab: usize, column: usize, unset: bool) {
     });
 }
 
+/// The unset columns of the oldest row read with nochange.
 fn take_unchanged(vtab: usize) -> Vec<usize> {
     NOCHANGE_COLS.with(|m| {
         let mut m = m.borrow_mut();
-        match m.iter().position(|(v, _)| *v == vtab) {
-            Some(i) => m.swap_remove(i).1,
+        match m.iter().position(|e| e.0 == vtab) {
+            Some(i) => m.remove(i).3,
             None => Vec::new(),
         }
     })

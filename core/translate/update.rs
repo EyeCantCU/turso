@@ -281,6 +281,9 @@ fn prepare_update_plan(
     if table.btree().is_some_and(|bt| !bt.has_rowid) {
         bail_parse_error!("UPDATE of WITHOUT ROWID tables is not supported");
     }
+    if table.virtual_table().is_some() && !body.returning.is_empty() {
+        bail_parse_error!("UPDATE RETURNING is not available on virtual tables");
+    }
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     validate_update(

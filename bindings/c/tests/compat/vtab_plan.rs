@@ -81,6 +81,7 @@ extern "C" {
         out: *mut *mut c_void,
     ) -> c_int;
     fn sqlite3_db_config(db: *mut sqlite3, op: c_int, ...) -> c_int;
+    fn sqlite3_vtab_on_conflict(db: *mut sqlite3) -> c_int;
 }
 
 type XCreate = unsafe extern "C" fn(
@@ -229,6 +230,9 @@ enum Mode {
 }
 
 static MODE: AtomicI32 = AtomicI32::new(0);
+/// The connection of the test in progress, for sqlite3_vtab_on_conflict.
+static DB: std::sync::atomic::AtomicPtr<sqlite3> =
+    std::sync::atomic::AtomicPtr::new(ptr::null_mut());
 static LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// Rows of the module: a = 1..=N, b = 's<a>', c = a % 3, h = a.
 const N: i64 = 10;
@@ -571,6 +575,10 @@ unsafe extern "C" fn rec_update(
         }
     }
     log(line);
+    log(format!(
+        "onconflict {}",
+        sqlite3_vtab_on_conflict(DB.load(Ordering::SeqCst))
+    ));
     SQLITE_OK
 }
 
@@ -669,6 +677,7 @@ unsafe fn open_rec() -> *mut sqlite3 {
         sqlite3_create_module(db, c("rec").as_ptr(), &REC_MODULE, ptr::null_mut()),
         SQLITE_OK
     );
+    DB.store(db, Ordering::SeqCst);
     exec_ok(db, "CREATE TABLE t1(x INTEGER PRIMARY KEY, y, z)");
     exec_ok(db, "INSERT INTO t1 VALUES(1, 2, 3), (2, 3, 4)");
     take_log();
@@ -1263,6 +1272,41 @@ fn test_vtab_plan_eponymous_writes() {
             "{log:?}"
         );
         assert!(log.contains(&"update 1 4".to_string()), "{log:?}");
+        assert!(log.contains(&"onconflict 4".to_string()), "{log:?}");
+
+        // RETURNING works for INSERT only; the rowid it reports is -1.
+        assert_eq!(
+            run(
+                db,
+                "INSERT INTO rec(a, b) VALUES (7, 'p'), (8, 'q') RETURNING b, a + 1, rowid"
+            ),
+            vec!["p|8|-1", "q|9|-1"]
+        );
+        assert_eq!(
+            run(db, "INSERT INTO rec(a) VALUES (1) RETURNING *"),
+            vec!["1|NULL|NULL"]
+        );
+        assert_eq!(
+            strip_error_prefix(run(db, "UPDATE rec SET b = 'y' WHERE a = 2 RETURNING a")),
+            vec!["error: UPDATE RETURNING is not available on virtual tables"]
+        );
+        assert_eq!(
+            strip_error_prefix(run(db, "DELETE FROM rec WHERE a = 2 RETURNING a")),
+            vec!["error: DELETE RETURNING is not available on virtual tables"]
+        );
+        // The statement's conflict mode reaches sqlite3_vtab_on_conflict.
+        for (sql, mode) in [
+            ("INSERT OR ROLLBACK INTO rec(a) VALUES (1)", 1),
+            ("INSERT OR IGNORE INTO rec(a) VALUES (1)", 2),
+            ("INSERT OR FAIL INTO rec(a) VALUES (1)", 3),
+            ("INSERT OR REPLACE INTO rec(a) VALUES (1)", 5),
+            ("UPDATE OR FAIL rec SET b = 'z' WHERE a = 4", 3),
+            ("UPDATE OR ROLLBACK rec SET b = 'z' WHERE a = 4", 1),
+        ] {
+            take_log();
+            assert!(run(db, sql).is_empty(), "{sql}");
+            assert!(take_log().contains(&format!("onconflict {mode}")), "{sql}");
+        }
         sqlite3_close(db);
     }
 }
