@@ -26,6 +26,7 @@ mod compat_stubs;
 mod hooks;
 mod session;
 
+mod fts5;
 mod rtree;
 pub mod vfs;
 pub mod vfs_unix;
@@ -3664,6 +3665,7 @@ fn limbo_err_code(err: &LimboError) -> i32 {
         LimboError::ConstraintViolation(v) if v.message == "datatype mismatch" => SQLITE_MISMATCH,
         LimboError::TooBig => SQLITE_TOOBIG,
         LimboError::Corrupt(..) => SQLITE_CORRUPT,
+        LimboError::CorruptVtab(..) => SQLITE_CORRUPT,
         LimboError::NotADB => SQLITE_NOTADB,
         // A Raise is a constraint error that carries its own conflict
         // resolution, and SQLite reports it as SQLITE_CONSTRAINT.

@@ -1747,7 +1747,9 @@ pub fn op_vupdate(
                 LimboError::Constraint(_)
                     | LimboError::ConstraintViolation(_)
                     | LimboError::ReadOnly
+                    // Module errors that carry SQLite's message.
                     | LimboError::SqlError(_)
+                    | LimboError::CorruptVtab(_)
                     | LimboError::Corrupt(_)
             ) =>
         {
@@ -4076,18 +4078,20 @@ fn build_constraint_violation_error(
 }
 
 /// Call xCommit on all virtual tables that participated in the current transaction.
-pub(crate) fn vtab_commit_all(conn: &Connection) -> crate::Result<()> {
-    let mut set = conn.vtab_txn_states.write();
-    if set.is_empty() {
+pub(crate) fn vtab_commit_all(conn: &Arc<Connection>) -> crate::Result<()> {
+    let ids: Vec<u64> = conn.vtab_txn_states.read().iter().copied().collect();
+    if ids.is_empty() {
         return Ok(());
     }
-    let ids: Vec<u64> = set.drain().collect();
-    drop(set);
-    for id in ids {
-        // A table can be dropped (or its module replaced) mid-transaction.
-        if let Some(vtab) = conn.vtab_by_id(id) {
-            vtab.commit()?;
-        }
+    // A table can be dropped (or its module replaced) mid-transaction.
+    // No lock is held while a table runs xSync, which may run SQL.
+    let vtabs: Vec<_> = ids.iter().filter_map(|id| conn.vtab_by_id(*id)).collect();
+    for vtab in &vtabs {
+        vtab.sync(conn)?;
+    }
+    conn.vtab_txn_states.write().clear();
+    for vtab in &vtabs {
+        vtab.commit()?;
     }
     Ok(())
 }
@@ -4317,29 +4321,23 @@ fn named_savepoint_level(conn: &Connection, name: &str) -> Option<usize> {
 
 /// Runs a savepoint hook (0 = savepoint, 1 = release, 2 = rollback to) on
 /// every virtual table in the current transaction.
-fn vtab_savepoint_all(conn: &Connection, op: u8, level: usize) -> crate::Result<()> {
+fn vtab_savepoint_all(conn: &Arc<Connection>, op: u8, level: usize) -> crate::Result<()> {
     let ids: Vec<u64> = conn.vtab_txn_states.read().iter().copied().collect();
     if ids.is_empty() {
         return Ok(());
     }
-    for id in ids {
-        if let Some(vtab) = conn.vtab_by_id(id) {
-            vtab.savepoint_op(op, level)?;
-        }
+    let vtabs: Vec<_> = ids.iter().filter_map(|id| conn.vtab_by_id(*id)).collect();
+    for vtab in vtabs {
+        vtab.savepoint_op(conn, op, level)?;
     }
     Ok(())
 }
 
 /// Rollback all virtual tables that are part of the current transaction.
 pub(crate) fn vtab_rollback_all(conn: &Connection) -> crate::Result<()> {
-    let mut set = conn.vtab_txn_states.write();
-    if set.is_empty() {
-        return Ok(());
-    }
-    let ids: Vec<u64> = set.drain().collect();
-    drop(set);
+    let ids: Vec<u64> = conn.vtab_txn_states.write().drain().collect();
+    // A table can be dropped (or its module replaced) mid-transaction.
     for id in ids {
-        // A table can be dropped (or its module replaced) mid-transaction.
         if let Some(vtab) = conn.vtab_by_id(id) {
             vtab.rollback()?;
         }
@@ -5667,6 +5665,10 @@ pub fn op_savepoint(
                     }
                 }
             }
+            // As in SQLite, xSavepoint runs before the savepoint opens, so
+            // what a module writes there survives ROLLBACK TO.
+            let level = conn.named_savepoints.read().len();
+            vtab_savepoint_all(&conn, 0, level)?;
             conn.with_savepoint_schema_snapshot(
                 |main_schema_snapshot, temp_schema_snapshot, staged_schema_snapshot| {
                     let starts_transaction = conn.auto_commit.load(Ordering::SeqCst);
@@ -5766,8 +5768,6 @@ pub fn op_savepoint(
                         return Err(mirror_err);
                     }
                     conn.push_named_savepoint(frame);
-                    let level = conn.named_savepoints.read().len() - 1;
-                    vtab_savepoint_all(&conn, 0, level)?;
                     if starts_transaction {
                         turso_assert!(
                             !conn.tx_is_poisoned(),
@@ -11882,14 +11882,40 @@ pub fn op_function(
             }
         }
         crate::function::Func::External(f) => {
+            // Pointer values among the arguments (still-NULL registers).
+            let ptrs: Vec<_> = if state.reg_pointers.is_empty() {
+                Vec::new()
+            } else {
+                (*start_reg..*start_reg + arg_count)
+                    .map(|r| {
+                        state
+                            .reg_pointers
+                            .get(&r)
+                            .filter(|_| state.registers[r].is_null())
+                            .cloned()
+                    })
+                    .collect()
+            };
+            crate::pointer::take_result();
             let value = return_if_io!(
                 state,
                 f.func.call_scalar(
                     &mut state.extension_state,
                     &program.connection,
                     &state.registers[*start_reg..*start_reg + arg_count],
+                    &ptrs,
                 )
             );
+            let result_ptr = crate::pointer::take_result();
+            match result_ptr {
+                Some(p) if matches!(value, Value::Null) => {
+                    state.reg_pointers.insert(*dest, p);
+                }
+                _ if !state.reg_pointers.is_empty() => {
+                    state.reg_pointers.remove(dest);
+                }
+                _ => {}
+            }
             state.registers[*dest].set_value(value);
         }
         crate::function::Func::Math(math_func) => match math_func.arity() {
@@ -17337,6 +17363,11 @@ pub fn op_variable(
 ) -> InsnResult {
     load_insn!(Variable { index, dest }, insn);
     state.registers[*dest].set_value(state.get_parameter(*index));
+    if let Some(p) = state.parameter_pointer(*index) {
+        state.reg_pointers.insert(*dest, p);
+    } else if !state.reg_pointers.is_empty() {
+        state.reg_pointers.remove(dest);
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -18479,9 +18510,16 @@ pub fn op_rename_table(
             _ => panic!("only btree and virtual tables can be renamed"),
         }
 
+        // A renamed virtual table is connected again by the ParseSchema that
+        // follows, so its module sees the new name.
+        let reconnect = matches!(table.as_ref(), Table::Virtual(_));
         #[cfg(feature = "conn_raw_api")]
-        schema.register_table_root_page(&normalized_to, table.as_ref());
-        schema.insert_table(*namespace, normalized_to.to_owned(), table);
+        if !reconnect {
+            schema.register_table_root_page(&normalized_to, table.as_ref());
+        }
+        if !reconnect {
+            schema.insert_table(*namespace, normalized_to.to_owned(), table);
+        }
 
         for (child_namespace, tname, t_arc) in schema.all_tables_mut() {
             // skip the table we just renamed

@@ -125,11 +125,16 @@ impl ExtensionTable {
     }
 
     /// Savepoint hooks (`xSavepoint`, `xRelease`, `xRollbackTo`); `op` is 0, 1 or 2.
-    pub(crate) fn savepoint_op(&self, op: u8, level: usize) -> Result<()> {
+    pub(crate) fn savepoint_op(
+        &self,
+        connection: &Arc<Connection>,
+        op: u8,
+        level: usize,
+    ) -> Result<()> {
         match self {
             Self::C(_) => Ok(()),
             Self::Native(table) => match op {
-                0 => table.savepoint(level),
+                0 => table.savepoint(connection, level),
                 1 => table.release(level),
                 _ => table.rollback_to(level),
             },
@@ -147,6 +152,13 @@ impl ExtensionTable {
         match self {
             Self::C(table) => table.commit(),
             Self::Native(table) => table.commit(),
+        }
+    }
+
+    pub(crate) fn sync(&self, connection: &Arc<Connection>) -> Result<()> {
+        match self {
+            Self::C(_) => Ok(()),
+            Self::Native(table) => table.sync(connection),
         }
     }
 

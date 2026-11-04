@@ -3180,7 +3180,17 @@ fn translate_rename_virtual_table(
         db: database_id,
         namespace: namespace.id,
         from: old_name.to_owned(),
-        to: new_name_norm,
+        to: new_name_norm.clone(),
+    });
+    // RenameTable drops the old virtual table; as in SQLite, it is
+    // connected again under its new name.
+    program.emit_insn(Insn::ParseSchema {
+        db: database_id,
+        where_clause: Some(format!(
+            "tbl_name = '{}' AND type != 'trigger'",
+            escape_sql_string_literal(&new_name_norm)
+        )),
+        trigger_target_database_id: None,
     });
 
     program.emit_insn(Insn::Close {

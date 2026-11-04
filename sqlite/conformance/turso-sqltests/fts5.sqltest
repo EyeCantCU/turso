@@ -1,0 +1,159 @@
+@database :memory:
+@skip-file-if mvcc "virtual tables are not supported in mvcc mode"
+
+# SQLite's FTS5 extension. Expected outputs come from SQLite 3.54.
+
+setup docs {
+    CREATE VIRTUAL TABLE t USING fts5(a, b);
+    INSERT INTO t(rowid, a, b) VALUES
+        (1, 'the quick brown fox', 'jumps over the lazy dog'),
+        (2, 'a stitch in time saves nine', 'the early bird catches the worm'),
+        (3, 'all that glitters is not gold', 'fortune favours the brave'),
+        (4, 'brown bread and butter', 'quick quick slow');
+}
+
+@setup docs
+test fts5-match-terms {
+    SELECT rowid FROM t WHERE t MATCH 'quick';
+    SELECT rowid FROM t WHERE t MATCH 'brown OR gold' ORDER BY rowid;
+    SELECT rowid FROM t WHERE t MATCH 'the NOT quick';
+}
+expect {
+    1
+    4
+    1
+    3
+    4
+    2
+    3
+}
+
+@setup docs
+test fts5-phrase-prefix-near-columns {
+    SELECT rowid FROM t WHERE t MATCH '"quick brown"';
+    SELECT rowid FROM t WHERE t MATCH 'qu* AND (bro* OR slow)';
+    SELECT rowid FROM t WHERE t MATCH 'NEAR(fox jumps, 1)';
+    SELECT rowid FROM t WHERE t MATCH 'b:quick';
+    SELECT rowid FROM t WHERE t MATCH '^brown';
+    SELECT rowid FROM t WHERE b MATCH 'the' ORDER BY rowid;
+}
+expect {
+    1
+    1
+    4
+    4
+    4
+    1
+    2
+    3
+}
+
+@setup docs
+test fts5-table-valued-syntax {
+    SELECT rowid FROM t('fox');
+    SELECT rowid FROM t WHERE t = 'gold';
+}
+expect {
+    1
+    3
+}
+
+@setup docs
+test fts5-auxiliary-functions {
+    SELECT rowid, highlight(t, 0, '[', ']') FROM t WHERE t MATCH 'quick OR brown' ORDER BY rowid;
+    SELECT rowid, snippet(t, 1, '<', '>', '...', 3) FROM t WHERE t MATCH 'the' ORDER BY rowid;
+    SELECT rowid FROM t WHERE t MATCH 'quick OR glitters' ORDER BY bm25(t);
+    SELECT rowid FROM t WHERE t MATCH 'the OR quick' ORDER BY rank;
+}
+expect {
+    1|the [quick] [brown] fox
+    4|[brown] bread and butter
+    1|jumps over <the>...
+    2|<the> early bird...
+    3|fortune favours <the>...
+    3
+    4
+    1
+    1
+    4
+    2
+    3
+}
+
+@setup docs
+test fts5-vocab {
+    CREATE VIRTUAL TABLE v USING fts5vocab(t, row);
+    SELECT term, doc, cnt FROM v WHERE term >= 'q' AND term < 's';
+    CREATE VIRTUAL TABLE c USING fts5vocab(t, col);
+    SELECT term, col, doc, cnt FROM c WHERE term = 'quick';
+}
+expect {
+    quick|2|3
+    quick|a|1|1
+    quick|b|1|2
+}
+
+@setup docs
+test fts5-commands-and-integrity {
+    INSERT INTO t(t) VALUES('optimize');
+    INSERT INTO t(t, rank) VALUES('merge', 16);
+    INSERT INTO t(t, rank) VALUES('pgsz', 64);
+    INSERT INTO t(rowid, a, b) VALUES(5, 'one more document', 'with brown words');
+    DELETE FROM t WHERE rowid = 2;
+    UPDATE t SET a = 'replaced text' WHERE rowid = 3;
+    INSERT INTO t(t) VALUES('integrity-check');
+    SELECT rowid FROM t WHERE t MATCH 'brown OR replaced' ORDER BY rowid;
+    SELECT k, v FROM t_config ORDER BY k;
+}
+expect {
+    1
+    3
+    4
+    5
+    pgsz|64
+    version|4
+}
+
+test fts5-shadow-tables {
+    CREATE VIRTUAL TABLE s USING fts5(x, prefix='2', detail=column, tokenize='porter');
+    SELECT name FROM sqlite_schema WHERE name LIKE 's%' ORDER BY name;
+    INSERT INTO s VALUES('connections connected');
+    SELECT rowid FROM s WHERE s MATCH 'connect';
+    SELECT rowid FROM s WHERE s MATCH 'co*';
+}
+expect {
+    s
+    s_config
+    s_content
+    s_data
+    s_docsize
+    s_idx
+    1
+    1
+}
+
+test fts5-external-content {
+    CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT);
+    INSERT INTO docs VALUES(10, 'red apple'), (20, 'green pear');
+    CREATE VIRTUAL TABLE e USING fts5(body, content='docs', content_rowid='id');
+    INSERT INTO e(e) VALUES('rebuild');
+    SELECT rowid, body FROM e WHERE e MATCH 'pear';
+}
+expect {
+    20|green pear
+}
+
+test fts5-errors {
+    CREATE VIRTUAL TABLE x USING fts5(a, rank);
+}
+expect error {
+    reserved fts5 column name: rank
+}
+
+test fts5-syntax-error {
+    CREATE VIRTUAL TABLE y USING fts5(a);
+    SELECT * FROM y WHERE y MATCH 'a AND';
+}
+expect error {
+    fts5: syntax error near ""
+}

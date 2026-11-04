@@ -5,6 +5,7 @@
 use std::ptr;
 
 mod dbstat;
+mod fts5;
 mod lifecycle;
 mod rtree;
 mod vtab;

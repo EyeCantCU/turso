@@ -115,6 +115,18 @@ pub trait VirtualTable: Debug + Send + Sync {
     ) -> Result<Box<dyn TableUpdate>> {
         self.create_update_on_conflict(args, on_conflict)
     }
+    /// Runs before `commit`, while the transaction is still open (xSync).
+    fn sync(&mut self, _connection: &Arc<Connection>) -> Result<()> {
+        Ok(())
+    }
+    /// Like `savepoint`, with the connection that opened it.
+    fn savepoint_with_connection(
+        &mut self,
+        _connection: &Arc<Connection>,
+        level: usize,
+    ) -> Result<()> {
+        self.savepoint(level)
+    }
     /// Whether `CREATE VIRTUAL TABLE` enlists the new table in the
     /// transaction, so `commit` (or `rollback`) runs without a `begin`.
     fn commits_after_create(&self) -> bool {
@@ -279,6 +291,10 @@ impl NativeTable {
         self.0.write().commit()
     }
 
+    pub(crate) fn sync(&self, connection: &Arc<Connection>) -> Result<()> {
+        self.0.write().sync(connection)
+    }
+
     pub(crate) fn rollback(&self) -> Result<()> {
         self.0.write().rollback()
     }
@@ -291,8 +307,8 @@ impl NativeTable {
         self.0.read().commits_after_create()
     }
 
-    pub(crate) fn savepoint(&self, level: usize) -> Result<()> {
-        self.0.write().savepoint(level)
+    pub(crate) fn savepoint(&self, connection: &Arc<Connection>, level: usize) -> Result<()> {
+        self.0.write().savepoint_with_connection(connection, level)
     }
 
     pub(crate) fn release(&self, level: usize) -> Result<()> {
@@ -329,7 +345,12 @@ trait TableInstance: Debug + Send + Sync {
         on_conflict: u8,
     ) -> Result<Box<dyn TableUpdate>>;
     fn commits_after_create(&self) -> bool;
-    fn savepoint(&mut self, level: usize) -> Result<()>;
+    fn sync(&mut self, connection: &Arc<Connection>) -> Result<()>;
+    fn savepoint_with_connection(
+        &mut self,
+        connection: &Arc<Connection>,
+        level: usize,
+    ) -> Result<()>;
     fn release(&mut self, level: usize) -> Result<()>;
     fn rollback_to(&mut self, level: usize) -> Result<()>;
     fn begin(&mut self) -> Result<()>;
@@ -387,8 +408,16 @@ impl<T: VirtualTable> TableInstance for T {
         VirtualTable::commits_after_create(self)
     }
 
-    fn savepoint(&mut self, level: usize) -> Result<()> {
-        VirtualTable::savepoint(self, level)
+    fn sync(&mut self, connection: &Arc<Connection>) -> Result<()> {
+        VirtualTable::sync(self, connection)
+    }
+
+    fn savepoint_with_connection(
+        &mut self,
+        connection: &Arc<Connection>,
+        level: usize,
+    ) -> Result<()> {
+        VirtualTable::savepoint_with_connection(self, connection, level)
     }
 
     fn release(&mut self, level: usize) -> Result<()> {

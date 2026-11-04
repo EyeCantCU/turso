@@ -318,6 +318,8 @@ impl Database {
             #[cfg(all(feature = "fts", not(target_family = "wasm")))]
             syms.index_methods
                 .insert(FTS_INDEX_METHOD_NAME.to_string(), Arc::new(FtsIndexMethod));
+            #[cfg(feature = "fts5")]
+            crate::fts5::register(&mut syms);
         }
         let syms = self.builtin_syms.data_ptr();
         // Pass the mutex pointer and the appropriate handler

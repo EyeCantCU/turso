@@ -37,6 +37,7 @@ pub mod namespace;
 pub mod native_ext;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod numeric;
+pub mod pointer;
 pub mod schema;
 pub mod security;
 pub mod skiplist;
@@ -70,6 +71,10 @@ mod incremental;
 mod incremental_blob;
 pub mod user_function;
 pub use incremental_blob::Blob;
+#[cfg(feature = "fts5")]
+mod fts5;
+#[cfg(feature = "fts5")]
+pub use fts5::api as fts5_api;
 mod info;
 #[cfg(all(feature = "json", not(any(feature = "fuzz", feature = "bench"))))]
 mod json;

@@ -413,6 +413,9 @@ const unsigned char *sqlite3_value_text(sqlite3_value*);
 
 const void *sqlite3_value_blob(sqlite3_value*);
 int sqlite3_value_encoding(sqlite3_value*);
+int sqlite3_bind_pointer(sqlite3_stmt*, int, void*, const char*, void(*)(void*));
+void *sqlite3_value_pointer(sqlite3_value*, const char*);
+void sqlite3_result_pointer(sqlite3_context*, void*, const char*, void(*)(void*));
 
 int sqlite3_value_bytes(sqlite3_value*);
 

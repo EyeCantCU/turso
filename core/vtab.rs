@@ -441,9 +441,22 @@ impl VirtualTable {
     }
 
     /// Runs a savepoint hook (0 = savepoint, 1 = release, 2 = rollback to).
-    pub(crate) fn savepoint_op(&self, op: u8, level: usize) -> crate::Result<()> {
+    pub(crate) fn savepoint_op(
+        &self,
+        connection: &Arc<Connection>,
+        op: u8,
+        level: usize,
+    ) -> crate::Result<()> {
         match &self.vtab_type {
-            VirtualTableType::External(table) => table.savepoint_op(op, level),
+            VirtualTableType::External(table) => table.savepoint_op(connection, op, level),
+            _ => Ok(()),
+        }
+    }
+
+    /// xSync: runs before commit while the transaction is still open.
+    pub(crate) fn sync(&self, connection: &Arc<Connection>) -> crate::Result<()> {
+        match &self.vtab_type {
+            VirtualTableType::External(table) => table.sync(connection),
             _ => Ok(()),
         }
     }
