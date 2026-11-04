@@ -666,6 +666,11 @@ pub trait Wal: Debug + Send + Sync {
     /// Returns true if this WAL instance currently holds the write lock.
     fn holds_write_lock(&self) -> bool;
 
+    /// Whether this connection holds the exclusive VACUUM lock.
+    fn holds_vacuum_lock(&self) -> bool {
+        false
+    }
+
     /// Whether shutdown checkpointing is valid when this process closes its last connection.
     fn should_checkpoint_on_close(&self) -> bool;
 
@@ -3667,6 +3672,13 @@ impl Wal for WalFile {
     /// Returns true if this WAL instance currently holds the write lock.
     fn holds_write_lock(&self) -> bool {
         self.write_lock_held.load(Ordering::Acquire)
+    }
+
+    fn holds_vacuum_lock(&self) -> bool {
+        self.vacuum_lock_guard
+            .read()
+            .as_ref()
+            .is_some_and(VacuumLockGuard::is_write)
     }
 
     fn should_checkpoint_on_close(&self) -> bool {

@@ -4916,9 +4916,10 @@ pub fn op_transaction_inner(
                             state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                         }
                         // If the pager already holds a read lock (e.g., after
-                        // SchemaUpdated reprepare or prior write tx), skip
-                        // locks that are already held.
-                        if pager.holds_read_lock() {
+                        // SchemaUpdated reprepare or prior write tx), or VACUUM
+                        // of this database holds it exclusively, skip locks
+                        // that are already held.
+                        if pager.holds_read_lock() || pager.holds_vacuum_lock() {
                             if matches!(tx_mode, TransactionMode::Write)
                                 && !pager.holds_write_lock()
                             {
