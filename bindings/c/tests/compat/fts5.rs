@@ -877,3 +877,77 @@ fn test_pointer_values() {
         sqlite3_close(db);
     }
 }
+
+// Tokenizers and auxiliary functions belong to the connection that
+// registered them.
+#[test]
+fn test_fts5_registrations_are_per_connection() {
+    unsafe {
+        let path = std::env::temp_dir().join(format!("fts5_perconn_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let cpath = CString::new(path.to_str().unwrap()).unwrap();
+        let (mut db1, mut db2): (*mut sqlite3, *mut sqlite3) = (ptr::null_mut(), ptr::null_mut());
+        assert_eq!(sqlite3_open(cpath.as_ptr(), &mut db1), SQLITE_OK);
+        assert_eq!(sqlite3_open(cpath.as_ptr(), &mut db2), SQLITE_OK);
+        let api = fts5_api_of(db1);
+        let mut user: *mut c_void = ptr::null_mut();
+        let mut tok: *mut fts5_tokenizer_v2 = ptr::null_mut();
+        let u61 = CString::new("unicode61").unwrap();
+        assert_eq!(
+            ((*api).x_find_tokenizer_v2)(api, u61.as_ptr(), &mut user, &mut tok),
+            SQLITE_OK
+        );
+        BASE_USER = user;
+        BASE_TOK = tok;
+        let name = CString::new("perconn").unwrap();
+        assert_eq!(
+            ((*api).x_create_tokenizer_v2)(
+                api,
+                name.as_ptr(),
+                ptr::null_mut(),
+                &raw mut REV_TOKENIZER,
+                None
+            ),
+            SQLITE_OK
+        );
+        let f = CString::new("perconn_aux").unwrap();
+        assert_eq!(
+            ((*api).x_create_function)(api, f.as_ptr(), ptr::null_mut(), Some(insttok), None),
+            SQLITE_OK
+        );
+        // db2's api does not see db1's tokenizer.
+        let api2 = fts5_api_of(db2);
+        assert_ne!(
+            ((*api2).x_find_tokenizer_v2)(api2, name.as_ptr(), &mut user, &mut tok),
+            SQLITE_OK
+        );
+
+        exec(
+            db1,
+            "CREATE VIRTUAL TABLE t USING fts5(x, tokenize='perconn')",
+        );
+        exec(db1, "INSERT INTO t VALUES('hello world')");
+        assert_eq!(
+            rows(db1, "SELECT rowid FROM t WHERE t MATCH 'olleh'").unwrap(),
+            ["1"]
+        );
+        assert_eq!(
+            rows(db1, "SELECT perconn_aux(t) FROM t WHERE t MATCH 'olleh'").unwrap(),
+            ["0:0:0=hello/0"]
+        );
+        let e1 = rows(db2, "SELECT rowid FROM t WHERE t MATCH 'olleh'").unwrap_err();
+        let e2 = rows(
+            db2,
+            "CREATE VIRTUAL TABLE u USING fts5(x, tokenize='perconn')",
+        )
+        .unwrap_err();
+        let e3 = rows(db2, "SELECT perconn_aux(t) FROM t").unwrap_err();
+        assert_eq!(e1, "no such tokenizer: perconn");
+        assert_eq!(e2, "no such tokenizer: perconn");
+        // (turso's message carries a "Parse error: " prefix; the errmsg topic owns that.)
+        assert!(e3.ends_with("no such function: perconn_aux"), "{e3}");
+        sqlite3_close(db1);
+        sqlite3_close(db2);
+        let _ = std::fs::remove_file(&path);
+    }
+}

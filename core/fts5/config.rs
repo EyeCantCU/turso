@@ -2,7 +2,10 @@
 //! %_config table (fts5_config.c).
 
 use super::tokenize::{self, Pattern, Tokenizer};
-use crate::sync::{Arc, Mutex};
+use crate::sync::{Arc, Mutex, Weak};
+use crate::Connection;
+
+type TokEntry = (Weak<Connection>, Arc<dyn Tokenizer>);
 use crate::Value;
 
 pub(crate) const DEFAULT_PAGE_SIZE: i32 = 4050;
@@ -54,7 +57,10 @@ pub(crate) struct Fts5Config {
     pub content_exprlist: String,
     pub tokenizer_args: Vec<String>,
     /// Created on first use, as in SQLite (except for CREATE and trigram).
-    tokenizer: Mutex<Option<Arc<dyn Tokenizer>>>,
+    /// Tokenizer instances per connection (keyed by connection address).
+    tokenizer: Mutex<std::collections::HashMap<usize, TokEntry>>,
+    /// The tokenizer's LIKE/GLOB support, known once one was created.
+    pattern: Mutex<Option<Pattern>>,
 }
 
 impl std::fmt::Debug for Fts5Config {
@@ -551,17 +557,24 @@ impl Fts5Config {
             content_rowid,
             content_exprlist: exprlist,
             tokenizer_args,
-            tokenizer: Mutex::new(None),
+            tokenizer: Mutex::new(std::collections::HashMap::new()),
+            pattern: Mutex::new(None),
         })
     }
 
-    /// The table's tokenizer, created on first use (sqlite3Fts5LoadTokenizer).
-    pub(crate) fn tokenizer(&self) -> Result<Arc<dyn Tokenizer>, String> {
-        let mut slot = self.tokenizer.lock();
-        if let Some(t) = slot.as_ref() {
+    /// The table's tokenizer for `conn`, created on first use
+    /// (sqlite3Fts5LoadTokenizer) from the tokenizers visible to `conn`.
+    pub(crate) fn tokenizer(
+        &self,
+        conn: Option<&Arc<Connection>>,
+    ) -> Result<Arc<dyn Tokenizer>, String> {
+        let key = conn.map_or(0, |c| Arc::as_ptr(c) as usize);
+        let mut slots = self.tokenizer.lock();
+        if let Some((_, t)) = slots.get(&key) {
             return Ok(t.clone());
         }
         let args = &self.tokenizer_args;
+        let _scope = super::registry::LookupScope::enter(conn);
         let module = tokenize::find_module(args.first().map(|s| s.as_str()))
             .ok_or_else(|| format!("no such tokenizer: {}", args[0]))?;
         let rest = if args.is_empty() { &[][..] } else { &args[1..] };
@@ -570,7 +583,11 @@ impl Fts5Config {
                 .create(rest)
                 .map_err(|_| "error in tokenizer constructor".to_string())?,
         );
-        *slot = Some(tok.clone());
+        *self.pattern.lock() = Some(tok.pattern());
+        // Drop instances of closed connections.
+        slots.retain(|k, (w, _)| *k == 0 || w.strong_count() > 0);
+        let w = conn.map(Arc::downgrade).unwrap_or_default();
+        slots.insert(key, (w, tok.clone()));
         Ok(tok)
     }
 
@@ -586,7 +603,10 @@ impl Fts5Config {
     }
 
     pub(crate) fn pattern(&self) -> Pattern {
-        self.tokenizer().map_or(Pattern::None, |t| t.pattern())
+        if let Some(p) = *self.pattern.lock() {
+            return p;
+        }
+        self.tokenizer(None).map_or(Pattern::None, |t| t.pattern())
     }
 
     /// `CREATE TABLE x(...)` declared to the core.

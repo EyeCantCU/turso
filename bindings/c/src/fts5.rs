@@ -371,6 +371,14 @@ impl TokenizerModule for CModuleRef {
     }
 }
 
+/// The connection an `fts5_api` handle belongs to.
+unsafe fn api_conn(api: *mut fts5_api) -> Option<Arc<Connection>> {
+    if api.is_null() {
+        return None;
+    }
+    (*(api as *const ApiHandle)).conn.upgrade()
+}
+
 unsafe extern "C" fn x_create_tokenizer(
     _api: *mut fts5_api,
     name: *const ffi::c_char,
@@ -393,7 +401,10 @@ unsafe extern "C" fn x_create_tokenizer(
         tokenize: CTokenize::V1(tokenize),
         destroy,
     });
-    register_tokenizer(&name, Arc::new(CModuleRef(m)));
+    let Some(conn) = api_conn(_api) else {
+        return SQLITE_MISUSE;
+    };
+    register_tokenizer(&conn, &name, Arc::new(CModuleRef(m)));
     SQLITE_OK
 }
 
@@ -422,7 +433,10 @@ unsafe extern "C" fn x_create_tokenizer_v2(
         tokenize: CTokenize::V2(tokenize),
         destroy,
     });
-    register_tokenizer(&name, Arc::new(CModuleRef(m)));
+    let Some(conn) = api_conn(_api) else {
+        return SQLITE_MISUSE;
+    };
+    register_tokenizer(&conn, &name, Arc::new(CModuleRef(m)));
     SQLITE_OK
 }
 
@@ -507,16 +521,29 @@ static RUST_TOKENIZER_V2: fts5_tokenizer_v2 = fts5_tokenizer_v2 {
     x_tokenize: Some(rust_tok_tokenize_v2),
 };
 
-/// User data for a found tokenizer; kept for the life of the process.
-fn module_handle(name: Option<String>) -> Option<*mut ffi::c_void> {
-    static FOUND: OnceLock<Mutex<HashMap<Option<String>, usize>>> = OnceLock::new();
-    let module = find_tokenizer(name.as_deref())?;
+/// User data for a tokenizer found through `api`'s connection; kept for the
+/// life of the process and reused while the same module is found.
+unsafe fn module_handle(api: *mut fts5_api, name: Option<String>) -> Option<*mut ffi::c_void> {
+    type Found = HashMap<(usize, Option<String>), usize>;
+    static FOUND: OnceLock<Mutex<Found>> = OnceLock::new();
+    let conn = (!api.is_null())
+        .then(|| (*(api as *const ApiHandle)).conn.upgrade())
+        .flatten();
+    let module = find_tokenizer(conn.as_ref(), name.as_deref())?;
     let mut map = FOUND
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap();
-    let key = name.map(|n| n.to_ascii_lowercase());
-    // A re-registered tokenizer gets a new handle.
+    let key = (
+        conn.as_ref().map_or(0, |c| Arc::as_ptr(c) as usize),
+        name.map(|n| n.to_ascii_lowercase()),
+    );
+    if let Some(&p) = map.get(&key) {
+        let old = &*(p as *const Arc<dyn TokenizerModule>);
+        if Arc::ptr_eq(old, &module) {
+            return Some(p as *mut ffi::c_void);
+        }
+    }
     let p = Box::into_raw(Box::new(module)) as usize;
     map.insert(key, p);
     Some(p as *mut ffi::c_void)
@@ -528,7 +555,7 @@ unsafe extern "C" fn x_find_tokenizer(
     user: *mut *mut ffi::c_void,
     tok: *mut fts5_tokenizer,
 ) -> ffi::c_int {
-    let Some(h) = module_handle(c_name(name)) else {
+    let Some(h) = module_handle(_api, c_name(name)) else {
         if !user.is_null() {
             *user = std::ptr::null_mut();
         }
@@ -553,7 +580,7 @@ unsafe extern "C" fn x_find_tokenizer_v2(
     user: *mut *mut ffi::c_void,
     tok: *mut *mut fts5_tokenizer_v2,
 ) -> ffi::c_int {
-    let Some(h) = module_handle(c_name(name)) else {
+    let Some(h) = module_handle(_api, c_name(name)) else {
         if !user.is_null() {
             *user = std::ptr::null_mut();
         }

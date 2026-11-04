@@ -251,7 +251,7 @@ impl<'a> Storage<'a> {
         f: &mut dyn FnMut(&[u8], i32),
     ) -> Result<i32> {
         let mut sz = 0i32;
-        let rc = self.cfg.tokenizer().map_err(err)?.tokenize(
+        let rc = self.cfg.tokenizer(Some(self.conn)).map_err(err)?.tokenize(
             flags,
             text,
             locale,

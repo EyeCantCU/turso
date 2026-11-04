@@ -5,7 +5,8 @@ use super::config::{is_bareword, Detail, Fts5Config};
 use super::index::{char_len, Index, Pending, Structure, MAIN_PREFIX};
 use super::tokenize::{TOKENIZE_PREFIX, TOKENIZE_QUERY, TOKEN_COLOCATED};
 use super::varint::*;
-use crate::Result;
+use crate::sync::Arc;
+use crate::{Connection, Result};
 
 const MAX_TOKEN_SIZE: usize = 32768;
 const DEFAULT_NEARDIST: i32 = 10;
@@ -175,6 +176,7 @@ fn lossy(b: &[u8]) -> String {
 
 struct Parser<'a> {
     cfg: &'a Fts5Config,
+    conn: Option<&'a Arc<Connection>>,
     lex: Lexer<'a>,
     phrase_to_and: bool,
     locale: Option<&'a [u8]>,
@@ -220,7 +222,7 @@ impl<'a> Parser<'a> {
         let z = dequote_query(text);
         let flags = TOKENIZE_QUERY | if prefix { TOKENIZE_PREFIX } else { 0 };
         let terms = &mut phrase.terms;
-        let tokenizer = self.cfg.tokenizer()?;
+        let tokenizer = self.cfg.tokenizer(self.conn)?;
         let rc = tokenizer.tokenize(flags, &z, self.locale, &mut |tflags, tok, _, _| {
             let tok = &tok[..tok.len().min(MAX_TOKEN_SIZE)];
             if !terms.is_empty() && (tflags & TOKEN_COLOCATED) != 0 {
@@ -624,6 +626,7 @@ impl Expr {
     /// sqlite3Fts5ExprNew. `icol` < ncol applies an implicit column filter.
     pub(crate) fn parse(
         cfg: &Fts5Config,
+        conn: Option<&Arc<Connection>>,
         phrase_to_and: bool,
         icol: usize,
         text: &[u8],
@@ -631,6 +634,7 @@ impl Expr {
     ) -> std::result::Result<Expr, String> {
         let mut p = Parser {
             cfg,
+            conn,
             lex: Lexer {
                 z: text,
                 pos: 0,
@@ -732,6 +736,7 @@ impl Expr {
 /// (sqlite3Fts5ExprPattern). `None` when the pattern has no 3-char run.
 pub(crate) fn pattern_expr(
     cfg: &Fts5Config,
+    conn: Option<&Arc<Connection>>,
     glob: bool,
     icol: usize,
     text: &[u8],
@@ -784,7 +789,7 @@ pub(crate) fn pattern_expr(
             icol = cfg.ncol();
         }
     }
-    Expr::parse(cfg, and, icol, &out, None).map(Some)
+    Expr::parse(cfg, conn, and, icol, &out, None).map(Some)
 }
 
 // ------------------------------------------------------------------ evaluation

@@ -48,7 +48,7 @@ pub trait TokenizerModule: Send + Sync {
 
 type Registry = HashMap<String, Arc<dyn TokenizerModule>>;
 
-static REGISTRY: LazyLock<RwLock<Registry>> = LazyLock::new(|| {
+static BUILTIN: LazyLock<RwLock<Registry>> = LazyLock::new(|| {
     let mut map: Registry = HashMap::new();
     map.insert("unicode61".into(), Arc::new(Unicode61Module));
     map.insert("ascii".into(), Arc::new(AsciiModule));
@@ -57,15 +57,28 @@ static REGISTRY: LazyLock<RwLock<Registry>> = LazyLock::new(|| {
     RwLock::new(map)
 });
 
-/// Finds a tokenizer module by name (case-insensitive); `None` is the default.
+/// Finds a tokenizer module by name (case-insensitive; `None` is the
+/// default): the tokenizers of the connection in the current lookup scope
+/// first, then the built-ins.
 pub(crate) fn find_module(name: Option<&str>) -> Option<Arc<dyn TokenizerModule>> {
     let name = name.unwrap_or("unicode61").to_ascii_lowercase();
-    REGISTRY.read().get(&name).cloned()
+    if let Some(conn) = super::registry::current_conn() {
+        if let Some(Some(m)) = super::registry::with(&conn, |r| r.tokenizers.get(&name).cloned()) {
+            return Some(m);
+        }
+    }
+    BUILTIN.read().get(&name).cloned()
 }
 
-/// Registers (or replaces) a tokenizer module.
-pub(crate) fn register_module(name: &str, module: Arc<dyn TokenizerModule>) {
-    REGISTRY.write().insert(name.to_ascii_lowercase(), module);
+/// Registers (or replaces) a tokenizer module on `conn`.
+pub(crate) fn register_module(
+    conn: &Arc<crate::Connection>,
+    name: &str,
+    module: Arc<dyn TokenizerModule>,
+) {
+    super::registry::with_mut(conn, |r| {
+        r.tokenizers.insert(name.to_ascii_lowercase(), module)
+    });
 }
 
 /// Reads one UTF-8 character the way FTS5_READ_UTF8 does.

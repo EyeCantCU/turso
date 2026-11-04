@@ -9,10 +9,9 @@ pub use super::tokenize::{
 
 use crate::function::ExternalFunc;
 use crate::native_ext::FunctionArity;
-use crate::sync::{Arc, RwLock};
+use crate::sync::Arc;
 use crate::{Connection, Result, Value};
-use std::collections::HashMap;
-use std::sync::{LazyLock, OnceLock};
+use std::sync::OnceLock;
 
 /// An auxiliary function, such as bm25() or a function registered with
 /// `fts5_api.xCreateFunction`.
@@ -20,18 +19,19 @@ pub trait AuxFunction: Send + Sync {
     fn call(&self, api: &mut dyn AuxApi, args: &[Value]) -> Result<Value>;
 }
 
-type AuxRegistry = HashMap<String, Arc<dyn AuxFunction>>;
-
-static AUX: LazyLock<RwLock<AuxRegistry>> = LazyLock::new(|| RwLock::new(HashMap::new()));
 static FTS5_HOOK: OnceLock<fn(&Arc<Connection>, usize)> = OnceLock::new();
 
-/// Registers (or replaces) a tokenizer.
-pub fn register_tokenizer(name: &str, module: Arc<dyn TokenizerModule>) {
-    super::tokenize::register_module(name, module);
+/// Registers (or replaces) a tokenizer on `conn` (xCreateTokenizer).
+pub fn register_tokenizer(conn: &Arc<Connection>, name: &str, module: Arc<dyn TokenizerModule>) {
+    super::tokenize::register_module(conn, name, module);
 }
 
-/// A tokenizer by name; `None` is the default (unicode61).
-pub fn find_tokenizer(name: Option<&str>) -> Option<Arc<dyn TokenizerModule>> {
+/// A tokenizer visible to `conn` by name; `None` is the default (unicode61).
+pub fn find_tokenizer(
+    conn: Option<&Arc<Connection>>,
+    name: Option<&str>,
+) -> Option<Arc<dyn TokenizerModule>> {
+    let _scope = super::registry::LookupScope::enter(conn);
     super::tokenize::find_module(name)
 }
 
@@ -44,7 +44,7 @@ pub fn register_aux_function(
     f: Arc<dyn AuxFunction>,
 ) -> Result<()> {
     let key = name.to_ascii_lowercase();
-    AUX.write().insert(key.clone(), f);
+    super::registry::with_mut(conn, |r| r.aux.insert(key.clone(), f));
     let func = ExternalFunc::new_native_scalar(
         key.clone(),
         FunctionArity::Variadic,
@@ -56,8 +56,9 @@ pub fn register_aux_function(
     Ok(())
 }
 
-pub(crate) fn find_aux(name: &str) -> Option<Arc<dyn AuxFunction>> {
-    AUX.read().get(&name.to_ascii_lowercase()).cloned()
+/// An auxiliary function registered on `conn` through fts5_api.
+pub(crate) fn find_aux(conn: &Arc<Connection>, name: &str) -> Option<Arc<dyn AuxFunction>> {
+    super::registry::with(conn, |r| r.aux.get(&name.to_ascii_lowercase()).cloned()).flatten()
 }
 
 /// Sets the handler for the SQL function `fts5(?)`, which the C API uses

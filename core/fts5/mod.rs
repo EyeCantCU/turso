@@ -10,6 +10,7 @@ mod config;
 mod expr;
 mod hash;
 mod index;
+mod registry;
 mod sql;
 mod storage;
 mod tokenize;
@@ -127,7 +128,7 @@ impl VirtualTableModule for Fts5Module {
         let cfg =
             Fts5Config::parse(info.schema_name, info.table_name, &args_text(args)).map_err(err)?;
         if info.create || cfg.preload_tokenizer() {
-            cfg.tokenizer().map_err(err)?;
+            cfg.tokenizer(info.connection).map_err(err)?;
         }
         if info.create {
             if let Some(conn) = info.connection {
@@ -812,7 +813,9 @@ impl CursorState {
                     if text.first() == Some(&b'*') {
                         return self.special_match(&text[1..]);
                     }
-                    let e = Expr::parse(cfg, false, col, &text, locale.as_deref()).map_err(err)?;
+                    let e =
+                        Expr::parse(cfg, Some(&self.conn), false, col, &text, locale.as_deref())
+                            .map_err(err)?;
                     expr = Some(match expr {
                         None => e,
                         Some(prev) => prev.and(e),
@@ -822,7 +825,8 @@ impl CursorState {
                     let col = read_col(&mut k);
                     if let Some(text) = value_text(v) {
                         if let Some(e) =
-                            expr::pattern_expr(cfg, c == b'G', col, &text).map_err(err)?
+                            expr::pattern_expr(cfg, Some(&self.conn), c == b'G', col, &text)
+                                .map_err(err)?
                         {
                             expr = Some(match expr {
                                 None => e,
@@ -1036,7 +1040,7 @@ impl CursorState {
     fn call_aux(&mut self, name: &str, args: &[Value]) -> Result<Value> {
         let prev = std::mem::replace(&mut self.current_aux, name.to_ascii_lowercase());
         // Functions registered through fts5_api take precedence, as in SQLite.
-        let r = if let Some(f) = api::find_aux(name) {
+        let r = if let Some(f) = api::find_aux(&self.conn, name) {
             f.call(self, args)
         } else {
             match aux::call_builtin(name, self, args) {
@@ -1100,7 +1104,7 @@ impl CursorState {
                 })
                 .collect();
             let mut ioff: i64 = ((icol as i64) << 32) - 1;
-            let rc = cfg.tokenizer().map_err(err)?.tokenize(
+            let rc = cfg.tokenizer(Some(&self.conn)).map_err(err)?.tokenize(
                 tokenize::TOKENIZE_DOCUMENT,
                 &text,
                 loc.as_deref(),
@@ -1188,17 +1192,21 @@ impl CursorState {
                 }
                 let text = row.get(i + 1).and_then(value_text).unwrap_or_default();
                 let mut n = 0i64;
-                self.inner.cfg.tokenizer().map_err(err)?.tokenize(
-                    tokenize::TOKENIZE_AUX,
-                    &text,
-                    None,
-                    &mut |tflags, _, _, _| {
-                        if tflags & tokenize::TOKEN_COLOCATED == 0 {
-                            n += 1;
-                        }
-                        0
-                    },
-                );
+                self.inner
+                    .cfg
+                    .tokenizer(Some(&self.conn))
+                    .map_err(err)?
+                    .tokenize(
+                        tokenize::TOKENIZE_AUX,
+                        &text,
+                        None,
+                        &mut |tflags, _, _, _| {
+                            if tflags & tokenize::TOKEN_COLOCATED == 0 {
+                                n += 1;
+                            }
+                            0
+                        },
+                    );
                 *size = n;
             }
             sizes
@@ -1247,7 +1255,7 @@ impl AuxApi for CursorState {
         let tok = self
             .inner
             .cfg
-            .tokenizer()
+            .tokenizer(Some(&self.conn))
             .map_err(|e| ApiError::Err(err(e)))?;
         let rc = tok.tokenize(tokenize::TOKENIZE_AUX, text, locale, cb);
         if rc != 0 {
@@ -1547,7 +1555,7 @@ impl CursorState {
         let (text, loc) = row_column_text(cfg, &row, icol as usize);
         let mut ioff_cur: i64 = ((icol as i64) << 32) - 1;
         let mut found: Option<Vec<u8>> = None;
-        let rc = cfg.tokenizer().map_err(err)?.tokenize(
+        let rc = cfg.tokenizer(Some(&self.conn)).map_err(err)?.tokenize(
             tokenize::TOKENIZE_DOCUMENT,
             &text,
             loc.as_deref(),
