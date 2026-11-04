@@ -2092,9 +2092,6 @@ impl Pager {
             .collect()
     }
 
-    /// Invalidate every cursor's page stack. Called from rollback — pinned
-    /// pages may now hold pre-rollback bytes (cf. saveAllCursors in
-    /// sqlite3BtreeRollback, btree.c:4485).
     /// Save the position of every registered cursor so it re-seeks by key
     /// on its next use, like SQLite's saveAllCursors. A position that cannot
     /// be saved without I/O falls back to invalidation.
@@ -2145,6 +2142,9 @@ impl Pager {
         }
     }
 
+    /// Invalidate every cursor's page stack. Called from rollback — pinned
+    /// pages may now hold pre-rollback bytes (cf. saveAllCursors in
+    /// sqlite3BtreeRollback, btree.c:4485).
     pub(crate) fn invalidate_all_cursors(&self) {
         let snapshot: smallvec::SmallVec<[RegisteredCursor; 8]> = {
             let registry = self.cursor_registry.lock();
