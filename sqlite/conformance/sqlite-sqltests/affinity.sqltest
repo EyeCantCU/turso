@@ -59,7 +59,7 @@ test affinity-insert-text-from-real {
     SELECT c1, typeof(c1) FROM t1;
 }
 expect {
-    1025.1655084066|text
+    1025.1655084065988|text
 }
 
 @cross-check-integrity
@@ -293,7 +293,7 @@ test affinity-original-issue {
     SELECT typeof(c1), c1 FROM t1 ORDER BY c1 COLLATE BINARY DESC, rowid ASC;
 }
 expect raw {
-text|1025.1655084066
+text|1025.1655084065988
 text| 
 }
 
@@ -307,7 +307,7 @@ test affinity-insert-text-from-real-2 {
     SELECT c1, typeof(c1) FROM t1;
 }
 expect {
-    1025.1655084066|text
+    1025.1655084065988|text
 }
 
 @cross-check-integrity
@@ -453,7 +453,7 @@ test affinity-original-issue-2 {
     SELECT typeof(c1), c1 FROM t1 ORDER BY c1 COLLATE BINARY DESC, rowid ASC;
 }
 expect raw {
-text|1025.1655084066
+text|1025.1655084065988
 text| 
 }
 

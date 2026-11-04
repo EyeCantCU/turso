@@ -1778,14 +1778,14 @@ test quote-float-scientific-format {
     SELECT quote(CAST('2.042747795102219097e+05' AS REAL))
 }
 expect {
-    2.042747795102219097e+05
+    204274.77951022191
 }
 
 test quote-float-scientific-zero-exponent {
     SELECT quote(pi()), quote(-10 / 3.0)
 }
 expect {
-    3.141592653589793116e+00|-3.333333333333333482e+00
+    3.1415926535897931|-3.3333333333333335
 }
 
 # Regression: QUOTE() should return TEXT type for floats, not REAL

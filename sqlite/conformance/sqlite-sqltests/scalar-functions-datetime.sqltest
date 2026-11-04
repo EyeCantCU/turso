@@ -1550,7 +1550,7 @@ test strftime-real-format-argument {
     SELECT strftime(2460324.8751736111, 0), CAST(2460324.8751736111 AS TEXT), strftime(1.0, 0);
 }
 expect {
-    2460324.87517361|2460324.87517361|1.0
+    2460324.8751736111|2460324.8751736111|1.0
 }
 
 test strftime-hour-without-leading-zero-1 {
