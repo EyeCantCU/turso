@@ -3598,10 +3598,10 @@ impl<'a> Parser<'a> {
                     });
                 }
                 TK_CHECK => {
-                    result.push(NamedTableConstraint {
-                        name,
-                        constraint: self.parse_check_table_constraint()?,
-                    });
+                    let constraint = self.parse_check_table_constraint()?;
+                    // SQLite accepts and ignores ON CONFLICT on a table CHECK.
+                    self.parse_on_conflict()?;
+                    result.push(NamedTableConstraint { name, constraint });
                 }
                 TK_FOREIGN => {
                     result.push(NamedTableConstraint {
@@ -4153,14 +4153,20 @@ impl<'a> Parser<'a> {
         let has_not = match self.peek()? {
             Some(tok) => match tok.token_type {
                 TK_DEFERRABLE => false,
-                TK_NOT => {
-                    eat_assert!(self, TK_NOT);
-                    true
-                }
+                TK_NOT => true,
                 _ => return Ok(None),
             },
             _ => return Ok(None),
         };
+        if has_not {
+            // `REFERENCES t NOT NULL`: the NOT starts the next constraint.
+            let saved = (self.peekable, self.current_token.clone(), self.lexer.offset);
+            eat_assert!(self, TK_NOT);
+            if self.peek()?.map(|t| t.token_type) != Some(TK_DEFERRABLE) {
+                (self.peekable, self.current_token, self.lexer.offset) = saved;
+                return Ok(None);
+            }
+        }
 
         eat_expect!(self, TK_DEFERRABLE);
 

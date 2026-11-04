@@ -685,3 +685,46 @@ fn emit_index_stats(
     // Label for empty index case, just skip the insert
     program.preassign_label_to_next_insn(lbl_empty);
 }
+
+/// Deletes the sqlite_stat1 rows whose column `column` (0 = tbl, 1 = idx) is
+/// `name`, as SQLite's sqlite3ClearStatTables does when a table or an index
+/// is dropped. Does nothing when the database has no sqlite_stat1.
+pub(crate) fn emit_clear_stat1_rows(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    database_id: usize,
+    column: usize,
+    name: &str,
+) {
+    let Some(stat1) = resolver.with_schema(database_id, |s| {
+        s.get_btree_table(NamespaceId::ROOT, crate::stats::STATS_TABLE)
+    }) else {
+        return;
+    };
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(stat1.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id,
+        root_page: RegisterOrLiteral::Literal(stat1.root_page),
+        db: database_id,
+    });
+    let value_reg = program.alloc_register();
+    let name_reg = program.emit_string8_new_reg(name.to_string());
+    program.mark_last_insn_constant();
+    program.cursor_loop(cursor_id, |program, _rowid| {
+        program.emit_column_or_rowid(cursor_id, column, value_reg);
+        let next = program.allocate_label();
+        program.emit_insn(Insn::Ne {
+            lhs: value_reg,
+            rhs: name_reg,
+            target_pc: next,
+            flags: CmpInsFlags::default().jump_if_null(),
+            collation: CollationSeq::BINARY,
+        });
+        program.emit_insn(Insn::Delete {
+            cursor_id,
+            table_name: crate::stats::STATS_TABLE.to_string(),
+            is_part_of_update: false,
+        });
+        program.preassign_label_to_next_insn(next);
+    });
+}

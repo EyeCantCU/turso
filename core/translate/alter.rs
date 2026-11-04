@@ -3300,9 +3300,25 @@ fn rewrite_trigger_sql_for_column_rename(
     // Get the trigger's owning table to check unqualified column references
     let trigger_table_name_raw = tbl_name.name.as_str();
     let trigger_table_name = normalize_ident(trigger_table_name_raw);
-    let trigger_table = resolver
-        .with_schema(trigger_database_id, |schema| {
-            schema.get_btree_table(NamespaceId::ROOT, &trigger_table_name)
+    // A TEMP trigger may be on a table of another database, named with a
+    // qualifier or found after the temp database.
+    let mut trigger_dbs = vec![trigger_database_id];
+    if let Some(qualifier) = &tbl_name.namespace {
+        if let Some(db) = resolver
+            .catalog
+            .namespace_database_id(&normalize_ident(qualifier.as_str()))
+        {
+            trigger_dbs = vec![db];
+        }
+    } else if trigger_database_id == crate::TEMP_DB_ID {
+        trigger_dbs.push(target_database_id);
+    }
+    let trigger_table = trigger_dbs
+        .iter()
+        .find_map(|db| {
+            resolver.with_schema(*db, |schema| {
+                schema.get_btree_table(NamespaceId::ROOT, &trigger_table_name)
+            })
         })
         .ok_or_else(|| {
             LimboError::ParseError(format!("trigger table not found: {trigger_table_name}"))
@@ -6003,6 +6019,8 @@ enum NamedConstraint {
     ForeignKey(usize),
     /// PRIMARY KEY or UNIQUE, which DROP CONSTRAINT refuses.
     Key,
+    /// A name only the text keeps, such as on a DEFAULT.
+    TextOnly,
 }
 
 fn find_named_constraint(btree: &BTreeTable, name: &str) -> Option<NamedConstraint> {
@@ -6220,7 +6238,15 @@ fn translate_alter_constraint(
     input: &str,
     namespace: NamespaceRef,
 ) -> Result<()> {
+    use crate::translate::schema_text::{
+        add_constraint, alter_constraint_text, drop_constraint, has_named_constraint, DropError,
+        DropTarget,
+    };
+    use turso_parser::token::TokenType;
     let database_id = namespace.database_id;
+    // Like SQLite, the stored text is edited in place.
+    let old_sql = btree.sql.clone();
+    let mut new_sql: Option<String> = None;
     let find_column = |btree: &BTreeTable, name: &ast::Name| -> Result<usize> {
         btree
             .get_column(name.as_str())
@@ -6242,6 +6268,12 @@ fn translate_alter_constraint(
                 connection,
                 namespace,
             )?;
+            new_sql = old_sql.as_deref().and_then(|sql| {
+                let cons =
+                    alter_constraint_text(input, &[TokenType::TK_SET], &[TokenType::TK_NOT])?;
+                let sql = drop_constraint(sql, DropTarget::NotNull(idx)).ok()?;
+                add_constraint(&sql, cons, Some(idx))
+            });
             let column = &mut btree.columns_mut()[idx];
             column.set_notnull(true);
             column.set_explicit_notnull(true);
@@ -6250,6 +6282,9 @@ fn translate_alter_constraint(
         }
         ast::AlterTableBody::DropNotNull(column) => {
             let idx = find_column(&btree, &column)?;
+            new_sql = old_sql
+                .as_deref()
+                .and_then(|sql| drop_constraint(sql, DropTarget::NotNull(idx)).ok());
             if btree.columns()[idx].explicit_notnull() {
                 clear_column_notnull(&mut btree, idx);
             }
@@ -6265,7 +6300,11 @@ fn translate_alter_constraint(
                 .collect();
             validate_check_expr(expr, &btree.name, &column_names, &resolver.catalog)?;
             if let Some(name) = &constraint.name {
-                if find_named_constraint(&btree, name.as_str()).is_some() {
+                let exists = old_sql
+                    .as_deref()
+                    .and_then(|sql| has_named_constraint(sql, name.as_str()))
+                    .unwrap_or_else(|| find_named_constraint(&btree, name.as_str()).is_some());
+                if exists {
                     emit_halt(
                         program,
                         crate::error::SQLITE_ERROR,
@@ -6284,10 +6323,37 @@ fn translate_alter_constraint(
                 connection,
                 namespace,
             )?;
+            new_sql = old_sql.as_deref().and_then(|sql| {
+                let cons = alter_constraint_text(
+                    input,
+                    &[TokenType::TK_ADD],
+                    &[TokenType::TK_CONSTRAINT, TokenType::TK_CHECK],
+                )?;
+                add_constraint(sql, cons, None)
+            });
             btree.check_constraints.push(check);
         }
         ast::AlterTableBody::DropConstraint(name) => {
-            match find_named_constraint(&btree, name.as_str()) {
+            // SQLite finds the constraint in the text, so its answer decides.
+            let text_result = old_sql
+                .as_deref()
+                .map(|sql| drop_constraint(sql, DropTarget::Named(name.as_str())));
+            let found = find_named_constraint(&btree, name.as_str());
+            let found = match &text_result {
+                Some(Err(DropError::NoSuchConstraint)) => None,
+                Some(Err(DropError::MayNotBeDropped)) => Some(NamedConstraint::Key),
+                Some(Ok(sql)) => {
+                    new_sql = Some(sql.clone());
+                    match found {
+                        Some(NamedConstraint::Key) => None,
+                        found => found,
+                    }
+                    .or(Some(NamedConstraint::TextOnly))
+                }
+                _ => found,
+            };
+            match found {
+                Some(NamedConstraint::TextOnly) => {}
                 None => {
                     emit_halt(
                         program,
@@ -6314,9 +6380,12 @@ fn translate_alter_constraint(
         _ => unreachable!("not a constraint edit"),
     }
 
-    let sql = escape_sql_string_literal(
-        &btree.to_sql_as(&resolver.mangle_name(namespace, &btree.declared_name)),
-    );
+    // Fall back to regenerated text when the edit does not describe the table.
+    let new_sql = new_sql
+        .filter(|sql| btree.has_same_definition(sql))
+        .unwrap_or_else(|| btree.to_sql_as(&resolver.mangle_name(namespace, &btree.declared_name)));
+    btree.sql = Some(new_sql.clone());
+    let sql = escape_sql_string_literal(&new_sql);
     let escaped_table_name = escape_sql_string_literal(mangled_table_name);
     let stmt = format!(
         "UPDATE {qualified_schema_table} SET sql = '{sql}' \

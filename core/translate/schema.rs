@@ -2708,6 +2708,14 @@ pub fn translate_drop_table(
         program.preassign_label_to_next_insn(end_ver_loop_label);
     }
 
+    crate::translate::analyze::emit_clear_stat1_rows(
+        program,
+        resolver,
+        database_id,
+        0,
+        &resolver.mangle_name(namespace, table.get_name()),
+    );
+
     // Drop the in-memory structures for the table
     program.emit_insn(Insn::DropTable {
         db: database_id,

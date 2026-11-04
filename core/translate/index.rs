@@ -1699,6 +1699,14 @@ pub fn translate_drop_index(
         )?;
     }
 
+    crate::translate::analyze::emit_clear_stat1_rows(
+        program,
+        resolver,
+        database_id,
+        1,
+        &index.name,
+    );
+
     // Remove from the Schema any mention of the index
     program.emit_insn(Insn::DropIndex {
         index: index.clone(),
