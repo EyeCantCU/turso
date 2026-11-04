@@ -8,7 +8,7 @@ test printf-json-J {
     SELECT printf('%J', 'a"b' || char(10) || '\');
 }
 expect {
-    "a\"b\n\\"
+    "a\"b\n\\\\"
 }
 
 test printf-json-j {
@@ -28,8 +28,8 @@ expect {
 test printf-json-width {
     SELECT printf('%5J|%-5J|', 'ab', 'ab');
 }
-expect {
-     "ab"|"ab" |
+expect raw {
+ "ab"|"ab" |
 }
 
 test printf-json-precision {
@@ -126,8 +126,8 @@ expect {
 test printf-char-utf8-width {
     SELECT printf('%5c|%-3.2c|', 'é', 'é');
 }
-expect {
-        é|éé |
+expect raw {
+    é|éé |
 }
 
 test percentile-median {
@@ -162,35 +162,35 @@ test percentile-fraction-range {
     SELECT percentile(x, 101) FROM (SELECT 1 x);
 }
 expect error {
-    the fraction argument to percentile() is not between 0.0 and 100.0
+    the fraction argument to percentile\(\) is not between 0.0 and 100.0
 }
 
 test percentile-cont-fraction-range {
     SELECT percentile_cont(x, 2) FROM (SELECT 1 x);
 }
 expect error {
-    the fraction argument to percentile_cont() is not between 0.0 and 1.0
+    the fraction argument to percentile_cont\(\) is not between 0.0 and 1.0
 }
 
 test percentile-fraction-not-constant {
     SELECT percentile(x, x) FROM (SELECT 1 x UNION ALL SELECT 2);
 }
 expect error {
-    the fraction argument to percentile() is not the same for all input rows
+    the fraction argument to percentile\(\) is not the same for all input rows
 }
 
 test percentile-input-not-numeric {
     SELECT median(x) FROM (SELECT '5' x);
 }
 expect error {
-    input to median() is not numeric
+    input to median\(\) is not numeric
 }
 
 test percentile-inf-input {
     SELECT median(x) FROM (SELECT 1e999 x);
 }
 expect error {
-    Inf input to median()
+    Inf input to median\(\)
 }
 
 test percentile-window-running {
