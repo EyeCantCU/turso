@@ -547,7 +547,15 @@ impl SqliteWalIndex {
         }
         let slot = |k: usize| unsafe { &*(hashes.add(k * 2) as *const AtomicU16) };
         let mut k = hash(pgno);
+        let mut probes = 0;
         while slot(k).load(Ordering::Relaxed) != 0 {
+            // A full table is corrupt, as walIndexAppend's nCollide check says.
+            probes += 1;
+            if probes >= NSLOT {
+                return Err(crate::LimboError::Corrupt(
+                    "SQLite wal-index hash table is full".into(),
+                ));
+            }
             k = (k + 1) & (NSLOT - 1);
         }
         unsafe { (pgnos as *mut u32).add(idx - 1).write_volatile(pgno) };

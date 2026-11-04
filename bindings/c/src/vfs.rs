@@ -344,6 +344,22 @@ impl VfsIo {
         Ok(self.host.get_or_init(|| io).clone())
     }
 
+    /// Open the main database `full` through the VFS just to look at its
+    /// methods (no URI parameters consumed, not registered).
+    unsafe fn open_vfs_file_for_probe(&self, full: &str, flags: OpenFlags) -> Option<Arc<VfsFile>> {
+        let mut oflags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_MAIN_DB;
+        if flags.contains(OpenFlags::Create) {
+            oflags |= SQLITE_OPEN_CREATE;
+        }
+        let mut b = vec![0u8; 4];
+        b.extend_from_slice(full.as_bytes());
+        b.extend_from_slice(&[0, 0, 0, 0]);
+        let block: Arc<[u8]> = b.into();
+        VfsFile::open(self.vfs, Some((block, 4)), oflags)
+            .ok()
+            .map(|(f, _)| f)
+    }
+
     /// Main-database file opened at `path` through this adapter.
     fn main_file(&self, path: &str) -> Option<Arc<VfsFile>> {
         self.files.lock().ok()?.get(path).and_then(Weak::upgrade)
@@ -1077,14 +1093,22 @@ impl File for VfsShmFile {
         } else {
             SQLITE_SHM_SHARED
         };
-        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
-        let cur = held[slot as usize];
+        // The state mutex is never held across a VFS call: its callbacks
+        // may use this database again on the same thread.
+        let held = |v: Option<ffi::c_int>| {
+            let mut h = self.held.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(v) = v {
+                h[slot as usize] = v;
+            }
+            h[slot as usize]
+        };
+        let cur = held(None);
         if cur == want {
             return Ok(true);
         }
         // A VFS like turso's unix converts a held lock in place.
         if self.shm_lock(slot, SQLITE_SHM_LOCK | want)? {
-            held[slot as usize] = want;
+            held(Some(want));
             return Ok(true);
         }
         if cur == 0 {
@@ -1092,13 +1116,13 @@ impl File for VfsShmFile {
         }
         // SQLite's unix VFS does not convert: drop ours, then retry.
         self.shm_lock(slot, SQLITE_SHM_UNLOCK | cur)?;
-        held[slot as usize] = 0;
+        held(Some(0));
         if self.shm_lock(slot, SQLITE_SHM_LOCK | want)? {
-            held[slot as usize] = want;
+            held(Some(want));
             return Ok(true);
         }
         if self.shm_lock(slot, SQLITE_SHM_LOCK | cur)? {
-            held[slot as usize] = cur;
+            held(Some(cur));
         }
         Ok(false)
     }
@@ -1127,8 +1151,10 @@ impl File for VfsShmFile {
             return Ok(());
         }
         let slot = Self::slot(offset)?;
-        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
-        let cur = std::mem::take(&mut held[slot as usize]);
+        let cur = {
+            let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut held[slot as usize])
+        };
         if cur != 0 {
             self.shm_lock(slot, SQLITE_SHM_UNLOCK | cur)?;
         }
@@ -1319,7 +1345,9 @@ pub(crate) unsafe fn open_v2_via_vfs(
         let host_file = std::path::Path::new(&full)
             .parent()
             .is_some_and(|dir| dir.is_dir());
-        let res = if host_file && !nolock {
+        // Shared memory is a property of the VFS's files: look at one.
+        let has_shm = host_file && !nolock && io_dyn_has_shm(&io_dyn, &full, open_flags);
+        let res = if has_shm {
             super::multiprocess::open_file_db(io_dyn.clone(), &full, open_flags, default_db_opts())
         } else {
             turso_core::Database::open_file_with_flags(
@@ -1355,6 +1383,19 @@ pub(crate) unsafe fn open_v2_via_vfs(
     let name = CString::new(full).unwrap_or_default();
     *db_out = sqlite3::new(io_dyn, db, conn, name).into_raw();
     Some(extension::run_auto_extensions(*db_out))
+}
+
+/// Whether the VFS's main-database files have shared-memory methods.
+fn io_dyn_has_shm(io: &Arc<dyn IO>, full: &str, flags: OpenFlags) -> bool {
+    let Some(vfs_io) = VfsIo::of_io(io) else {
+        return false;
+    };
+    let probe_flags = (flags | OpenFlags::NoLock) & !OpenFlags::ReadOnly;
+    let file = unsafe { vfs_io.open_vfs_file_for_probe(full, probe_flags) };
+    file.is_some_and(|f| {
+        f.methods()
+            .is_some_and(|m| m.i_version >= 2 && m.x_shm_map.is_some() && m.x_shm_lock.is_some())
+    })
 }
 
 /// Closes the engine connection (the final checkpoint) while the handle is
