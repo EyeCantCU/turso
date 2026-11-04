@@ -680,37 +680,14 @@ pub fn str_to_f64(input: impl AsRef<str>) -> Option<StrToF64> {
         exponent += 1;
     }
 
-    let mut result = DoubleDouble::from(significant);
-
-    if exponent > 0 {
-        while exponent >= 100 {
-            exponent -= 100;
-            result *= DoubleDouble::E100;
-        }
-        while exponent >= 10 {
-            exponent -= 10;
-            result *= DoubleDouble::E10;
-        }
-        while exponent >= 1 {
-            exponent -= 1;
-            result *= DoubleDouble::E1;
-        }
+    // SQLite 3.54's sqlite3AtoF: correctly rounded significant * 10^exponent.
+    let result = if significant == 0 {
+        0.0
     } else {
-        while exponent <= -100 {
-            exponent += 100;
-            result *= DoubleDouble::NEG_E100;
-        }
-        while exponent <= -10 {
-            exponent += 10;
-            result *= DoubleDouble::NEG_E10;
-        }
-        while exponent <= -1 {
-            exponent += 1;
-            result *= DoubleDouble::NEG_E1;
-        }
-    }
+        crate::functions::fpdecode::fp10_convert2(significant, exponent)
+    };
 
-    let result = NonNan::new(f64::from(result) * sign)
+    let result = NonNan::new(result * sign)
         .unwrap_or_else(|| NonNan::new(sign * f64::INFINITY).unwrap());
 
     if !valid_exponent || input.count() > 0 {
@@ -766,82 +743,21 @@ pub fn round_half_away_from_zero_tie(f: f64, precision: usize) -> Option<f64> {
     Some(result)
 }
 
-/// Shortest of 15 or 17 significant digits that round-trips, as (digits, exp10).
-fn float_digits(v: f64) -> (Vec<u8>, i32) {
-    let parse = |s: &str| {
-        let (m, e) = s.split_once('e').unwrap();
-        let digits: Vec<u8> = m.bytes().filter(u8::is_ascii_digit).collect();
-        (digits, e.parse::<i32>().unwrap())
-    };
-    let s15 = format!("{v:.14e}");
-    // SQLite always uses 17 digits for deep subnormals.
-    let s = if v >= 1e-310 && s15.parse::<f64>() == Ok(v) {
-        s15
-    } else {
-        format!("{v:.16e}")
-    };
-    let (mut digits, exp) = parse(&s);
-    while digits.len() > 1 && digits.last() == Some(&b'0') {
-        digits.pop();
-    }
-    (digits, exp)
-}
-
-/// Renders a REAL like SQLite's text conversion (sqlite3VdbeMemStringify):
-/// "%!.15g" with a 17-digit fallback, decimal up to 1e16.
+/// Renders a REAL like SQLite's text conversion: "%!.17g", where FpDecode
+/// itself drops digits that are not needed to round-trip.
 pub fn format_float(v: f64) -> String {
-    format_float_with(v, 16, float_digits)
+    if v.is_nan() {
+        return String::new();
+    }
+    crate::functions::printf::format_g(v, 17, true)
 }
 
 /// Renders a REAL like plain "%!.15g", as sqlite3_expanded_sql does.
 pub fn format_float_g15(v: f64) -> String {
-    format_float_with(v, 14, |a| {
-        let s = format!("{a:.14e}");
-        let (m, e) = s.split_once('e').unwrap();
-        let mut d: Vec<u8> = m.bytes().filter(u8::is_ascii_digit).collect();
-        while d.len() > 1 && d.last() == Some(&b'0') {
-            d.pop();
-        }
-        (d, e.parse().unwrap())
-    })
-}
-
-fn format_float_with(
-    v: f64,
-    max_decimal_exp: i32,
-    digits_of: impl Fn(f64) -> (Vec<u8>, i32),
-) -> String {
     if v.is_nan() {
         return String::new();
     }
-    if v.is_infinite() {
-        return if v < 0.0 { "-Inf" } else { "Inf" }.to_string();
-    }
-    if v == 0.0 {
-        return "0.0".to_string();
-    }
-    let (digits, exp) = digits_of(v.abs());
-    let digits = unsafe { str::from_utf8_unchecked(&digits) };
-    let sign = if v < 0.0 { "-" } else { "" };
-    if !(-4..=max_decimal_exp).contains(&exp) {
-        let rest = if digits.len() > 1 { &digits[1..] } else { "0" };
-        return format!(
-            "{sign}{}.{rest}e{}{:02}",
-            &digits[..1],
-            if exp >= 0 { '+' } else { '-' },
-            exp.abs()
-        );
-    }
-    if exp < 0 {
-        format!("{sign}0.{}{digits}", "0".repeat((-exp - 1) as usize))
-    } else {
-        let int_len = exp as usize + 1;
-        if digits.len() <= int_len {
-            format!("{sign}{digits}{}.0", "0".repeat(int_len - digits.len()))
-        } else {
-            format!("{sign}{}.{}", &digits[..int_len], &digits[int_len..])
-        }
-    }
+    crate::functions::printf::format_g(v, 15, true)
 }
 
 pub fn format_float_for_quote(v: f64) -> String {
@@ -900,6 +816,56 @@ fn test_format_float_g15() {
     assert_eq!(format_float_g15(0.1 + 0.2), "0.3");
     assert_eq!(format_float_g15(-1.5e-7), "-1.5e-07");
     assert_eq!(format_float_g15(0.0001), "0.0001");
+}
+
+#[test]
+fn test_format_float_sqlite_last_digit() {
+    // SQLite 3.54.1: its own decimal rounding, not shortest round-trip.
+    assert_eq!(format_float(1025.1655084065987), "1025.1655084065988");
+    assert_eq!(format_float(49.47), "49.47");
+}
+
+/// Differential fuzz helper: reads f64 bit patterns (hex, one per line) from
+/// $FLOAT_BITS and writes "bits<TAB>text<TAB>g15<TAB>g17" to $FLOAT_OUT.
+/// Compared against sqlite3 by testing/float-digits/fuzz.py.
+#[test]
+#[ignore]
+fn float_digits_dump() {
+    use crate::functions::printf::format_g;
+    use std::io::Write;
+    let (Ok(inp), Ok(out)) = (std::env::var("FLOAT_BITS"), std::env::var("FLOAT_OUT")) else {
+        return;
+    };
+    let mut w = std::io::BufWriter::new(std::fs::File::create(out).unwrap());
+    for line in std::fs::read_to_string(inp).unwrap().lines() {
+        let v = f64::from_bits(u64::from_str_radix(line.trim(), 16).unwrap());
+        let q = format_float_for_quote(v);
+        writeln!(
+            w,
+            "{line}\t{}\t{}\t{}\t{}\t{q}",
+            format_float(v),
+            format_g(v, 15, true),
+            format_g(v, 17, true),
+            format_g(v, 17, false)
+        )
+        .unwrap();
+    }
+}
+
+/// Differential fuzz helper for text -> REAL: $FLOAT_STRS in, hex bits to $FLOAT_PARSE_OUT.
+#[test]
+#[ignore]
+fn float_parse_dump() {
+    use std::io::Write;
+    let (Ok(inp), Ok(out)) = (std::env::var("FLOAT_STRS"), std::env::var("FLOAT_PARSE_OUT"))
+    else {
+        return;
+    };
+    let mut w = std::io::BufWriter::new(std::fs::File::create(out).unwrap());
+    for line in std::fs::read_to_string(inp).unwrap().lines() {
+        let v = str_to_f64(line).map_or(0.0, f64::from);
+        writeln!(w, "{:x}", v.to_bits()).unwrap();
+    }
 }
 
 #[test]

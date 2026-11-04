@@ -310,6 +310,10 @@ fn render_integer(s: &Spec, args: &mut ArgList, mut precision: i64, width: i64) 
 /// %f %e %E %g %G. Returns the fully padded field.
 fn render_float(s: &Spec, args: &mut ArgList, precision: i64, width: i64) -> Vec<u8> {
     let value = args.double();
+    render_float_value(s, value, precision, width)
+}
+
+fn render_float_value(s: &Spec, value: f64, precision: i64, width: i64) -> Vec<u8> {
     let mut precision = if precision < 0 { 6 } else { precision }.min(MAX_WIDTH);
     let upper = matches!(s.conv, b'E' | b'G');
     let mut xtype = match s.conv {
@@ -472,6 +476,23 @@ fn render_float(s: &Spec, args: &mut ArgList, precision: i64, width: i64) -> Vec
         }
     }
     z
+}
+
+/// Renders `value` as SQLite's `%.<precision>g`, or `%!.<precision>g` with `altform2`.
+pub fn format_g(value: f64, precision: i64, altform2: bool) -> String {
+    let s = Spec {
+        left_justify: false,
+        prefix: 0,
+        alternate: false,
+        altform2,
+        zero_pad: false,
+        thousand: false,
+        long: 0,
+        width: Count::None,
+        precision: Count::None,
+        conv: b'g',
+    };
+    String::from_utf8_lossy(&render_float_value(&s, value, precision, 0)).into_owned()
 }
 
 /// %c: first character of the argument's text, repeated `precision` times.

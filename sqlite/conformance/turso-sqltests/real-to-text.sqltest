@@ -50,3 +50,20 @@ test real-text-negative-zero {
 expect {
     0.0
 }
+
+# SQLite's digit generation (FpDecode) is not shortest round-trip.
+test real-text-fpdecode-last-digit {
+    SELECT CAST(1025.1655084065987 AS TEXT), 1025.1655084065987 || '',
+           quote(1025.1655084065987), json_quote(1025.1655084065987),
+           printf('%!.17g', 1025.1655084065987);
+}
+expect {
+    1025.1655084065988|1025.1655084065988|1025.1655084065988|1025.1655084065988|1025.1655084065988
+}
+
+test real-text-fpdecode-inexact-atof {
+    SELECT CAST(7.8287826562850499e-295 AS TEXT), CAST(1.7383389519587511e-310 AS TEXT), CAST(49.47 AS TEXT);
+}
+expect {
+    7.8287826562850499e-295|1.7383389519587511e-310|49.47
+}
