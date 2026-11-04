@@ -793,6 +793,10 @@ fn update_pragma(
             connection.set_check_constraints_ignored(enabled);
             Ok(TransactionMode::None)
         }
+        PragmaName::DeferForeignKeys => {
+            connection.set_defer_foreign_keys(parse_pragma_enabled(&value));
+            Ok(TransactionMode::None)
+        }
         #[cfg(target_vendor = "apple")]
         PragmaName::Fullfsync => {
             let enabled = parse_pragma_enabled(&value);
@@ -1864,6 +1868,13 @@ fn query_pragma(
             let register = program.alloc_register();
             let enabled = connection.get_count_changes();
             program.emit_int(enabled as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::DeferForeignKeys => {
+            let register = program.alloc_register();
+            program.emit_int(connection.defer_foreign_keys() as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)

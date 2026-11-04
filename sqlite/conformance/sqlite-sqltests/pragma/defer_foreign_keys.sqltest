@@ -1,0 +1,59 @@
+@database :memory:
+
+test defer-foreign-keys-child-before-parent {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x REFERENCES p);
+    BEGIN;
+    PRAGMA defer_foreign_keys = ON;
+    INSERT INTO c VALUES (5);
+    INSERT INTO p VALUES (5);
+    COMMIT;
+    SELECT * FROM c;
+}
+expect {
+    5
+}
+
+test defer-foreign-keys-resets-at-commit {
+    PRAGMA foreign_keys = ON;
+    BEGIN;
+    PRAGMA defer_foreign_keys = ON;
+    PRAGMA defer_foreign_keys;
+    COMMIT;
+    PRAGMA defer_foreign_keys;
+}
+expect {
+    1
+    0
+}
+
+test defer-foreign-keys-violation-at-commit {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x REFERENCES p);
+    BEGIN;
+    PRAGMA defer_foreign_keys = ON;
+    INSERT INTO c VALUES (6);
+    COMMIT;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test defer-foreign-keys-parent-delete-and-reinsert {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x REFERENCES p);
+    INSERT INTO p VALUES (1);
+    INSERT INTO c VALUES (1);
+    BEGIN;
+    PRAGMA defer_foreign_keys = ON;
+    DELETE FROM p WHERE id = 1;
+    INSERT INTO p VALUES (1);
+    COMMIT;
+    SELECT count(*) FROM p;
+}
+expect {
+    1
+}

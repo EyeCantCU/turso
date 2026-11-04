@@ -5348,6 +5348,7 @@ pub fn op_auto_commit(
                 // Pre-check deferred FKs; leave tx open and do NOT clear violations
                 check_deferred_fk_on_commit(&conn)?;
                 vtab_commit_all(&conn)?;
+                conn.set_defer_foreign_keys(false);
                 conn.auto_commit.store(true, Ordering::SeqCst);
                 conn.set_tx_read_only(false);
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
@@ -18624,7 +18625,8 @@ pub fn op_fk_counter(
         },
         insn
     );
-    if !*deferred {
+    // PRAGMA defer_foreign_keys turns every immediate constraint into a deferred one.
+    if !*deferred && !program.connection.defer_foreign_keys() {
         state.increment_fk_immediate_violations_during_stmt(*increment_value);
         if state.get_fk_immediate_violations_during_stmt() == 0 {
             state.fk_immediate_violation = None;

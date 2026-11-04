@@ -231,6 +231,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["fullfsync"],
         ),
+        DeferForeignKeys => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["defer_foreign_keys"],
+        ),
         IgnoreCheckConstraints => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["ignore_check_constraints"],

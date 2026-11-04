@@ -28,10 +28,10 @@ use crate::{
             NoConstantOptReason, ReturningBufferCtx, WalkControl,
         },
         fkeys::{
-            build_index_affinity_string, child_index_for_fk, emit_fk_restrict_halt,
-            emit_fk_violation, emit_guarded_fk_decrement, emit_skip_if_any_null,
-            fk_constraint_info, index_probe, index_scan_match_any, open_read_index,
-            open_read_table, table_scan_match_any, ForeignKeyActions,
+            build_index_affinity_string, child_index_for_fk, emit_fk_violation,
+            emit_guarded_fk_decrement, emit_skip_if_any_null, fk_constraint_info, index_probe,
+            index_scan_match_any, open_read_index, open_read_table, table_scan_match_any,
+            ForeignKeyActions,
         },
         plan::{
             ColumnMask, ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination,
@@ -1100,6 +1100,7 @@ pub fn translate_insert(
             &btree_table,
             &insertion,
             on_replace,
+            connection.defer_foreign_keys(),
             resolver,
             namespace,
         )?;
@@ -4167,7 +4168,7 @@ pub fn emit_fk_child_insert_checks(
                     .collect();
                 let constraint_info =
                     fk_constraint_info(program, resolver, child_tbl, &fk_ref.fk, fk_col_regs)?;
-                emit_fk_restrict_halt(program, Some(Box::new(constraint_info)))?;
+                emit_fk_immediate_check(program, constraint_info);
             }
             program.preassign_label_to_next_insn(fk_ok);
         } else {
@@ -4282,7 +4283,7 @@ pub fn emit_fk_child_insert_checks(
                             .collect();
                         let constraint_info =
                             fk_constraint_info(p, resolver, child_tbl, &fk_ref.fk, fk_col_regs)?;
-                        emit_fk_restrict_halt(p, Some(Box::new(constraint_info)))?;
+                        emit_fk_immediate_check(p, constraint_info);
                     }
                     Ok(())
                 },
@@ -4377,6 +4378,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
     parent_table: &BTreeTable,
     insertion: &Insertion,
     force_immediate: bool,
+    defer_all: bool,
     resolver: &Resolver,
     namespace: NamespaceRef,
 ) -> crate::Result<()> {
@@ -4389,14 +4391,16 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 .child_table
                 .name
                 .eq_ignore_ascii_case(&parent_table.name);
+        // PRAGMA defer_foreign_keys (as of prepare time) makes every FK deferred.
+        let deferred = pref.fk.deferred || defer_all;
         // Skip only when it cannot repair anything: non-deferred and not self-referencing
-        if !force_immediate && !pref.fk.deferred && !is_self_ref {
+        if !force_immediate && !deferred && !is_self_ref {
             continue;
         }
         // Nothing to do if the parent counter is 0
         let skip_fk = program.allocate_label();
         program.emit_insn(Insn::FkIfZero {
-            deferred: pref.fk.deferred,
+            deferred,
             target_pc: skip_fk,
         });
 
@@ -4435,7 +4439,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
             // Decrement once per matching child row
             index_scan_match_any(program, icur, probe_start, n_cols, new_row_rowid, |p| {
                 let next = p.allocate_label();
-                emit_guarded_fk_decrement(p, next, pref.fk.deferred);
+                emit_guarded_fk_decrement(p, next, deferred);
                 p.preassign_label_to_next_insn(next);
                 Ok(())
             })?;
@@ -4449,7 +4453,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 resolver,
                 |p| {
                     let next = p.allocate_label();
-                    emit_guarded_fk_decrement(p, next, pref.fk.deferred);
+                    emit_guarded_fk_decrement(p, next, deferred);
                     p.preassign_label_to_next_insn(next);
                     Ok(())
                 },
@@ -4493,4 +4497,15 @@ fn emit_custom_type_encode(
         table_name,
         &layout,
     )
+}
+
+/// Fail the statement now for a missing parent key, unless PRAGMA
+/// defer_foreign_keys, checked at run time, defers it to the commit.
+fn emit_fk_immediate_check(program: &mut ProgramBuilder, constraint_info: ConstraintInfo) {
+    program.emit_insn(Insn::FkCounter {
+        constraint_info: Some(Box::new(constraint_info)),
+        increment_value: 1,
+        deferred: false,
+    });
+    program.emit_insn(Insn::FkCheck { deferred: false });
 }

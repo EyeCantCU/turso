@@ -1971,6 +1971,8 @@ pub enum PragmaName {
     DataSyncRetry,
     /// List databases
     DatabaseList,
+    /// Defer all foreign key checks until the transaction ends
+    DeferForeignKeys,
     /// Encoding - only support utf8
     Encoding,
     /// Current free page count.
