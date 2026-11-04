@@ -508,6 +508,9 @@ pub struct Connection {
     /// A write ended in the read transaction of sibling statements; only the
     /// last active statement may end it.
     pub(super) read_kept_for_siblings: AtomicBool,
+    /// Modules registered at open whose stored tables are not connected yet;
+    /// connected when a statement fails to find a table.
+    pub(crate) pending_vtab_connect: Mutex<Vec<String>>,
     /// Deprecated pragma: when ON (default), column refs use just the column name
     pub(super) short_column_names: AtomicBool,
     /// Simulator-only planner control used by the differential fuzzer.
@@ -1278,8 +1281,28 @@ impl Connection {
         self.prepare_with_origin(sql, StatementOrigin::Root)
     }
 
-    #[turso_macros::trace_stack]
     pub(crate) fn prepare_with_origin(
+        self: &Arc<Connection>,
+        sql: impl AsRef<str>,
+        origin: StatementOrigin,
+    ) -> Result<Statement> {
+        let result = self.prepare_with_origin_once(sql.as_ref(), origin);
+        if let Err(LimboError::ParseError(msg)) = &result {
+            if msg.starts_with("no such table") && !self.pending_vtab_connect.lock().is_empty() {
+                let modules = std::mem::take(&mut *self.pending_vtab_connect.lock());
+                for module in modules {
+                    if let Err(e) = self.connect_stored_vtabs(&module) {
+                        tracing::debug!("connecting stored tables of vtab module {module}: {e}");
+                    }
+                }
+                return self.prepare_with_origin_once(sql.as_ref(), origin);
+            }
+        }
+        result
+    }
+
+    #[turso_macros::trace_stack]
+    fn prepare_with_origin_once(
         self: &Arc<Connection>,
         sql: impl AsRef<str>,
         origin: StatementOrigin,

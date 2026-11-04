@@ -141,7 +141,7 @@ pub(crate) fn on_open(db: *mut sqlite3, conn: &Arc<Connection>) {
         .lock()
         .unwrap()
         .insert(Arc::as_ptr(conn) as usize, name);
-    let _ = conn.register_vtab_module_local(
+    let _ = conn.register_vtab_module_local_at_open(
         turso_core::sqlite_dbpage::DBPAGE_MODULE_NAME,
         turso_core::sqlite_dbpage::DbpageModule,
         true,
@@ -153,7 +153,7 @@ pub(crate) fn on_open(db: *mut sqlite3, conn: &Arc<Connection>) {
         } else {
             turso_core::vdbevtab::BYTECODE_MODULE_NAME
         };
-        let _ = conn.register_vtab_module_local(
+        let _ = conn.register_vtab_module_local_at_open(
             name,
             turso_core::vdbevtab::BytecodeModule { tables_used },
             false,
@@ -161,7 +161,7 @@ pub(crate) fn on_open(db: *mut sqlite3, conn: &Arc<Connection>) {
         );
     }
     let _ =
-        conn.register_vtab_module_local("sqlite_stmt", StmtModule { db: db as usize }, false, true);
+        conn.register_vtab_module_local_at_open("sqlite_stmt", StmtModule { db: db as usize }, false, true);
 }
 
 /// Disconnects the eponymous virtual tables, as sqlite3_close does before

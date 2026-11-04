@@ -392,6 +392,37 @@ impl Connection {
     where
         M: crate::native_ext::VirtualTableModule + 'static,
     {
+        self.register_vtab_module_local_inner(name, module, creatable, eponymous, true)
+    }
+
+    /// Like [`Self::register_vtab_module_local`] but reads no schema: for a
+    /// module registered as the connection opens, which must not start the
+    /// first transaction (it would create the wal-index of an EXCLUSIVE
+    /// connection). Stored tables of the module connect on schema load.
+    pub fn register_vtab_module_local_at_open<M>(
+        self: &Arc<Connection>,
+        name: &str,
+        module: M,
+        creatable: bool,
+        eponymous: bool,
+    ) -> crate::Result<()>
+    where
+        M: crate::native_ext::VirtualTableModule + 'static,
+    {
+        self.register_vtab_module_local_inner(name, module, creatable, eponymous, false)
+    }
+
+    fn register_vtab_module_local_inner<M>(
+        self: &Arc<Connection>,
+        name: &str,
+        module: M,
+        creatable: bool,
+        eponymous: bool,
+        connect_stored: bool,
+    ) -> crate::Result<()>
+    where
+        M: crate::native_ext::VirtualTableModule + 'static,
+    {
         let module = VTabImpl {
             module_kind: if creatable {
                 VTabKind::VirtualTable
@@ -414,8 +445,12 @@ impl Connection {
         }
         self.bump_prepare_context_generation();
         if creatable && self.is_db_initialized() {
-            if let Err(e) = self.connect_stored_vtabs(name) {
-                tracing::debug!("connecting stored tables of vtab module {name}: {e}");
+            if connect_stored {
+                if let Err(e) = self.connect_stored_vtabs(name) {
+                    tracing::debug!("connecting stored tables of vtab module {name}: {e}");
+                }
+            } else {
+                self.pending_vtab_connect.lock().push(name.to_string());
             }
         }
         Ok(())
@@ -424,7 +459,7 @@ impl Connection {
     /// Connects the tables in sqlite_schema that use `module_name` and are
     /// not loaded yet. No lock is held while the module's constructor runs,
     /// since it may query this connection.
-    fn connect_stored_vtabs(self: &Arc<Connection>, module_name: &str) -> crate::Result<()> {
+    pub(crate) fn connect_stored_vtabs(self: &Arc<Connection>, module_name: &str) -> crate::Result<()> {
         let mut rows: Vec<(String, String)> = Vec::new();
         {
             let mut stmt = self

@@ -279,7 +279,7 @@ impl sqlite3 {
         #[cfg(feature = "csv")]
         register_csv_module(&conn);
         // Built in, as with SQLITE_ENABLE_DBSTAT_VTAB.
-        let _ = conn.register_vtab_module_local(
+        let _ = conn.register_vtab_module_local_at_open(
             turso_core::dbstat::DBSTAT_MODULE_NAME,
             turso_core::dbstat::DbstatModule::new(&conn),
             true,
