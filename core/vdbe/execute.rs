@@ -1765,7 +1765,6 @@ pub fn op_vupdate(
                     | LimboError::ReadOnly
                     // Module errors that carry SQLite's message.
                     | LimboError::SqlError(_)
-                    | LimboError::CorruptVtab(_)
                     | LimboError::Corrupt(_)
             ) =>
         {
@@ -4113,7 +4112,6 @@ fn build_constraint_violation_error(
 
 /// Call xCommit on all virtual tables that participated in the current transaction.
 pub(crate) fn vtab_commit_all(conn: &Arc<Connection>) -> crate::Result<()> {
-    vtab_hook_all(conn, false, crate::native_ext::TableHook::Sync)?;
     vtab_hook_all(conn, true, crate::native_ext::TableHook::Commit)
 }
 

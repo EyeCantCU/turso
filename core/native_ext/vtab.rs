@@ -40,8 +40,6 @@ impl Debug for ConnectInfo<'_> {
 #[derive(Debug, Clone, Copy)]
 pub enum TableHook<'a> {
     Begin,
-    /// xSync: before commit, while the transaction is still open.
-    Sync,
     Commit,
     Rollback,
     Savepoint(usize),
@@ -136,18 +134,6 @@ pub trait VirtualTable: Debug + Send + Sync {
     ) -> Result<Box<dyn TableUpdate>> {
         self.create_update_on_conflict(args, on_conflict)
     }
-    /// Runs before `commit`, while the transaction is still open (xSync).
-    fn sync(&mut self, _connection: &Arc<Connection>) -> Result<()> {
-        Ok(())
-    }
-    /// Like `savepoint`, with the connection that opened it.
-    fn savepoint_with_connection(
-        &mut self,
-        _connection: &Arc<Connection>,
-        level: usize,
-    ) -> Result<()> {
-        self.savepoint(level)
-    }
     /// Whether `CREATE VIRTUAL TABLE` enlists the new table in the
     /// transaction, so `commit` (or `rollback`) runs without a `begin`.
     fn commits_after_create(&self) -> bool {
@@ -186,10 +172,9 @@ pub trait VirtualTable: Debug + Send + Sync {
     fn hook(&mut self, conn: &Arc<Connection>, hook: TableHook<'_>) -> Result<()> {
         match hook {
             TableHook::Begin => self.begin(),
-            TableHook::Sync => self.sync(conn),
             TableHook::Commit => self.commit(),
             TableHook::Rollback => self.rollback(),
-            TableHook::Savepoint(level) => self.savepoint_with_connection(conn, level),
+            TableHook::Savepoint(level) => self.savepoint(level),
             TableHook::Release(level) => self.release(level),
             TableHook::RollbackTo(level) => self.rollback_to(level),
             TableHook::Rename(name) => self.rename_with_connection(conn, name),

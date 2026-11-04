@@ -1074,3 +1074,64 @@ fn test_fts5_plans() {
         sqlite3_close(db);
     }
 }
+
+// FTS3 and FTS5 both define snippet(); each table supplies its own through
+// xFindFunction, over placeholder global functions.
+#[test]
+fn test_fts3_and_fts5_aux_functions_coexist() {
+    unsafe {
+        let mut db: *mut sqlite3 = ptr::null_mut();
+        let name = CString::new(":memory:").unwrap();
+        assert_eq!(sqlite3_open(name.as_ptr(), &mut db), SQLITE_OK);
+        exec(db, "CREATE VIRTUAL TABLE f3 USING fts3(a)");
+        exec(db, "CREATE VIRTUAL TABLE f5 USING fts5(a)");
+        exec(
+            db,
+            "INSERT INTO f3 VALUES('the quick brown fox jumps over the lazy dog')",
+        );
+        exec(
+            db,
+            "INSERT INTO f5 VALUES('a quick movement of the enemy will jeopardize six gunboats')",
+        );
+        let mut got = Vec::new();
+        for q in [
+            "SELECT snippet(f3) || ' | ' || snippet(f5, 0, '[', ']', '...', 4) FROM f3, f5 WHERE f3 MATCH 'quick' AND f5 MATCH 'quick'",
+            "SELECT snippet(f5, 0, '<', '>', '', 3) || ' | ' || snippet(f3, '<', '>', '') FROM f5, f3 WHERE f5 MATCH 'enemy' AND f3 MATCH 'lazy'",
+            "SELECT offsets(f3) || ' | ' || highlight(f5, 0, '(', ')') || ' | ' || round(bm25(f5), 6) FROM f3, f5 WHERE f3 MATCH 'fox' AND f5 MATCH 'six'",
+            "SELECT snippet('x')",
+            "SELECT bm25(1)",
+            "SELECT highlight(f3, 0, '[', ']') FROM f3 WHERE f3 MATCH 'fox'",
+            "SELECT matchinfo(f5) FROM f5 WHERE f5 MATCH 'six'",
+        ] {
+            got.push(q.to_string());
+            match rows(db, q) {
+                Ok(r) => got.extend(r),
+                Err(e) => got.push(format!("ERR {}", e.trim_start_matches("Parse error: "))),
+            }
+        }
+        if std::env::var("FTS5_PRINT").is_ok() {
+            for g in &got {
+                println!("{g:?},");
+            }
+        }
+        // Expected output from SQLite 3.54.1 (FTS5_PRINT=1 with --features sqlite3).
+        let expected: &[&str] = &[
+            "SELECT snippet(f3) || ' | ' || snippet(f5, 0, '[', ']', '...', 4) FROM f3, f5 WHERE f3 MATCH 'quick' AND f5 MATCH 'quick'",
+            "the <b>quick</b> brown fox jumps over the lazy dog | a [quick] movement of...",
+            "SELECT snippet(f5, 0, '<', '>', '', 3) || ' | ' || snippet(f3, '<', '>', '') FROM f5, f3 WHERE f5 MATCH 'enemy' AND f3 MATCH 'lazy'",
+            "the <enemy> will | the quick brown fox jumps over the <lazy> dog",
+            "SELECT offsets(f3) || ' | ' || highlight(f5, 0, '(', ')') || ' | ' || round(bm25(f5), 6) FROM f3, f5 WHERE f3 MATCH 'fox' AND f5 MATCH 'six'",
+            "0 0 16 3 | a quick movement of the enemy will jeopardize (six) gunboats | -1.0e-06",
+            "SELECT snippet('x')",
+            "ERR unable to use function snippet in the requested context",
+            "SELECT bm25(1)",
+            "ERR unable to use function bm25 in the requested context",
+            "SELECT highlight(f3, 0, '[', ']') FROM f3 WHERE f3 MATCH 'fox'",
+            "ERR unable to use function highlight in the requested context",
+            "SELECT matchinfo(f5) FROM f5 WHERE f5 MATCH 'six'",
+            "ERR unable to use function matchinfo in the requested context",
+        ];
+        assert_eq!(got, expected);
+        sqlite3_close(db);
+    }
+}

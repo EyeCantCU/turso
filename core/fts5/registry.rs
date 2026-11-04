@@ -43,6 +43,14 @@ pub(crate) fn with<R>(conn: &Arc<Connection>, f: impl FnOnce(&ConnRegistry) -> R
     map.get(&key(conn)).map(|(_, r)| f(r))
 }
 
+/// Whether any open connection registered auxiliary function `name`.
+pub(crate) fn any_aux(name: &str) -> bool {
+    REGISTRIES
+        .lock()
+        .values()
+        .any(|(w, r)| w.strong_count() > 0 && r.aux.contains_key(name))
+}
+
 thread_local! {
     /// The connection whose registry tokenizer lookups use (a tokenizer
     /// such as porter looks up its parent while being created).

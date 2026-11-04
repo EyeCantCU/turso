@@ -766,7 +766,6 @@ impl VirtualTable for Fts3Vtab {
         };
         match hook {
             TableHook::Begin => write::begin(&ctx),
-            TableHook::Sync => Ok(()),
             TableHook::Commit => write::sync(&ctx),
             TableHook::Rollback => {
                 write::pending_clear(&ctx);

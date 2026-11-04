@@ -25,7 +25,7 @@ use crate::connection::SymbolTable;
 use crate::function::ExternalFunc;
 use crate::native_ext::{
     ConnectInfo, ConstraintInfo, ConstraintUsage, FunctionArity, IndexInfo, OrderByInfo,
-    ScalarCall, ScalarFunction, TableUpdate, VTabKind, VirtualTable, VirtualTableCursor,
+    ScalarCall, ScalarFunction, TableHook, TableUpdate, VTabKind, VirtualTable, VirtualTableCursor,
     VirtualTableModule,
 };
 use crate::sync::Weak;
@@ -72,16 +72,13 @@ pub(crate) fn register(syms: &mut SymbolTable) {
             vocab::VocabModule,
         ))),
     );
-    for name in ["bm25", "highlight", "snippet", "fts5_get_locale"] {
-        if let Ok(f) = ExternalFunc::new_native_scalar(
-            name.to_string(),
-            FunctionArity::Variadic,
-            false,
-            AuxFunction {
-                name: name.to_string(),
-            },
-        ) {
-            syms.functions.insert(name.to_string(), Arc::new(f));
+    // The auxiliary functions are found through xFindFunction; the global
+    // names are only placeholders, as sqlite3_overload_function makes them.
+    for name in BUILTIN_AUX {
+        if !syms.functions.contains_key(name) {
+            if let Some(f) = overload_placeholder(name) {
+                syms.functions.insert(name.to_string(), f);
+            }
         }
     }
     let simple: [(&'static str, FunctionArity); 4] = [
@@ -268,7 +265,66 @@ impl Fts5Table {
     }
 }
 
+const BUILTIN_AUX: [&str; 4] = ["bm25", "highlight", "snippet", "fts5_get_locale"];
+
+/// A function as `sqlite3_overload_function` registers it: it only works
+/// when a virtual table's xFindFunction supplies the real one.
+pub(crate) fn overload_placeholder(name: &str) -> Option<Arc<ExternalFunc>> {
+    ExternalFunc::new_native_scalar(
+        name.to_string(),
+        FunctionArity::Variadic,
+        false,
+        Overload {
+            name: name.to_string(),
+        },
+    )
+    .ok()
+    .map(Arc::new)
+}
+
+#[derive(Debug)]
+struct Overload {
+    name: String,
+}
+
+impl ScalarFunction for Overload {
+    type Call = OverloadCall;
+    fn create_call(&self) -> Result<OverloadCall> {
+        Ok(OverloadCall(self.name.clone()))
+    }
+}
+
+struct OverloadCall(String);
+
+impl ScalarCall for OverloadCall {
+    type Output = Value;
+    fn step(&mut self, _conn: &Arc<Connection>, _args: &[Register]) -> IOResultOr<Value> {
+        Err(err(format!(
+            "unable to use function {} in the requested context",
+            self.0
+        ))
+        .into())
+    }
+}
+
 impl VirtualTable for Fts5Table {
+    /// fts5FindFunctionMethod: the built-in auxiliary functions and those
+    /// registered through fts5_api.
+    fn find_function(&self, _n_arg: i32, name: &str) -> Option<(i32, Arc<ExternalFunc>)> {
+        let lname = name.to_ascii_lowercase();
+        if !BUILTIN_AUX.contains(&lname.as_str()) && !registry::any_aux(&lname) {
+            return None;
+        }
+        let f = ExternalFunc::new_native_scalar(
+            lname.clone(),
+            FunctionArity::Variadic,
+            false,
+            AuxFunction { name: lname },
+        )
+        .ok()?;
+        Some((1, Arc::new(f)))
+    }
+
     type Cursor = Fts5Cursor;
 
     fn open(&self, connection: Arc<Connection>) -> Result<Self::Cursor> {
@@ -443,26 +499,19 @@ impl VirtualTable for Fts5Table {
         }))
     }
 
-    fn sync(&mut self, connection: &Arc<Connection>) -> Result<()> {
-        self.inner.sync(connection)
-    }
-
-    fn savepoint_with_connection(
-        &mut self,
-        connection: &Arc<Connection>,
-        _level: usize,
-    ) -> Result<()> {
-        self.inner.sync(connection)
-    }
-
-    fn rollback_to(&mut self, _level: usize) -> Result<()> {
-        self.inner.discard_all();
-        Ok(())
-    }
-
-    fn rollback(&mut self) -> Result<()> {
-        self.inner.discard_all();
-        Ok(())
+    /// Commit flushes pending writes first (xSync), while the transaction
+    /// is still open; a savepoint flushes them so ROLLBACK TO can discard.
+    fn hook(&mut self, conn: &Arc<Connection>, hook: TableHook<'_>) -> Result<()> {
+        match hook {
+            TableHook::Commit | TableHook::Savepoint(_) => self.inner.sync(conn),
+            TableHook::Rollback | TableHook::RollbackTo(_) => {
+                self.inner.discard_all();
+                Ok(())
+            }
+            TableHook::Rename(name) => self.rename_with_connection(conn, name),
+            TableHook::Destroy => self.destroy_with_connection(conn),
+            TableHook::Begin | TableHook::Release(_) => Ok(()),
+        }
     }
 
     fn destroy_with_connection(&mut self, connection: &Arc<Connection>) -> Result<()> {
