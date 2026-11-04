@@ -161,8 +161,8 @@ pub trait VirtualTable: Debug + Send + Sync {
     }
 }
 
-/// A pointer value (`sqlite3_result_pointer`): a type tag and the object.
-pub type PointerPayload = (&'static str, Arc<dyn std::any::Any + Send + Sync>);
+/// A pointer value for a column (`sqlite3_result_pointer` in xColumn).
+pub type PointerPayload = Arc<crate::pointer::PointerValue>;
 
 pub trait VirtualTableCursor: Send + Sync {
     /// A pointer-typed NULL for `column`, read before `column`.

@@ -1554,20 +1554,27 @@ pub fn op_vcolumn(
         },
         insn
     );
-    let pointer = {
-        let cursor = state.get_cursor(*cursor_id);
-        cursor.as_virtual_mut().column_pointer(*column)
-    };
-    if let Some((tag, ptr)) = pointer {
-        state.registers[*dest] = Register::Pointer(crate::vdbe::PointerValue::new(tag, ptr));
-        state.pc += 1;
-        return Ok(InsnFunctionStepResult::Step);
-    }
-    let value = {
+    let (value, pointer) = {
         let cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_virtual_mut();
-        return_if_io!(state, cursor.column(*column))
+        let value = return_if_io!(state, cursor.column(*column));
+        // A pointer-typed NULL (sqlite3_result_pointer in xColumn).
+        let pointer = if matches!(value, Value::Null) {
+            cursor.column_pointer(*column)
+        } else {
+            None
+        };
+        (value, pointer)
     };
+    match pointer {
+        Some(p) => {
+            state.reg_pointers.insert(*dest, p);
+        }
+        None if !state.reg_pointers.is_empty() => {
+            state.reg_pointers.remove(dest);
+        }
+        None => {}
+    }
     state.registers[*dest].set_value(value);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -7340,7 +7347,7 @@ pub fn op_decr_jump_zero(
                 state.pc += 1;
             }
         }
-        Register::Value(_) | Register::Record(_) | Register::Pointer(_) => {
+        Register::Value(_) | Register::Record(_) => {
             bail_constraint_error!("datatype mismatch");
         }
         Register::Aggregate(_) => {
@@ -9505,7 +9512,7 @@ fn op_agg_step_slow(state: &mut ProgramState, data: &AggStepData) -> InsnResult 
         if let AggFunc::Count | AggFunc::Count0 = func {
             let counts = match (func, &state.registers[*col]) {
                 (AggFunc::Count0, _) => Some(true),
-                (_, Register::Value(Value::Null) | Register::Pointer(_)) => Some(false),
+                (_, Register::Value(Value::Null)) => Some(false),
                 (_, Register::Value(_) | Register::Record(_)) => Some(true),
                 (_, Register::Aggregate(_)) => None,
             };
@@ -13188,7 +13195,7 @@ pub fn op_insert(
                                 let record = ImmutableRecord::from_values(values, values.len())?;
                                 std::borrow::Cow::Owned(record)
                             }
-                            Register::Aggregate(..) | Register::Pointer(_) => {
+                            Register::Aggregate(..) => {
                                 unreachable!("Cannot insert an aggregate value.")
                             }
                         };
@@ -13210,7 +13217,7 @@ pub fn op_insert(
                             let record = ImmutableRecord::from_values(values, values.len())?;
                             std::borrow::Cow::Owned(record)
                         }
-                        Register::Aggregate(..) | Register::Pointer(_) => {
+                        Register::Aggregate(..) => {
                             unreachable!("Cannot insert an aggregate value.")
                         }
                     };
@@ -13378,7 +13385,7 @@ pub fn op_insert(
                             let record = ImmutableRecord::from_values(values, values.len())?;
                             std::borrow::Cow::Owned(record)
                         }
-                        Register::Aggregate(..) | Register::Pointer(_) => {
+                        Register::Aggregate(..) => {
                             unreachable!("Cannot insert an aggregate value.")
                         }
                     };
@@ -16828,7 +16835,7 @@ pub fn op_add_imm(
     let current_value = match current {
         Register::Value(val) => val,
         Register::Aggregate(_) => &Value::Null,
-        Register::Record(_) | Register::Pointer(_) => &Value::Null,
+        Register::Record(_) => &Value::Null,
     };
 
     // SQLite coerces the register to an integer before adding.

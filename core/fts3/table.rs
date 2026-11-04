@@ -1098,21 +1098,36 @@ impl VirtualTableCursor for Fts3Cursor {
     }
 
     fn column_pointer(&mut self, column: usize) -> Option<crate::native_ext::PointerPayload> {
-        (column == self.state.lock().tab.ncol()).then(|| {
-            let p: Arc<dyn std::any::Any + Send + Sync> = self.state.clone();
-            (CURSOR_POINTER, p)
-        })
+        if column != self.state.lock().tab.ncol() {
+            return None;
+        }
+        // The pointer owns one reference to the cursor state, released by
+        // the destructor when the value goes away.
+        let ptr = Arc::into_raw(self.state.clone()) as usize;
+        Some(Arc::new(crate::pointer::PointerValue {
+            ptr,
+            ty: CURSOR_POINTER.as_bytes().to_vec(),
+            destructor: Some(release_cursor_pointer),
+        }))
     }
+}
+
+unsafe extern "C" fn release_cursor_pointer(p: *mut std::ffi::c_void) {
+    // SAFETY: `p` came from Arc::into_raw in column_pointer, and the
+    // destructor runs once, when the pointer value is dropped.
+    unsafe { drop(Arc::from_raw(p as *const Mutex<CursorState>)) };
 }
 
 /// The cursor behind an auxiliary function's first argument
 /// (`sqlite3_value_pointer(v, "fts3cursor")`).
-fn cursor_arg(r: &Register) -> Option<Arc<Mutex<CursorState>>> {
-    match r {
-        Register::Pointer(p) if p.tag == CURSOR_POINTER => {
-            p.ptr.clone().downcast::<Mutex<CursorState>>().ok()
-        }
-        _ => None,
+fn cursor_arg() -> Option<Arc<Mutex<CursorState>>> {
+    let ptr =
+        crate::pointer::arg_pointer(0, CURSOR_POINTER.as_bytes())? as *const Mutex<CursorState>;
+    // SAFETY: the pointer value, alive for this call, holds a reference
+    // taken by Arc::into_raw; take another for the caller.
+    unsafe {
+        Arc::increment_strong_count(ptr);
+        Some(Arc::from_raw(ptr))
     }
 }
 
@@ -1150,7 +1165,7 @@ impl ScalarCall for AuxCall {
         if self.0 == Aux::Snippet && vals.len() > 6 {
             return Err(sql_error("wrong number of arguments to function snippet()").into());
         }
-        let Some(state) = args.first().and_then(cursor_arg) else {
+        let Some(state) = cursor_arg() else {
             return Err(sql_error(format!("illegal first argument to {name}")).into());
         };
         let mut st = state.lock();

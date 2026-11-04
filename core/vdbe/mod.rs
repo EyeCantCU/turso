@@ -469,39 +469,6 @@ pub enum Register {
     Value(Value),
     Aggregate(AggContext),
     Record(ImmutableRecord),
-    /// A pointer-typed NULL (`sqlite3_result_pointer`): reads as NULL
-    /// everywhere, but a function can take the pointer back.
-    Pointer(PointerValue),
-}
-
-/// The payload of a [`Register::Pointer`]: a type tag and the object.
-#[derive(Clone)]
-pub struct PointerValue {
-    pub tag: &'static str,
-    pub ptr: crate::sync::Arc<dyn std::any::Any + Send + Sync>,
-    null: Value,
-}
-
-impl PointerValue {
-    pub fn new(tag: &'static str, ptr: crate::sync::Arc<dyn std::any::Any + Send + Sync>) -> Self {
-        Self {
-            tag,
-            ptr,
-            null: Value::Null,
-        }
-    }
-}
-
-impl std::fmt::Debug for PointerValue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Pointer({})", self.tag)
-    }
-}
-
-impl PartialEq for PointerValue {
-    fn eq(&self, other: &Self) -> bool {
-        self.tag == other.tag && crate::sync::Arc::ptr_eq(&self.ptr, &other.ptr)
-    }
 }
 
 impl TryClone for Register {
@@ -515,7 +482,6 @@ impl TryClone for Register {
                 record.get_payload(),
                 RecordBuf::alloc(),
             )?)),
-            Register::Pointer(p) => Ok(Register::Pointer(p.clone())),
         }
     }
 
@@ -542,7 +508,6 @@ impl TryClone for Register {
                     RecordBuf::alloc(),
                 )?);
             }
-            (dst, Register::Pointer(p)) => *dst = Register::Pointer(p.clone()),
             (_, Register::Aggregate(_)) => unreachable!("aggregate accumulators cannot be copied"),
         }
         Ok(())
@@ -2126,7 +2091,6 @@ impl Register {
                 turso_assert!(!r.is_invalidated());
                 r.as_blob_value()
             }
-            Register::Pointer(p) => &p.null,
             _ => panic!("register holds unexpected value: {self:?}"),
         }
     }
@@ -2618,7 +2582,6 @@ impl Program {
                         Register::Value(v) => eprintln!("R[{i}] = {v}"),
                         Register::Aggregate(_) => eprintln!("R[{i}] = <aggregate>"),
                         Register::Record(_) => eprintln!("R[{i}] = <record>"),
-                        Register::Pointer(p) => eprintln!("R[{i}] = {p:?}"),
                     }
                 }
             }
@@ -4272,7 +4235,6 @@ impl Row {
         };
         let value = match value {
             Register::Value(value) => value,
-            Register::Pointer(_) => value.get_value(),
             _ => unreachable!("a row should be formed of values only"),
         };
         T::from_value(value)
@@ -4287,7 +4249,6 @@ impl Row {
         };
         match value {
             Register::Value(value) => value,
-            Register::Pointer(_) => value.get_value(),
             _ => unreachable!("a row should be formed of values only"),
         }
     }
