@@ -482,10 +482,17 @@ pub unsafe extern "C" fn sqlite3_vfs_find(z_vfs_name: *const ffi::c_char) -> *mu
     }
 }
 
+/// Names of SQLite's unix VFS variants, all served by turso's own locking.
+/// unix-flock is what SQLite builds with SQLITE_ENABLE_LOCKING_STYLE add.
 fn is_builtin_vfs_name(n: &[u8]) -> bool {
     matches!(
         n,
-        b"unix" | b"unix-none" | b"unix-excl" | b"unix-dotfile" | b"unix-namedsem"
+        b"unix"
+            | b"unix-none"
+            | b"unix-excl"
+            | b"unix-dotfile"
+            | b"unix-namedsem"
+            | b"unix-flock"
     )
 }
 
