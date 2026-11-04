@@ -221,6 +221,7 @@ const SQLITE_OPEN_READWRITE: i32 = 0x00000002;
 const SQLITE_OPEN_CREATE: i32 = 0x00000004;
 const SQLITE_OPEN_URI: i32 = 0x00000040;
 
+mod interleave;
 mod reentrancy;
 
 mod tests {

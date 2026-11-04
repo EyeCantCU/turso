@@ -486,8 +486,6 @@ static FUNC_BRIDGES: [ScalarFunction; MAX_CUSTOM_FUNCS] = [
 
 // ===== End custom function infrastructure =====
 
-mod reentrancy;
-
 static INIT_DONE: std::sync::Once = std::sync::Once::new();
 
 #[no_mangle]
@@ -1185,7 +1183,6 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> ffi::c_int
         return SQLITE_MISUSE;
     }
     let stmt_ref = &mut *stmt;
-    let _scope = reentrancy::StepScope::cleanup(stmt_ref);
 
     // first, finalize any execution if it was unfinished
     // (for example, many drivers can consume just one row and finalize statement after that, while there still can be work to do)
@@ -1231,7 +1228,6 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     // Nothing here needs the lock while stepping: core's Connection is
     // internally synchronized, and the statement itself was never protected
     // by the handle lock to begin with.
-    let _scope = reentrancy::StepScope::step(stmt);
     let res = stmt.stmt.run_one_step_blocking(|| Ok(()), || Ok(()));
     let rc = match res {
         Ok(Some(_)) => {
@@ -1361,7 +1357,6 @@ pub unsafe extern "C" fn sqlite3_reset(stmt: *mut sqlite3_stmt) -> ffi::c_int {
         return SQLITE_OK;
     }
     let stmt = &mut *stmt;
-    let _scope = reentrancy::StepScope::cleanup(stmt);
     // first, finalize any execution if it was unfinished
     // (for example, many drivers can consume just one row and finalize statement after that, while there still can be work to do)
     // (this is necessary because queries like INSERT INTO t VALUES (1), (2), (3) RETURNING id return values within a transaction)
