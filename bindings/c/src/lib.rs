@@ -3741,6 +3741,7 @@ fn limbo_err_code(err: &LimboError) -> i32 {
     match err {
         LimboError::Corrupt(..) => SQLITE_CORRUPT,
         LimboError::NotADB => SQLITE_NOTADB,
+        LimboError::CantOpen => SQLITE_CANTOPEN,
         // A Raise is a constraint error that carries its own conflict
         // resolution, and SQLite reports it as SQLITE_CONSTRAINT.
         LimboError::Constraint(_)

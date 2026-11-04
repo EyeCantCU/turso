@@ -3777,6 +3777,8 @@ impl Database {
             ) {
                 Ok(interlock) => interlock,
                 Err(LimboError::LockingError(_)) => return Err(LimboError::Busy),
+                // SQLite reports a wal-index it cannot open as SQLITE_CANTOPEN.
+                Err(LimboError::CompletionError(_)) => return Err(LimboError::CantOpen),
                 Err(err) => return Err(err),
             };
             if interlock.claim_index_rebuild() {
