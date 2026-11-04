@@ -141,6 +141,10 @@ int sqlite3_trace_v2(sqlite3*,
                      void *pCtx);
 
 void *sqlite3_trace(sqlite3*, void(*xTrace)(void*, const char*), void*);
+int sqlite3_autovacuum_pages(sqlite3 *db,
+                             unsigned int(*)(void*, const char*, unsigned int, unsigned int, unsigned int),
+                             void*,
+                             void(*)(void*));
 
 void *sqlite3_profile(sqlite3*, void(*xProfile)(void*, const char*, sqlite3_uint64), void*);
 

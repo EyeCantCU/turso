@@ -133,7 +133,7 @@ pub use cdc::{
 #[cfg(feature = "simulator")]
 pub use connection::SubqueryUnnestingMode;
 pub use connection::{
-    resolve_ext_path, Connection, ExtensionLoader, Row, StepResult, SymbolTable,
+    resolve_ext_path, AutovacuumPagesFn, Connection, ExtensionLoader, Row, StepResult, SymbolTable,
     TriggerTraceCallback,
 };
 pub(crate) use connection::{AtomicTransactionState, TransactionState};

@@ -24,6 +24,7 @@
 
 #include <tcl.h>
 #include <sqlite3.h>
+#include <stdio.h>
 #include <string.h>
 #include <strings.h>
 #include <stdlib.h>
@@ -1446,6 +1447,79 @@ static int exec_collect_cb(void *ctx, int argc, char **argv, char **colv)
  * message on failure. "%HH" sequences in the SQL are decoded to raw bytes
  * first, which is how upstream tests inject invalid UTF-8 into statements.
  */
+/* sqlite3_autovacuum_pages DB ?SCRIPT?, as in upstream test1.c: SCRIPT is
+ * called with schema, page count, free pages and page size and returns how
+ * many free pages to give back. */
+typedef struct AutovacPageData {
+    Tcl_Interp *interp;
+    char       *script;
+} AutovacPageData;
+
+static unsigned int autovac_pages_cb(void *arg, const char *schema,
+                                     unsigned int n_pages, unsigned int n_free,
+                                     unsigned int page_size)
+{
+    AutovacPageData *data = (AutovacPageData *)arg;
+    Tcl_DString str;
+    char buf[32];
+    int x = (int)n_free;
+    Tcl_DStringInit(&str);
+    Tcl_DStringAppend(&str, data->script, -1);
+    Tcl_DStringAppendElement(&str, schema);
+    snprintf(buf, sizeof(buf), "%u", n_pages);
+    Tcl_DStringAppendElement(&str, buf);
+    snprintf(buf, sizeof(buf), "%u", n_free);
+    Tcl_DStringAppendElement(&str, buf);
+    snprintf(buf, sizeof(buf), "%u", page_size);
+    Tcl_DStringAppendElement(&str, buf);
+    Tcl_ResetResult(data->interp);
+    Tcl_Eval(data->interp, Tcl_DStringValue(&str));
+    Tcl_DStringFree(&str);
+    (void)Tcl_GetIntFromObj(NULL, Tcl_GetObjResult(data->interp), &x);
+    return (unsigned int)x;
+}
+
+static void autovac_pages_free(void *arg)
+{
+    AutovacPageData *data = (AutovacPageData *)arg;
+    Tcl_Free(data->script);
+    Tcl_Free((char *)data);
+}
+
+static int TursoAutovacuumPagesCmd(ClientData cd, Tcl_Interp *interp,
+                                   int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    if (objc != 2 && objc != 3) {
+        Tcl_WrongNumArgs(interp, 1, objv, "DB ?SCRIPT?");
+        return TCL_ERROR;
+    }
+    const char *db_name = Tcl_GetString(objv[1]);
+    TursoDb *tdb = find_turso_db(interp, db_name);
+    if (!tdb) {
+        Tcl_AppendResult(interp, "no such database: ", db_name, NULL);
+        return TCL_ERROR;
+    }
+    int rc;
+    if (objc == 3) {
+        Tcl_Size len;
+        const char *script = Tcl_GetStringFromObj(objv[2], &len);
+        AutovacPageData *data = (AutovacPageData *)Tcl_Alloc(sizeof(*data));
+        data->interp = interp;
+        data->script = Tcl_Alloc(len + 1);
+        memcpy(data->script, script, len + 1);
+        rc = sqlite3_autovacuum_pages(tdb->db, autovac_pages_cb, data,
+                                      autovac_pages_free);
+    } else {
+        rc = sqlite3_autovacuum_pages(tdb->db, NULL, NULL, NULL);
+    }
+    if (rc != SQLITE_OK) {
+        Tcl_SetObjResult(interp, Tcl_NewIntObj(rc));
+        return TCL_ERROR;
+    }
+    return TCL_OK;
+}
+
 static int TursoExecCmd(ClientData cd, Tcl_Interp *interp,
                         int objc, Tcl_Obj *const objv[])
 {
@@ -3701,6 +3775,8 @@ int Tursotcl_Init(Tcl_Interp *interp)
     Tcl_CreateObjCommand(interp, "sqlite3", TursoOpenCmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "sqlite", TursoOpenCmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "sqlite3_exec", TursoExecCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_autovacuum_pages",
+                         TursoAutovacuumPagesCmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "sqlite3_connection_pointer",
                          TursoConnectionPointerCmd, NULL, NULL);
     Sqlitetestrtree_Init(interp);

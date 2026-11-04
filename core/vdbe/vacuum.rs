@@ -2081,7 +2081,12 @@ fn vacuum_in_place_step(
 
                 let config = VacuumTargetBuildConfig {
                     source_conn: connection.clone(),
-                    escaped_schema_name: "main".to_string(),
+                    escaped_schema_name: connection
+                        .list_all_databases()
+                        .into_iter()
+                        .find(|(idx, _, _)| *idx == db)
+                        .map_or_else(|| "main".to_string(), |(_, name, _)| name)
+                        .replace('"', "\"\""),
                     source_db_id: db,
                     header_meta,
                     source_custom_types,

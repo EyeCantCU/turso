@@ -101,6 +101,7 @@ fn default_db_opts() -> DatabaseOpts {
     opts
 }
 
+mod autovacuum;
 mod compat_lifecycle;
 mod guard;
 mod multiprocess;

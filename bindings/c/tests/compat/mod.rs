@@ -102,6 +102,20 @@ extern "C" {
     fn sqlite3_column_table_name(stmt: *mut sqlite3_stmt, idx: i32) -> *const libc::c_char;
     fn sqlite3_last_insert_rowid(db: *mut sqlite3) -> i64;
     fn sqlite3_column_count(stmt: *mut sqlite3_stmt) -> i32;
+    fn sqlite3_autovacuum_pages(
+        db: *mut sqlite3,
+        callback: Option<
+            unsafe extern "C" fn(
+                *mut libc::c_void,
+                *const libc::c_char,
+                libc::c_uint,
+                libc::c_uint,
+                libc::c_uint,
+            ) -> libc::c_uint,
+        >,
+        arg: *mut libc::c_void,
+        destructor: Option<unsafe extern "C" fn(*mut libc::c_void)>,
+    ) -> i32;
     fn sqlite3_bind_text(
         stmt: *mut sqlite3_stmt,
         idx: i32,
@@ -5138,6 +5152,74 @@ mod wrappers {
             let text = std::ffi::CStr::from_ptr(sqlite3_column_text(stmt, 0));
             assert_eq!(text.to_str().unwrap(), "ok");
             assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+    #[derive(Default)]
+    struct AutovacCalls {
+        calls: Vec<(String, u32, u32, u32)>,
+        destroyed: bool,
+    }
+
+    unsafe extern "C" fn autovac_half(
+        arg: *mut libc::c_void,
+        schema: *const libc::c_char,
+        pages: libc::c_uint,
+        free: libc::c_uint,
+        page_size: libc::c_uint,
+    ) -> libc::c_uint {
+        let calls = &mut *(arg as *mut AutovacCalls);
+        let schema = std::ffi::CStr::from_ptr(schema)
+            .to_str()
+            .unwrap()
+            .to_string();
+        calls.calls.push((schema, pages, free, page_size));
+        free / 2
+    }
+
+    unsafe extern "C" fn autovac_destroy(arg: *mut libc::c_void) {
+        (*(arg as *mut AutovacCalls)).destroyed = true;
+    }
+
+    #[test]
+    fn test_autovacuum_pages_limits_commit_vacuum() {
+        unsafe {
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+            av_run(db, c"PRAGMA page_size = 4096");
+            av_run(db, c"PRAGMA auto_vacuum = FULL");
+            av_run(db, c"CREATE TABLE t(x)");
+            av_run(
+                db,
+                c"WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 40) \
+                  INSERT INTO t SELECT randomblob(2000) FROM n",
+            );
+            let pages = av_run(db, c"PRAGMA page_count").2 as u32;
+            let mut calls = Box::new(AutovacCalls::default());
+            let arg = &mut *calls as *mut AutovacCalls as *mut libc::c_void;
+            assert_eq!(
+                sqlite3_autovacuum_pages(db, Some(autovac_half), arg, Some(autovac_destroy)),
+                SQLITE_OK
+            );
+            av_run(db, c"DELETE FROM t");
+            assert_eq!(calls.calls.len(), 1, "one call per commit");
+            let (schema, n_pages, free, size) = calls.calls[0].clone();
+            assert_eq!((schema.as_str(), n_pages, size), ("main", pages, 4096));
+            assert!(free > 0);
+            assert_eq!(
+                av_run(db, c"PRAGMA freelist_count").2,
+                (free - free / 2) as i64
+            );
+            // Replacing the callback runs the old destructor.
+            assert_eq!(
+                sqlite3_autovacuum_pages(db, None, ptr::null_mut(), None),
+                SQLITE_OK
+            );
+            assert!(calls.destroyed);
+            av_run(db, c"CREATE TABLE u(y)");
+            assert_eq!(av_run(db, c"PRAGMA freelist_count").2, 0);
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
     }

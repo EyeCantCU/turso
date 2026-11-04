@@ -557,7 +557,6 @@ proc sqlite3_stmt_scanstatus {args} { return "" }
 proc sqlite3_stmt_scanstatus_reset {args} { return "" }
 proc sqlite3_system_errno {args} { return 0 }
 proc sqlite3_mmap_warm {args} { return SQLITE_OK }
-proc sqlite3_autovacuum_pages {args} { return "" }
 proc sqlite3_rekey {args} { return "" }
 proc sqlite3_key {args} { return "" }
 proc sqlite3_normalize {sql} { return $sql }
@@ -1384,4 +1383,29 @@ proc finish_test {} {
 # database the parent is testing.
 if {![info exists ::TURSO_CHILD_PROCESS]} {
   reset_db
+}
+
+# Turso keeps every database in WAL mode, so an auto-vacuum database only
+# shrinks on disk at a checkpoint, while upstream tests run in rollback mode
+# and read the file size right after COMMIT. Before [file size] of an
+# auto-vacuum database that [db] or [db2] has open, checkpoint it.
+if {[info commands ::__turso_tcl_file] eq ""} {
+  rename ::file ::__turso_tcl_file
+  proc ::file {args} {
+    if {[lindex $args 0] eq "size" && [llength $args] == 2} {
+      catch {
+        set target [::__turso_tcl_file normalize [lindex $args 1]]
+        foreach h {db db2} {
+          if {[info commands ::$h] eq ""} continue
+          foreach {seq schema path} [$h eval {PRAGMA database_list}] {
+            if {$path eq "" || [::__turso_tcl_file normalize $path] ne $target} continue
+            if {[$h one "PRAGMA \"$schema\".auto_vacuum"] != 0} {
+              $h eval "PRAGMA \"$schema\".wal_checkpoint(TRUNCATE)"
+            }
+          }
+        }
+      }
+    }
+    uplevel 1 [list ::__turso_tcl_file {*}$args]
+  }
 }

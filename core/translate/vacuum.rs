@@ -101,16 +101,12 @@ pub fn translate_vacuum(
                 return Err(LimboError::Busy);
             }
 
-            // Schema-qualified VACUUM is not supported yet.
-            if schema_name != "main" {
-                bail_parse_error!(
-                    "VACUUM is only supported for the main database; schema '{}' is not supported yet",
-                    schema_name
-                );
+            let db = connection.get_database_id_by_name(&schema_name)?;
+            // Like SQLite, vacuuming the temp database does nothing here.
+            if db == TEMP_DB_ID {
+                return Ok(());
             }
-            program.emit_insn(Insn::Vacuum {
-                db: crate::MAIN_DB_ID,
-            });
+            program.emit_insn(Insn::Vacuum { db });
             Ok(())
         }
     }
