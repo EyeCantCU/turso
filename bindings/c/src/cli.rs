@@ -210,18 +210,48 @@ pub(crate) fn on_close(conn: &Arc<Connection>) {
     drop(entries);
 }
 
-/// Whether `name` is a table (not a view) of the main database, for
-/// sqlite3_table_column_metadata with a NULL column.
-pub(crate) fn table_exists(conn: &Arc<Connection>, name: &str) -> bool {
+/// (schema, name, type) of every table and view (PRAGMA table_list).
+fn table_list(conn: &Arc<Connection>) -> Vec<(String, String, String)> {
     let text = |v: &Value| v.to_text().unwrap_or_default().to_string();
-    conn.pragma_query("table_list").is_ok_and(|rows| {
-        rows.iter().any(|r| {
-            r.len() > 2
-                && text(&r[0]) == "main"
-                && text(&r[1]).eq_ignore_ascii_case(name)
-                && text(&r[2]) != "view"
+    conn.pragma_query("table_list")
+        .map(|rows| {
+            rows.iter()
+                .filter(|r| r.len() > 2)
+                .map(|r| (text(&r[0]), text(&r[1]), text(&r[2])))
+                .collect()
         })
+        .unwrap_or_default()
+}
+
+/// Whether `name` is a table (not a view) of `schema`, for
+/// sqlite3_table_column_metadata with a NULL column.
+pub(crate) fn table_exists(conn: &Arc<Connection>, schema: &str, name: &str) -> bool {
+    table_list(conn).iter().any(|(s, n, t)| {
+        s.eq_ignore_ascii_case(schema) && n.eq_ignore_ascii_case(name) && t != "view"
     })
+}
+
+/// The schema holding table `name`, searching temp before main, then the
+/// attached databases (sqlite3FindTable).
+pub(crate) fn table_schema(conn: &Arc<Connection>, name: &str) -> Option<String> {
+    let list = table_list(conn);
+    let rank = |s: &str| match s {
+        "temp" => 0,
+        "main" => 1,
+        _ => 2,
+    };
+    list.iter()
+        .filter(|(_, n, _)| n.eq_ignore_ascii_case(name))
+        .min_by_key(|(s, _, _)| rank(s))
+        .map(|(s, _, _)| s.clone())
+}
+
+/// Whether `schema` names a database of the connection.
+pub(crate) fn schema_exists(conn: &Arc<Connection>, schema: &str) -> bool {
+    conn.list_all_databases()
+        .iter()
+        .any(|(_, n, _)| n.eq_ignore_ascii_case(schema))
+        || schema.eq_ignore_ascii_case("temp")
 }
 
 // ------------------------------------------------------------ client data

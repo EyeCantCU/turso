@@ -37,6 +37,7 @@ fn validate_delete(
         && !connection.is_mvcc_bootstrap_connection()
         && !connection.allows_user_dml(tbl_name)
     {
+        let tbl_name = crate::introspect::dml_error_name(tbl_name);
         crate::bail_parse_error!("table {tbl_name} may not be modified");
     }
     if crate::translate::planner::is_protected_shadow_table(

@@ -87,7 +87,10 @@ fn validate(
         && !conn.is_mvcc_bootstrap_connection()
         && !conn.allows_user_dml(table_name)
     {
-        crate::bail_parse_error!("table {} may not be modified", table_name);
+        crate::bail_parse_error!(
+            "table {} may not be modified",
+            crate::introspect::dml_error_name(table_name)
+        );
     }
     if crate::translate::planner::is_protected_shadow_table(
         resolver,

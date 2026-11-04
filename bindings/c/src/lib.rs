@@ -3637,18 +3637,17 @@ pub unsafe extern "C" fn sqlite3_table_column_metadata(
         Err(_) => return SQLITE_MISUSE,
     };
 
-    // Handle database name (can be NULL for main database)
+    // A NULL database name searches temp, then main, then attached ones.
     let db_name = if z_db_name.is_null() {
-        "main"
+        cli::table_schema(&db_inner.conn, table_name).unwrap_or_else(|| "main".to_string())
     } else {
         match CStr::from_ptr(z_db_name).to_str() {
-            Ok(s) => s,
+            Ok(s) => s.to_string(),
             Err(_) => return SQLITE_MISUSE,
         }
     };
 
-    // For now, we only support the main database
-    if db_name != "main" {
+    if !cli::schema_exists(&db_inner.conn, &db_name) {
         rc = SQLITE_ERROR;
     } else {
         // Handle column name (can be NULL to just check table existence)
@@ -3659,10 +3658,10 @@ pub unsafe extern "C" fn sqlite3_table_column_metadata(
             };
 
             // Use pragma table_info to get column information
-            match db_inner
-                .conn
-                .pragma_query(&format!("table_info({table_name})"))
-            {
+            match db_inner.conn.pragma_query(&format!(
+                "\"{}\".table_info({table_name})",
+                db_name.replace('"', "\"\"")
+            )) {
                 Ok(rows) => {
                     let mut found_column = false;
                     for row in rows {
@@ -3721,7 +3720,7 @@ pub unsafe extern "C" fn sqlite3_table_column_metadata(
                     rc = SQLITE_ERROR;
                 }
             }
-        } else if !cli::table_exists(&db_inner.conn, table_name) {
+        } else if !cli::table_exists(&db_inner.conn, &db_name, table_name) {
             // A NULL column only checks that the table exists.
             rc = SQLITE_ERROR;
         }

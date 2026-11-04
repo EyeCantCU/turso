@@ -1553,3 +1553,45 @@ fn test_cli_writable_schema_defensive() {
         sqlite3_close(db);
     }
 }
+
+#[test]
+fn test_cli_table_column_metadata_schemas() {
+    unsafe {
+        let db = open();
+        exec_ok(
+            db,
+            "CREATE TABLE m(a); CREATE TEMP TABLE p(key TEXT PRIMARY KEY, value)",
+        );
+        let meta = |schema: Option<&str>, table: &str, col: Option<&str>| {
+            let s = schema.map(c);
+            let col = col.map(c);
+            sqlite3_table_column_metadata(
+                db,
+                s.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+                c(table).as_ptr(),
+                col.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+        // The shell's .parameter checks TEMP.sqlite_parameters this way.
+        assert_eq!(meta(Some("TEMP"), "p", Some("key")), SQLITE_OK);
+        assert_eq!(meta(Some("temp"), "p", None), SQLITE_OK);
+        assert_eq!(meta(Some("main"), "p", None), SQLITE_ERROR);
+        assert_eq!(meta(None, "p", Some("value")), SQLITE_OK);
+        assert_eq!(meta(None, "m", Some("a")), SQLITE_OK);
+        assert_eq!(meta(Some("temp"), "m", None), SQLITE_ERROR);
+        assert_eq!(meta(Some("nosuch"), "m", None), SQLITE_ERROR);
+        // Writes to the schema table name it sqlite_master.
+        // ("Parse error: " is turso's prefix until compat/errmsg.)
+        let msg = query_err(db, "DELETE FROM sqlite_schema");
+        assert!(
+            msg.ends_with("table sqlite_master may not be modified"),
+            "{msg}"
+        );
+        sqlite3_close(db);
+    }
+}

@@ -304,3 +304,13 @@ fn is_schema_table_name(name: &str) -> bool {
     .iter()
     .any(|n| n.eq_ignore_ascii_case(name))
 }
+
+/// The name SQLite reports for a protected table: its schema table is
+/// always "sqlite_master".
+pub(crate) fn dml_error_name(name: &str) -> &str {
+    if is_schema_table_name(name) {
+        "sqlite_master"
+    } else {
+        name
+    }
+}
