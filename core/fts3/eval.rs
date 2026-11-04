@@ -10,9 +10,11 @@ use super::segment::{
     decode_doclist, decode_poslist, seg_reader_cursor, MultiSegReader, SegFilter, COLUMN_FILTER,
     FIRST, IGNORE_EMPTY, PREFIX, REQUIRE_POS,
 };
-use super::table::Ctx;
+use super::table::{Ctx, Fts3Table};
+use crate::Connection;
 use crate::Result;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// A position list: (column, positions), columns and positions ascending.
 pub(crate) type Pl = Vec<(i32, Vec<i64>)>;
@@ -35,6 +37,10 @@ pub(crate) struct PhraseState {
     list_idx: Option<usize>,
     or_iter: Option<isize>,
     or_docid: i64,
+    /// Highest token index in the loaded doclist (`iDoclistToken`), or -1.
+    doclist_token: i32,
+    /// Tokens tested against the row content instead (deferred tokens).
+    deferred: Vec<usize>,
 }
 
 #[derive(Default, Clone)]
@@ -43,6 +49,8 @@ pub(crate) struct NodeState {
     pub eof: bool,
     pub start: bool,
     pub ami: Option<Vec<u32>>,
+    /// Every token below this node is deferred (`bDeferred`).
+    pub deferred: bool,
 }
 
 pub(crate) struct Eval {
@@ -56,6 +64,52 @@ pub(crate) struct Eval {
     pub ncol: usize,
     min_docid: i64,
     max_docid: i64,
+    /// Whether any token is deferred (`pCsr->pDeferred`).
+    any_deferred: bool,
+    /// Documents in the table (`pCsr->nDoc`), known once deferral ran.
+    n_doc: i64,
+    tab: Arc<Fts3Table>,
+    conn: Arc<Connection>,
+    langid: i32,
+    /// The row content the deferred tokens were matched against.
+    row_cache: Option<(i64, Vec<Option<Vec<u8>>>)>,
+    /// First error raised while testing deferred tokens.
+    err: Option<crate::LimboError>,
+}
+
+/// One token's place while deferral is decided (`Fts3TokenAndCost`).
+struct TokenCost {
+    phrase: usize,
+    token: usize,
+    root: Option<usize>,
+    ovfl: i64,
+    icol: i32,
+}
+
+/// Merges a token doclist into a phrase's partial doclist
+/// (`fts3EvalPhraseMergeToken`); positions are those of the later token.
+fn merge_token(partial: &mut Option<(i32, Doclist)>, itoken: i32, dl: Doclist) {
+    *partial = Some(match partial.take() {
+        None => (itoken, dl),
+        Some((max, prev)) => {
+            let (left, right, dist) = if max < itoken {
+                (prev, dl, itoken - max)
+            } else {
+                (dl, prev, max - itoken)
+            };
+            let mut rmap: BTreeMap<i64, Pl> = right.into_iter().collect();
+            let mut out = Doclist::new();
+            for (d, pl) in left {
+                if let Some(r) = rmap.remove(&d) {
+                    let m = pl_phrase(&pl, &r, dist as i64);
+                    if !m.is_empty() {
+                        out.push((d, m));
+                    }
+                }
+            }
+            (max.max(itoken), out)
+        }
+    });
 }
 
 /// Union of position lists (`fts3PoslistMerge`).
@@ -120,7 +174,8 @@ fn pl_nonempty(pl: &Option<Pl>) -> bool {
 
 /// Loads one token's doclist (`fts3TermSelect`), merged over all segments
 /// and, for a prefix token, all matching terms.
-fn token_doclist(ctx: &Ctx, langid: i32, tok: &super::expr::Token, icol: i32) -> Result<Doclist> {
+/// The segment readers of one token (`fts3TermSegReaderCursor`).
+fn token_cursor(ctx: &Ctx, langid: i32, tok: &super::expr::Token) -> Result<MultiSegReader> {
     let tab = ctx.tab;
     let nterm = tok.z.len() as i32;
     let mut csr = MultiSegReader::default();
@@ -183,6 +238,42 @@ fn token_doclist(ctx: &Ctx, langid: i32, tok: &super::expr::Token, icol: i32) ->
             &mut csr,
         )?;
     }
+    Ok(csr)
+}
+
+/// Pages of a token's doclist beyond one per leaf (`sqlite3Fts3MsrOvfl`).
+fn token_ovfl(ctx: &Ctx, csr: &MultiSegReader) -> Result<i64> {
+    let pgsz = ctx.tab.page_size(ctx.conn)? as i64;
+    let sql = format!(
+        "SELECT length(block) FROM {} WHERE blockid = ?",
+        ctx.tab.shadow("segments")
+    );
+    let mut novfl = 0;
+    for seg in &csr.segs {
+        if seg.is_pending() || seg.is_root_only() {
+            continue;
+        }
+        for b in seg.start_block..=seg.leaf_end_block {
+            let n = match ctx.sql().row(&sql, &[crate::Value::from_i64(b)])? {
+                Some(r) => super::value_int(&r[0]),
+                None => return Err(super::corrupt()),
+            };
+            if n + 35 > pgsz {
+                novfl += (n + 34) / pgsz;
+            }
+        }
+    }
+    Ok(novfl)
+}
+
+/// `fts3TermSelect` over a token's readers.
+fn cursor_doclist(
+    ctx: &Ctx,
+    mut csr: MultiSegReader,
+    tok: &super::expr::Token,
+    icol: i32,
+) -> Result<Doclist> {
+    let tab = ctx.tab;
     let ncol = tab.columns.len() as i32;
     let flags = IGNORE_EMPTY
         | REQUIRE_POS
@@ -240,7 +331,8 @@ fn token_doclist(ctx: &Ctx, langid: i32, tok: &super::expr::Token, icol: i32) ->
 impl Eval {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        ctx: &Ctx,
+        tab: Arc<Fts3Table>,
+        conn: Arc<Connection>,
         expr: Expr,
         langid: i32,
         bdesc: bool,
@@ -248,62 +340,327 @@ impl Eval {
         max_docid: i64,
     ) -> Result<Self> {
         let n = expr.nodes.len();
-        let tab = ctx.tab;
-        let mut ph: Vec<Option<PhraseState>> = (0..n).map(|_| None).collect();
-        for i in expr.all_phrases() {
-            let p = expr.nodes[i].phrase.as_ref().expect("phrase");
-            // fts3EvalPhraseLoad: merge the token doclists left to right.
-            let mut dl: Option<Doclist> = None;
-            for t in &p.tokens {
-                let tdl = token_doclist(ctx, langid, t, p.icol)?;
-                dl = Some(match dl {
-                    None => tdl,
-                    Some(prev) => {
-                        let mut right: BTreeMap<i64, Pl> = tdl.into_iter().collect();
-                        let mut out = Doclist::new();
-                        for (d, pl) in prev {
-                            if let Some(r) = right.remove(&d) {
-                                let m = pl_phrase(&pl, &r, 1);
-                                if !m.is_empty() {
-                                    out.push((d, m));
-                                }
+        let ctx = Ctx {
+            conn: &conn,
+            tab: &tab,
+        };
+        let phrases = expr.all_phrases();
+        // Each token's readers (fts3EvalAllocateReaders).
+        let mut csrs: BTreeMap<(usize, usize), MultiSegReader> = BTreeMap::new();
+        let mut ntoken = 0;
+        for &e in &phrases {
+            let p = expr.nodes[e].phrase.as_ref().expect("phrase");
+            for (i, t) in p.tokens.iter().enumerate() {
+                csrs.insert((e, i), token_cursor(&ctx, langid, t)?);
+                ntoken += 1;
+            }
+        }
+        let mut partial: BTreeMap<usize, Option<(i32, Doclist)>> = BTreeMap::new();
+        let mut deferred: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        let mut n_doc = 0;
+        if ntoken > 1 && tab.fts4 {
+            // fts3EvalTokenCosts: AND/NEAR clusters, NOT subtrees skipped.
+            let mut tcs: Vec<TokenCost> = Vec::new();
+            let mut ors: Vec<usize> = Vec::new();
+            fn costs(
+                expr: &Expr,
+                n: usize,
+                root: Option<usize>,
+                tcs: &mut Vec<TokenCost>,
+                ors: &mut Vec<usize>,
+            ) {
+                let node = &expr.nodes[n];
+                if node.etype == PHRASE {
+                    let p = node.phrase.as_ref().expect("phrase");
+                    for i in 0..p.tokens.len() {
+                        tcs.push(TokenCost {
+                            phrase: n,
+                            token: i,
+                            root,
+                            ovfl: 0,
+                            icol: p.icol,
+                        });
+                    }
+                } else if node.etype != NOT {
+                    let (l, r) = (node.left.unwrap(), node.right.unwrap());
+                    let mut lroot = root;
+                    let mut rroot = root;
+                    if node.etype == OR {
+                        lroot = Some(l);
+                        ors.push(l);
+                    }
+                    costs(expr, l, lroot, tcs, ors);
+                    if node.etype == OR {
+                        rroot = Some(r);
+                        ors.push(r);
+                    }
+                    costs(expr, r, rroot, tcs, ors);
+                }
+            }
+            if let Some(root) = expr.root {
+                costs(&expr, root, None, &mut tcs, &mut ors);
+            }
+            for tc in tcs.iter_mut() {
+                tc.ovfl = token_ovfl(&ctx, &csrs[&(tc.phrase, tc.token)])?;
+            }
+            let mut row_avg = 0i64;
+            let roots: Vec<Option<usize>> = std::iter::once(None)
+                .chain(ors.into_iter().map(Some))
+                .collect();
+            for root in roots {
+                // fts3EvalSelectDeferred
+                if tab.content.is_some() {
+                    break;
+                }
+                let idx: Vec<usize> = (0..tcs.len()).filter(|&i| tcs[i].root == root).collect();
+                let novfl: i64 = idx.iter().map(|&i| tcs[i].ovfl).sum();
+                if novfl == 0 || idx.len() < 2 {
+                    continue;
+                }
+                if row_avg == 0 {
+                    // fts3EvalAverageDocsize
+                    let sql = format!("SELECT value FROM {} WHERE id=?", tab.shadow("stat"));
+                    let a = match ctx.sql().row(&sql, &[crate::Value::from_i64(0)])? {
+                        Some(r) => match &r[0] {
+                            crate::Value::Blob(b) => b.to_vec(),
+                            _ => return Err(super::corrupt()),
+                        },
+                        None => return Err(super::corrupt()),
+                    };
+                    let mut p = 0;
+                    let (nd, k) = super::get_varint(&a, p);
+                    p += k;
+                    let mut nbyte = 0;
+                    while p < a.len() {
+                        let (v, k) = super::get_varint(&a, p);
+                        p += k;
+                        nbyte = v;
+                    }
+                    if nd == 0 || nbyte == 0 {
+                        return Err(super::corrupt());
+                    }
+                    n_doc = nd;
+                    let pgsz = tab.page_size(&conn)? as i64;
+                    row_avg = ((nbyte / nd) + pgsz) / pgsz;
+                }
+                let mut done = vec![false; idx.len()];
+                let mut min_est: i64 = 0;
+                let mut load4: i64 = 1;
+                for ii in 0..idx.len() {
+                    let mut pick: Option<usize> = None;
+                    for (k, &i) in idx.iter().enumerate() {
+                        if !done[k] && pick.is_none_or(|p| tcs[i].ovfl < tcs[idx[p]].ovfl) {
+                            pick = Some(k);
+                        }
+                    }
+                    let k = pick.expect("token left");
+                    done[k] = true;
+                    let tc = &tcs[idx[k]];
+                    let key = (tc.phrase, tc.token);
+                    if ii > 0 && tc.ovfl >= ((min_est + (load4 / 4) - 1) / (load4 / 4)) * row_avg {
+                        csrs.remove(&key);
+                        deferred.entry(tc.phrase).or_default().push(tc.token);
+                    } else {
+                        if ii < 12 {
+                            load4 *= 4;
+                        }
+                        let pntok = expr.nodes[tc.phrase]
+                            .phrase
+                            .as_ref()
+                            .map(|p| p.tokens.len())
+                            .unwrap_or(0);
+                        if ii == 0 || (pntok > 1 && ii != idx.len() - 1) {
+                            let tok = expr.nodes[tc.phrase].phrase.as_ref().unwrap().tokens
+                                [tc.token]
+                                .clone();
+                            let csr = csrs.remove(&key).expect("token readers");
+                            let dl = cursor_doclist(&ctx, csr, &tok, tc.icol)?;
+                            let part = partial.entry(tc.phrase).or_default();
+                            merge_token(part, tc.token as i32, dl);
+                            let count = part.as_ref().map(|p| p.1.len()).unwrap_or(0) as i64;
+                            if ii == 0 || count < min_est {
+                                min_est = count;
                             }
                         }
-                        out
                     }
-                });
+                }
             }
-            let orig = dl.unwrap_or_default();
+        }
+        let mut ph: Vec<Option<PhraseState>> = (0..n).map(|_| None).collect();
+        let mut ns = vec![NodeState::default(); n];
+        let any_deferred = deferred.values().any(|v| !v.is_empty());
+        for &e in &phrases {
+            let p = expr.nodes[e].phrase.as_ref().expect("phrase");
+            let def = deferred.remove(&e).unwrap_or_default();
+            let mut part = partial.remove(&e).unwrap_or_default();
+            let mut remaining = Vec::new();
+            for (i, t) in p.tokens.iter().enumerate() {
+                if let Some(csr) = csrs.remove(&(e, i)) {
+                    remaining.push(i);
+                    let dl = cursor_doclist(&ctx, csr, t, p.icol)?;
+                    merge_token(&mut part, i as i32, dl);
+                }
+            }
+            let (doclist_token, orig) = match part {
+                Some((m, dl)) => (m, dl),
+                None => (-1, Doclist::new()),
+            };
+            // fts3EvalPhraseStart: only tokens still read from the index count.
             let incr_ok = bdesc == tab.desc
                 && !p.tokens.is_empty()
                 && p.tokens.len() <= 4
-                && p.tokens.iter().all(|t| {
-                    !t.first && (!t.is_prefix || tab.prefixes[1..].contains(&(t.z.len() as i32)))
+                && p.tokens.iter().all(|t| !t.first)
+                && !remaining.is_empty()
+                && remaining.iter().all(|&i| {
+                    let t = &p.tokens[i];
+                    !t.is_prefix || tab.prefixes[1..].contains(&(t.z.len() as i32))
                 });
+            ns[e].deferred = !p.tokens.is_empty() && def.len() == p.tokens.len();
             let mut st = PhraseState {
                 ntoken: p.tokens.len(),
                 icol: p.icol,
                 orig,
                 incr: incr_ok,
+                doclist_token,
+                deferred: def,
                 ..Default::default()
             };
             if !st.incr {
                 st.all.clone_from(&st.orig);
             }
-            ph[i] = Some(st);
+            ph[e] = Some(st);
         }
+        // bDeferred of operators: both sides deferred.
+        fn mark(expr: &Expr, n: usize, ns: &mut [NodeState]) -> bool {
+            let node = &expr.nodes[n];
+            if node.etype == PHRASE {
+                return ns[n].deferred;
+            }
+            let l = mark(expr, node.left.unwrap(), ns);
+            let r = mark(expr, node.right.unwrap(), ns);
+            ns[n].deferred = l && r;
+            ns[n].deferred
+        }
+        if let Some(root) = expr.root {
+            mark(&expr, root, &mut ns);
+        }
+        let ncol = tab.columns.len();
+        let desc_idx = tab.desc;
         Ok(Self {
             expr,
-            ns: vec![NodeState::default(); n],
+            ns,
             ph,
-            desc_idx: tab.desc,
+            desc_idx,
             bdesc,
             prev_id: 0,
             is_eof: false,
-            ncol: tab.columns.len(),
+            ncol,
             min_docid,
             max_docid,
+            any_deferred,
+            n_doc,
+            tab,
+            conn,
+            langid,
+            row_cache: None,
+            err: None,
         })
+    }
+
+    /// Positions of deferred token `tok` of phrase `e` in the current row
+    /// (`sqlite3Fts3CacheDeferredDoclists`).
+    fn deferred_positions(&mut self, e: usize, itok: usize) -> Result<Pl> {
+        if self
+            .row_cache
+            .as_ref()
+            .is_none_or(|(d, _)| *d != self.prev_id)
+        {
+            let sql = format!("{} WHERE rowid = ?", self.tab.read_select()?);
+            let row = super::Sql::new(&self.conn)
+                .row(&sql, &[crate::Value::from_i64(self.prev_id)])?
+                .ok_or_else(super::corrupt)?;
+            let texts = (0..self.ncol)
+                .map(|i| row.get(i + 1).and_then(super::value_text))
+                .collect();
+            self.row_cache = Some((self.prev_id, texts));
+        }
+        let p = self.expr.nodes[e].phrase.as_ref().expect("phrase");
+        let t = &p.tokens[itok];
+        let icol = p.icol;
+        let tok = self.tab.tokenizer(Some(&self.conn))?;
+        let texts = &self.row_cache.as_ref().unwrap().1;
+        let mut out = Pl::new();
+        for (i, text) in texts.iter().enumerate() {
+            if self.tab.notindexed[i] {
+                continue;
+            }
+            if icol < self.ncol as i32 && icol != i as i32 {
+                continue;
+            }
+            let Some(text) = text else { continue };
+            let mut poss = Vec::new();
+            tok.tokenize(self.langid, text, &mut |z, _, _, pos| {
+                if (!t.first || pos == 0)
+                    && (z.len() == t.z.len() || (t.is_prefix && t.z.len() < z.len()))
+                    && z.starts_with(&t.z)
+                {
+                    poss.push(pos as i64);
+                }
+                Ok(true)
+            })?;
+            if !poss.is_empty() {
+                out.push((i as i32, poss));
+            }
+        }
+        Ok(out)
+    }
+
+    /// `fts3EvalDeferredPhrase`: combines the deferred tokens' positions
+    /// with the phrase's loaded position list.
+    fn deferred_phrase(&mut self, e: usize) -> Result<()> {
+        let mut defs = self.phrase(e).deferred.clone();
+        defs.sort_unstable();
+        let mut acc: Option<Pl> = None;
+        let mut iprev: i64 = -1;
+        for itok in defs {
+            let pl = self.deferred_positions(e, itok)?;
+            if pl.is_empty() {
+                self.invalidate(e);
+                return Ok(());
+            }
+            acc = Some(match acc {
+                None => pl,
+                Some(a) => {
+                    let m = pl_phrase(&a, &pl, itok as i64 - iprev);
+                    if m.is_empty() {
+                        self.invalidate(e);
+                        return Ok(());
+                    }
+                    m
+                }
+            });
+            iprev = itok as i64;
+        }
+        let Some(acc) = acc else { return Ok(()) };
+        let undeferred = self.phrase(e).doclist_token as i64;
+        if undeferred < 0 {
+            let prev = self.prev_id;
+            let p = self.phrase(e);
+            p.list = Some(acc);
+            p.list_idx = None;
+            p.docid = prev;
+        } else {
+            let cur = self.phrase(e).list.clone().unwrap_or_default();
+            let m = if undeferred > iprev {
+                pl_phrase(&acc, &cur, undeferred - iprev)
+            } else {
+                pl_phrase(&cur, &acc, iprev - undeferred)
+            };
+            let p = self.phrase(e);
+            p.list_idx = None;
+            p.list = if m.is_empty() { None } else { Some(m) };
+        }
+        Ok(())
     }
 
     fn docid_cmp(&self, a: i64, b: i64) -> std::cmp::Ordering {
@@ -393,6 +750,18 @@ impl Eval {
         self.ns[n].start = true;
         let node = self.node(n).clone();
         match node.etype {
+            NEAR | AND if self.ns[node.left.unwrap()].deferred => {
+                let r = node.right.unwrap();
+                self.next_row(r);
+                self.ns[n].docid = self.ns[r].docid;
+                self.ns[n].eof = self.ns[r].eof;
+            }
+            NEAR | AND if self.ns[node.right.unwrap()].deferred => {
+                let l = node.left.unwrap();
+                self.next_row(l);
+                self.ns[n].docid = self.ns[l].docid;
+                self.ns[n].eof = self.ns[l].eof;
+            }
             NEAR | AND => {
                 let (l, r) = (node.left.unwrap(), node.right.unwrap());
                 self.next_row(l);
@@ -568,6 +937,19 @@ impl Eval {
                 a || b
             }
             NOT => self.test_expr(node.left.unwrap()) && !self.test_expr(node.right.unwrap()),
+            _ if self.any_deferred
+                && (self.ns[n].deferred
+                    || (self.ns[n].docid == self.prev_id && self.phrase(n).list.is_some())) =>
+            {
+                if self.ns[n].deferred {
+                    self.invalidate(n);
+                }
+                if let Err(e) = self.deferred_phrase(n) {
+                    self.err.get_or_insert(e);
+                }
+                self.ns[n].docid = self.prev_id;
+                self.phrase(n).list.is_some()
+            }
             _ => {
                 !self.ns[n].eof
                     && self.ns[n].docid == self.prev_id
@@ -583,10 +965,11 @@ impl Eval {
             return;
         };
         loop {
+            self.row_cache = None;
             self.next_row(root);
             self.is_eof = self.ns[root].eof;
             self.prev_id = self.ns[root].docid;
-            if self.is_eof || self.test_expr(root) {
+            if self.is_eof || self.test_expr(root) || self.err.is_some() {
                 break;
             }
         }
@@ -687,7 +1070,7 @@ impl Eval {
         }
         let mut root = e;
         while let Some(p) = self.node(root).parent {
-            if self.node(p).etype == NEAR {
+            if self.node(p).etype == NEAR || self.ns[root].deferred {
                 root = p;
             } else {
                 break;
@@ -710,7 +1093,7 @@ impl Eval {
                     break;
                 }
                 let full = self.expr.root.unwrap();
-                if self.test_expr(full) {
+                if self.test_expr(full) || self.err.is_some() {
                     break;
                 }
             }
@@ -734,6 +1117,17 @@ impl Eval {
 
     /// `sqlite3Fts3EvalPhraseStats`: hits and documents per column.
     pub(crate) fn phrase_stats(&mut self, e: usize, out: &mut [u32]) {
+        let parent_near = self
+            .node(e)
+            .parent
+            .is_some_and(|p| self.node(p).etype == NEAR);
+        if self.ns[e].deferred && !parent_near {
+            for c in 0..self.ncol {
+                out[c * 3 + 1] = self.n_doc as u32;
+                out[c * 3 + 2] = self.n_doc as u32;
+            }
+            return;
+        }
         self.gather_stats(e);
         let ami = self.ns[e].ami.clone().unwrap_or_default();
         for c in 0..self.ncol {
@@ -771,7 +1165,10 @@ impl Eval {
             if !bor {
                 return None;
             }
-            let run = near;
+            let mut run = near;
+            while self.ns[run].deferred {
+                run = self.node(run).parent.expect("deferred node has a parent");
+            }
             if self.phrase(e).incr {
                 let eof_save = self.ns[run].eof;
                 let docid = self.ns[e].docid;
@@ -871,6 +1268,14 @@ impl Eval {
             .find(|(c, _)| *c == icol)
             .map(|(_, p)| p)
             .filter(|p| !p.is_empty())
+    }
+
+    /// Takes the error, if any, raised while testing deferred tokens.
+    pub(crate) fn take_err(&mut self) -> Result<()> {
+        match self.err.take() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// The current position list of a phrase (`doclist.pList`).

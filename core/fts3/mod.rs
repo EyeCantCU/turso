@@ -66,7 +66,7 @@ impl Connection {
 }
 
 fn corrupt() -> LimboError {
-    LimboError::Corrupt("database disk image is malformed".to_string())
+    LimboError::CorruptVtab("database disk image is malformed".to_string())
 }
 
 fn sql_error(msg: impl Into<String>) -> LimboError {

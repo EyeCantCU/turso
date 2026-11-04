@@ -87,6 +87,10 @@ impl SegReader {
         }
     }
 
+    pub(crate) fn is_root_only(&self) -> bool {
+        self.root_only
+    }
+
     pub(crate) fn is_pending(&self) -> bool {
         self.pending.is_some()
     }

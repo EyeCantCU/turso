@@ -166,6 +166,19 @@ pub(crate) fn rename(ctx: &Ctx, new: &str) -> Result<()> {
     }
     suffixes.push("segments");
     suffixes.push("segdir");
+    // A name already taken would fail part way; SQLite's statement journal
+    // undoes the earlier renames, so fail before making any.
+    for sfx in &suffixes {
+        let taken = sql
+            .row(
+                "SELECT 1 FROM sqlite_schema WHERE name = ? COLLATE NOCASE",
+                &[Value::build_text(format!("{new}_{sfx}"))],
+            )?
+            .is_some();
+        if taken {
+            return Err(sql_error("SQL logic error"));
+        }
+    }
     ctx.with_pending(|p| p.ignore_savepoint = true);
     let mut r = Ok(());
     for s in suffixes {
@@ -182,6 +195,10 @@ pub(crate) fn rename(ctx: &Ctx, new: &str) -> Result<()> {
         }
     }
     ctx.with_pending(|p| p.ignore_savepoint = false);
+    if r.is_err() {
+        // SQLite's fts3DbExec reports only the error code.
+        return Err(sql_error("SQL logic error"));
+    }
     let key = tab.pending_key();
     *tab.name.write() = new.to_string();
     let mut inner = ctx.conn.fts3.inner.lock();
@@ -1263,7 +1280,7 @@ pub(crate) fn integrity_check(ctx: &Ctx) -> Result<bool> {
         for i in 0..tab.nindex() {
             match checksum_index(ctx, langid, i) {
                 Ok(c) => c1 ^= c,
-                Err(LimboError::Corrupt(_)) => return Ok(false),
+                Err(LimboError::CorruptVtab(_)) => return Ok(false),
                 Err(e) => return Err(e),
             }
         }

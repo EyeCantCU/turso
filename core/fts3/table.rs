@@ -17,12 +17,11 @@ use crate::native_ext::{
     ScalarCall, ScalarFunction, TableHook, TableUpdate, VTabKind, VirtualTable, VirtualTableCursor,
     VirtualTableModule,
 };
-use crate::sync::atomic::{AtomicI32, AtomicU64, AtomicU8, Ordering};
-use crate::sync::{Arc, Mutex, RwLock, Weak};
+use crate::sync::atomic::{AtomicI32, AtomicU8, Ordering};
+use crate::sync::{Arc, Mutex, RwLock};
 use crate::types::IOResultOr;
 use crate::vdbe::Register;
 use crate::{Connection, IOResult, LimboError, Result, SymbolTable, Value};
-use std::collections::HashMap;
 use turso_ext::{ConstraintOp, ResultCode};
 
 pub(crate) const FULLSCAN_SEARCH: i32 = 0;
@@ -737,6 +736,10 @@ impl VirtualTable for Fts3Vtab {
         idx_num & 0xffff == DOCID_SEARCH
     }
 
+    fn find_function(&self, name: &str, _nargs: usize) -> Option<Arc<ExternalFunc>> {
+        find_aux(name)
+    }
+
     fn create_update(&mut self, _args: Vec<Value>) -> Result<Box<dyn TableUpdate>> {
         Err(LimboError::ReadOnly)
     }
@@ -803,11 +806,8 @@ impl TableUpdate for Fts3Update {
     }
 }
 
-/// Live cursors, so the auxiliary functions can find theirs.
-static CURSORS: std::sync::LazyLock<std::sync::Mutex<HashMap<u64, Weak<Mutex<CursorState>>>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
-static NEXT_CURSOR: AtomicU64 = AtomicU64::new(1);
-const CURSOR_MAGIC: &[u8; 8] = b"fts3cur\0";
+/// The pointer type of the hidden table column, as in SQLite.
+const CURSOR_POINTER: &str = "fts3cursor";
 
 pub(crate) struct CursorState {
     pub tab: Arc<Fts3Table>,
@@ -832,13 +832,11 @@ pub(crate) struct CursorState {
 }
 
 pub(crate) struct Fts3Cursor {
-    id: u64,
     state: Arc<Mutex<CursorState>>,
 }
 
 impl Fts3Cursor {
     fn new(tab: Arc<Fts3Table>, conn: Arc<Connection>) -> Self {
-        let id = NEXT_CURSOR.fetch_add(1, Ordering::Relaxed);
         let state = Arc::new(Mutex::new(CursorState {
             tab,
             conn,
@@ -858,14 +856,7 @@ impl Fts3Cursor {
             eval: None,
             mi: None,
         }));
-        CURSORS.lock().unwrap().insert(id, Arc::downgrade(&state));
-        Self { id, state }
-    }
-}
-
-impl Drop for Fts3Cursor {
-    fn drop(&mut self) {
-        CURSORS.lock().unwrap().remove(&self.id);
+        Self { state }
     }
 }
 
@@ -955,6 +946,7 @@ impl CursorState {
                     return Ok(());
                 }
                 ev.next();
+                ev.take_err()?;
                 self.eof = ev.is_eof;
                 self.prev_id = ev.prev_id;
                 self.require_seek = true;
@@ -1049,9 +1041,9 @@ impl CursorState {
                 icol,
                 query.as_deref(),
             )?;
-            let ctx = self.ctx();
             let ev = Eval::new(
-                &ctx,
+                self.tab.clone(),
+                self.conn.clone(),
                 e,
                 self.langid,
                 self.bdesc,
@@ -1083,9 +1075,7 @@ impl VirtualTableCursor for Fts3Cursor {
         let mut st = self.state.lock();
         let ncol = st.tab.ncol();
         let v = if column == ncol {
-            let mut b = CURSOR_MAGIC.to_vec();
-            b.extend_from_slice(&self.id.to_le_bytes());
-            Value::from_slice(&b).map_err(|_| LimboError::InternalError("oom".into()))?
+            Value::Null
         } else if column == ncol + 1 {
             Value::from_i64(st.prev_id)
         } else if column == ncol + 2 && st.eval.is_some() {
@@ -1106,25 +1096,27 @@ impl VirtualTableCursor for Fts3Cursor {
     fn rowid(&self) -> i64 {
         self.state.lock().prev_id
     }
-}
 
-/// The cursor behind an auxiliary function's first argument.
-fn cursor_arg(v: &Value) -> Option<Arc<Mutex<CursorState>>> {
-    let b = v.to_blob()?;
-    if b.len() != 16 || &b[..8] != CURSOR_MAGIC {
-        return None;
+    fn column_pointer(&mut self, column: usize) -> Option<crate::native_ext::PointerPayload> {
+        (column == self.state.lock().tab.ncol()).then(|| {
+            let p: Arc<dyn std::any::Any + Send + Sync> = self.state.clone();
+            (CURSOR_POINTER, p)
+        })
     }
-    let id = u64::from_le_bytes(b[8..16].try_into().ok()?);
-    CURSORS.lock().unwrap().get(&id)?.upgrade()
 }
 
-fn arg_error(f: &str) -> LimboError {
-    sql_error(format!(
-        "unable to use function {f} in the requested context"
-    ))
+/// The cursor behind an auxiliary function's first argument
+/// (`sqlite3_value_pointer(v, "fts3cursor")`).
+fn cursor_arg(r: &Register) -> Option<Arc<Mutex<CursorState>>> {
+    match r {
+        Register::Pointer(p) if p.tag == CURSOR_POINTER => {
+            p.ptr.clone().downcast::<Mutex<CursorState>>().ok()
+        }
+        _ => None,
+    }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Aux {
     Snippet,
     Offsets,
@@ -1155,15 +1147,15 @@ impl ScalarCall for AuxCall {
             Aux::Matchinfo => "matchinfo",
             Aux::Optimize => "optimize",
         };
-        let Some(state) = vals.first().and_then(cursor_arg) else {
-            return Err(arg_error(name).into());
+        if self.0 == Aux::Snippet && vals.len() > 6 {
+            return Err(sql_error("wrong number of arguments to function snippet()").into());
+        }
+        let Some(state) = args.first().and_then(cursor_arg) else {
+            return Err(sql_error(format!("illegal first argument to {name}")).into());
         };
         let mut st = state.lock();
         let v = match self.0 {
             Aux::Snippet => {
-                if vals.len() > 6 {
-                    return Err(sql_error("wrong number of arguments to function snippet()").into());
-                }
                 let text = |i: usize, d: &str| -> Vec<u8> {
                     vals.get(i)
                         .map(|v| value_text(v).unwrap_or_default())
@@ -1295,20 +1287,21 @@ pub(crate) fn register(syms: &mut SymbolTable) -> Result<()> {
     }
     super::aux::register(syms);
     super::tokenize_vtab::register(syms);
-    let funcs: [(&str, FunctionArity, Aux); 4] = [
-        ("snippet", FunctionArity::Variadic, Aux::Snippet),
-        ("offsets", FunctionArity::Exact(1), Aux::Offsets),
-        ("matchinfo", FunctionArity::OneOf(&[1, 2]), Aux::Matchinfo),
-        ("optimize", FunctionArity::Exact(1), Aux::Optimize),
+    // sqlite3_overload_function(): the real ones come from xFindFunction.
+    let funcs: [(&'static str, FunctionArity); 4] = [
+        ("snippet", FunctionArity::Variadic),
+        ("offsets", FunctionArity::Exact(1)),
+        ("matchinfo", FunctionArity::OneOf(&[1, 2])),
+        ("optimize", FunctionArity::Exact(1)),
     ];
-    for (name, arity, aux) in funcs {
+    for (name, arity) in funcs {
         syms.functions.insert(
             name.to_string(),
             Arc::new(ExternalFunc::new_native_scalar(
                 name.to_string(),
                 arity,
                 false,
-                AuxFunc(aux),
+                Overload(name),
             )?),
         );
     }
@@ -1322,4 +1315,45 @@ pub(crate) fn register(syms: &mut SymbolTable) -> Result<()> {
         )?),
     );
     Ok(())
+}
+
+/// A function SQLite registers with `sqlite3_overload_function`: it only
+/// works when a virtual table's xFindFunction replaces it.
+#[derive(Debug)]
+struct Overload(&'static str);
+
+impl ScalarFunction for Overload {
+    type Call = OverloadCall;
+    fn create_call(&self) -> Result<OverloadCall> {
+        Ok(OverloadCall(self.0))
+    }
+}
+
+struct OverloadCall(&'static str);
+
+impl ScalarCall for OverloadCall {
+    type Output = Value;
+
+    fn step(&mut self, _conn: &Arc<Connection>, _args: &[Register]) -> IOResultOr<Value> {
+        Err(sql_error(format!(
+            "unable to use function {} in the requested context",
+            self.0
+        ))
+        .into())
+    }
+}
+
+/// `fts3FindFunctionMethod`.
+fn find_aux(name: &str) -> Option<Arc<ExternalFunc>> {
+    let (aux, arity) = match name.to_ascii_lowercase().as_str() {
+        "snippet" => (Aux::Snippet, FunctionArity::Variadic),
+        "offsets" => (Aux::Offsets, FunctionArity::Exact(1)),
+        "matchinfo" => (Aux::Matchinfo, FunctionArity::OneOf(&[1, 2])),
+        "optimize" => (Aux::Optimize, FunctionArity::Exact(1)),
+        _ => return None,
+    };
+    let lname = name.to_ascii_lowercase();
+    ExternalFunc::new_native_scalar(lname, arity, false, AuxFunc(aux))
+        .ok()
+        .map(Arc::new)
 }

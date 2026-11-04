@@ -56,7 +56,8 @@ fn run_turso(conn: &Arc<Connection>, sql: &str) -> Vec<String> {
     })();
     match r {
         Ok(v) => v,
-        Err(e) => vec![format!("ERROR: {e}")],
+        // The C API reports parse errors without turso's prefix.
+        Err(e) => vec![format!("ERROR: {e}").replacen("Parse error: ", "", 1)],
     }
 }
 
@@ -364,6 +365,54 @@ fn insert_select_and_content_columns() {
     // Reopen: the content table's columns come from the loaded schema.
     let (_db, conn) = open_turso(&path);
     for q in queries {
+        assert_eq!(run_turso(&conn, q), run_sqlite(&sqlite, q), "{q}");
+    }
+}
+
+/// The hidden column reads as NULL, the auxiliary functions reject other
+/// arguments with SQLite's messages, deferred tokens give SQLite's
+/// matchinfo() on a large FTS4 table, and a damaged %_stat row is rejected.
+#[test]
+fn hidden_column_deferred_tokens_and_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_db, conn) = open_turso(&dir.path().join("d.db"));
+    let sqlite = rusqlite::Connection::open(dir.path().join("s.db")).unwrap();
+    let mut setup = vec![
+        "PRAGMA page_size=1024".to_string(),
+        "CREATE VIRTUAL TABLE t USING fts4(a, b)".to_string(),
+        "CREATE TABLE t_taken(x)".to_string(),
+        "BEGIN".to_string(),
+    ];
+    for i in 1..=1500 {
+        let extra = if i % 150 == 0 { "rare" } else { "" };
+        let body = vec!["alpha beta gamma"; 20 + i % 7].join(" ");
+        setup.push(format!(
+            "INSERT INTO t VALUES('{body} {extra} w{}', 'beta alpha {extra}')",
+            i % 11
+        ));
+    }
+    setup.push("COMMIT".to_string());
+    for s in &setup {
+        sqlite.execute_batch(s).unwrap();
+        conn.execute(s).unwrap();
+    }
+    for q in [
+        "SELECT typeof(t), t IS NULL FROM t WHERE rowid = 1",
+        "SELECT quote(t) FROM t WHERE t MATCH 'rare'",
+        "SELECT snippet(a) FROM t WHERE t MATCH 'rare'",
+        "SELECT offsets(1) FROM t WHERE t MATCH 'rare'",
+        "SELECT matchinfo('x') FROM t WHERE t MATCH 'rare'",
+        "SELECT snippet(t, 1, 2, 3, 4, 5, 6) FROM t WHERE t MATCH 'rare'",
+        "SELECT rowid, matchinfo(t, 'pcnaxs'), offsets(t) FROM t WHERE t MATCH 'alpha rare'",
+        "SELECT rowid, matchinfo(t, 'x') FROM t WHERE t MATCH '\"alpha beta\" rare'",
+        "SELECT rowid, matchinfo(t, 'x') FROM t WHERE t MATCH 'rare NEAR/2 alpha'",
+        "SELECT rowid, snippet(t) FROM t WHERE t MATCH 'alpha OR rare' AND rowid > 1490",
+        "ALTER TABLE t RENAME TO t_taken",
+        "SELECT name FROM sqlite_schema ORDER BY name",
+        "UPDATE t_stat SET value = x'00' || substr(value, 2) WHERE id = 0",
+        "SELECT count(*) FROM t WHERE t MATCH 'alpha rare'",
+        "SELECT count(*) FROM t WHERE t MATCH 'rare'",
+    ] {
         assert_eq!(run_turso(&conn, q), run_sqlite(&sqlite, q), "{q}");
     }
 }

@@ -536,6 +536,7 @@ pub(crate) fn matchinfo(st: &mut CursorState, fmt: Option<&[u8]>) -> Result<Vec<
                     }
                     // SQLite re-tests the row, which redoes NEAR trims.
                     ev.retest();
+                    ev.take_err()?;
                 }
                 for (i, &e) in phrases.iter().enumerate() {
                     for col in 0..ncol {
