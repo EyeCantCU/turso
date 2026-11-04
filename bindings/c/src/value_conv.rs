@@ -63,16 +63,10 @@ fn raw_bytes(v: &ExtValue) -> Option<Vec<u8>> {
 fn encode(bytes: &[u8], enc: Enc) -> Vec<u8> {
     let mut out = match enc {
         Enc::Utf8 => bytes.to_vec(),
-        _ => {
-            let text = String::from_utf8_lossy(bytes);
-            text.encode_utf16()
-                .flat_map(|u| match enc {
-                    Enc::Utf16Be => u.to_be_bytes(),
-                    Enc::Utf16Le => u.to_le_bytes(),
-                    _ => u.to_ne_bytes(),
-                })
-                .collect()
-        }
+        _ => turso_core::utf8_to_utf16(
+            bytes,
+            enc == Enc::Utf16Be || (enc == Enc::Utf16 && cfg!(target_endian = "big")),
+        ),
     };
     let nul = if enc == Enc::Utf8 { 1 } else { 2 };
     out.resize(out.len() + nul, 0);

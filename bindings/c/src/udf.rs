@@ -381,10 +381,10 @@ pub unsafe extern "C" fn sqlite3_create_function16(
         units.push(*p);
         p = p.add(1);
     }
-    let utf8 = String::from_utf16_lossy(&units);
+    let utf8 = crate::compat_stubs::u16_to_utf8(&units);
     create_function(
         db,
-        utf8.as_bytes(),
+        &utf8,
         n_args,
         enc,
         context,

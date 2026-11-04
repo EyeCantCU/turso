@@ -972,14 +972,39 @@ enum Kind {
 }
 
 type U16Map = HashMap<(usize, ffi::c_int, Kind), Vec<u16>>;
+/// UTF-8 bytes to native-endian UTF-16 units, converted like SQLite
+/// (invalid bytes become U+FFFD) by core's converter.
+pub(crate) fn utf8_to_u16(bytes: &[u8]) -> Vec<u16> {
+    let be = cfg!(target_endian = "big");
+    turso_core::utf8_to_utf16(bytes, be)
+        .chunks_exact(2)
+        .map(|c| {
+            if be {
+                u16::from_be_bytes([c[0], c[1]])
+            } else {
+                u16::from_le_bytes([c[0], c[1]])
+            }
+        })
+        .collect()
+}
+
+/// Native-endian UTF-16 units to UTF-8 bytes via core's converter.
+pub(crate) fn u16_to_utf8(units: &[u16]) -> Vec<u8> {
+    let be = cfg!(target_endian = "big");
+    let bytes: Vec<u8> = units
+        .iter()
+        .flat_map(|u| if be { u.to_be_bytes() } else { u.to_le_bytes() })
+        .collect();
+    turso_core::utf16_to_utf8(&bytes, be)
+}
+
 static U16_CACHE: Mutex<Option<U16Map>> = Mutex::new(None);
 
 /// Store `s` (NUL-terminated UTF-16) for (handle, col, kind) and return a
 /// pointer to it. An identical previous value keeps its buffer so that
 /// pointers handed out earlier for the same unchanged value stay valid.
 fn u16_store(handle: usize, col: ffi::c_int, kind: Kind, s: &[u8]) -> *const ffi::c_void {
-    let text = String::from_utf8_lossy(s);
-    let mut v: Vec<u16> = text.encode_utf16().collect();
+    let mut v = utf8_to_u16(s);
     v.push(0);
     let mut g = U16_CACHE.lock().unwrap();
     let map = g.get_or_insert_with(HashMap::new);
@@ -1032,7 +1057,7 @@ pub unsafe extern "C" fn sqlite3_prepare16_v2(
         return SQLITE_MISUSE;
     }
     let units = utf16_units(sql as *const u16, n_byte);
-    let mut bytes = String::from_utf16_lossy(&units).into_bytes();
+    let mut bytes = u16_to_utf8(&units);
     let len = bytes.len();
     bytes.push(0);
     let mut tail8: *const ffi::c_char = std::ptr::null();
@@ -1051,9 +1076,7 @@ pub unsafe extern "C" fn sqlite3_prepare16_v2(
                 .saturating_sub(bytes.as_ptr() as usize)
                 .min(len)
         };
-        let n16 = String::from_utf8_lossy(&bytes[..consumed])
-            .encode_utf16()
-            .count();
+        let n16 = utf8_to_u16(&bytes[..consumed]).len();
         *tail = (sql as *const u16).add(n16) as *const ffi::c_void;
     }
     rc
@@ -1085,7 +1108,7 @@ pub unsafe extern "C" fn sqlite3_bind_text16(
         sqlite3_bind_null(stmt, idx)
     } else {
         let units = utf16_units(data as *const u16, n_byte);
-        let bytes = String::from_utf16_lossy(&units).into_bytes();
+        let bytes = u16_to_utf8(&units);
         sqlite3_bind_text(
             stmt,
             idx,
@@ -1136,8 +1159,7 @@ pub unsafe extern "C" fn sqlite3_column_bytes16(
     let n = sqlite3_column_bytes(stmt, idx) as usize;
     // Computed without touching the cache so that a pointer previously
     // returned by sqlite3_column_text16 is not invalidated.
-    let s = String::from_utf8_lossy(std::slice::from_raw_parts(p, n));
-    (s.encode_utf16().count() * 2) as ffi::c_int
+    (utf8_to_u16(std::slice::from_raw_parts(p, n)).len() * 2) as ffi::c_int
 }
 
 unsafe fn col_str16(
