@@ -3121,3 +3121,100 @@ fn subprocess_idle_begin_sees_table_created_by_other_process() {
     assert_eq!(rows.len(), 1);
     conn.execute("commit").unwrap();
 }
+
+/// Open, write `rows` rows with auto-checkpoint off, and close.
+fn write_rows_and_close(path: &str, rows: i64) {
+    let db = open_multiprocess_db(multiprocess_test_io(), path).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.wal_auto_actions_disable();
+    conn.execute("create table if not exists test(id integer primary key, value text)")
+        .unwrap();
+    for i in 0..rows {
+        conn.execute(format!("insert into test(value) values ('v{i}')"))
+            .unwrap();
+    }
+    conn.close().unwrap();
+}
+
+// The four tests below replace upstream tests that asserted reuse of the
+// persisted tshm authority on an exclusive reopen. Like SQLite's wal-index
+// recovery, the first opener now rebuilds it from the WAL file.
+
+#[test]
+fn exclusive_reopen_rebuilds_authority_from_wal_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rebuild.db");
+    let path = path.to_str().unwrap();
+    write_rows_and_close(path, 5);
+    let db = open_multiprocess_db(multiprocess_test_io(), path).unwrap();
+    let telemetry = db.shared_wal_open_telemetry().unwrap();
+    assert!(telemetry.loaded_from_disk_scan);
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    assert_eq!(count_test_rows(&conn), 5);
+}
+
+#[test]
+fn exclusive_reopen_follows_a_wal_replaced_while_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("replaced.db");
+    let path = path.to_str().unwrap();
+    write_rows_and_close(path, 2);
+    let wal = format!("{path}-wal");
+    let saved = std::fs::read(&wal).unwrap();
+    write_rows_and_close(path, 3);
+    // Put back the shorter WAL: the persisted authority describes 5 rows.
+    std::fs::write(&wal, saved).unwrap();
+    let db = open_multiprocess_db(multiprocess_test_io(), path).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    assert_eq!(count_test_rows(&conn), 2);
+}
+
+#[test]
+fn exclusive_reopen_of_empty_wal_starts_uninitialized() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("empty-wal.db");
+    let path = path.to_str().unwrap();
+    write_rows_and_close(path, 4);
+    {
+        let db = open_multiprocess_db(multiprocess_test_io(), path).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        run_checkpoint(
+            &conn,
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            },
+        );
+        conn.close().unwrap();
+    }
+    let db = open_multiprocess_db(multiprocess_test_io(), path).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    assert_eq!(wal_max_frame(&conn), 0);
+    assert_eq!(count_test_rows(&conn), 4);
+    // The next write starts a fresh WAL generation that later opens find.
+    conn.execute("insert into test(value) values ('after')")
+        .unwrap();
+    conn.close().unwrap();
+    let db = open_multiprocess_db(multiprocess_test_io(), path).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    assert_eq!(count_test_rows(&conn), 5);
+}
+
+#[test]
+fn exclusive_reopen_after_restart_checkpoint_reads_the_database_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("restarted.db");
+    let path = path.to_str().unwrap();
+    write_rows_and_close(path, 3);
+    {
+        let db = open_multiprocess_db(multiprocess_test_io(), path).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        run_checkpoint(&conn, CheckpointMode::Restart);
+        conn.close().unwrap();
+    }
+    let db = open_multiprocess_db(multiprocess_test_io(), path).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    assert_eq!(count_test_rows(&conn), 3);
+    conn.execute("insert into test(value) values ('x')")
+        .unwrap();
+    assert_eq!(count_test_rows(&conn), 4);
+}
