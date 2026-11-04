@@ -575,7 +575,7 @@ int sqlite3_declare_vtab(sqlite3 *db, const char *zSQL);
 int sqlite3_vtab_config(sqlite3 *db, int op, ...);
 int sqlite3_vtab_on_conflict(sqlite3 *db);
 int sqlite3_vtab_nochange(void *ctx);
-int sqlite3_value_nochange(sqlite3_value *value);
+int sqlite3_value_nochange(void *value);
 const char *sqlite3_vtab_collation(sqlite3_index_info *pIdxInfo, int iCons);
 int sqlite3_vtab_distinct(sqlite3_index_info *pIdxInfo);
 int sqlite3_vtab_in(sqlite3_index_info *pIdxInfo, int iCons, int bHandle);
