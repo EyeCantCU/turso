@@ -1000,6 +1000,8 @@ pub(crate) struct DeferredSeekState {
     pub table_cursor_id: CursorID,
     /// The rowid that DeferredSeek saves before the index can move.
     pub rowid: i64,
+    /// For a WITHOUT ROWID table: its primary key, read from the index entry.
+    pub key: Option<crate::sync::Arc<crate::types::ImmutableRecord>>,
 }
 
 pub(crate) enum VacuumOpState {

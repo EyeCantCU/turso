@@ -502,6 +502,41 @@ fn eqp_index(index: &Index, covering: bool) -> EqpIndex {
     }
 }
 
+/// The [EqpDetail] for the target of an UPDATE or DELETE, with SQLite's
+/// notion of a covering index there: an UPDATE rewrites the whole row
+/// (`two_pass_delete` None) so never; a one-pass DELETE of a rowid table reads
+/// the row, a two-pass one (RETURNING) first collects rowids from the index;
+/// a WITHOUT ROWID DELETE is covered when the index holds every column.
+pub(crate) fn eqp_detail_for_dml_target(
+    table: &JoinedTable,
+    two_pass_delete: Option<bool>,
+) -> EqpDetail {
+    let covered = match (two_pass_delete, table.op.index(), table.btree()) {
+        (Some(_), Some(index), Some(btree)) if !btree.has_rowid => {
+            btree.columns().iter().enumerate().all(|(pos, col)| {
+                col.is_virtual_generated()
+                    || index
+                        .columns
+                        .iter()
+                        .any(|c| c.expr.is_none() && c.pos_in_table == pos)
+            })
+        }
+        (Some(two_pass), _, _) => two_pass,
+        (None, _, _) => false,
+    };
+    let mut detail = eqp_detail_for_table_op(table, None, None);
+    if let EqpDetail::Scan {
+        index: Some(index), ..
+    }
+    | EqpDetail::Search {
+        index: Some(index), ..
+    } = &mut detail
+    {
+        index.covering &= covered;
+    }
+    detail
+}
+
 /// Build the [EqpDetail] for a joined table.
 pub(crate) fn eqp_detail_for_table_op(
     table: &JoinedTable,

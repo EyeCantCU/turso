@@ -11,7 +11,7 @@ use crate::{
             emit_program_for_select, get_triggers_including_temp, has_triggers_including_temp,
             OperationMode, TriggerTime,
         },
-        eqp::eqp_detail_for_table_op,
+        eqp::eqp_detail_for_dml_target,
         expr::{
             emit_returning_results, emit_returning_scan_back, emit_table_column,
             restore_returning_row_image_in_cache, seed_returning_row_image_in_cache,
@@ -317,7 +317,7 @@ fn emit_row_loop_delete(
         emit_explain!(
             program,
             true,
-            eqp_detail_for_table_op(table_ref, None, None)
+            eqp_detail_for_dml_target(table_ref, Some(!plan.result_columns.is_empty()))
         );
 
         // Set up main query execution loop

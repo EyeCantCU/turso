@@ -308,3 +308,57 @@ test without-rowid-eqp-primary-key {
 expect pattern {
     SEARCH u USING PRIMARY KEY \(k=\?\)
 }
+
+test without-rowid-multi-index-or {
+    CREATE TABLE u(k TEXT PRIMARY KEY, v, w, x) WITHOUT ROWID;
+    CREATE INDEX uv ON u(v);
+    CREATE INDEX uw ON u(w);
+    INSERT INTO u SELECT 'k' || value, value % 17, value % 23, value FROM generate_series(1, 300);
+    ANALYZE;
+    SELECT count(*), sum(x) FROM u WHERE v = 3 OR w = 5;
+    SELECT x FROM u WHERE k IN ('k5', 'k7', 'k300') ORDER BY x;
+}
+expect {
+    30|4256
+    5
+    7
+    300
+}
+
+test without-rowid-update-delete-through-index {
+    CREATE TABLE u(k TEXT PRIMARY KEY, v UNIQUE, w, x) WITHOUT ROWID;
+    CREATE INDEX uw ON u(w);
+    INSERT INTO u SELECT 'k' || value, value, value % 13, value % 7 FROM generate_series(1, 200);
+    ANALYZE;
+    UPDATE u SET x = x + 100 WHERE w = 3;
+    UPDATE u SET w = w + 1 WHERE w = 5;
+    UPDATE u SET k = k || 'z' WHERE w = 7;
+    DELETE FROM u WHERE w = 1;
+    SELECT count(*), sum(x), sum(w) FROM u;
+    PRAGMA integrity_check;
+}
+expect {
+    184|2155|1185
+    ok
+}
+
+test without-rowid-eqp-delete-through-index {
+    CREATE TABLE u(k TEXT PRIMARY KEY, w, x) WITHOUT ROWID;
+    CREATE INDEX uw ON u(w);
+    EXPLAIN QUERY PLAN DELETE FROM u WHERE w = 1;
+}
+expect pattern {
+    SEARCH u USING INDEX uw \(w=\?\)
+}
+
+# The table b-tree is ordered by the primary key only.
+test without-rowid-no-seek-on-non-key-column {
+    CREATE TABLE t1(a INT PRIMARY KEY) WITHOUT ROWID;
+    INSERT INTO t1(a) VALUES (10);
+    ALTER TABLE t1 ADD COLUMN b INT;
+    SELECT * FROM t1 WHERE a = 20 OR (a = 10 AND b = 10);
+    SELECT count(*) FROM t1 WHERE a = 10 AND b IS NULL;
+}
+expect {
+    1
+}

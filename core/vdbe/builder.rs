@@ -1383,38 +1383,15 @@ impl ProgramBuilder {
     pub fn emit_deferred_seek(&mut self, index_cursor_id: CursorID, table_cursor_id: CursorID) {
         let cursor_type = self.get_cursor_type(index_cursor_id);
         if let Some(CursorType::BTreeIndex(index)) = cursor_type {
-            if !index.has_rowid {
-                // An index of a WITHOUT ROWID table ends with the primary key,
-                // which finds the row: seek the table now. Other rowid-free
-                // indexes cannot identify a row, and the plan reads only them.
-                let index = index.clone();
-                if let Some(CursorType::BTreeTable(table)) = self.get_cursor_type(table_cursor_id) {
-                    if !table.has_rowid {
-                        let table = table.clone();
-                        if let Ok(positions) =
-                            crate::translate::without_rowid::pk_positions_in_index(&table, &index)
-                        {
-                            let key = self.alloc_registers(positions.len());
-                            for (i, pos) in positions.into_iter().enumerate() {
-                                self.emit_insn(Insn::Column {
-                                    cursor_id: index_cursor_id,
-                                    column: pos,
-                                    dest: key + i,
-                                    default: None,
-                                });
-                            }
-                            let found = self.allocate_label();
-                            let _ = crate::translate::without_rowid::emit_seek_row(
-                                self,
-                                &table,
-                                table_cursor_id,
-                                key,
-                                found,
-                            );
-                            self.preassign_label_to_next_insn(found);
-                        }
-                    }
-                }
+            // An index of a WITHOUT ROWID table ends with the primary key, which
+            // finds the row. Other rowid-free indexes cannot identify a row, and
+            // the plan reads only them; SQLite emits no DeferredSeek then.
+            let table_is_without_rowid = matches!(
+                self.get_cursor_type(table_cursor_id),
+                Some(CursorType::BTreeTable(table)) if !table.has_rowid
+                    && crate::translate::without_rowid::pk_positions_in_index(table, index).is_ok()
+            );
+            if !index.has_rowid && !table_is_without_rowid {
                 return;
             }
         }
