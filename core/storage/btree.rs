@@ -1452,6 +1452,11 @@ impl BTreeCursor {
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG, name = "prev"))]
     pub fn get_prev_record(&mut self) -> IOResultOr<()> {
         let mut inner = || {
+            if self.stack.current_page == -1 {
+                // The page stack was dropped, e.g. another statement cleared
+                // this btree under the cursor: the scan ends, as in next().
+                return Ok::<_, Box<crate::LimboError>>(IOResult::Done(false));
+            }
             loop {
                 // Resume hook: if a previous backwards-iteration call yielded
                 // for spill IO mid-descent, the loop-top mutations

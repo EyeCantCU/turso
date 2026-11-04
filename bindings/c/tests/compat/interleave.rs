@@ -375,3 +375,22 @@ fn test_failed_statement_inside_callback_rolls_back_alone() {
         sqlite3_close(db);
     }
 }
+
+#[test]
+fn test_scan_ends_when_another_statement_clears_the_table() {
+    unsafe {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(&dir);
+        exec(db, "CREATE TABLE t(x)");
+        for order in ["DESC", "ASC"] {
+            exec(db, "INSERT INTO t VALUES (1), (2), (3), (4)");
+            let sel = prepare(db, &format!("SELECT x FROM t ORDER BY rowid {order}"));
+            assert!(next(sel).is_some());
+            exec(db, "DELETE FROM t");
+            assert_eq!(drain(sel), Vec::<String>::new());
+            assert_eq!(sqlite3_finalize(sel), SQLITE_OK);
+            assert_eq!(rows(db, "SELECT count(*) FROM t"), v(&["0"]));
+        }
+        sqlite3_close(db);
+    }
+}
