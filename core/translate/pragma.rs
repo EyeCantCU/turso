@@ -283,6 +283,7 @@ pub fn translate_pragma(
             | PragmaName::IndexXinfo
             | PragmaName::IndexList
             | PragmaName::ForeignKeyList
+            | PragmaName::ForeignKeyCheck
             | PragmaName::TableList
             | PragmaName::TableInfo
             | PragmaName::TableXinfo
@@ -668,6 +669,7 @@ fn update_pragma(
         PragmaName::IndexXinfo => unreachable!("index_xinfo cannot be set"),
         PragmaName::IndexList => unreachable!("index_list cannot be set"),
         PragmaName::ForeignKeyList => unreachable!("foreign_key_list cannot be set"),
+        PragmaName::ForeignKeyCheck => unreachable!("foreign_key_check cannot be set"),
         PragmaName::TableList => unreachable!("table_list cannot be set"),
         PragmaName::QueryOnly => query_pragma(
             PragmaName::QueryOnly,
@@ -1323,6 +1325,57 @@ fn query_pragma(
             let pragma_meta = pragma_for(&pragma);
             for col_name in pragma_meta.columns.iter() {
                 program.add_pragma_result_column(col_name.to_string());
+            }
+            Ok(TransactionMode::Read)
+        }
+        PragmaName::ForeignKeyCheck => {
+            let table_name = match &value {
+                Some(ast::Expr::Name(name)) | Some(ast::Expr::Id(name)) => {
+                    Some(name.as_str().to_string())
+                }
+                Some(ast::Expr::Literal(ast::Literal::String(s))) => {
+                    Some(s.trim_matches('\'').to_string())
+                }
+                _ => None,
+            };
+            let table_namespace = match &table_name {
+                Some(name) => {
+                    let ns = resolve_table_pragma_namespace(
+                        resolver,
+                        namespace,
+                        schema_was_explicit,
+                        name,
+                    )?;
+                    if resolver.with_schema(ns.database_id, |s| s.get_table(ns.id, name).is_none())
+                    {
+                        crate::bail_parse_error!("no such table: {name}");
+                    }
+                    ns
+                }
+                None => namespace,
+            };
+            let sql = resolver.with_schema(table_namespace.database_id, |s| {
+                super::fk_check::foreign_key_check_sql(s, table_namespace.id, table_name.as_deref())
+            })?;
+            // The query names its own result columns.
+            if let Some(sql) = sql {
+                let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+                let Ok(Some(ast::Cmd::Stmt(ast::Stmt::Select(select)))) = parser.next_cmd() else {
+                    crate::bail_parse_error!("could not build foreign_key_check query");
+                };
+                program.nested(|program| {
+                    super::select::translate_select(
+                        select,
+                        resolver,
+                        program,
+                        super::plan::QueryDestination::ResultRows,
+                        &connection,
+                    )
+                })?;
+            } else {
+                for col_name in pragma_for(&pragma).columns.iter() {
+                    program.add_pragma_result_column(col_name.to_string());
+                }
             }
             Ok(TransactionMode::Read)
         }

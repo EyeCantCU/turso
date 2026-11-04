@@ -20,6 +20,7 @@ pub mod eqp;
 pub(crate) mod expr;
 pub(crate) mod expr_context;
 pub(crate) mod expression_index;
+pub(crate) mod fk_check;
 pub(crate) mod fkeys;
 pub(crate) mod group_by;
 pub(crate) mod index;
