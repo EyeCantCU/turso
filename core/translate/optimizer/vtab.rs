@@ -454,6 +454,7 @@ impl<'a> Analyzer<'a> {
     }
 
     /// The LIKE/GLOB prefix bounds of `isLikeOrGlob`, as two virtual terms.
+    #[allow(clippy::too_many_arguments)]
     fn like_bounds(
         &self,
         where_idx: usize,
@@ -986,6 +987,16 @@ pub(crate) fn collect_terms(input: &VtabPlanInput) -> Result<(Vec<VtabTerm>, boo
     Ok((terms, all_passed))
 }
 
+/// SQLite's default NULL placement (no KEYINFO_ORDER_BIGNULL).
+fn default_nulls(order: SortOrder, nulls: Option<ast::NullsOrder>) -> bool {
+    matches!(
+        (order, nulls),
+        (_, None)
+            | (SortOrder::Asc, Some(ast::NullsOrder::First))
+            | (SortOrder::Desc, Some(ast::NullsOrder::Last))
+    )
+}
+
 /// The ORDER BY list to pass and `sqlite3_vtab_distinct`.
 fn order_by_for(input: &VtabPlanInput) -> Result<(Vec<IndexOrderBy>, i32, bool)> {
     let table = &input.table_references.joined_tables()[input.table_index];
@@ -1011,44 +1022,39 @@ fn order_by_for(input: &VtabPlanInput) -> Result<(Vec<IndexOrderBy>, i32, bool)>
     const GROUPBY: u8 = 2;
     const WANT_DISTINCT: u8 = 4;
     const SORTBYGROUP: u8 = 8;
-    let (list, flags): (Vec<(&Expr, SortOrder, Option<ast::NullsOrder>)>, u8) =
-        if let Some(group_by) = input.group_by {
-            let list: Vec<_> = group_by
-                .exprs
-                .iter()
-                .map(|e| (e, SortOrder::Asc, None))
-                .collect();
-            let sbg = if same(&order_exprs, &list) {
-                SORTBYGROUP
-            } else {
-                0
-            };
-            (list, GROUPBY | sbg)
-        } else if shape.distinct && !shape.aggregate {
-            if order_exprs.is_empty() {
-                (result_exprs, DISTINCTBY)
-            } else if same(&order_exprs, &result_exprs) {
-                (result_exprs, DISTINCTBY | SORTBYGROUP)
-            } else {
-                (order_exprs, WANT_DISTINCT)
-            }
-        } else if shape.aggregate {
-            (Vec::new(), 0)
+    type OrderList<'e> = Vec<(&'e Expr, SortOrder, Option<ast::NullsOrder>)>;
+    let (list, flags): (OrderList, u8) = if let Some(group_by) = input.group_by {
+        let list: Vec<_> = group_by
+            .exprs
+            .iter()
+            .map(|e| (e, SortOrder::Asc, None))
+            .collect();
+        let sbg = if same(&order_exprs, &list) {
+            SORTBYGROUP
         } else {
-            (order_exprs, 0)
+            0
         };
+        (list, GROUPBY | sbg)
+    } else if shape.distinct && !shape.aggregate {
+        if order_exprs.is_empty() {
+            (result_exprs, DISTINCTBY)
+        } else if same(&order_exprs, &result_exprs) {
+            (result_exprs, DISTINCTBY | SORTBYGROUP)
+        } else {
+            (order_exprs, WANT_DISTINCT)
+        }
+    } else if shape.aggregate {
+        (Vec::new(), 0)
+    } else {
+        (order_exprs, 0)
+    };
     let mut out = Vec::new();
     let mut all = !list.is_empty();
     for (e, order, nulls) in &list {
         if e.is_constant(input.resolver) {
             continue;
         }
-        let default_nulls = match (order, nulls) {
-            (_, None) => true,
-            (SortOrder::Asc, Some(ast::NullsOrder::First)) => true,
-            (SortOrder::Desc, Some(ast::NullsOrder::Last)) => true,
-            _ => false,
-        };
+        let default_nulls = default_nulls(*order, *nulls);
         if !default_nulls {
             all = false;
             break;
@@ -1088,12 +1094,7 @@ fn order_by_for(input: &VtabPlanInput) -> Result<(Vec<IndexOrderBy>, i32, bool)>
     // LIMIT also needs every ORDER BY term to be a plain column.
     let plain = input.order_by.iter().all(|(e, o, n)| {
         matches!(e.as_ref(), Expr::Column { table: t, .. } | Expr::RowId { table: t, .. } if *t == table.internal_id)
-            && match (o, n) {
-                (_, None) => true,
-                (SortOrder::Asc, Some(ast::NullsOrder::First)) => true,
-                (SortOrder::Desc, Some(ast::NullsOrder::Last)) => true,
-                _ => false,
-            }
+            && default_nulls(*o, *n)
     });
     if !all {
         return Ok((Vec::new(), 0, plain));
@@ -1284,7 +1285,7 @@ pub(crate) fn plan_vtab(input: &VtabPlanInput) -> Result<Option<Arc<VtabCandidat
     let (m_prereq, _) = prereq_masks(input.table_references, input.table_index);
     let mut b = LoopBuilder {
         vtab,
-        table_name: &table.table.get_name().to_string(),
+        table_name: table.table.get_name(),
         terms: &terms,
         req,
         loops: Vec::new(),

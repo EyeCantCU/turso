@@ -207,10 +207,13 @@ std::thread_local! {
     /// Per table: columns of the current row left unset in a nochange read.
     /// Rows read with nochange, oldest first: table, cursor, row, unset columns.
     /// UPDATE reads all rows before its xUpdate calls, which take them in order.
-    static NOCHANGE_COLS: RefCell<Vec<(usize, usize, u64, Vec<usize>)>> = const { RefCell::new(Vec::new()) };
+    static NOCHANGE_COLS: RefCell<Vec<NochangeRow>> = const { RefCell::new(Vec::new()) };
     /// xUpdate arguments that are unchanged columns.
     static NOCHANGE_VALUES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
+
+/// A row read with nochange: table, cursor, row number, unset columns.
+type NochangeRow = (usize, usize, u64, Vec<usize>);
 
 /// Marks a nochange xColumn result the table did not set.
 const NOCHANGE_UNSET: &str = "\u{1}nochange";

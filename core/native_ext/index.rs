@@ -112,11 +112,17 @@ impl IndexPlan {
     }
 }
 
+/// The older interface's column number: the rowid is `u32::MAX`.
+fn legacy_column(column: i32) -> u32 {
+    if column < 0 {
+        u32::MAX
+    } else {
+        column as u32
+    }
+}
+
 fn legacy_op(c: &IndexConstraint) -> Option<ConstraintOp> {
     // An IN is offered as EQ, as SQLite does; the planner loops over its values.
-    if c.column < 0 {
-        return None;
-    }
     Some(match c.op {
         index_op::EQ => ConstraintOp::Eq,
         index_op::LT => ConstraintOp::Lt,
@@ -125,6 +131,13 @@ fn legacy_op(c: &IndexConstraint) -> Option<ConstraintOp> {
         index_op::GE => ConstraintOp::Ge,
         index_op::NE => ConstraintOp::Ne,
         index_op::MATCH => ConstraintOp::Match,
+        index_op::LIKE => ConstraintOp::Like,
+        index_op::GLOB => ConstraintOp::Glob,
+        index_op::REGEXP => ConstraintOp::Regexp,
+        index_op::ISNOT => ConstraintOp::IsNot,
+        index_op::ISNOTNULL => ConstraintOp::IsNotNull,
+        index_op::ISNULL => ConstraintOp::IsNull,
+        index_op::IS => ConstraintOp::Is,
         _ => return None,
     })
 }
@@ -145,7 +158,7 @@ pub(crate) fn best_index_via_legacy(
             legacy_op(c).map(|op| {
                 positions.push(i);
                 ConstraintInfo {
-                    column_index: c.column as u32,
+                    column_index: legacy_column(c.column),
                     op,
                     usable: c.usable,
                     index: i,
@@ -153,17 +166,14 @@ pub(crate) fn best_index_via_legacy(
             })
         })
         .collect();
-    let order_by: Vec<OrderByInfo> = if req.order_by.iter().all(|o| o.column >= 0) {
-        req.order_by
-            .iter()
-            .map(|o| OrderByInfo {
-                column_index: o.column as u32,
-                desc: o.desc,
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let order_by: Vec<OrderByInfo> = req
+        .order_by
+        .iter()
+        .map(|o| OrderByInfo {
+            column_index: legacy_column(o.column),
+            desc: o.desc,
+        })
+        .collect();
     let info = match best_index(&constraints, &order_by) {
         Ok(info) => info,
         Err(ResultCode::ConstraintViolation) => return Ok(None),

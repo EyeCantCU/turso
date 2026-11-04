@@ -48,6 +48,8 @@ const SQLITE_INDEX_SCAN_UNIQUE: c_int = 1;
     all(not(feature = "sqlite3"), target_os = "windows"),
     link(name = "turso_sqlite3", kind = "raw-dylib")
 )]
+// vtab.rs declares the same functions with its own module type.
+#[allow(clashing_extern_declarations)]
 extern "C" {
     fn sqlite3_mprintf(fmt: *const c_char, ...) -> *mut c_char;
     fn sqlite3_result_null(ctx: *mut c_void);
@@ -61,10 +63,11 @@ extern "C" {
     fn sqlite3_result_error(ctx: *mut c_void, msg: *const c_char, n: c_int);
     fn sqlite3_user_data(ctx: *mut c_void) -> *mut c_void;
     fn sqlite3_value_double(v: *mut c_void) -> f64;
+    // The module type is local to this file; vtab.rs declares its own.
     fn sqlite3_create_module(
         db: *mut sqlite3,
         name: *const c_char,
-        module: *const sqlite3_module,
+        module: *const c_void,
         aux: *mut c_void,
     ) -> c_int;
     fn sqlite3_declare_vtab(db: *mut sqlite3, sql: *const c_char) -> c_int;
@@ -674,7 +677,12 @@ unsafe fn open_rec() -> *mut sqlite3 {
     let mut db = ptr::null_mut();
     assert_eq!(sqlite3_open(c(":memory:").as_ptr(), &mut db), SQLITE_OK);
     assert_eq!(
-        sqlite3_create_module(db, c("rec").as_ptr(), &REC_MODULE, ptr::null_mut()),
+        sqlite3_create_module(
+            db,
+            c("rec").as_ptr(),
+            &REC_MODULE as *const sqlite3_module as *const c_void,
+            ptr::null_mut()
+        ),
         SQLITE_OK
     );
     DB.store(db, Ordering::SeqCst);

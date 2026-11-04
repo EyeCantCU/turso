@@ -468,6 +468,9 @@ impl VirtualTable for RtreeTable {
         for c in &mut req.constraints {
             c.column = c.column.max(0);
         }
+        for o in &mut req.order_by {
+            o.column = o.column.max(0);
+        }
         crate::native_ext::best_index_via_legacy(&req, |c, o| self.best_index(c, o))
     }
 
