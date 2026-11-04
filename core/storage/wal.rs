@@ -1531,7 +1531,10 @@ impl ShmWalCoordination {
         authority: Arc<MappedSharedWalCoordination>,
     ) -> Self {
         let coordination = Self::new_unseeded(shared, authority);
-        coordination.seed_or_sync_authority();
+        coordination
+            .authority
+            .clone()
+            .with_open_lock(|| coordination.seed_or_sync_authority());
         coordination
     }
 
@@ -1563,6 +1566,14 @@ impl ShmWalCoordination {
         sqlite: Option<Arc<crate::storage::sqlite_shm_interlock::SqliteShmInterlock>>,
     ) -> Self {
         self.sqlite = sqlite;
+        let authority = self.authority.clone();
+        authority.with_open_lock(|| self.seed_with_sqlite_index());
+        self
+    }
+
+    /// See [`Self::with_sqlite_index`]; runs under the open lock.
+    #[cfg(target_os = "linux")]
+    fn seed_with_sqlite_index(&self) {
         if self.sqlite.is_some() {
             let locked = self.lock_authority_for_seed();
             self.seed_or_sync_authority_locked(locked);
@@ -1600,7 +1611,6 @@ impl ShmWalCoordination {
                 }
             }
         }
-        self
     }
 
     /// Take the tshm writer and checkpoint locks to seed the authority. A
@@ -1906,17 +1916,25 @@ impl ShmWalCoordination {
         let Some(sqlite) = self.sqlite.as_ref() else {
             return;
         };
-        let Ok(Some(header)) = sqlite.index().read_header() else {
-            return;
+        let index = sqlite.index();
+        let valid = match index.read_header() {
+            Ok(Some(header)) if sqlite.change_seen(header.change) => return,
+            Ok(Some(_)) => true,
+            // An invalid header: recover it under WAL_WRITE_LOCK, as a
+            // SQLite reader does in walIndexReadHdr.
+            Ok(None) => false,
+            Err(_) => return,
         };
-        if sqlite.change_seen(header.change) {
-            return;
-        }
         if !self.authority.try_acquire_writer(self.owner) {
             return;
         }
         if self.fallback.try_write_lock() {
-            self.import_sqlite_commits(false, false);
+            if valid {
+                self.import_sqlite_commits(false, false);
+            } else if index.try_lock_write().unwrap_or(false) {
+                self.import_sqlite_commits(true, false);
+                index.unlock_write();
+            }
             self.fallback.unlock_write_lock();
         }
         self.authority.release_writer(self.owner);
@@ -1937,8 +1955,12 @@ impl ShmWalCoordination {
         let (mark, header) = if write_locked {
             match index.read_header() {
                 Ok(Some(header)) => (None, header),
-                // No valid header: nothing SQLite committed can be found.
-                Ok(None) => return true,
+                // Invalid (a writer died mid-update, or the VFS reset it):
+                // recover it from the WAL file first, as SQLite would.
+                Ok(None) => match self.recover_sqlite_index(ckpt_held) {
+                    Some(header) => (None, header),
+                    None => return false,
+                },
                 Err(_) => return false,
             }
         } else {
@@ -1955,6 +1977,33 @@ impl ShmWalCoordination {
             sqlite.note_change(header.change);
         }
         imported
+    }
+
+    /// Rebuild SQLite's invalid wal-index from the WAL file, like
+    /// walIndexRecover. The caller holds WAL_WRITE_LOCK; `ckpt_held` says it
+    /// also holds WAL_CKPT_LOCK. None if the locks are busy.
+    #[cfg(target_os = "linux")]
+    fn recover_sqlite_index(
+        &self,
+        ckpt_held: bool,
+    ) -> Option<crate::storage::sqlite_wal_index::IndexSnapshot> {
+        let index = self.sqlite.as_ref()?.index();
+        if !ckpt_held && !index.try_lock_ckpt().unwrap_or(false) {
+            return None;
+        }
+        let recovered = if index.try_lock_recover().unwrap_or(false) {
+            let header = index.recover();
+            index.unlock_recover();
+            header
+                .inspect_err(|err| tracing::error!("recovering SQLite wal-index failed: {err}"))
+                .ok()
+        } else {
+            None
+        };
+        if !ckpt_held {
+            index.unlock_ckpt();
+        }
+        recovered
     }
 
     /// See [`Self::import_sqlite_commits`]; `header` cannot change meanwhile.
@@ -9604,15 +9653,17 @@ pub mod test {
         bulk_inserts(&conn, 8, 2);
 
         let pager = conn.pager.load();
-        let partial = run_checkpoint_until_done(
+        // Only a complete checkpoint syncs the database file and so records
+        // a proof, as in SQLite.
+        let complete = run_checkpoint_until_done(
             &pager,
             CheckpointMode::Passive {
-                upper_bound_inclusive: Some(1),
+                upper_bound_inclusive: None,
             },
         );
         assert!(
-            partial.wal_total_backfilled > 0 && !partial.everything_backfilled(),
-            "setup must create a partial checkpoint with a positive durable backfill proof"
+            complete.wal_total_backfilled > 0 && complete.everything_backfilled(),
+            "setup must create a checkpoint with a positive durable backfill proof"
         );
 
         let authority = db.shared_wal_coordination().unwrap().unwrap();
@@ -9652,12 +9703,12 @@ pub mod test {
         let replacement = run_checkpoint_until_done(
             &pager,
             CheckpointMode::Passive {
-                upper_bound_inclusive: Some(1),
+                upper_bound_inclusive: None,
             },
         );
         assert!(
-            replacement.wal_total_backfilled > 0 && !replacement.everything_backfilled(),
-            "replacement setup must create a new partial checkpoint after RESTART"
+            replacement.wal_total_backfilled > 0 && replacement.everything_backfilled(),
+            "replacement setup must create a new complete checkpoint after RESTART"
         );
 
         let snapshot_after_replacement = authority.snapshot();
@@ -9671,7 +9722,7 @@ pub mod test {
                 db_size_after,
                 db_crc_after
             ),
-            "partial checkpoint after RESTART must install a replacement proof for the new generation"
+            "checkpoint after RESTART must install a replacement proof for the new generation"
         );
         assert_ne!(
             snapshot_after_replacement.checkpoint_seq, snapshot_before_restart.checkpoint_seq,
@@ -9692,15 +9743,17 @@ pub mod test {
         bulk_inserts(&conn, 8, 2);
 
         let pager = conn.pager.load();
-        let partial = run_checkpoint_until_done(
+        // Only a complete checkpoint syncs the database file and so records
+        // a proof, as in SQLite.
+        let complete = run_checkpoint_until_done(
             &pager,
             CheckpointMode::Passive {
-                upper_bound_inclusive: Some(1),
+                upper_bound_inclusive: None,
             },
         );
         assert!(
-            partial.wal_total_backfilled > 0 && !partial.everything_backfilled(),
-            "setup must create a partial checkpoint with a positive durable backfill proof"
+            complete.wal_total_backfilled > 0 && complete.everything_backfilled(),
+            "setup must create a checkpoint with a positive durable backfill proof"
         );
 
         let authority = db.shared_wal_coordination().unwrap().unwrap();
@@ -9750,12 +9803,12 @@ pub mod test {
         let replacement = run_checkpoint_until_done(
             &pager,
             CheckpointMode::Passive {
-                upper_bound_inclusive: Some(1),
+                upper_bound_inclusive: None,
             },
         );
         assert!(
-            replacement.wal_total_backfilled > 0 && !replacement.everything_backfilled(),
-            "replacement setup must create a new partial checkpoint after TRUNCATE"
+            replacement.wal_total_backfilled > 0 && replacement.everything_backfilled(),
+            "replacement setup must create a new complete checkpoint after TRUNCATE"
         );
 
         let snapshot_after_replacement = authority.snapshot();
@@ -9769,7 +9822,7 @@ pub mod test {
                 db_size_after,
                 db_crc_after
             ),
-            "partial checkpoint after TRUNCATE must install a replacement proof for the new generation"
+            "checkpoint after TRUNCATE must install a replacement proof for the new generation"
         );
         assert_ne!(
             snapshot_after_replacement.checkpoint_seq, snapshot_before_truncate.checkpoint_seq,

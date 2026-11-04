@@ -3,15 +3,20 @@
 //! A connection opened through a non-default VFS does all of its file I/O
 //! through the application's `sqlite3_vfs` / `sqlite3_io_methods`: [`VfsIo`]
 //! implements turso_core's `IO` on top of a C VFS and [`VfsFile`] implements
-//! `File` on top of a `sqlite3_file`. Turso keeps its WAL index in process
-//! memory, so the xShm* methods are never needed by the engine; the database
-//! file is locked EXCLUSIVE for the life of a read-write connection, which is
-//! what turso does with its own I/O when multiprocess WAL is not in use.
+//! `File` on top of a `sqlite3_file`.
+//!
+//! Multi-process access goes through the VFS too: the database-file locks
+//! the SQLite interlock holds use xLock/xUnlock, and SQLite's wal-index
+//! (`-shm`) uses xShmMap/xShmLock/xShmBarrier/xShmUnmap of the main
+//! database file ([`VfsShmFile`]). Turso's private coordination file
+//! (`-tshm`) needs host shared memory, so it is only available when the
+//! database is a host file. Without multiprocess WAL (no shm methods, or not
+//! a host file) a read-write connection holds the database EXCLUSIVE.
 
 use super::*;
 use std::collections::HashMap as Map;
 use std::sync::Weak;
-use turso_core::io::{FileId, FileSyncType};
+use turso_core::io::{FileId, FileSyncType, SharedWalLockKind, SharedWalMappedRegion};
 use turso_core::{Buffer, Completion, CompletionError, File, OpenFlags, IO};
 
 pub(crate) type VfsFn = Option<unsafe extern "C" fn()>;
@@ -152,7 +157,20 @@ const SQLITE_ACCESS_EXISTS: ffi::c_int = 0;
 
 const SQLITE_LOCK_NONE: ffi::c_int = 0;
 const SQLITE_LOCK_SHARED: ffi::c_int = 1;
+const SQLITE_LOCK_RESERVED: ffi::c_int = 2;
 const SQLITE_LOCK_EXCLUSIVE: ffi::c_int = 4;
+
+const SQLITE_SHM_UNLOCK: ffi::c_int = 1;
+const SQLITE_SHM_LOCK: ffi::c_int = 2;
+const SQLITE_SHM_SHARED: ffi::c_int = 4;
+const SQLITE_SHM_EXCLUSIVE: ffi::c_int = 8;
+/// Byte offsets the core interlock and wal-index lock (see
+/// turso_core's sqlite_shm_interlock / sqlite_wal_index).
+const SHM_LOCK_BASE: u64 = 120;
+const SHM_NLOCK: u64 = 8;
+const SHM_DMS: u64 = 128;
+const SHM_REGION: usize = 32768;
+const DB_SHARED_FIRST: u64 = 0x4000_0000 + 2;
 
 const SQLITE_SYNC_NORMAL: ffi::c_int = 2;
 const SQLITE_SYNC_FULL: ffi::c_int = 3;
@@ -191,6 +209,8 @@ pub(crate) struct VfsIo {
     /// SQLite-format filename blocks (name, URI parameters, journal and WAL
     /// names) of main databases, by path; xOpen names point into them.
     names: Mutex<Map<String, NameBlock>>,
+    /// Host I/O for turso's `-tshm` coordination file.
+    host: std::sync::OnceLock<Arc<dyn IO>>,
 }
 
 // The VFS methods are called with the per-file mutex held, as SQLite does.
@@ -222,6 +242,7 @@ impl VfsIo {
             vfs,
             files: Mutex::new(Map::new()),
             names: Mutex::new(Map::new()),
+            host: std::sync::OnceLock::new(),
         });
         all.push(Arc::downgrade(&io));
         io
@@ -307,6 +328,22 @@ impl VfsIo {
         block
     }
 
+    /// Host I/O for turso's `-tshm` coordination file at `full`: shared host
+    /// memory, so only next to a host database file.
+    fn host_coordination_io(&self, full: &str) -> turso_core::Result<Arc<dyn IO>> {
+        let db = &full[..full.len() - "-tshm".len()];
+        if turso_core::io::get_file_id(db).is_err() {
+            return Err(LimboError::InvalidArgument(format!(
+                "experimental multiprocess WAL is not supported for '{db}': not a host file"
+            )));
+        }
+        if let Some(h) = self.host.get() {
+            return Ok(h.clone());
+        }
+        let io: Arc<dyn IO> = Arc::new(turso_core::UnixIO::new()?);
+        Ok(self.host.get_or_init(|| io).clone())
+    }
+
     /// Main-database file opened at `path` through this adapter.
     fn main_file(&self, path: &str) -> Option<Arc<VfsFile>> {
         self.files.lock().ok()?.get(path).and_then(Weak::upgrade)
@@ -369,6 +406,17 @@ impl IO for VfsIo {
         unsafe {
             // Turso's own temp files (sorters, ephemeral tables) are anonymous
             // temp files of the VFS, as in SQLite.
+            if path.ends_with("-tshm") {
+                let full = self.resolve(path)?;
+                // No host file, no coordination file: report it missing.
+                let Ok(host) = self.host_coordination_io(&full) else {
+                    return Err(LimboError::CompletionError(CompletionError::IOError(
+                        std::io::ErrorKind::NotFound,
+                        "open",
+                    )));
+                };
+                return host.open_file(&full, flags, false);
+            }
             let kind = if path.ends_with("/tursodb_temp_file") {
                 FileKind::Temp
             } else if path.ends_with("-wal") {
@@ -449,7 +497,8 @@ impl IO for VfsIo {
                 }
                 if let Ok(mut m) = self.files.lock() {
                     m.retain(|_, w| w.strong_count() > 0);
-                    m.insert(full, Arc::downgrade(&file));
+                    // The first handle is the engine's (the interlock opens more).
+                    m.entry(full).or_insert_with(|| Arc::downgrade(&file));
                 }
             }
             Ok(file)
@@ -472,6 +521,35 @@ impl IO for VfsIo {
                 rc => Err(vfs_err(rc, "delete")),
             }
         }
+    }
+
+    fn supports_shared_wal_coordination(&self) -> bool {
+        true
+    }
+
+    fn open_shared_wal_file(&self, path: &str) -> turso_core::Result<Arc<dyn File>> {
+        let unsupported = |why: &str| {
+            LimboError::InvalidArgument(format!(
+                "experimental multiprocess WAL is not supported for '{path}': {why}"
+            ))
+        };
+        let full = unsafe { self.resolve(path)? };
+        if let Some(db) = full.strip_suffix("-shm") {
+            // SQLite's wal-index lives in the VFS's shared memory of the
+            // main database file.
+            let main = self
+                .main_file(db)
+                .ok_or_else(|| unsupported("main database not open"))?;
+            return Ok(Arc::new(
+                VfsShmFile::new(main).ok_or_else(|| unsupported("no shared-memory methods"))?,
+            ));
+        }
+        if full.ends_with("-tshm") {
+            return self
+                .host_coordination_io(&full)?
+                .open_shared_wal_file(&full);
+        }
+        self.open_file(path, OpenFlags::Create | OpenFlags::NoLock, false)
     }
 
     fn file_id(&self, path: &str) -> turso_core::Result<FileId> {
@@ -679,6 +757,58 @@ impl File for VfsFile {
         self.unlock(SQLITE_LOCK_NONE)
     }
 
+    // The SQLite interlock's database lock: SHARED for the life of the
+    // connection, EXCLUSIVE for locking_mode=EXCLUSIVE, through xLock.
+    fn shared_wal_try_lock_byte(
+        &self,
+        offset: u64,
+        exclusive: bool,
+        _kind: SharedWalLockKind,
+    ) -> turso_core::Result<bool> {
+        if offset != DB_SHARED_FIRST {
+            return Err(vfs_err(SQLITE_IOERR, "lock"));
+        }
+        let busy = |r: turso_core::Result<()>| match r {
+            Ok(()) => Ok(true),
+            Err(LimboError::LockingError(_)) | Err(LimboError::Busy) => Ok(false),
+            Err(e) => Err(e),
+        };
+        if !busy(self.lock(SQLITE_LOCK_SHARED))? {
+            return Ok(false);
+        }
+        if !exclusive {
+            return Ok(true);
+        }
+        if busy(self.lock(SQLITE_LOCK_RESERVED))? && busy(self.lock(SQLITE_LOCK_EXCLUSIVE))? {
+            return Ok(true);
+        }
+        self.unlock(SQLITE_LOCK_SHARED)?;
+        Ok(false)
+    }
+
+    fn shared_wal_lock_byte(
+        &self,
+        offset: u64,
+        exclusive: bool,
+        kind: SharedWalLockKind,
+    ) -> turso_core::Result<()> {
+        if !exclusive && self.lock_level.load(Ordering::Relaxed) > SQLITE_LOCK_SHARED {
+            return self.unlock(SQLITE_LOCK_SHARED);
+        }
+        match self.shared_wal_try_lock_byte(offset, exclusive, kind)? {
+            true => Ok(()),
+            false => Err(LimboError::Busy),
+        }
+    }
+
+    fn shared_wal_unlock_byte(
+        &self,
+        _offset: u64,
+        _kind: SharedWalLockKind,
+    ) -> turso_core::Result<()> {
+        self.unlock(SQLITE_LOCK_NONE)
+    }
+
     fn pread(&self, pos: u64, c: Completion) -> turso_core::Result<Completion> {
         let _g = self.guard.lock();
         let Some(f) = self.methods().and_then(|m| m.x_read) else {
@@ -769,6 +899,238 @@ impl File for VfsFile {
         }
         c.complete(0);
         Ok(c)
+    }
+}
+
+/// SQLite's wal-index (`-shm`) through the VFS shared-memory methods of a
+/// main-database file: `shared_wal_map` maps 32 KiB regions with xShmMap,
+/// the lock bytes 120..127 are xShmLock slots, the barrier is xShmBarrier,
+/// and xShmUnmap runs on drop. The DMS byte is the VFS's own business.
+pub(crate) struct VfsShmFile {
+    file: Arc<VfsFile>,
+    /// Lock held per slot: 0 none, else SQLITE_SHM_SHARED or _EXCLUSIVE.
+    held: Mutex<[ffi::c_int; SHM_NLOCK as usize]>,
+}
+
+unsafe impl Send for VfsShmFile {}
+unsafe impl Sync for VfsShmFile {}
+
+struct VfsShmRegion(std::ptr::NonNull<u8>);
+
+unsafe impl Send for VfsShmRegion {}
+unsafe impl Sync for VfsShmRegion {}
+
+impl SharedWalMappedRegion for VfsShmRegion {
+    fn ptr(&self) -> std::ptr::NonNull<u8> {
+        self.0
+    }
+
+    fn len(&self) -> usize {
+        SHM_REGION
+    }
+}
+
+impl VfsShmFile {
+    /// None if the file's methods have no shared memory (iVersion < 2).
+    fn new(file: Arc<VfsFile>) -> Option<Self> {
+        let m = file.methods()?;
+        if m.i_version < 2 || m.x_shm_map.is_none() || m.x_shm_lock.is_none() {
+            return None;
+        }
+        Some(Self {
+            file,
+            held: Mutex::new([0; SHM_NLOCK as usize]),
+        })
+    }
+
+    fn methods(&self) -> &sqlite3_io_methods {
+        self.file.methods().expect("checked in new")
+    }
+
+    fn map_region(&self, region: usize) -> turso_core::Result<std::ptr::NonNull<u8>> {
+        let _g = self.file.guard.lock();
+        let f = self.methods().x_shm_map.expect("checked in new");
+        let mut p: *mut ffi::c_void = std::ptr::null_mut();
+        let rc = unsafe {
+            f(
+                self.file.raw(),
+                region as ffi::c_int,
+                SHM_REGION as ffi::c_int,
+                1,
+                &mut p,
+            )
+        };
+        if rc != SQLITE_OK {
+            return Err(vfs_err(rc, "shm map"));
+        }
+        std::ptr::NonNull::new(p as *mut u8).ok_or_else(|| vfs_err(SQLITE_IOERR, "shm map"))
+    }
+
+    fn shm_lock(&self, slot: u64, flags: ffi::c_int) -> turso_core::Result<bool> {
+        let _g = self.file.guard.lock();
+        let f = self.methods().x_shm_lock.expect("checked in new");
+        match unsafe { f(self.file.raw(), slot as ffi::c_int, 1, flags) } {
+            SQLITE_OK => Ok(true),
+            rc if rc & 0xff == SQLITE_BUSY => Ok(false),
+            rc => Err(vfs_err(rc, "shm lock")),
+        }
+    }
+
+    fn slot(offset: u64) -> turso_core::Result<u64> {
+        if (SHM_LOCK_BASE..SHM_LOCK_BASE + SHM_NLOCK).contains(&offset) {
+            Ok(offset - SHM_LOCK_BASE)
+        } else {
+            Err(vfs_err(SQLITE_IOERR, "shm lock"))
+        }
+    }
+}
+
+impl Drop for VfsShmFile {
+    fn drop(&mut self) {
+        let _g = self.file.guard.lock();
+        if let Some(f) = self.methods().x_shm_unmap {
+            unsafe { f(self.file.raw(), 0) };
+        }
+    }
+}
+
+impl File for VfsShmFile {
+    fn lock_file(&self, _exclusive: bool) -> turso_core::Result<()> {
+        Ok(())
+    }
+
+    fn unlock_file(&self) -> turso_core::Result<()> {
+        Ok(())
+    }
+
+    fn pread(&self, _pos: u64, _c: Completion) -> turso_core::Result<Completion> {
+        Err(vfs_err(SQLITE_IOERR, "shm read"))
+    }
+
+    fn pwrite(
+        &self,
+        _pos: u64,
+        _buffer: Arc<Buffer>,
+        _c: Completion,
+    ) -> turso_core::Result<Completion> {
+        Err(vfs_err(SQLITE_IOERR, "shm write"))
+    }
+
+    fn sync(&self, c: Completion, _sync_type: FileSyncType) -> turso_core::Result<Completion> {
+        c.complete(0);
+        Ok(c)
+    }
+
+    /// xShmMap grows the shared memory itself.
+    fn size(&self) -> turso_core::Result<u64> {
+        Ok(u64::MAX)
+    }
+
+    fn truncate(&self, _len: u64, _c: Completion) -> turso_core::Result<Completion> {
+        Err(vfs_err(SQLITE_IOERR, "shm truncate"))
+    }
+
+    fn shared_wal_set_len(&self, _len: u64) -> turso_core::Result<()> {
+        Ok(())
+    }
+
+    fn shared_wal_map(
+        &self,
+        offset: u64,
+        len: usize,
+    ) -> turso_core::Result<Box<dyn SharedWalMappedRegion>> {
+        if len != SHM_REGION || offset % SHM_REGION as u64 != 0 {
+            return Err(vfs_err(SQLITE_IOERR, "shm map"));
+        }
+        let p = self.map_region((offset / SHM_REGION as u64) as usize)?;
+        Ok(Box::new(VfsShmRegion(p)))
+    }
+
+    fn shared_wal_barrier(&self) {
+        let _g = self.file.guard.lock();
+        match self.methods().x_shm_barrier {
+            Some(f) => unsafe { f(self.file.raw()) },
+            None => std::sync::atomic::fence(Ordering::SeqCst),
+        }
+    }
+
+    fn shared_wal_try_lock_byte(
+        &self,
+        offset: u64,
+        exclusive: bool,
+        _kind: SharedWalLockKind,
+    ) -> turso_core::Result<bool> {
+        if offset == SHM_DMS {
+            // xShmMap takes (and if first, resets under) the VFS's DMS lock.
+            // Whether others are present cannot be probed through the VFS.
+            if exclusive {
+                return Ok(false);
+            }
+            self.map_region(0)?;
+            return Ok(true);
+        }
+        let slot = Self::slot(offset)?;
+        let want = if exclusive {
+            SQLITE_SHM_EXCLUSIVE
+        } else {
+            SQLITE_SHM_SHARED
+        };
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let cur = held[slot as usize];
+        if cur == want {
+            return Ok(true);
+        }
+        // A VFS like turso's unix converts a held lock in place.
+        if self.shm_lock(slot, SQLITE_SHM_LOCK | want)? {
+            held[slot as usize] = want;
+            return Ok(true);
+        }
+        if cur == 0 {
+            return Ok(false);
+        }
+        // SQLite's unix VFS does not convert: drop ours, then retry.
+        self.shm_lock(slot, SQLITE_SHM_UNLOCK | cur)?;
+        held[slot as usize] = 0;
+        if self.shm_lock(slot, SQLITE_SHM_LOCK | want)? {
+            held[slot as usize] = want;
+            return Ok(true);
+        }
+        if self.shm_lock(slot, SQLITE_SHM_LOCK | cur)? {
+            held[slot as usize] = cur;
+        }
+        Ok(false)
+    }
+
+    fn shared_wal_lock_byte(
+        &self,
+        offset: u64,
+        exclusive: bool,
+        kind: SharedWalLockKind,
+    ) -> turso_core::Result<()> {
+        for _ in 0..2000 {
+            if self.shared_wal_try_lock_byte(offset, exclusive, kind)? {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        Err(LimboError::Busy)
+    }
+
+    fn shared_wal_unlock_byte(
+        &self,
+        offset: u64,
+        _kind: SharedWalLockKind,
+    ) -> turso_core::Result<()> {
+        if offset == SHM_DMS {
+            return Ok(());
+        }
+        let slot = Self::slot(offset)?;
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let cur = std::mem::take(&mut held[slot as usize]);
+        if cur != 0 {
+            self.shm_lock(slot, SQLITE_SHM_UNLOCK | cur)?;
+        }
+        Ok(())
     }
 }
 
@@ -957,14 +1319,23 @@ pub(crate) unsafe fn open_v2_via_vfs(
             open_flags |= OpenFlags::NoLock;
         }
         PENDING_PARAMS.with(|p| *p.borrow_mut() = Some((full.clone(), params.clone())));
-        let res = turso_core::Database::open_file_with_flags(
-            io_dyn.clone(),
-            &full,
-            open_flags,
-            default_db_opts(),
-            None,
-            Arc::new(SqliteDialect),
-        );
+        // Shared with other processes through the VFS's locks and shared
+        // memory when it has them and names a host file; else exclusive.
+        let host_file = std::path::Path::new(&full)
+            .parent()
+            .is_some_and(|dir| dir.is_dir());
+        let res = if host_file && !nolock {
+            super::multiprocess::open_file_db(io_dyn.clone(), &full, open_flags, default_db_opts())
+        } else {
+            turso_core::Database::open_file_with_flags(
+                io_dyn.clone(),
+                &full,
+                open_flags,
+                default_db_opts(),
+                None,
+                Arc::new(SqliteDialect),
+            )
+        };
         PENDING_PARAMS.with(|p| *p.borrow_mut() = None);
         match res {
             // xOpen granted read-only access only: open read-only, as SQLite.
