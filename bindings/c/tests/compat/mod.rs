@@ -255,8 +255,8 @@ mod udf;
 
 mod abi_values;
 mod errmsg;
-mod misc;
 mod interleave;
+mod misc;
 mod reentrancy;
 mod session;
 mod textbytes;

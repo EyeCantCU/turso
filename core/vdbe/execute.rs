@@ -5306,12 +5306,13 @@ pub fn op_transaction_inner(
                     && program.connection.n_active_writes.load(Ordering::SeqCst) > 0;
                 // A helper statement nested in a statement that holds the
                 // statement journal runs inside that statement's savepoint.
-                let needs_stmt_journal = (program.needs_stmt_subtransactions.load(Ordering::Relaxed)
-                    && !(program.connection.is_nested_stmt()
-                        && is_main_db
-                        && mv_store.is_none()
-                        && pager.subjournal_in_use()))
-                    || joins_other_writers;
+                let needs_stmt_journal =
+                    (program.needs_stmt_subtransactions.load(Ordering::Relaxed)
+                        && !(program.connection.is_nested_stmt()
+                            && is_main_db
+                            && mv_store.is_none()
+                            && pager.subjournal_in_use()))
+                        || joins_other_writers;
                 if needs_stmt_journal {
                     if is_main_db {
                         let res = state.begin_statement(
