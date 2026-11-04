@@ -112,7 +112,7 @@ struct Fts5ExtensionApi {
         unsafe extern "C" fn(Ctx, c_int, *mut Fts5PhraseIter, *mut c_int) -> c_int,
     x_phrase_next_column: unsafe extern "C" fn(Ctx, *mut Fts5PhraseIter, *mut c_int),
     x_query_token: unsafe extern "C" fn(Ctx, c_int, c_int, *mut *const c_char, *mut c_int) -> c_int,
-    x_inst_token: *const c_void,
+    x_inst_token: unsafe extern "C" fn(Ctx, c_int, c_int, *mut *const c_char, *mut c_int) -> c_int,
     x_column_locale: *const c_void,
     x_tokenize_v2: *const c_void,
 }
@@ -505,6 +505,236 @@ fn test_fts5_api_tokenizer_and_auxiliary_function() {
                 .len(),
             1
         );
+        sqlite3_close(db);
+    }
+}
+
+// tokendata=1: a tokenizer that appends "\0" plus the original text of each
+// token, and an auxiliary function that reports xInstToken.
+unsafe extern "C" fn td_cb(
+    p: *mut c_void,
+    tflags: c_int,
+    tok: *const c_char,
+    n: c_int,
+    s: c_int,
+    e: c_int,
+) -> c_int {
+    let c = &*(p as *const TdCtx);
+    let mut t = std::slice::from_raw_parts(tok as *const u8, n as usize).to_vec();
+    let orig = std::slice::from_raw_parts(c.text.add(s as usize), (e - s) as usize);
+    if orig != t.as_slice() {
+        t.push(0);
+        t.extend_from_slice(orig);
+    }
+    (c.x_token)(c.ctx, tflags, t.as_ptr().cast(), t.len() as c_int, s, e)
+}
+
+struct TdCtx {
+    ctx: *mut c_void,
+    x_token: XToken,
+    text: *const u8,
+}
+
+unsafe extern "C" fn td_tokenize(
+    p: *mut c_void,
+    ctx: *mut c_void,
+    flags: c_int,
+    text: *const c_char,
+    n: c_int,
+    loc: *const c_char,
+    nloc: c_int,
+    x_token: XToken,
+) -> c_int {
+    let t = &*(p as *const RevTok);
+    let mut c = TdCtx {
+        ctx,
+        x_token,
+        text: text as *const u8,
+    };
+    ((*t.base).x_tokenize.unwrap())(
+        t.inner,
+        &mut c as *mut TdCtx as *mut c_void,
+        flags,
+        text,
+        n,
+        loc,
+        nloc,
+        td_cb,
+    )
+}
+
+static mut TD_TOKENIZER: fts5_tokenizer_v2 = fts5_tokenizer_v2 {
+    i_version: 2,
+    x_create: Some(rev_create),
+    x_delete: Some(rev_delete),
+    x_tokenize: Some(td_tokenize),
+};
+
+unsafe extern "C" fn insttok(
+    api: *const Fts5ExtensionApi,
+    ctx: Ctx,
+    sctx: *mut c_void,
+    _nval: c_int,
+    _vals: *mut *mut c_void,
+) {
+    let a = &*api;
+    let mut out = Vec::new();
+    let mut ninst = 0;
+    (a.x_inst_count)(ctx, &mut ninst);
+    for i in 0..ninst {
+        let (mut ip, mut ic, mut io) = (0, 0, 0);
+        (a.x_inst)(ctx, i, &mut ip, &mut ic, &mut io);
+        let mut z: *const c_char = ptr::null();
+        let mut n = 0;
+        let rc = (a.x_inst_token)(ctx, i, 0, &mut z, &mut n);
+        let tok = if z.is_null() {
+            "-".to_string()
+        } else {
+            String::from_utf8_lossy(std::slice::from_raw_parts(z as *const u8, n as usize))
+                .replace('\0', "|")
+        };
+        out.push(format!("{ip}:{ic}:{io}={tok}/{rc}"));
+    }
+    let c = CString::new(out.join(" ")).unwrap();
+    let transient = std::mem::transmute::<isize, Option<unsafe extern "C" fn(*mut c_void)>>(-1);
+    sqlite3_result_text(sctx, c.as_ptr(), -1, transient);
+}
+
+#[test]
+fn test_fts5_tokendata() {
+    unsafe {
+        let mut db: *mut sqlite3 = ptr::null_mut();
+        let name = CString::new(":memory:").unwrap();
+        assert_eq!(sqlite3_open(name.as_ptr(), &mut db), SQLITE_OK);
+        let api = fts5_api_of(db);
+        let mut user: *mut c_void = ptr::null_mut();
+        let mut tok: *mut fts5_tokenizer_v2 = ptr::null_mut();
+        let u61 = CString::new("unicode61").unwrap();
+        assert_eq!(
+            ((*api).x_find_tokenizer_v2)(api, u61.as_ptr(), &mut user, &mut tok),
+            SQLITE_OK
+        );
+        BASE_USER = user;
+        BASE_TOK = tok;
+        let td = CString::new("td").unwrap();
+        assert_eq!(
+            ((*api).x_create_tokenizer_v2)(
+                api,
+                td.as_ptr(),
+                ptr::null_mut(),
+                &raw mut TD_TOKENIZER,
+                None
+            ),
+            SQLITE_OK
+        );
+        let f = CString::new("insttok").unwrap();
+        assert_eq!(
+            ((*api).x_create_function)(api, f.as_ptr(), ptr::null_mut(), Some(insttok), None),
+            SQLITE_OK
+        );
+        let mut got = Vec::new();
+        for detail in ["full", "column", "none"] {
+            exec(db, "DROP TABLE IF EXISTS t");
+            exec(
+                db,
+                &format!("CREATE VIRTUAL TABLE t USING fts5(a, b, tokenize='td', tokendata=1, detail={detail})"),
+            );
+            exec(db, "INSERT INTO t(rowid, a, b) VALUES(1, 'Apple apple APPLE', 'Banana'), (2, 'banana', 'APPle pie'), (3, 'applesauce', 'Pie')");
+            exec(db, "BEGIN");
+            exec(db, "INSERT INTO t(rowid, a, b) VALUES(4, 'Apple', 'apple')");
+            for q in [
+                "SELECT rowid || ' ' || insttok(t) FROM t WHERE t MATCH 'apple' ORDER BY rowid",
+                "SELECT rowid || ' ' || insttok(t) FROM t WHERE t MATCH 'b:apple OR pie' ORDER BY rowid",
+                "SELECT rowid || ' ' || insttok(t) FROM t WHERE t MATCH 'app*' ORDER BY rowid",
+                "SELECT rowid || ' ' || highlight(t, 0, '[', ']') || ' ' || round(bm25(t), 4) FROM t WHERE t MATCH 'apple' ORDER BY rowid",
+                "SELECT count(*) FROM t_data",
+            ] {
+                got.push(format!("{detail}: {q}"));
+                match rows(db, q) {
+                    Ok(r) => got.extend(r),
+                    Err(e) => got.push(format!("ERR {e}")),
+                }
+            }
+            exec(db, "COMMIT");
+            exec(db, "INSERT INTO t(t) VALUES('integrity-check')");
+            exec(db, "CREATE VIRTUAL TABLE v USING fts5vocab(t, row)");
+            got.push(
+                rows(
+                    db,
+                    "SELECT replace(term, char(0), '|') || ':' || doc || ':' || cnt FROM v",
+                )
+                .unwrap()
+                .join(" "),
+            );
+            exec(db, "DROP TABLE v");
+        }
+        if std::env::var("FTS5_PRINT").is_ok() {
+            for g in &got {
+                println!("{g:?},");
+            }
+        }
+        // Expected output from SQLite 3.54.1 (FTS5_PRINT=1 with --features sqlite3).
+        let expected: &[&str] = &[
+            "full: SELECT rowid || ' ' || insttok(t) FROM t WHERE t MATCH 'apple' ORDER BY rowid",
+            "1 0:0:0=apple|Apple/0 0:0:1=apple/0 0:0:2=apple|APPLE/0",
+            "2 0:1:0=apple|APPle/0",
+            "4 0:0:0=apple|Apple/0 0:1:0=apple/0",
+            "full: SELECT rowid || ' ' || insttok(t) FROM t WHERE t MATCH 'b:apple OR pie' ORDER BY rowid",
+            "2 0:1:0=apple|APPle/0 1:1:1=pie/0",
+            "3 1:1:0=pie|Pie/0",
+            "4 0:1:0=-/0",
+            "full: SELECT rowid || ' ' || insttok(t) FROM t WHERE t MATCH 'app*' ORDER BY rowid",
+            "1 0:0:0=apple|Apple/0 0:0:1=apple/0 0:0:2=apple|APPLE/0",
+            "2 0:1:0=apple|APPle/0",
+            "3 0:0:0=applesauce/0",
+            "4 0:0:0=apple|Apple/0 0:1:0=apple/0",
+            "full: SELECT rowid || ' ' || highlight(t, 0, '[', ']') || ' ' || round(bm25(t), 4) FROM t WHERE t MATCH 'apple' ORDER BY rowid",
+            "1 [Apple] [apple] [APPLE] 0.0",
+            "2 banana 0.0",
+            "4 [Apple] 0.0",
+            "full: SELECT count(*) FROM t_data",
+            "4",
+            "apple:2:2 apple apple apple applesauce:1:1 banana:1:1 banana pie:1:1 pie",
+            "column: SELECT rowid || ' ' || insttok(t) FROM t WHERE t MATCH 'apple' ORDER BY rowid",
+            "1 0:0:0=apple|Apple/0 0:0:1=apple/0 0:0:2=apple|APPLE/0",
+            "2 0:1:0=apple|APPle/0",
+            "4 0:0:0=apple|Apple/0 0:1:0=apple/0",
+            "column: SELECT rowid || ' ' || insttok(t) FROM t WHERE t MATCH 'b:apple OR pie' ORDER BY rowid",
+            "2 0:1:0=apple|APPle/0 1:1:1=pie/0",
+            "3 1:1:0=pie|Pie/0",
+            "4 0:1:0=apple/0",
+            "column: SELECT rowid || ' ' || insttok(t) FROM t WHERE t MATCH 'app*' ORDER BY rowid",
+            "1 0:0:0=apple|Apple/0 0:0:1=apple/0 0:0:2=apple|APPLE/0",
+            "2 0:1:0=apple|APPle/0",
+            "3 0:0:0=applesauce/0",
+            "4 0:0:0=apple|Apple/0 0:1:0=apple/0",
+            "column: SELECT rowid || ' ' || highlight(t, 0, '[', ']') || ' ' || round(bm25(t), 4) FROM t WHERE t MATCH 'apple' ORDER BY rowid",
+            "1 [Apple] [apple] [APPLE] 0.0",
+            "2 banana 0.0",
+            "4 [Apple] 0.0",
+            "column: SELECT count(*) FROM t_data",
+            "4",
+            "NULL NULL NULL NULL NULL NULL NULL NULL NULL",
+            "none: SELECT rowid || ' ' || insttok(t) FROM t WHERE t MATCH 'apple' ORDER BY rowid",
+            "1 0:0:0=apple|Apple/0 0:0:1=apple/0 0:0:2=apple|APPLE/0",
+            "2 0:1:0=apple|APPle/0",
+            "4 0:0:0=apple|Apple/0 0:1:0=apple/0",
+            "none: SELECT rowid || ' ' || insttok(t) FROM t WHERE t MATCH 'b:apple OR pie' ORDER BY rowid",
+            "ERR fts5: column queries are not supported (detail=none)",
+            "none: SELECT rowid || ' ' || insttok(t) FROM t WHERE t MATCH 'app*' ORDER BY rowid",
+            "1 0:0:0=apple|Apple/0 0:0:1=apple/0 0:0:2=apple|APPLE/0",
+            "2 0:1:0=apple|APPle/0",
+            "3 0:0:0=applesauce/0",
+            "4 0:0:0=apple|Apple/0 0:1:0=apple/0",
+            "none: SELECT rowid || ' ' || highlight(t, 0, '[', ']') || ' ' || round(bm25(t), 4) FROM t WHERE t MATCH 'apple' ORDER BY rowid",
+            "1 [Apple] [apple] [APPLE] 0.0",
+            "2 banana 0.0",
+            "4 [Apple] 0.0",
+            "none: SELECT count(*) FROM t_data",
+            "4",
+            "NULL NULL NULL NULL NULL NULL NULL NULL NULL",
+        ];
+        assert_eq!(got, expected);
         sqlite3_close(db);
     }
 }

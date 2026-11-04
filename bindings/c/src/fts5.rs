@@ -14,7 +14,6 @@ use turso_core::{Connection, LimboError, Value};
 use turso_ext::Value as ExtValue;
 
 const SQLITE_DONE: ffi::c_int = 101;
-const SQLITE_RANGE: ffi::c_int = 25;
 const SQLITE_NOMEM: ffi::c_int = 7;
 
 // ------------------------------------------------------------------ pointers
@@ -1115,18 +1114,15 @@ unsafe extern "C" fn x_inst_token(
     pn: *mut ffi::c_int,
 ) -> ffi::c_int {
     let c = fctx(p);
-    let phrase = match c.api.inst(inst) {
-        Ok((ip, _, _)) => ip,
-        Err(e) => return api_rc(e),
-    };
-    match c.api.query_token(phrase, token) {
-        Ok(t) => {
+    match c.api.inst_token(inst, token) {
+        Ok(Some(t)) => {
             let (z, n) = c.keep(t);
             *pz = z;
             *pn = n;
             SQLITE_OK
         }
-        Err(_) => SQLITE_RANGE,
+        Ok(None) => SQLITE_OK,
+        Err(e) => api_rc(e),
     }
 }
 

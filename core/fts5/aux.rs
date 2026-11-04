@@ -64,6 +64,9 @@ pub trait AuxApi {
     ) -> ApiResult<()>;
     /// The text of token `token` of phrase `phrase` in the query.
     fn query_token(&mut self, phrase: i32, token: i32) -> ApiResult<Vec<u8>>;
+    /// xInstToken: the document token behind query token `token` of
+    /// instance `inst`; None leaves the C output unset, as SQLite does.
+    fn inst_token(&mut self, inst: i32, token: i32) -> ApiResult<Option<Vec<u8>>>;
     /// The detail mode: 0 full, 1 none, 2 columns.
     fn detail(&self) -> i32;
 }

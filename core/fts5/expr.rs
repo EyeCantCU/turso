@@ -928,6 +928,9 @@ pub(crate) struct Evaluator {
     phrases: Vec<EPhrase>,
     root: usize,
     last: i64,
+    /// Iterator positions (first iterator of each term) before the last
+    /// next(); None until next() is first called.
+    snapshot: Option<Vec<Vec<usize>>>,
 }
 
 fn rowid_cmp(a: i64, b: i64) -> std::cmp::Ordering {
@@ -952,6 +955,7 @@ impl Evaluator {
             phrases: Vec::new(),
             root: 0,
             last: rowid_range.1,
+            snapshot: None,
         };
         // Phrases first, with their doclists (colset-filtered).
         for (pi, phrase) in expr.phrases.iter().enumerate() {
@@ -960,7 +964,8 @@ impl Evaluator {
             for term in &phrase.terms {
                 let mut iters = Vec::with_capacity(term.alts.len());
                 for alt in &term.alts {
-                    let mut dl = query_token(index, s, pending, alt, term.prefix)?;
+                    let q = query_part(cfg.tokendata, alt);
+                    let mut dl = query_token(index, s, pending, q, term.prefix)?;
                     if let Some(cols) = &colset {
                         for (_, pl) in dl.iter_mut() {
                             *pl = match detail {
@@ -1084,6 +1089,12 @@ impl Evaluator {
 
     /// sqlite3Fts5ExprNext
     pub(crate) fn next(&mut self) {
+        self.snapshot = Some(
+            self.phrases
+                .iter()
+                .map(|p| p.terms.iter().map(|t| t.iters[0].idx).collect())
+                .collect(),
+        );
         let root = self.root;
         loop {
             self.node_next(root, None);
@@ -1094,6 +1105,21 @@ impl Evaluator {
         if rowid_cmp(self.nodes[root].rowid, self.last).is_gt() {
             self.nodes[root].eof = true;
         }
+    }
+
+    /// Whether the main iterator of term `t` of phrase `p` moved during the
+    /// last step (or the first positioning). SQLite's tokendata map only
+    /// holds rows reached since the last xNext.
+    pub(crate) fn term_arrived(&self, p: usize, t: usize) -> bool {
+        let Some(snap) = &self.snapshot else {
+            return true;
+        };
+        let cur = self
+            .phrases
+            .get(p)
+            .and_then(|ph| ph.terms.get(t))
+            .map(|term| term.iters[0].idx);
+        cur != snap.get(p).and_then(|v| v.get(t)).copied()
     }
 
     /// sqlite3Fts5ExprPoslist: phrase `i`'s position list at the current row.
@@ -1666,6 +1692,80 @@ fn near_match(lists: &mut [Vec<i64>], sizes: &[usize], near: i32) -> bool {
     ok
 }
 
+/// The part of a query token used for lookups: with tokendata=1, the bytes
+/// before the first NUL (fts5QueryTerm).
+pub(crate) fn query_part(tokendata: bool, token: &[u8]) -> &[u8] {
+    if tokendata {
+        let n = token.iter().position(|&b| b == 0).unwrap_or(token.len());
+        &token[..n]
+    } else {
+        token
+    }
+}
+
+/// Whether index term `term` (without its index byte) is `q` itself or `q`
+/// followed by token data (fts5IsTokendataPrefix).
+pub(crate) fn is_tokendata_match(term: &[u8], q: &[u8]) -> bool {
+    term.starts_with(q) && (term.len() == q.len() || term[q.len()] == 0)
+}
+
+/// The index terms a tokendata=1 query for `q` covers, with their doclists.
+pub(crate) fn tokendata_terms(
+    index: &Index,
+    s: &Structure,
+    pending: Option<&Pending>,
+    q: &[u8],
+) -> Result<Vec<super::index::TermDoclist>> {
+    let mut key = vec![MAIN_PREFIX];
+    key.extend_from_slice(q);
+    let mut terms = index.scan_prefix(s, pending, &key)?;
+    terms.retain(|(t, _)| is_tokendata_match(&t[1..], q));
+    Ok(terms)
+}
+
+/// A tokendata=1 query: the union of the doclists of `q` and every `q\0...`
+/// term. Rows hit by several terms get their lists merged keeping duplicate
+/// positions, as fts5IterSetOutputsTokendata does.
+fn tokendata_doclist(
+    index: &Index,
+    s: &Structure,
+    pending: Option<&Pending>,
+    q: &[u8],
+) -> Result<Vec<(i64, Vec<u8>)>> {
+    let terms = tokendata_terms(index, s, pending, q)?;
+    let detail = index.cfg.detail;
+    let mut merged: std::collections::BTreeMap<i64, Vec<Vec<u8>>> = Default::default();
+    for (_, dl) in terms {
+        for (rowid, pl) in dl {
+            merged.entry(rowid).or_default().push(pl);
+        }
+    }
+    Ok(merged
+        .into_iter()
+        .map(|(rowid, mut lists)| {
+            let pl = if lists.len() == 1 || detail == Detail::None {
+                lists.swap_remove(0)
+            } else {
+                let mut all: Vec<i64> = Vec::new();
+                for l in &lists {
+                    if detail == Detail::Full {
+                        all.extend(poslist_positions(l));
+                    } else {
+                        let (mut off, mut col) = (0, 0i64);
+                        while off < l.len() {
+                            col += get_varint32(l, &mut off) as i64 - 2;
+                            all.push(col);
+                        }
+                    }
+                }
+                all.sort();
+                positions_to_poslist(&all)
+            };
+            (rowid, pl)
+        })
+        .collect())
+}
+
 /// Whether a prefix query for `token` is served by a prefix index.
 fn has_prefix_index(index: &Index, token: &[u8]) -> bool {
     let nchar = char_len(token);
@@ -1682,6 +1782,9 @@ fn query_token(
     prefix: bool,
 ) -> Result<Vec<(i64, Vec<u8>)>> {
     let cfg = index.cfg;
+    if !prefix && cfg.tokendata {
+        return tokendata_doclist(index, s, pending, token);
+    }
     if !prefix {
         let mut key = vec![MAIN_PREFIX];
         key.extend_from_slice(token);

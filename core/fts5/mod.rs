@@ -702,7 +702,13 @@ pub(crate) struct CursorState {
     current_aux: String,
     scan_cache: HashMap<i64, Vec<Value>>,
     sql_cache: Arc<sql::SqlCache>,
+    /// xInstToken maps for detail=full: (phrase, token) -> rowid -> (pos, token).
+    token_maps: HashMap<(usize, usize), TokenMap>,
+    /// ORDER BY rank: SQLite's sorter plan, which keeps tokendata maps.
+    sorted: bool,
 }
+
+type TokenMap = Arc<HashMap<i64, Vec<(i64, Vec<u8>)>>>;
 
 impl CursorState {
     fn new(id: i64, inner: Arc<TableInner>, conn: Arc<Connection>) -> Self {
@@ -723,6 +729,8 @@ impl CursorState {
             docsize: None,
             poslists: None,
             insts: None,
+            token_maps: HashMap::new(),
+            sorted: false,
             auxdata: HashMap::new(),
             current_aux: String::new(),
             scan_cache: HashMap::new(),
@@ -829,6 +837,7 @@ impl CursorState {
             }
         }
         self.desc = idx_num & BI_ORDER_DESC != 0;
+        self.sorted = idx_num & BI_ORDER_RANK != 0;
         if eq.is_some() {
             le.clone_from(&eq);
             ge.clone_from(&eq);
@@ -858,8 +867,19 @@ impl CursorState {
                 None => Vec::new(),
             };
             self.rank = Some((name, rank_vals));
-            let w = self.inner.peek_writes(&self.conn);
             let index = Index::new(&self.conn, cfg, &vals);
+            if cfg.tokendata && e.phrases.iter().any(|p| p.terms.iter().any(|t| !t.prefix)) {
+                // A tokendata=1 term lookup flushes pending writes first.
+                let mut w = self.inner.take_writes(&self.conn);
+                let cache = w.cache.clone();
+                let r = {
+                    let _scope = sql::cache_scope(&cache);
+                    index.flush(&mut w.pending)
+                };
+                self.inner.put_writes(&self.conn, w);
+                r?;
+            }
+            let w = self.inner.peek_writes(&self.conn);
             let (s, _) = index.store.read_structure()?;
             let ev = Evaluator::new(
                 &e,
@@ -870,6 +890,7 @@ impl CursorState {
             )?;
             self.eval = Some(ev);
             self.expr = Some(e);
+            self.token_maps.clear();
             self.plan = Plan::Match;
         } else if cfg.content_table.is_none() {
             return Err(err(format!(
@@ -1063,21 +1084,12 @@ impl CursorState {
         };
         let expr = self.expr.clone().expect("expr");
         let cfg = &self.inner.cfg;
+        let tokendata = cfg.tokendata;
         let ncol = cfg.ncol();
         let mut out: Vec<Vec<u8>> = vec![Vec::new(); nphrase];
         let mut writers = vec![varint::PoslistWriter::default(); nphrase];
         for icol in 0..ncol {
-            let v = row.get(icol + 1).cloned().unwrap_or(Value::Null);
-            let loc_col = (cfg.locale && cfg.content == Content::Normal)
-                .then(|| row.get(1 + ncol + icol).cloned())
-                .flatten();
-            let (text, loc) = match storage::decode_locale(&v) {
-                Some((l, t)) if cfg.locale => (t, Some(l)),
-                _ => (
-                    value_text(&v).unwrap_or_default(),
-                    loc_col.and_then(|l| value_text(&l)),
-                ),
-            };
+            let (text, loc) = row_column_text(cfg, &row, icol);
             let ok: Vec<bool> = (0..nphrase)
                 .map(|i| {
                     matched[i].is_some()
@@ -1104,9 +1116,10 @@ impl CursorState {
                         let Some(t) = expr.phrases[i].terms.first() else {
                             continue;
                         };
+                        let nq = expr::query_part(tokendata, tok).len();
                         let hit = t.alts.iter().any(|a| {
-                            (a.len() == tok.len() || (a.len() < tok.len() && t.prefix))
-                                && tok.starts_with(a)
+                            let a = expr::query_part(tokendata, a);
+                            (a.len() == nq || (a.len() < nq && t.prefix)) && tok.starts_with(a)
                         });
                         if hit {
                             writers[i].append(&mut out[i], ioff);
@@ -1443,12 +1456,150 @@ impl AuxApi for CursorState {
             .ok_or(ApiError::Code(aux::RANGE))
     }
 
+    fn inst_token(&mut self, inst: i32, token: i32) -> ApiResult<Option<Vec<u8>>> {
+        self.inst_token_impl(inst, token)
+    }
+
     fn detail(&self) -> i32 {
         match self.cfg().detail {
             Detail::Full => 0,
             Detail::None => 1,
             Detail::Columns => 2,
         }
+    }
+}
+
+/// The text and locale of column `icol` of a content row (rowid first).
+fn row_column_text(cfg: &Fts5Config, row: &[Value], icol: usize) -> (Vec<u8>, Option<Vec<u8>>) {
+    let ncol = cfg.ncol();
+    let v = row.get(icol + 1).cloned().unwrap_or(Value::Null);
+    let loc_col = (cfg.locale && cfg.content == Content::Normal)
+        .then(|| row.get(1 + ncol + icol).cloned())
+        .flatten();
+    match storage::decode_locale(&v) {
+        Some((l, t)) if cfg.locale => (t, Some(l)),
+        _ => (
+            value_text(&v).unwrap_or_default(),
+            loc_col.and_then(|l| value_text(&l)),
+        ),
+    }
+}
+
+impl CursorState {
+    /// sqlite3Fts5ExprInstToken: the document token behind query token
+    /// `token` of instance `inst`. None where SQLite leaves the output unset.
+    fn inst_token_impl(&mut self, inst: i32, token: i32) -> ApiResult<Option<Vec<u8>>> {
+        let (ip, icol, ioff) = self.inst(inst)?;
+        let term = self
+            .expr
+            .as_ref()
+            .and_then(|e| e.phrases.get(ip as usize))
+            .and_then(|p| p.terms.get(token.max(0) as usize).filter(|_| token >= 0))
+            .cloned()
+            .ok_or(ApiError::Code(aux::RANGE))?;
+        let tokendata = self.cfg().tokendata;
+        if !tokendata && !term.prefix {
+            return Ok(Some(term.alts[0].clone()));
+        }
+        let q = expr::query_part(tokendata, &term.alts[0]).to_vec();
+        let pos = ((icol as i64) << 32) + (ioff + token) as i64;
+        let rowid = CursorState::rowid(self);
+        if self.cfg().detail == Detail::Full {
+            // A tokendata iterator's map is cleared at each xNext (not with the
+            // sorter), so only rows it reached in this step are found.
+            if !term.prefix
+                && !self.sorted
+                && !self
+                    .eval
+                    .as_ref()
+                    .is_some_and(|ev| ev.term_arrived(ip as usize, token as usize))
+            {
+                return Ok(None);
+            }
+            // From the index, as the tokendata iterator's map.
+            let key = (ip as usize, token as usize);
+            let map = match self.token_maps.get(&key) {
+                Some(m) => m.clone(),
+                None => {
+                    let m = Arc::new(self.build_token_map(&q, term.prefix)?);
+                    self.token_maps.insert(key, m.clone());
+                    m
+                }
+            };
+            let Some(entries) = map.get(&rowid) else {
+                return Ok(None);
+            };
+            let single = !term.prefix && entries.iter().all(|e| e.1 == entries[0].1);
+            return Ok(entries
+                .iter()
+                .find(|e| single || e.0 == pos)
+                .map(|e| e.1.clone()));
+        }
+        // detail=column/none: re-tokenize the row (as poslist population).
+        if self.cfg().is_contentless(true) {
+            return Ok(None);
+        }
+        let Some(row) = self.content_row()? else {
+            return Ok(None);
+        };
+        let inner = self.inner.clone();
+        let cfg = &inner.cfg;
+        let (text, loc) = row_column_text(cfg, &row, icol as usize);
+        let mut ioff_cur: i64 = ((icol as i64) << 32) - 1;
+        let mut found: Option<Vec<u8>> = None;
+        let rc = cfg.tokenizer().map_err(err)?.tokenize(
+            tokenize::TOKENIZE_DOCUMENT,
+            &text,
+            loc.as_deref(),
+            &mut |tflags, tok, _, _| {
+                let tok = &tok[..tok.len().min(storage::MAX_TOKEN_SIZE)];
+                if tflags & tokenize::TOKEN_COLOCATED == 0 {
+                    ioff_cur += 1;
+                }
+                if found.is_none() && ioff_cur == pos {
+                    let nq = expr::query_part(tokendata, tok).len();
+                    if (q.len() == nq || (q.len() < nq && term.prefix)) && tok.starts_with(&q) {
+                        found = Some(tok.to_vec());
+                    }
+                }
+                0
+            },
+        );
+        if rc != 0 {
+            return Err(ApiError::Code(rc));
+        }
+        Ok(found)
+    }
+
+    /// rowid -> (position, token) for every index term a prefix or
+    /// tokendata query for `q` covers.
+    fn build_token_map(
+        &mut self,
+        q: &[u8],
+        prefix: bool,
+    ) -> Result<HashMap<i64, Vec<(i64, Vec<u8>)>>> {
+        let vals = self.vals()?;
+        let index = Index::new(&self.conn, &self.inner.cfg, &vals);
+        let (s, _) = index.store.read_structure()?;
+        let w = self.inner.peek_writes(&self.conn);
+        let pending = w.as_ref().map(|w| &w.pending);
+        let terms = if prefix {
+            let mut key = vec![index::MAIN_PREFIX];
+            key.extend_from_slice(q);
+            index.scan_prefix(&s, pending, &key)?
+        } else {
+            expr::tokendata_terms(&index, &s, pending, q)?
+        };
+        let mut map: HashMap<i64, Vec<(i64, Vec<u8>)>> = HashMap::new();
+        for (t, dl) in terms {
+            for (rowid, pl) in dl {
+                let e = map.entry(rowid).or_default();
+                for p in varint::poslist_positions(&pl) {
+                    e.push((p, t[1..].to_vec()));
+                }
+            }
+        }
+        Ok(map)
     }
 }
 
