@@ -100,6 +100,35 @@ pub(crate) struct AvailableIndexes {
 
 impl AvailableIndexes {
     fn for_table_references(resolver: &Resolver, table_references: &TableReferences) -> Self {
+        Self::build(resolver, table_references)
+    }
+
+    /// Like `for_table_references`, and a read-only query can also seek the
+    /// primary key of a WITHOUT ROWID table, through an index over its b-tree.
+    fn for_select(resolver: &Resolver, table_references: &TableReferences) -> Self {
+        let mut available = Self::build(resolver, table_references);
+        if table_references.has_right_or_full_join() {
+            return available;
+        }
+        for jt in table_references.joined_tables() {
+            let Some(btree) = jt.btree() else {
+                continue;
+            };
+            if btree.has_rowid || btree.has_virtual_columns() {
+                continue;
+            }
+            if let Ok(index) = without_rowid_primary_key_scan_index(&btree) {
+                available
+                    .indexes_by_table_id
+                    .entry(jt.internal_id)
+                    .or_default()
+                    .push_front(Arc::new(index));
+            }
+        }
+        available
+    }
+
+    fn build(resolver: &Resolver, table_references: &TableReferences) -> Self {
         let indexes_by_table_id: HashMap<TableInternalId, VecDeque<Arc<Index>>> = table_references
             .joined_tables()
             .iter()
@@ -1112,8 +1141,7 @@ fn find_select_plan_form(
         }
     }
     optimize_subqueries(plan, resolver, cache, save_subquery_plans)?;
-    let available_indexes =
-        AvailableIndexes::for_table_references(resolver, &plan.table_references);
+    let available_indexes = AvailableIndexes::for_select(resolver, &plan.table_references);
     rewrite_or_terms(&mut plan.where_clause, &available_indexes)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition = eliminate_constant_conditions(
         &mut plan.where_clause,
@@ -5409,3 +5437,51 @@ mod tests {
         }
     }
 }
+
+/// The b-tree of a WITHOUT ROWID table seen as a covering index: the primary
+/// key, then every other stored column, in record order.
+fn without_rowid_primary_key_scan_index(table: &BTreeTable) -> Result<Index> {
+    let mut columns = crate::alloc::Vec::new();
+    for col in table.without_rowid_pk_columns()? {
+        crate::alloc::TursoVecExt::try_push(&mut columns, col)?;
+    }
+    let n_key_col = columns.len();
+    let mut rest: std::vec::Vec<(usize, usize)> = table
+        .columns()
+        .iter()
+        .enumerate()
+        .filter(|(pos, c)| {
+            !c.is_virtual_generated() && !columns.iter().any(|k| k.pos_in_table == *pos)
+        })
+        .map(|(pos, _)| (table.logical_to_physical_column(pos), pos))
+        .collect();
+    rest.sort();
+    for (_, pos) in rest {
+        let column = &table.columns()[pos];
+        let mut index_column = IndexColumn::new(
+            column.name.as_deref().unwrap_or_default(),
+            pos,
+            column.collation(),
+        );
+        index_column.default = column.default.clone();
+        crate::alloc::TursoVecExt::try_push(&mut columns, index_column)?;
+    }
+    Ok(Index {
+        name: WITHOUT_ROWID_PRIMARY_KEY_SCAN.to_string(),
+        table_name: table.name.clone(),
+        root_page: table.root_page,
+        n_key_col,
+        columns,
+        unique: true,
+        ephemeral: false,
+        has_rowid: false,
+        where_clause: None,
+        index_method: None,
+        on_conflict: None,
+        constraint_name: None,
+    })
+}
+
+/// Name of the index `without_rowid_primary_key_scan_index` builds; EXPLAIN
+/// QUERY PLAN shows it as SQLite's "PRIMARY KEY".
+pub(crate) const WITHOUT_ROWID_PRIMARY_KEY_SCAN: &str = "sqlite_without_rowid_primary_key";
