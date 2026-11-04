@@ -18674,7 +18674,8 @@ pub fn op_fk_if_zero(
         state.pc = target_pc.as_offset_int();
         return Ok(InsnFunctionStepResult::Step);
     }
-    let v = if *deferred {
+    // Under PRAGMA defer_foreign_keys immediate violations are counted as deferred.
+    let v = if *deferred || program.connection.defer_foreign_keys() {
         program.connection.get_deferred_foreign_key_violations()
     } else {
         state.get_fk_immediate_violations_during_stmt()
