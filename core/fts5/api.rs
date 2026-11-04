@@ -46,9 +46,9 @@ pub fn register_aux_function(
     // As sqlite3_overload_function: a placeholder unless the name exists;
     // tables supply the real function through xFindFunction.
     let mut syms = conn.syms.write();
-    if !syms.functions.contains_key(&key) {
-        if let Some(f) = super::overload_placeholder(&key) {
-            syms.functions.insert(key, f);
+    if let std::collections::hash_map::Entry::Vacant(e) = syms.functions.entry(key) {
+        if let Some(f) = super::overload_placeholder(e.key()) {
+            e.insert(f);
         }
     }
     drop(syms);
