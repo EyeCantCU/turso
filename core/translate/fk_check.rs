@@ -48,7 +48,17 @@ pub(crate) fn foreign_key_check_sql(
                 None => "1".to_string(),
                 Some(parent) => {
                     // A parent key without a PRIMARY KEY or UNIQUE index is an error.
-                    schema.resolve_fk(namespace, fk, &child, &parent, true)?;
+                    // SQLite accepts the index's columns in any order.
+                    if let Err(e) = schema.resolve_fk(namespace, fk, &child, &parent, true) {
+                        if !unique_index_covers(
+                            schema,
+                            fk.parent_namespace,
+                            &parent,
+                            &fk.parent_columns,
+                        ) {
+                            return Err(e);
+                        }
+                    }
                     let parent_cols: Vec<String> = if !fk.parent_columns.is_empty() {
                         fk.parent_columns.to_vec()
                     } else if parent.primary_key_columns.is_empty() {
@@ -88,4 +98,32 @@ pub(crate) fn foreign_key_check_sql(
         "SELECT \"table\", rowid, parent, fkid FROM ({}) ORDER BY o, rowid, fkid",
         selects.join(" UNION ALL ")
     )))
+}
+
+/// Whether a UNIQUE index (or the primary key) of `parent` has exactly the
+/// columns `cols`, in any order.
+fn unique_index_covers(
+    schema: &Schema,
+    namespace: NamespaceId,
+    parent: &crate::schema::BTreeTable,
+    cols: &[String],
+) -> bool {
+    if cols.is_empty() {
+        return false;
+    }
+    let same_set = |names: &mut dyn Iterator<Item = &str>| {
+        let names: Vec<&str> = names.collect();
+        names.len() == cols.len()
+            && cols
+                .iter()
+                .all(|c| names.iter().any(|n| n.eq_ignore_ascii_case(c)))
+    };
+    let pk = parent.primary_key_columns.iter().map(|(n, _)| n.as_str());
+    if same_set(&mut pk.into_iter()) {
+        return true;
+    }
+    schema
+        .get_indices(namespace, &parent.name)
+        .filter(|idx| idx.unique && idx.where_clause.is_none())
+        .any(|idx| same_set(&mut idx.key_columns().iter().map(|c| c.name.as_str())))
 }
