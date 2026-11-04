@@ -611,17 +611,6 @@ where
     Ok((result, ElementType::ARRAY))
 }
 
-/// converts a `Jsonb` value to a db Value
-///
-/// # Arguments
-///
-/// - `jsonb` – the value to convert
-/// - `element_type` – the element type of the jsonb
-/// - `flag` – how the result should be formatted (null values will stay null).
-///   - If the flag is `OutputVariant::Binary`, the result is a `Value::Blob`.
-///   - If it is `OutputVariant::ElementType` and the `element_type` is text, the result has a subtype of `TextSubtype::Text`, with the outer quotes removed.
-///   - If it is `OutputVariant::String` and the `element_type` is text, the result has a subtype of `TextSubtype::Text`.
-///   - If the `element_type` is not text, the flag is ignored.
 /// Text going into the JSON code, which works on `&str`: bytes that are not
 /// UTF-8 are escaped into private code points (text_bytes::escape_bytes).
 fn json_input<'a>(text: &crate::types::TextRef<'a>) -> Cow<'a, str> {
@@ -642,6 +631,17 @@ fn json_output(s: String, subtype: TextSubtype) -> Value {
     Value::Text(text)
 }
 
+/// converts a `Jsonb` value to a db Value
+///
+/// # Arguments
+///
+/// - `jsonb` – the value to convert
+/// - `element_type` – the element type of the jsonb
+/// - `flag` – how the result should be formatted (null values will stay null).
+///   - If the flag is `OutputVariant::Binary`, the result is a `Value::Blob`.
+///   - If it is `OutputVariant::ElementType` and the `element_type` is text, the result has a subtype of `TextSubtype::Text`, with the outer quotes removed.
+///   - If it is `OutputVariant::String` and the `element_type` is text, the result has a subtype of `TextSubtype::Text`.
+///   - If the `element_type` is not text, the flag is ignored.
 pub fn json_string_to_db_type(
     json: Jsonb,
     element_type: ElementType,
