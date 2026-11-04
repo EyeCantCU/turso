@@ -993,7 +993,7 @@ impl MappedSharedWalCoordination {
         })?)?;
         let lock_kind = Self::lock_kind_for_mode(ownership_mode);
         // Held until the caller has seeded the authority (release_open_lock).
-        file.shared_wal_lock_byte(OPEN_LOCK_OFFSET, true, lock_kind)?;
+        Self::wait_open_lock(&file, true, lock_kind)?;
         match Self::create_or_open_locked(file.clone(), path, reader_slot_count, ownership_mode) {
             Ok(mut region) => {
                 region.open_lock_exclusive = true;
@@ -1101,7 +1101,7 @@ impl MappedSharedWalCoordination {
             Err(err) => return Err(err),
         };
         let lock_kind = Self::lock_kind_for_mode(ownership_mode);
-        file.shared_wal_lock_byte(OPEN_LOCK_OFFSET, false, lock_kind)?;
+        Self::wait_open_lock(&file, false, lock_kind)?;
         match Self::open_existing_locked(file.clone(), path, reader_slot_count, ownership_mode) {
             Ok(mut region) => {
                 *region.open_lock_held.get_mut() = true;
@@ -1188,16 +1188,28 @@ impl MappedSharedWalCoordination {
         }
     }
 
-    /// Take the open lock (blocking) for an open of the database; it is held
-    /// already when this mapping was just created.
+    /// Wait (bounded, as another process's open is short) for the open
+    /// lock; Busy after that, like an open SQLite cannot lock.
+    fn wait_open_lock(
+        file: &Arc<dyn File>,
+        exclusive: bool,
+        lock_kind: SharedWalLockKind,
+    ) -> Result<()> {
+        for _ in 0..2000 {
+            if file.shared_wal_try_lock_byte(OPEN_LOCK_OFFSET, exclusive, lock_kind)? {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        Err(LimboError::Busy)
+    }
+
+    /// Take the open lock for an open of the database; it is held already
+    /// when this mapping was just created.
     pub(crate) fn acquire_open_lock(&self) -> Result<()> {
         let mut held = self.open_lock_held.lock();
         if !*held {
-            self.file.shared_wal_lock_byte(
-                OPEN_LOCK_OFFSET,
-                self.open_lock_exclusive,
-                self.lock_kind(),
-            )?;
+            Self::wait_open_lock(&self.file, self.open_lock_exclusive, self.lock_kind())?;
             *held = true;
         }
         Ok(())
