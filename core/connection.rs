@@ -618,6 +618,9 @@ pub struct Connection {
     pub(crate) statement_activity: Arc<Mutex<StatementActivity>>,
     /// Whether pragma ignore_check_constraints=ON for this connection
     pub(super) check_constraints_pragma: AtomicBool,
+    /// PRAGMA defer_foreign_keys: treat every foreign key as deferred until the
+    /// transaction ends.
+    pub(super) defer_foreign_keys: AtomicBool,
     /// Track when each virtual table instance is currently in transaction.
     pub(crate) vtab_txn_states: RwLock<HashSet<u64>>,
     /// Set while VACUUM replays `CREATE VIRTUAL TABLE` into its target: the
@@ -5023,7 +5026,19 @@ impl Connection {
     }
 
     pub(crate) fn set_tx_state(&self, state: TransactionState) {
+        // Like SQLite, defer_foreign_keys switches off when a transaction ends.
+        if matches!(state, TransactionState::None) {
+            self.defer_foreign_keys.store(false, Ordering::Release);
+        }
         self.transaction_state.set(state);
+    }
+
+    pub fn set_defer_foreign_keys(&self, defer: bool) {
+        self.defer_foreign_keys.store(defer, Ordering::Release);
+    }
+
+    pub fn defer_foreign_keys(&self) -> bool {
+        self.defer_foreign_keys.load(Ordering::Acquire)
     }
 
     pub(crate) fn get_tx_state(&self) -> TransactionState {

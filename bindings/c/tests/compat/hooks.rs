@@ -864,3 +864,70 @@ fn test_authorizer_may_clear_itself() {
         assert_eq!(sqlite3_close(db), SQLITE_OK);
     }
 }
+
+/// Records op, keys and row values only.
+unsafe extern "C" fn preupdate_values_cb(
+    p: *mut libc::c_void,
+    db: *mut sqlite3,
+    op: i32,
+    _zdb: *const libc::c_char,
+    table: *const libc::c_char,
+    k1: i64,
+    k2: i64,
+) {
+    let old = if op == SQLITE_INSERT {
+        "-".to_string()
+    } else {
+        row_text(db, true)
+    };
+    let new = if op == 9 {
+        "-".to_string()
+    } else {
+        row_text(db, false)
+    };
+    push(
+        p,
+        format!(
+            "{} {} {k1} {k2} old={old} new={new}",
+            op_name(op),
+            cstr(table)
+        ),
+    );
+}
+
+#[test]
+fn test_preupdate_hook_without_rowid() {
+    unsafe {
+        let db = open_mem();
+        let log = Log::default();
+        assert_eq!(
+            exec(
+                db,
+                "CREATE TABLE w(a TEXT, b INT, c, PRIMARY KEY(b, a)) WITHOUT ROWID"
+            ),
+            SQLITE_OK
+        );
+        sqlite3_preupdate_hook(db, Some(preupdate_values_cb), as_arg(&log));
+        assert_eq!(run(db, "INSERT INTO w VALUES('x', 1, 'c1')"), SQLITE_DONE);
+        assert_eq!(run(db, "UPDATE w SET c = 'c2' WHERE b = 1"), SQLITE_DONE);
+        assert_eq!(run(db, "UPDATE w SET b = 2 WHERE b = 1"), SQLITE_DONE);
+        assert_eq!(
+            run(db, "INSERT OR REPLACE INTO w VALUES('x', 2, 'c3')"),
+            SQLITE_DONE
+        );
+        assert_eq!(run(db, "DELETE FROM w"), SQLITE_DONE);
+        // Keys are 0 for a WITHOUT ROWID table; values are in column order.
+        assert_eq!(
+            take(&log),
+            [
+                "INSERT w 0 0 old=- new='x',1,'c1'",
+                "UPDATE w 0 0 old='x',1,'c1' new='x',1,'c2'",
+                "UPDATE w 0 0 old='x',1,'c2' new='x',2,'c2'",
+                "DELETE w 0 0 old='x',2,'c2' new=-",
+                "INSERT w 0 0 old=- new='x',2,'c3'",
+                "DELETE w 0 0 old='x',2,'c3' new=-",
+            ]
+        );
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}

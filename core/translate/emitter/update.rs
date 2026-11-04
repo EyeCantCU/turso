@@ -806,7 +806,7 @@ fn emit_replace_delete<'a>(
             });
             label
         });
-        let other_num_regs = other_index.columns.len() + 1;
+        let other_num_regs = other_index.columns.len() + other_index.has_rowid as usize;
         let other_start_reg = program.alloc_registers(other_num_regs);
 
         for (reg_offset, column_index) in other_index.columns.iter().enumerate() {
@@ -821,11 +821,13 @@ fn emit_replace_delete<'a>(
             )?;
         }
 
-        program.emit_insn(Insn::Copy {
-            src_reg: conflicting_rowid_reg,
-            dst_reg: other_start_reg + other_num_regs - 1,
-            extra_amount: 0,
-        });
+        if other_index.has_rowid {
+            program.emit_insn(Insn::Copy {
+                src_reg: conflicting_rowid_reg,
+                dst_reg: other_start_reg + other_num_regs - 1,
+                extra_amount: 0,
+            });
+        }
 
         program.emit_insn(Insn::IdxDelete {
             start_reg: other_start_reg,
@@ -941,16 +943,20 @@ fn emit_update_column_values<'a>(
                     program.emit_null(target_reg, None);
                 } else {
                     let self_table_context = match table_column.generated_type() {
-                        GeneratedType::Virtual { .. } => Some(SelfTableContext::ForDML {
-                            dml_ctx: DmlColumnContext::layout(
-                                column_ctx.target_table.table.columns(),
-                                column_ctx.start,
-                                column_ctx.rowid_reg,
-                                column_ctx.layout.clone(),
-                                DmlRowForm::StoredExceptUpdated(column_ctx.updated_columns.clone()),
-                            ),
-                            table: column_ctx.target_table.table.require_btree()?,
-                        }),
+                        GeneratedType::Virtual { .. } | GeneratedType::Stored { .. } => {
+                            Some(SelfTableContext::ForDML {
+                                dml_ctx: DmlColumnContext::layout(
+                                    column_ctx.target_table.table.columns(),
+                                    column_ctx.start,
+                                    column_ctx.rowid_reg,
+                                    column_ctx.layout.clone(),
+                                    DmlRowForm::StoredExceptUpdated(
+                                        column_ctx.updated_columns.clone(),
+                                    ),
+                                ),
+                                table: column_ctx.target_table.table.require_btree()?,
+                            })
+                        }
                         GeneratedType::NotGenerated => None,
                     };
 
@@ -1044,7 +1050,7 @@ fn emit_update_column_values<'a>(
         } else {
             // Column is not being updated, read it from the table
             match table_column.generated_type() {
-                GeneratedType::NotGenerated => {
+                GeneratedType::Stored { .. } | GeneratedType::NotGenerated => {
                     let column_idx_in_index = column_ctx.index.as_ref().and_then(|(idx, _)| {
                         idx.columns.iter().position(|c| {
                             table_column
@@ -1284,9 +1290,45 @@ fn emit_update_insns<'a>(
                 1 // rowid reg
             },
     );
-    program.emit_insn(Insn::RowId {
-        cursor_id: iteration_cursor_id,
-        dest: beg,
+    // A WITHOUT ROWID row is located by its primary key (`pk_old`) instead of a
+    // rowid. The key is the start of the table record, or the trailing columns
+    // of the write-set scratch table.
+    let wr_table = target_table.table.btree().filter(|t| !t.has_rowid);
+    let pk_old = match &wr_table {
+        Some(wr) => {
+            let n = super::super::without_rowid::pk_len(wr)?;
+            let pk_old = program.alloc_registers(n);
+            let offset = if uses_write_set {
+                access_table.table.columns().len() - n
+            } else {
+                0
+            };
+            for i in 0..n {
+                program.emit_insn(Insn::Column {
+                    cursor_id: iteration_cursor_id,
+                    column: offset + i,
+                    dest: pk_old + i,
+                    default: None,
+                });
+            }
+            program.emit_insn(Insn::Null {
+                dest: beg,
+                dest_end: None,
+            });
+            Some((wr.clone(), pk_old))
+        }
+        None => {
+            program.emit_insn(Insn::RowId {
+                cursor_id: iteration_cursor_id,
+                dest: beg,
+            });
+            None
+        }
+    };
+    let pk_updated = wr_table.as_ref().is_some_and(|wr| {
+        set_clauses.iter().any(|sc| {
+            sc.column_index != ROWID_SENTINEL && wr.columns()[sc.column_index].primary_key()
+        })
     });
 
     let rowid_set_clause_reg = if updates_rowid {
@@ -1308,7 +1350,8 @@ fn emit_update_insns<'a>(
         constraint_rowid_alias_conflict.unwrap_or(ResolveType::Abort)
     };
 
-    let not_exists_check_required = updates_rowid || iteration_cursor_id != target_table_cursor_id;
+    let not_exists_check_required =
+        updates_rowid || pk_updated || iteration_cursor_id != target_table_cursor_id;
     let update_namespace = target_table.namespace;
     let update_database_id = update_namespace.database_id;
     let updated_column_indices: ColumnMask = set_clauses
@@ -1342,11 +1385,15 @@ fn emit_update_insns<'a>(
     let trigger_ignore_jump_label = program.allocate_label();
 
     if not_exists_check_required {
-        program.emit_insn(Insn::NotExists {
-            cursor: target_table_cursor_id,
-            rowid_reg: beg,
-            target_pc: check_rowid_not_exists_label.unwrap(),
-        });
+        emit_seek_target_row(
+            program,
+            &pk_old,
+            target_table_cursor_id,
+            beg,
+            check_rowid_not_exists_label.unwrap(),
+        )?;
+    } else if pk_old.is_some() {
+        // The iteration cursor is the table cursor and already on the row.
     } else {
         // if no rowid, we're done
         program.emit_insn(Insn::IsNull {
@@ -1613,13 +1660,15 @@ fn emit_update_insns<'a>(
                 }
 
                 // BEFORE UPDATE Triggers may have altered the btree so we need to seek again.
-                program.emit_insn(Insn::NotExists {
-                cursor: target_table_cursor_id,
-                rowid_reg: beg,
-                target_pc: check_rowid_not_exists_label.expect(
+                emit_seek_target_row(
+                program,
+                &pk_old,
+                target_table_cursor_id,
+                beg,
+                check_rowid_not_exists_label.expect(
                     "check_rowid_not_exists_label must be set if there are BEFORE UPDATE triggers",
                 ),
-            });
+            )?;
 
                 if has_after_triggers {
                     // Preserve pseudo-row 'OLD' for AFTER triggers by copying to new registers
@@ -1686,7 +1735,7 @@ fn emit_update_insns<'a>(
             &column_ctx,
             skip_row_label,
             t_ctx,
-            |column| !column.is_virtual_generated(),
+            |column| !column.is_generated(),
         )?;
     }
 
@@ -1753,7 +1802,7 @@ fn emit_update_insns<'a>(
                 &column_ctx,
                 skip_row_label,
                 t_ctx,
-                |column| !column.is_virtual_generated(),
+                |column| !column.is_generated(),
             )?;
         }
         let has_check_constraints = !btree.check_constraints.is_empty();
@@ -1816,7 +1865,7 @@ fn emit_update_insns<'a>(
             &column_ctx,
             skip_row_label,
             t_ctx,
-            Column::is_virtual_generated,
+            Column::is_generated,
         )?;
     }
 
@@ -1895,6 +1944,26 @@ fn emit_update_insns<'a>(
         }
 
         program.preassign_label_to_next_insn(record_label);
+    }
+
+    // A new primary key of a WITHOUT ROWID row must not belong to another row.
+    if let (true, Some((wr, pk_old))) = (pk_updated, &pk_old) {
+        emit_without_rowid_pk_change_check(
+            program,
+            connection,
+            table_references,
+            &target_table,
+            target_table_cursor_id,
+            all_index_cursors,
+            wr,
+            *pk_old,
+            start,
+            &layout,
+            skip_row_label,
+            check_rowid_not_exists_label.expect("a key change needs the row-not-found label"),
+            update_namespace,
+            t_ctx,
+        )?;
     }
 
     // After the PK check above, NotExists may have repositioned the cursor.
@@ -2007,6 +2076,7 @@ fn emit_update_insns<'a>(
         record_reg: usize,
         idx_start_reg: usize,
         num_cols: usize,
+        has_rowid: bool,
         old_satisfies_where: Option<usize>,
         new_satisfies_where: Option<usize>,
     }
@@ -2071,7 +2141,8 @@ fn emit_update_insns<'a>(
 
         // Build new index key for constraint checking and later insertion (Phase 3).
         let num_cols = index.columns.len();
-        let idx_start_reg = program.alloc_registers(num_cols + 1);
+        let rec_len = num_cols + index.has_rowid as usize;
+        let idx_start_reg = program.alloc_registers(rec_len);
         let rowid_reg = effective_rowid_reg;
 
         for (i, col) in index.columns.iter().enumerate() {
@@ -2091,11 +2162,13 @@ fn emit_update_insns<'a>(
             )?;
         }
         // last register is the rowid
-        program.emit_insn(Insn::Copy {
-            src_reg: rowid_reg,
-            dst_reg: idx_start_reg + num_cols,
-            extra_amount: 0,
-        });
+        if index.has_rowid {
+            program.emit_insn(Insn::Copy {
+                src_reg: rowid_reg,
+                dst_reg: idx_start_reg + num_cols,
+                extra_amount: 0,
+            });
+        }
 
         // Apply affinity BEFORE MakeRecord so the index record has correctly converted values.
         // This is needed for all indexes (not just unique) because the index should store
@@ -2121,11 +2194,13 @@ fn emit_update_insns<'a>(
 
         program.emit_insn(Insn::MakeRecord {
             start_reg: to_u32(idx_start_reg),
-            count: to_u32(num_cols + 1),
+            count: to_u32(rec_len),
             dest_reg: to_u32(*record_reg),
             index_name: Some(index.name.clone()),
             affinity_str: None,
         });
+        // From here on, `num_cols` is the key the UNIQUE check compares.
+        let num_cols = index.n_key_col;
 
         // Handle unique constraint BEFORE IdxDelete (matches SQLite order).
         // If the constraint check fails (Halt/Ignore/Replace), the old index
@@ -2169,19 +2244,45 @@ fn emit_update_insns<'a>(
             });
 
             let idx_rowid_reg = program.alloc_register();
-            program.emit_insn(Insn::IdxRowId {
-                cursor_id: *idx_cursor_id,
-                dest: idx_rowid_reg,
-            });
+            // The conflicting row's primary key, for a WITHOUT ROWID table.
+            let conflict_pk = match &pk_old {
+                Some((wr, pk_old)) => {
+                    let n = super::super::without_rowid::pk_len(wr)?;
+                    let conflict_pk = program.alloc_registers(n);
+                    super::super::without_rowid::emit_pk_from_index(
+                        program,
+                        wr,
+                        index,
+                        *idx_cursor_id,
+                        conflict_pk,
+                    )?;
+                    // Skip the failure if the entry belongs to the row being changed.
+                    super::super::without_rowid::emit_jump_if_pk_equal(
+                        program,
+                        wr,
+                        conflict_pk,
+                        *pk_old,
+                        constraint_check,
+                    )?;
+                    Some(conflict_pk)
+                }
+                None => {
+                    program.emit_insn(Insn::IdxRowId {
+                        cursor_id: *idx_cursor_id,
+                        dest: idx_rowid_reg,
+                    });
 
-            // Skip over the UNIQUE constraint failure if the existing row is the one that we are currently changing
-            program.emit_insn(Insn::Eq {
-                lhs: beg,
-                rhs: idx_rowid_reg,
-                target_pc: constraint_check,
-                flags: CmpInsFlags::default(),
-                collation: CollationSeq::for_internal_values(),
-            });
+                    // Skip over the UNIQUE constraint failure if the existing row is the one that we are currently changing
+                    program.emit_insn(Insn::Eq {
+                        lhs: beg,
+                        rhs: idx_rowid_reg,
+                        target_pc: constraint_check,
+                        flags: CmpInsFlags::default(),
+                        collation: CollationSeq::for_internal_values(),
+                    });
+                    None
+                }
+            };
             match idx_conflict {
                 ResolveType::Ignore => {
                     // For IGNORE, skip this row's update but continue with other rows
@@ -2199,11 +2300,22 @@ fn emit_update_insns<'a>(
 
                     // Seek to the conflicting row
                     let after_delete_label = program.allocate_label();
-                    program.emit_insn(Insn::SeekRowid {
-                        cursor_id: target_table_cursor_id,
-                        src_reg: idx_rowid_reg,
-                        target_pc: after_delete_label, // Skip if row doesn't exist
-                    });
+                    match (&pk_old, conflict_pk) {
+                        (Some((wr, _)), Some(conflict_pk)) => {
+                            super::super::without_rowid::emit_seek_row(
+                                program,
+                                wr,
+                                target_table_cursor_id,
+                                conflict_pk,
+                                after_delete_label,
+                            )?
+                        }
+                        _ => program.emit_insn(Insn::SeekRowid {
+                            cursor_id: target_table_cursor_id,
+                            src_reg: idx_rowid_reg,
+                            target_pc: after_delete_label, // Skip if row doesn't exist
+                        }),
+                    }
 
                     emit_replace_delete(
                         program,
@@ -2222,16 +2334,25 @@ fn emit_update_insns<'a>(
 
                     // Seek back to the original row we're updating
                     let continue_label = program.allocate_label();
-                    program.emit_insn(Insn::SeekRowid {
-                        cursor_id: target_table_cursor_id,
-                        src_reg: original_rowid_reg,
-                        target_pc: continue_label, // Should always succeed
-                    });
+                    match &pk_old {
+                        Some((wr, pk_old)) => super::super::without_rowid::emit_seek_row(
+                            program,
+                            wr,
+                            target_table_cursor_id,
+                            *pk_old,
+                            continue_label,
+                        )?,
+                        None => program.emit_insn(Insn::SeekRowid {
+                            cursor_id: target_table_cursor_id,
+                            src_reg: original_rowid_reg,
+                            target_pc: continue_label, // Should always succeed
+                        }),
+                    }
                     program.preassign_label_to_next_insn(continue_label);
                 }
                 _ => {
                     // ABORT/FAIL/ROLLBACK behavior
-                    let column_names = index.columns.iter().enumerate().fold(
+                    let column_names = index.key_columns().iter().enumerate().fold(
                         String::with_capacity(50),
                         |mut accum, (idx, col)| {
                             if idx > 0 {
@@ -2273,7 +2394,8 @@ fn emit_update_insns<'a>(
             idx_cursor_id: *idx_cursor_id,
             record_reg: *record_reg,
             idx_start_reg,
-            num_cols,
+            num_cols: rec_len - index.has_rowid as usize,
+            has_rowid: index.has_rowid,
             old_satisfies_where,
             new_satisfies_where,
         });
@@ -2427,7 +2549,7 @@ fn emit_update_insns<'a>(
             });
         }
 
-        let num_regs = index.columns.len() + 1;
+        let num_regs = index.columns.len() + index.has_rowid as usize;
         let delete_start_reg = program.alloc_registers(num_regs);
         for (reg_offset, column_index) in index.columns.iter().enumerate() {
             emit_index_column_value_old_image(
@@ -2440,10 +2562,12 @@ fn emit_update_insns<'a>(
                 delete_start_reg + reg_offset,
             )?;
         }
-        program.emit_insn(Insn::RowId {
-            cursor_id: target_table_cursor_id,
-            dest: delete_start_reg + num_regs - 1,
-        });
+        if index.has_rowid {
+            program.emit_insn(Insn::RowId {
+                cursor_id: target_table_cursor_id,
+                dest: delete_start_reg + num_regs - 1,
+            });
+        }
         program.emit_insn(Insn::IdxDelete {
             start_reg: delete_start_reg,
             num_regs,
@@ -2473,7 +2597,7 @@ fn emit_update_insns<'a>(
             cursor_id: ctx.idx_cursor_id,
             record_reg: ctx.record_reg,
             unpacked_start: Some(ctx.idx_start_reg),
-            unpacked_count: Some((ctx.num_cols + 1) as u32),
+            unpacked_count: Some((ctx.num_cols + ctx.has_rowid as usize) as u32),
             flags: IdxInsertFlags::new().nchange(true),
         });
 
@@ -2485,19 +2609,16 @@ fn emit_update_insns<'a>(
     match &target_table.table {
         Table::BTree(ref table) => {
             let record_reg = program.alloc_register();
-            emit_make_record(
-                program,
-                target_table.table.columns().iter(),
-                start,
-                record_reg,
-            );
+            emit_make_record(program, table, start, record_reg);
 
             if not_exists_check_required {
-                program.emit_insn(Insn::NotExists {
-                    cursor: target_table_cursor_id,
-                    rowid_reg: beg,
-                    target_pc: check_rowid_not_exists_label.unwrap(),
-                });
+                emit_seek_target_row(
+                    program,
+                    &pk_old,
+                    target_table_cursor_id,
+                    beg,
+                    check_rowid_not_exists_label.unwrap(),
+                )?;
             }
 
             // create alias for CDC rowid after the change (will differ from cdc_rowid_before_reg only in case of UPDATE with change in rowid alias)
@@ -2572,6 +2693,18 @@ fn emit_update_insns<'a>(
                 },
                 table_name: target_table.identifier.clone(),
             });
+            // An index b-tree insert can leave the cursor off the new entry; later
+            // reads of the row (RETURNING, triggers) need it there.
+            if pk_old.is_some() {
+                let positioned = program.allocate_label();
+                program.emit_insn(Insn::NotFound {
+                    cursor_id: target_table_cursor_id,
+                    target_pc: positioned,
+                    record_reg,
+                    num_regs: 0,
+                });
+                program.preassign_label_to_next_insn(positioned);
+            }
 
             // CDC must capture the row exactly as written by this UPDATE, before any FK
             // action or AFTER trigger this UPDATE fires can write further CDC rows of
@@ -2925,4 +3058,134 @@ fn emit_update_insns<'a>(
 
     t_ctx.resolver.register_columns.clear();
     Ok(())
+}
+
+/// Position the target cursor on the row being updated: by rowid, or by the
+/// primary key of a WITHOUT ROWID table.
+fn emit_seek_target_row(
+    program: &mut ProgramBuilder,
+    pk_old: &Option<(Arc<BTreeTable>, usize)>,
+    cursor_id: usize,
+    rowid_reg: usize,
+    not_found: BranchOffset,
+) -> crate::Result<()> {
+    match pk_old {
+        Some((wr, pk_old)) => crate::translate::without_rowid::emit_seek_row(
+            program, wr, cursor_id, *pk_old, not_found,
+        ),
+        None => {
+            program.emit_insn(Insn::NotExists {
+                cursor: cursor_id,
+                rowid_reg,
+                target_pc: not_found,
+            });
+            Ok(())
+        }
+    }
+}
+
+/// When an UPDATE changes the primary key of a WITHOUT ROWID row, check that
+/// no other row has the new key, resolving a conflict like SQLite, then seek
+/// back to the row being updated.
+#[allow(clippy::too_many_arguments)]
+fn emit_without_rowid_pk_change_check<'a>(
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+    table_references: &mut TableReferences,
+    target_table: &Arc<JoinedTable>,
+    cursor_id: usize,
+    all_index_cursors: &[(Arc<Index>, usize)],
+    wr: &BTreeTable,
+    pk_old: usize,
+    start: usize,
+    layout: &ColumnLayout,
+    skip_row_label: BranchOffset,
+    row_not_found: BranchOffset,
+    update_namespace: NamespaceRef,
+    t_ctx: &mut TranslateCtx<'a>,
+) -> crate::Result<()> {
+    let pk_cols = wr.without_rowid_pk_columns()?;
+    let n = pk_cols.len();
+    let new_pk = program.alloc_registers(n);
+    for (i, col) in pk_cols.iter().enumerate() {
+        program.emit_insn(Insn::Copy {
+            src_reg: layout.to_register(start, col.pos_in_table),
+            dst_reg: new_pk + i,
+            extra_amount: 0,
+        });
+    }
+    program.emit_insn(Insn::Affinity {
+        start_reg: new_pk,
+        count: NonZeroUsize::new(n).expect("a primary key has columns"),
+        affinities: pk_cols
+            .iter()
+            .map(|c| wr.columns()[c.pos_in_table].affinity().aff_mask())
+            .collect(),
+    });
+    let no_conflict = program.allocate_label();
+    crate::translate::without_rowid::emit_jump_if_pk_equal(
+        program,
+        wr,
+        new_pk,
+        pk_old,
+        no_conflict,
+    )?;
+    program.emit_insn(Insn::NoConflict {
+        cursor_id,
+        target_pc: no_conflict,
+        record_reg: new_pk,
+        num_regs: n,
+    });
+    let conflict = if program.flags.has_statement_conflict() {
+        program.resolve_type
+    } else {
+        wr.unique_sets
+            .iter()
+            .find(|u| u.is_primary_key)
+            .and_then(|u| u.conflict_clause)
+            .unwrap_or(ResolveType::Abort)
+    };
+    match conflict {
+        ResolveType::Ignore => {
+            program.emit_insn(Insn::Goto {
+                target_pc: skip_row_label,
+            });
+        }
+        ResolveType::Replace => {
+            let unused_rowid_reg = program.alloc_register();
+            emit_replace_delete(
+                program,
+                connection,
+                table_references,
+                target_table,
+                cursor_id,
+                all_index_cursors,
+                unused_rowid_reg,
+                None,
+                update_namespace,
+                t_ctx,
+            )?;
+        }
+        _ => {
+            let description = pk_cols
+                .iter()
+                .map(|c| format!("{}.{}", wr.name, c.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            program.emit_insn(Insn::Halt {
+                constraint_info: Some(Box::new(ConstraintInfo::primary_key(
+                    &wr.name,
+                    wr.primary_key_constraint_name.clone(),
+                    pk_cols.iter().map(|c| c.name.clone()).collect(),
+                    (new_pk..new_pk + n).collect(),
+                ))),
+                err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+                description,
+                on_error: program.constraint_halt_on_error(conflict),
+                description_reg: None,
+            });
+        }
+    }
+    program.preassign_label_to_next_insn(no_conflict);
+    crate::translate::without_rowid::emit_seek_row(program, wr, cursor_id, pk_old, row_not_found)
 }

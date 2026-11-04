@@ -1,0 +1,56 @@
+@database :memory:
+
+test foreign-key-check-reports-violations {
+    CREATE TABLE p(id INTEGER PRIMARY KEY, k UNIQUE);
+    CREATE TABLE c(x REFERENCES p, y REFERENCES p(k), z);
+    CREATE TABLE p2(u, v, PRIMARY KEY(u, v));
+    CREATE TABLE c2(a, b, FOREIGN KEY(a, b) REFERENCES p2(u, v));
+    INSERT INTO p VALUES (1, 'a');
+    INSERT INTO c VALUES (1, 'a', 0), (2, 'a', 1), (1, 'zz', 2), (NULL, NULL, 3);
+    INSERT INTO c2 VALUES (1, 2);
+    PRAGMA foreign_key_check(c);
+    PRAGMA foreign_key_check(c2);
+}
+expect {
+    c|2|p|1
+    c|3|p|0
+    c2|1|p2|0
+}
+
+test foreign-key-check-one-table {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x REFERENCES p);
+    CREATE TABLE d(x REFERENCES p);
+    INSERT INTO c VALUES (5);
+    INSERT INTO d VALUES (6);
+    PRAGMA foreign_key_check(d);
+}
+expect {
+    d|1|p|0
+}
+
+test foreign-key-check-table-valued {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x REFERENCES p);
+    INSERT INTO c VALUES (5);
+    SELECT "table", parent, fkid FROM pragma_foreign_key_check('c');
+}
+expect {
+    c|p|0
+}
+
+test foreign-key-check-missing-parent-table {
+    CREATE TABLE m(id INTEGER PRIMARY KEY, r REFERENCES missing);
+    INSERT INTO m VALUES (1, 5), (2, NULL);
+    PRAGMA foreign_key_check(m);
+}
+expect {
+    m|1|missing|0
+}
+
+test foreign-key-check-no-such-table {
+    PRAGMA foreign_key_check(nosuch);
+}
+expect error {
+    no such table: nosuch
+}

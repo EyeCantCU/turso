@@ -165,6 +165,7 @@ impl EmitOrderBy {
                 table_name: String::new(),
                 ephemeral: true,
                 root_page: 0,
+                n_key_col: index_columns.len(),
                 columns: index_columns,
                 unique: false,
                 has_rowid: false,

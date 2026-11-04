@@ -3428,10 +3428,20 @@ expect {
     2|42|43
 }
 
-# ADD COLUMN STORED is rejected (SQLite allows STORED, limbo does not)
-@skip-if sqlite "limbo does not support STORED generated columns"
+# ADD COLUMN STORED works only on an empty table, as in SQLite
+test gencol_alter_add_stored_empty_table {
+    CREATE TABLE t1(a INTEGER);
+    ALTER TABLE t1 ADD COLUMN b AS (a * 2) STORED;
+    INSERT INTO t1(a) VALUES(4);
+    SELECT * FROM t1;
+}
+expect {
+    4|8
+}
+
 test gencol_alter_add_stored_rejected {
     CREATE TABLE t1(a INTEGER);
+    INSERT INTO t1 VALUES(1);
     ALTER TABLE t1 ADD COLUMN b AS (a * 2) STORED;
 }
 expect error {
@@ -4082,22 +4092,100 @@ expect error {
     (bind parameters prohibited|parameters prohibited in generated columns)
 }
 
-# --- Stored generated columns rejected ---
+# --- Stored generated columns ---
 
-@skip-if sqlite "TODO support stored generated columns"
-test gencol_stored_rejected {
-    CREATE TABLE t1(a INTEGER, b INTEGER AS (a * 2) STORED);
+test gencol_stored_insert_update {
+    CREATE TABLE t1(a INT, b INT AS (a*2) STORED, c AS (a+1), d AS (b+c) STORED, e TEXT);
+    INSERT INTO t1(a, e) VALUES(1, 'x'), (2, 'y');
+    UPDATE t1 SET a = 10 WHERE a = 1;
+    UPDATE t1 SET e = 'z' WHERE a = 2;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    2|4|3|7|z
+    10|20|11|31|x
+}
+
+test gencol_stored_index {
+    CREATE TABLE t1(a, b AS (a*3) STORED);
+    CREATE INDEX t1b ON t1(b);
+    INSERT INTO t1(a) VALUES(1), (2);
+    UPDATE t1 SET a = 5 WHERE a = 1;
+    SELECT a FROM t1 WHERE b = 15;
+    PRAGMA integrity_check;
+}
+expect {
+    5
+    ok
+}
+
+test gencol_stored_not_null {
+    CREATE TABLE t1(a, b AS (a) STORED NOT NULL);
+    INSERT INTO t1(a) VALUES(NULL);
 }
 expect error {
-    Stored generated columns are not supported
+    NOT NULL constraint failed: t1.b
 }
 
-@skip-if sqlite "TODO support stored generated columns"
-test gencol_stored_generated_always_rejected {
-    CREATE TABLE t1(a REAL, b INTEGER GENERATED ALWAYS AS (a) STORED);
+test gencol_stored_cannot_insert {
+    CREATE TABLE t1(a, b AS (a) STORED);
+    INSERT INTO t1(a, b) VALUES(1, 2);
 }
 expect error {
-    Stored generated columns are not supported
+    cannot INSERT into generated column "b"
+}
+
+test gencol_stored_strict_type_check {
+    CREATE TABLE t1(x INTEGER, y INTEGER AS (x || 'a') STORED) STRICT;
+    INSERT INTO t1(x) VALUES(1);
+}
+expect error {
+    cannot store TEXT value in INTEGER column t1.y
+}
+
+test gencol_stored_upsert_recomputes {
+    CREATE TABLE t1(a, b AS (a) STORED UNIQUE);
+    INSERT INTO t1(a) VALUES(2);
+    INSERT INTO t1(a) VALUES(2) ON CONFLICT(b) DO UPDATE SET a = excluded.a + 10;
+    SELECT * FROM t1;
+    PRAGMA integrity_check;
+}
+expect {
+    12|12
+    ok
+}
+
+test gencol_stored_upsert_not_null {
+    CREATE TABLE t1(a UNIQUE, b AS (a) STORED NOT NULL);
+    INSERT INTO t1 VALUES(1);
+    INSERT INTO t1 VALUES(1) ON CONFLICT(a) DO UPDATE SET a = NULL;
+}
+expect error {
+    NOT NULL constraint failed: t1.b
+}
+
+test gencol_stored_table_xinfo {
+    CREATE TABLE t1(a, b AS (a) STORED, c AS (a));
+    SELECT name, hidden FROM pragma_table_xinfo('t1');
+}
+expect {
+    a|0
+    b|3
+    c|2
+}
+
+test gencol_stored_triggers_see_values {
+    CREATE TABLE t1(a, b AS (a*3) STORED);
+    CREATE TABLE log(x);
+    CREATE TRIGGER t1i BEFORE INSERT ON t1 BEGIN INSERT INTO log VALUES(new.b); END;
+    CREATE TRIGGER t1u AFTER UPDATE ON t1 BEGIN INSERT INTO log VALUES(old.b || '->' || new.b); END;
+    INSERT INTO t1(a) VALUES(2);
+    UPDATE t1 SET a = 5;
+    SELECT * FROM log;
+}
+expect {
+    6
+    6->15
 }
 
 # =============================================================================

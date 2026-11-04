@@ -310,6 +310,7 @@ pub fn translate_pragma(
             | PragmaName::IndexXinfo
             | PragmaName::IndexList
             | PragmaName::ForeignKeyList
+            | PragmaName::ForeignKeyCheck
             | PragmaName::TableList
             | PragmaName::TableInfo
             | PragmaName::TableXinfo
@@ -721,6 +722,7 @@ fn update_pragma(
         PragmaName::IndexXinfo => unreachable!("index_xinfo cannot be set"),
         PragmaName::IndexList => unreachable!("index_list cannot be set"),
         PragmaName::ForeignKeyList => unreachable!("foreign_key_list cannot be set"),
+        PragmaName::ForeignKeyCheck => unreachable!("foreign_key_check cannot be set"),
         PragmaName::TableList => unreachable!("table_list cannot be set"),
         PragmaName::QueryOnly => query_pragma(
             PragmaName::QueryOnly,
@@ -852,6 +854,10 @@ fn update_pragma(
         PragmaName::IgnoreCheckConstraints => {
             let enabled = parse_pragma_enabled(&value);
             connection.set_check_constraints_ignored(enabled);
+            Ok(TransactionMode::None)
+        }
+        PragmaName::DeferForeignKeys => {
+            connection.set_defer_foreign_keys(parse_pragma_enabled(&value));
             Ok(TransactionMode::None)
         }
         #[cfg(target_vendor = "apple")]
@@ -1230,7 +1236,7 @@ fn query_pragma(
                         index_namespace.id,
                         &index_name,
                     )? {
-                        for (seqno, col) in index.columns.iter().enumerate() {
+                        for (seqno, col) in index.key_columns().iter().enumerate() {
                             program.emit_int(seqno as i64, base_reg);
                             emit_index_column_cid_and_name(program, col, base_reg + 1);
                             program.emit_result_row(base_reg, 3);
@@ -1277,7 +1283,8 @@ fn query_pragma(
                             emit_index_column_cid_and_name(program, col, base_reg + 1);
                             program.emit_int(desc as i64, base_reg + 3);
                             program.emit_string8(coll, base_reg + 4);
-                            program.emit_int(1, base_reg + 5); // key column
+                            // key column; the primary key suffix of a WITHOUT ROWID index is not
+                            program.emit_int((seqno < index.n_key_col) as i64, base_reg + 5);
                             program.emit_result_row(base_reg, 6);
                         }
 
@@ -1395,6 +1402,57 @@ fn query_pragma(
             let pragma_meta = pragma_for(&pragma);
             for col_name in pragma_meta.columns.iter() {
                 program.add_pragma_result_column(col_name.to_string());
+            }
+            Ok(TransactionMode::Read)
+        }
+        PragmaName::ForeignKeyCheck => {
+            let table_name = match &value {
+                Some(ast::Expr::Name(name)) | Some(ast::Expr::Id(name)) => {
+                    Some(name.as_str().to_string())
+                }
+                Some(ast::Expr::Literal(ast::Literal::String(s))) => {
+                    Some(s.trim_matches('\'').to_string())
+                }
+                _ => None,
+            };
+            let table_namespace = match &table_name {
+                Some(name) => {
+                    let ns = resolve_table_pragma_namespace(
+                        resolver,
+                        namespace,
+                        schema_was_explicit,
+                        name,
+                    )?;
+                    if resolver.with_schema(ns.database_id, |s| s.get_table(ns.id, name).is_none())
+                    {
+                        crate::bail_parse_error!("no such table: {name}");
+                    }
+                    ns
+                }
+                None => namespace,
+            };
+            let sql = resolver.with_schema(table_namespace.database_id, |s| {
+                super::fk_check::foreign_key_check_sql(s, table_namespace.id, table_name.as_deref())
+            })?;
+            // The query names its own result columns.
+            if let Some(sql) = sql {
+                let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+                let Ok(Some(ast::Cmd::Stmt(ast::Stmt::Select(select)))) = parser.next_cmd() else {
+                    crate::bail_parse_error!("could not build foreign_key_check query");
+                };
+                program.nested(|program| {
+                    super::select::translate_select(
+                        select,
+                        resolver,
+                        program,
+                        super::plan::QueryDestination::ResultRows,
+                        &connection,
+                    )
+                })?;
+            } else {
+                for col_name in pragma_for(&pragma).columns.iter() {
+                    program.add_pragma_result_column(col_name.to_string());
+                }
             }
             Ok(TransactionMode::Read)
         }
@@ -1954,6 +2012,13 @@ fn query_pragma(
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
         }
+        PragmaName::DeferForeignKeys => {
+            let register = program.alloc_register();
+            program.emit_int(connection.defer_foreign_keys() as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
         PragmaName::IgnoreCheckConstraints => {
             let ignored = connection.check_constraints_ignored();
             let register = program.alloc_register();
@@ -2083,8 +2148,13 @@ fn find_index_by_name(
     }
     let Some(table) = index_name
         .strip_prefix(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
-        .and_then(|rest| rest.strip_suffix("_1"))
-        .and_then(|table_name| schema.get_btree_table(namespace, table_name))
+        .and_then(|rest| rest.rsplit_once('_'))
+        .and_then(|(table_name, _)| schema.get_btree_table(namespace, table_name))
+        .filter(|t| {
+            !t.has_rowid
+                && t.without_rowid_pk_index_name()
+                    .eq_ignore_ascii_case(index_name)
+        })
     else {
         return Ok(None);
     };
@@ -2098,10 +2168,7 @@ fn without_rowid_primary_key_index(table: &BTreeTable) -> Result<Option<Index>> 
     let primary_key = table.unique_sets.iter().find(|us| us.is_primary_key);
     let index = Index::automatic_from_primary_key(
         table,
-        (
-            format!("{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{}_1", table.name),
-            table.root_page,
-        ),
+        (table.without_rowid_pk_index_name(), table.root_page),
         table.primary_key_columns.len(),
         primary_key.and_then(|us| us.conflict_clause),
         primary_key.map_or(&[], |us| us.columns.as_slice()),
@@ -2172,6 +2239,8 @@ fn emit_columns_for_table_info(
             1
         } else if column.is_virtual_generated() {
             2
+        } else if column.is_stored_generated() {
+            3
         } else {
             // normal column
             0

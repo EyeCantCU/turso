@@ -1989,6 +1989,8 @@ pub enum PragmaName {
     DataSyncRetry,
     /// List databases
     DatabaseList,
+    /// Defer all foreign key checks until the transaction ends
+    DeferForeignKeys,
     /// Encoding - only support utf8
     Encoding,
     /// Current free page count.
@@ -1997,6 +1999,8 @@ pub enum PragmaName {
     IncrementalVacuum,
     /// Enable or disable foreign key constraint enforcement
     ForeignKeys,
+    /// Reports rows that violate foreign key constraints
+    ForeignKeyCheck,
     /// Returns information about foreign keys declared by a table
     ForeignKeyList,
     /// Deprecated: control whether column names include table name prefix

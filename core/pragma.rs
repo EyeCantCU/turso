@@ -201,6 +201,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["foreign_keys"],
         ),
+        ForeignKeyCheck => Pragma::new(
+            PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::Result1,
+            &["table", "rowid", "parent", "fkid"],
+        ),
         ForeignKeyList => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::Result1 | PragmaFlags::SchemaOpt,
             &[
@@ -227,6 +231,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
         PragmaName::Fullfsync => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["fullfsync"],
+        ),
+        DeferForeignKeys => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["defer_foreign_keys"],
         ),
         IgnoreCheckConstraints => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,

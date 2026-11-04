@@ -2874,6 +2874,7 @@ impl Database {
                 crate::connection::StatementActivity::default(),
             )),
             check_constraints_pragma: AtomicBool::new(false),
+            defer_foreign_keys: AtomicBool::new(false),
             vtab_txn_states: RwLock::new(HashSet::default()),
             vtab_connect_only: AtomicBool::new(false),
             index_method_tx_cursors: crate::sync::Mutex::new(Vec::new()),

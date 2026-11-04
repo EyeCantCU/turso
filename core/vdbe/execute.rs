@@ -5507,6 +5507,7 @@ pub fn op_auto_commit(
                 // Pre-check deferred FKs; leave tx open and do NOT clear violations
                 check_deferred_fk_on_commit(&conn)?;
                 vtab_commit_all(&conn)?;
+                conn.set_defer_foreign_keys(false);
                 conn.auto_commit.store(true, Ordering::SeqCst);
                 conn.set_tx_read_only(false);
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
@@ -10056,7 +10057,7 @@ pub fn op_sorter_compare(
         && compare_immutable(
             previous_sorter_values,
             current_sorter_values,
-            &cursor.index_key_info,
+            &cursor.index_key_info[..(*num_regs).min(cursor.index_key_info.len())],
         )
         .is_eq();
     if is_equal {
@@ -13371,8 +13372,7 @@ pub fn op_insert(
                 };
                 let is_schema_root = root_page == 1
                     || root_page == i64::from(crate::mvcc::database::SQLITE_SCHEMA_MVCC_TABLE_ID);
-                let target = if has_rowid
-                    && !is_schema_root
+                let target = if !is_schema_root
                     && !flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT)
                     && !flag.has(InsertFlags::SKIP_ALL_CHANGE_COUNTS)
                 {
@@ -13385,9 +13385,14 @@ pub fn op_insert(
                     state.active_op_state.insert().sub_state = OpInsertSubState::Insert;
                     continue;
                 };
-                let key = match &state.registers[*key_reg].get_value() {
-                    Value::Numeric(Numeric::Integer(i)) => *i,
-                    _ => unreachable!("expected integer key"),
+                // A WITHOUT ROWID row reports key 0, as in SQLite.
+                let key = if has_rowid {
+                    match &state.registers[*key_reg].get_value() {
+                        Value::Numeric(Numeric::Integer(i)) => *i,
+                        _ => unreachable!("expected integer key"),
+                    }
+                } else {
+                    0
                 };
                 let is_update = flag.has(InsertFlags::SKIP_LAST_ROWID);
                 // The UPDATE's own Delete, if it removed the old row first.
@@ -13413,7 +13418,28 @@ pub fn op_insert(
                 if (is_update && own.is_none()) || (!is_update && !has_pending) {
                     let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
-                    if return_if_io!(state, cursor.rowid()) == Some(key) {
+                    let same_row = if has_rowid {
+                        return_if_io!(state, cursor.rowid()) == Some(key)
+                    } else {
+                        // The cursor is on the row this record overwrites if the keys match.
+                        let n_key = target.table.without_rowid_pk_columns()?.len();
+                        let new_key = match &state.registers[*record_reg] {
+                            Register::Record(r) => r.get_values_owned()?,
+                            _ => crate::alloc::Vec::new(),
+                        };
+                        let cursor = state.get_cursor(*cursor_id);
+                        let cursor = cursor.as_btree_mut();
+                        match return_if_io!(state, cursor.record()) {
+                            Some(record) => {
+                                let old = record.get_values_owned()?;
+                                old.len() >= n_key
+                                    && new_key.len() >= n_key
+                                    && old[..n_key] == new_key[..n_key]
+                            }
+                            None => false,
+                        }
+                    };
+                    if same_row {
                         let cursor = state.get_cursor(*cursor_id);
                         let cursor = cursor.as_btree_mut();
                         if let Some(record) = return_if_io!(state, cursor.record()) {
@@ -13840,7 +13866,13 @@ pub fn op_delete(
                     {
                         let cursor = state.get_cursor(*cursor_id);
                         let cursor = cursor.as_btree_mut();
-                        if let Some(rowid) = return_if_io!(state, cursor.rowid()) {
+                        // A WITHOUT ROWID row reports key 0, as in SQLite.
+                        let rowid = if target.table.has_rowid {
+                            return_if_io!(state, cursor.rowid())
+                        } else {
+                            Some(0)
+                        };
+                        if let Some(rowid) = rowid {
                             let values = if program.connection.data_hooks.has_preupdate_hook() {
                                 let cursor = state.get_cursor(*cursor_id);
                                 let cursor = cursor.as_btree_mut();
@@ -14107,10 +14139,15 @@ pub fn op_idx_delete(
                 *state.active_op_state.idx_delete() = OpIdxDeleteState::Verifying;
             }
             OpIdxDeleteState::Verifying => {
-                let rowid = {
+                // An index of a WITHOUT ROWID table has no rowid; the eq_only seek
+                // already found the whole entry.
+                let has_rowid = state.get_cursor(*cursor_id).as_btree_mut().has_rowid();
+                let rowid = if has_rowid {
                     let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
                     return_if_io!(state, cursor.rowid())
+                } else {
+                    Some(0)
                 };
 
                 if rowid.is_none() && *raise_error_if_no_matching_entry {
@@ -15582,6 +15619,7 @@ pub fn op_drop_view(
     conn.with_database_schema_mut(*db, |schema| {
         schema.remove_view(*namespace, view_name).ok();
         schema.remove_broken_view(*namespace, view_name);
+        schema.remove_triggers_for_table(*namespace, view_name);
     })?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -19066,7 +19104,7 @@ pub fn op_alter_column(
                     }
                     ic.default.clone_from(&table_column.default);
                     ic.expr = table_column
-                        .generated_expr()
+                        .virtual_generated_expr()
                         .map(|expr| Box::new(expr.clone()));
                 }
             }
@@ -19388,7 +19426,8 @@ pub fn op_fk_counter(
         },
         insn
     );
-    if !*deferred {
+    // PRAGMA defer_foreign_keys turns every immediate constraint into a deferred one.
+    if !*deferred && !program.connection.defer_foreign_keys() {
         state.increment_fk_immediate_violations_during_stmt(*increment_value);
         if state.get_fk_immediate_violations_during_stmt() == 0 {
             state.fk_immediate_violation = None;

@@ -332,6 +332,10 @@ impl Display for EqpDetail {
                 if let Some(vtab_index) = vtab_index {
                     write!(f, " VIRTUAL TABLE INDEX {vtab_index}")?;
                 }
+                // A WITHOUT ROWID table read through its own b-tree is a plain scan.
+                let index = index.as_ref().filter(|index| {
+                    index.name != crate::translate::optimizer::WITHOUT_ROWID_PRIMARY_KEY_SCAN
+                });
                 if let Some(index) = index {
                     if index.covering {
                         write!(f, " USING COVERING INDEX {}", index.name)?;
@@ -353,6 +357,12 @@ impl Display for EqpDetail {
             } => {
                 write!(f, "SEARCH {}", table.identifier())?;
                 match index {
+                    Some(index)
+                        if index.name
+                            == crate::translate::optimizer::WITHOUT_ROWID_PRIMARY_KEY_SCAN =>
+                    {
+                        write!(f, " USING PRIMARY KEY")?
+                    }
                     Some(index) if index.covering => {
                         write!(f, " USING COVERING INDEX {}", index.name)?
                     }

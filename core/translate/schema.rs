@@ -838,11 +838,6 @@ fn validate(
                 if table.primary_key_columns.is_empty() {
                     bail_parse_error!("PRIMARY KEY missing on table {}", table_name);
                 }
-                if table.unique_sets.iter().any(|us| !us.is_primary_key) {
-                    bail_parse_error!(
-                        "secondary UNIQUE constraints on WITHOUT ROWID tables are not supported"
-                    );
-                }
             } else if table.has_autoincrement {
                 // SQLite allows AUTOINCREMENT only on a key declared exactly as
                 // INTEGER PRIMARY KEY: quotes around INTEGER are allowed, a size
@@ -1472,7 +1467,7 @@ pub fn translate_create_table(
 
     let index_regs = collect_autoindexes(&body, program, &mangled_tbl_name, resolver)?;
     if let Some(index_regs) = index_regs.as_ref() {
-        for index_reg in index_regs.iter() {
+        for (index_reg, _) in index_regs.iter() {
             program.emit_insn(Insn::CreateBtree {
                 db: database_id,
                 root: *index_reg,
@@ -1512,12 +1507,9 @@ pub fn translate_create_table(
     )?;
 
     if let Some(index_regs) = index_regs {
-        for (idx, index_reg) in index_regs.into_iter().enumerate() {
-            let index_name = format!(
-                "{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{}_{}",
-                mangled_tbl_name,
-                idx + 1
-            );
+        for (index_reg, number) in index_regs {
+            let index_name =
+                format!("{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{mangled_tbl_name}_{number}");
             emit_schema_entry(
                 program,
                 resolver,
@@ -1954,7 +1946,7 @@ fn collect_autoindexes(
     program: &mut ProgramBuilder,
     tbl_name: &str,
     resolver: &Resolver,
-) -> Result<Option<Vec<usize>>> {
+) -> Result<Option<Vec<(usize, usize)>>> {
     let table = create_table(
         tbl_name,
         body,
@@ -1962,11 +1954,15 @@ fn collect_autoindexes(
         resolver.catalog.dialect.supports_namespaces(),
     )?;
 
-    let mut regs: Vec<usize> = Vec::new();
+    // (register, autoindex number). The primary key of a WITHOUT ROWID table
+    // has no b-tree of its own but still takes a number, as in SQLite.
+    let mut regs: Vec<(usize, usize)> = Vec::new();
+    let mut number = 0;
 
     // include UNIQUE singles, include PK single only if not rowid alias
     for us in table.unique_sets.iter().filter(|us| us.columns.len() == 1) {
         if us.is_primary_key && !table.has_rowid {
+            number += 1;
             continue;
         }
         let col_name = &us.columns.first().unwrap().name;
@@ -1982,15 +1978,17 @@ fn collect_autoindexes(
         };
 
         if needs_index {
-            regs.push(program.alloc_register());
+            number += 1;
+            regs.push((program.alloc_register(), number));
         }
     }
 
-    for _us in table.unique_sets.iter().filter(|us| us.columns.len() > 1) {
-        if !table.has_rowid && _us.is_primary_key {
+    for us in table.unique_sets.iter().filter(|us| us.columns.len() > 1) {
+        number += 1;
+        if !table.has_rowid && us.is_primary_key {
             continue;
         }
-        regs.push(program.alloc_register());
+        regs.push((program.alloc_register(), number));
     }
     if regs.is_empty() {
         Ok(None)

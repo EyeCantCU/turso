@@ -322,18 +322,16 @@ fn test_create_table_without_rowid_requires_primary_key(
 }
 
 #[turso_macros::test]
-fn test_create_table_without_rowid_rejects_secondary_unique(
-    tmp_db: TempDatabase,
-) -> anyhow::Result<()> {
+fn test_create_table_without_rowid_secondary_unique(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();
 
-    assert_that!(
-        conn.execute("CREATE TABLE t(a TEXT PRIMARY KEY, b INT UNIQUE, c TEXT) WITHOUT ROWID")
-    )
-    .err()
-    .display_string()
-    .contains("secondary UNIQUE constraints on WITHOUT ROWID tables are not supported");
+    conn.execute("CREATE TABLE t(a TEXT PRIMARY KEY, b INT UNIQUE, c TEXT) WITHOUT ROWID")?;
+    conn.execute("INSERT INTO t VALUES ('k', 1, 'x')")?;
+    assert_that!(conn.execute("INSERT INTO t VALUES ('l', 1, 'y')"))
+        .err()
+        .display_string()
+        .contains("UNIQUE constraint failed: t.b");
     Ok(())
 }
 

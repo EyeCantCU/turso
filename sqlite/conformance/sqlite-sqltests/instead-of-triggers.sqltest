@@ -1,0 +1,94 @@
+@database :memory:
+
+test instead-of-insert-update-delete {
+    CREATE TABLE t(a, b);
+    CREATE VIEW v AS SELECT a, b FROM t;
+    CREATE TRIGGER vi INSTEAD OF INSERT ON v BEGIN INSERT INTO t VALUES (new.a * 10, new.b); END;
+    CREATE TRIGGER vu INSTEAD OF UPDATE ON v BEGIN UPDATE t SET b = new.b WHERE a = old.a; END;
+    CREATE TRIGGER vd INSTEAD OF DELETE ON v BEGIN DELETE FROM t WHERE a = old.a; END;
+    INSERT INTO v VALUES (1, 2), (3, 4);
+    UPDATE v SET b = 99 WHERE a = 10;
+    DELETE FROM v WHERE a = 30;
+    SELECT * FROM t;
+}
+expect {
+    10|99
+}
+
+test instead-of-changes-count-no-rows {
+    CREATE TABLE t(a, b);
+    CREATE VIEW v AS SELECT a, b FROM t;
+    CREATE TRIGGER vi INSTEAD OF INSERT ON v BEGIN INSERT INTO t VALUES (new.a, new.b); END;
+    INSERT INTO v VALUES (1, 2), (3, 4);
+    SELECT changes(), total_changes();
+}
+expect {
+    0|2
+}
+
+test instead-of-insert-column-list-and-defaults {
+    CREATE TABLE t(a, b);
+    CREATE VIEW v AS SELECT a, b FROM t;
+    CREATE TRIGGER vi INSTEAD OF INSERT ON v BEGIN INSERT INTO t VALUES (new.a, new.b); END;
+    INSERT INTO v(b) VALUES (7);
+    INSERT INTO v DEFAULT VALUES;
+    SELECT quote(a), quote(b) FROM t;
+}
+expect {
+    NULL|7
+    NULL|NULL
+}
+
+test instead-of-update-of-column {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 'x');
+    CREATE VIEW w AS SELECT a FROM t;
+    CREATE TRIGGER wu INSTEAD OF UPDATE OF a ON w BEGIN INSERT INTO t VALUES ('u', old.a || '>' || new.a); END;
+    UPDATE w SET a = a + 1 WHERE a = 1;
+    SELECT * FROM t;
+}
+expect {
+    1|x
+    u|1>2
+}
+
+# Triggers fire newest first, so the RAISE runs before the insert.
+test instead-of-raise-ignore {
+    CREATE TABLE t(a, b);
+    CREATE VIEW v AS SELECT a, b FROM t;
+    CREATE TRIGGER vi2 INSTEAD OF INSERT ON v BEGIN INSERT INTO t VALUES (new.a, new.b); END;
+    CREATE TRIGGER vi INSTEAD OF INSERT ON v WHEN new.a > 100 BEGIN SELECT RAISE(IGNORE); END;
+    INSERT INTO v SELECT 500, 'big' UNION ALL SELECT 5, 'small';
+    SELECT * FROM t;
+}
+expect {
+    5|small
+}
+
+test instead-of-view-without-matching-trigger {
+    CREATE TABLE t(a);
+    CREATE VIEW w AS SELECT a FROM t;
+    UPDATE w SET a = 1;
+}
+expect error {
+    cannot modify w because it is a view
+}
+
+test instead-of-trigger-on-table-rejected {
+    CREATE TABLE t(a);
+    CREATE TRIGGER tt INSTEAD OF INSERT ON t BEGIN SELECT 1; END;
+}
+expect error {
+    cannot create INSTEAD OF trigger on table: t
+}
+
+test drop-view-drops-its-triggers {
+    CREATE TABLE t(a);
+    CREATE VIEW v AS SELECT a FROM t;
+    CREATE TRIGGER vi INSTEAD OF INSERT ON v BEGIN INSERT INTO t VALUES (new.a); END;
+    DROP VIEW v;
+    SELECT count(*) FROM sqlite_schema WHERE type = 'trigger';
+}
+expect {
+    0
+}

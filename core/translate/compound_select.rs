@@ -590,6 +590,7 @@ fn create_dedupe_index(
     }
 
     let dedupe_index = Arc::new(Index {
+        n_key_col: dedupe_columns.len(),
         columns: dedupe_columns,
         name: "compound_dedupe".to_string(),
         root_page: 0,
@@ -793,6 +794,7 @@ fn create_collection_index(
     }
 
     let index = Arc::new(Index {
+        n_key_col: columns.len(),
         columns,
         name: "compound_collection".to_string(),
         root_page: 0,

@@ -764,15 +764,16 @@ pub fn emit_parent_index_key_change_checks(
         return Ok(None);
     }
 
-    let idx_len = index.columns.len();
+    // Only the declared key is the parent key; a WITHOUT ROWID index adds the PK.
+    let idx_len = index.n_key_col;
     let layout = table_btree.column_layout()?;
     let some_idx_columns_are_virtual = index
-        .columns
+        .key_columns()
         .iter()
         .any(|col| table_btree.columns()[col.pos_in_table].is_virtual_generated());
 
     let old_key = program.alloc_registers(idx_len);
-    let idx_target_cols = index.columns.iter().map(|c| c.pos_in_table);
+    let idx_target_cols = index.key_columns().iter().map(|c| c.pos_in_table);
     let dml_ctx = some_idx_columns_are_virtual
         .then(|| {
             emit_columns_and_dependencies(
@@ -785,7 +786,7 @@ pub fn emit_parent_index_key_change_checks(
             )
         })
         .transpose()?;
-    for (i, index_col) in index.columns.iter().enumerate() {
+    for (i, index_col) in index.key_columns().iter().enumerate() {
         if let Some(ref ctx) = dml_ctx {
             emit_table_column_for_dml(
                 program,
@@ -808,7 +809,7 @@ pub fn emit_parent_index_key_change_checks(
         }
     }
     let new_key = program.alloc_registers(idx_len);
-    for (i, index_col) in index.columns.iter().enumerate() {
+    for (i, index_col) in index.key_columns().iter().enumerate() {
         let pos_in_table = index_col.pos_in_table;
         let column = &table_btree.columns()[pos_in_table];
         let src = if column.is_rowid_alias() {
@@ -1689,6 +1690,40 @@ pub fn emit_fk_update_parent_actions(
             )? {
                 deferred_new_key_plans.push(plan);
             }
+        }
+    }
+
+    // The primary key of a WITHOUT ROWID parent is not in `indexes_to_update`.
+    let mut pk_indexes: Vec<Arc<Index>> = Vec::new();
+    if !table_btree.has_rowid {
+        for fk in &check_fks {
+            if let Some(idx) = fk
+                .parent_unique_index
+                .as_ref()
+                .filter(|idx| idx.root_page == table_btree.root_page)
+            {
+                if !pk_indexes.iter().any(|i| i.name == idx.name) {
+                    pk_indexes.push(idx.clone());
+                }
+            }
+        }
+    }
+    for index in pk_indexes {
+        if let Some(plan) = emit_parent_index_key_change_checks(
+            program,
+            cursor_id,
+            start,
+            old_rowid_reg,
+            rowid_new_reg,
+            &check_fks,
+            table_btree,
+            &index,
+            updated_positions,
+            new_key_probe_mode,
+            database_id,
+            resolver,
+        )? {
+            deferred_new_key_plans.push(plan);
         }
     }
 

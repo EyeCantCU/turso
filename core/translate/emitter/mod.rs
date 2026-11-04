@@ -1234,22 +1234,14 @@ pub fn emit_cdc_patch_record(
     }
 }
 
-pub(super) fn emit_make_record<'a>(
+pub(super) fn emit_make_record(
     program: &mut ProgramBuilder,
-    cols: impl IntoIterator<Item = &'a Column>,
+    table: &BTreeTable,
     start_reg: usize,
     dest_reg: usize,
 ) {
-    let storable_cols: Vec<&Column> = cols
-        .into_iter()
-        .filter(|c| !c.is_virtual_generated())
-        .collect();
-    let storable_count = storable_cols.len();
-
-    let affinity_str: String = storable_cols
-        .iter()
-        .map(|c| c.affinity().aff_mask())
-        .collect();
+    let affinity_str = table.record_affinity_str();
+    let storable_count = affinity_str.len();
 
     program.emit_insn(Insn::MakeRecord {
         start_reg: to_u32(start_reg),
@@ -2256,7 +2248,7 @@ fn emit_index_column_value_new_image(
                 )?;
                 program.emit_column_affinity(dest_reg, col_in_table.affinity());
             }
-            GeneratedType::NotGenerated => {
+            GeneratedType::Stored { .. } | GeneratedType::NotGenerated => {
                 let src_reg = if col_in_table.is_rowid_alias() {
                     rowid_reg
                 } else {

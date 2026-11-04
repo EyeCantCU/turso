@@ -3228,6 +3228,10 @@ impl Schema {
             // we must process unique_sets in this exact order in order to emit automatic indices schema entries in the same order
             let mut pk_index_added = false;
             for unique_set in &table.unique_sets {
+                // The table b-tree itself is the primary key of a WITHOUT ROWID table.
+                if unique_set.is_primary_key && !table.has_rowid {
+                    continue;
+                }
                 if unique_set.is_primary_key {
                     assert!(
                         table.primary_key_columns.len() == unique_set.columns.len(),
@@ -4328,9 +4332,9 @@ impl Schema {
                 .find(|idx| {
                     idx.unique
                         && idx.where_clause.is_none()
-                        && idx.columns.len() == parent_cols.len()
+                        && idx.n_key_col == parent_cols.len()
                         && idx
-                            .columns
+                            .key_columns()
                             .iter()
                             .zip(parent_cols.iter())
                             .zip(parent_collations.iter())
@@ -4339,6 +4343,40 @@ impl Schema {
                             })
                 })
                 .cloned();
+            // The PRIMARY KEY of a WITHOUT ROWID parent is the table b-tree itself.
+            let found = match found {
+                Some(found) => Some(found),
+                None if !parent_tbl.has_rowid => {
+                    let pk_cols = parent_tbl.without_rowid_pk_columns()?;
+                    let matches = pk_cols.len() == parent_cols.len()
+                        && pk_cols
+                            .iter()
+                            .zip(parent_cols.iter())
+                            .zip(parent_collations.iter())
+                            .all(|((ic, pc), collation)| {
+                                ic.name.eq_ignore_ascii_case(pc) && ic.collation == *collation
+                            });
+                    if matches {
+                        Some(Arc::new(Index {
+                            name: format!("{}_primary_key", parent_tbl.name),
+                            table_name: parent_tbl.name.clone(),
+                            root_page: parent_tbl.root_page,
+                            n_key_col: pk_cols.len(),
+                            columns: pk_cols,
+                            unique: true,
+                            ephemeral: false,
+                            has_rowid: false,
+                            where_clause: None,
+                            index_method: None,
+                            on_conflict: None,
+                            constraint_name: None,
+                        }))
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            };
             if require_unique && found.is_none() {
                 return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
             }
@@ -4637,6 +4675,7 @@ impl TryClone for Index {
             name: self.name.clone(),
             table_name: self.table_name.clone(),
             root_page: self.root_page,
+            n_key_col: self.n_key_col,
             columns: self.columns.try_clone()?,
             unique: self.unique,
             ephemeral: self.ephemeral,
@@ -5128,7 +5167,7 @@ impl GeneratedColGraph {
 
         // walk each virtual column's expression once to extract edges
         for (j, col) in columns.iter().enumerate() {
-            let GeneratedType::Virtual { ref expr, .. } = col.generated_type() else {
+            let Some(expr) = col.generated_expr() else {
                 continue;
             };
             let mut direct = BitSet::default();
@@ -5467,6 +5506,64 @@ impl BTreeTable {
         self.has_virtual_columns
     }
 
+    /// The PRIMARY KEY of a WITHOUT ROWID table as index columns, in key order,
+    /// with duplicate columns removed.
+    pub fn without_rowid_pk_columns(&self) -> Result<Vec<IndexColumn>> {
+        let pk_set = self.unique_sets.iter().find(|u| u.is_primary_key);
+        let mut cols: Vec<IndexColumn> = Vec::new();
+        for (i, (col_name, order)) in self.primary_key_columns.iter().enumerate() {
+            let Some((pos_in_table, column)) = self.get_column(col_name) else {
+                crate::bail_parse_error!("no such column: {col_name}");
+            };
+            if cols.iter().any(|c| c.pos_in_table == pos_in_table) {
+                continue;
+            }
+            let constraint_col = pk_set.and_then(|u| u.columns.get(i));
+            let explicit_collation = constraint_col.and_then(|c| c.collation);
+            cols.try_push(IndexColumn {
+                name: normalize_ident(col_name),
+                order: *order,
+                nulls_order: constraint_col.and_then(|c| c.nulls_order),
+                pos_in_table,
+                collation: explicit_collation
+                    .map_or_else(|| column.collation(), CollationSeq::Text),
+                explicit_collation,
+                default: column.default.clone(),
+                expr: None,
+            })?;
+        }
+        Ok(cols)
+    }
+
+    /// Affinities of the stored columns in record order.
+    pub fn record_affinity_str(&self) -> String {
+        let mut cols: Vec<(usize, &Column)> = self
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.is_virtual_generated())
+            .map(|(i, c)| (self.logical_to_physical_column(i), c))
+            .collect();
+        cols.sort_by_key(|(physical, _)| *physical);
+        cols.iter().map(|(_, c)| c.affinity().aff_mask()).collect()
+    }
+
+    /// The `sqlite_autoindex_<table>_<N>` name SQLite gives the primary key of a
+    /// WITHOUT ROWID table; N counts the automatic indexes declared before it.
+    pub fn without_rowid_pk_index_name(&self) -> String {
+        let singles = self.unique_sets.iter().filter(|u| u.columns.len() == 1);
+        let compounds = self.unique_sets.iter().filter(|u| u.columns.len() > 1);
+        let number = singles
+            .chain(compounds)
+            .position(|u| u.is_primary_key)
+            .map_or(1, |i| i + 1);
+        format!("sqlite_autoindex_{}_{number}", self.name)
+    }
+
+    pub fn has_stored_generated_columns(&self) -> bool {
+        self.columns.iter().any(Column::is_stored_generated)
+    }
+
     /// Build a `ColumnLayout` for this table's register mapping.
     pub fn column_layout(&self) -> Result<ColumnLayout, TryReserveError> {
         ColumnLayout::from_btree(self)
@@ -5634,13 +5731,18 @@ impl BTreeTable {
 
             push_collation(&mut sql, column.text_collation());
 
-            if let GeneratedType::Virtual { original_sql, .. } = &column.generated_type() {
+            if let GeneratedType::Virtual { original_sql, .. }
+            | GeneratedType::Stored { original_sql, .. } = &column.generated_type()
+            {
                 if column.generated_always {
                     sql.push_str(" GENERATED ALWAYS");
                 }
                 sql.push_str(" AS (");
                 sql.push_str(original_sql);
                 sql.push(')');
+                if column.is_stored_generated() {
+                    sql.push_str(" STORED");
+                }
             }
 
             // Add column-level CHECK constraints inline
@@ -5926,7 +6028,7 @@ impl BTreeTable {
         {
             let mut guard = self.columns_mut();
             for i in 0..guard.len() {
-                if guard[i].is_virtual_generated() {
+                if guard[i].is_generated() {
                     let mut expr = guard[i].generated_expr().cloned().unwrap();
                     resolve_gencol_expr_columns(&mut expr, &guard)?;
                     *guard[i].generated_expr_mut().unwrap() = expr;
@@ -6029,7 +6131,10 @@ impl BTreeTable {
         for j in targets {
             if !self.columns[j].is_virtual_generated() {
                 deps.set(j)?;
-                continue;
+                // A STORED generated column changes with its dependencies.
+                if !self.columns[j].is_stored_generated() {
+                    continue;
+                }
             }
             for i in graph.dependencies[j].iter() {
                 if !self.columns[i].is_virtual_generated() {
@@ -6688,6 +6793,12 @@ pub fn create_table(
                             }
                         };
                         let sort_order = column.order.unwrap_or(SortOrder::Asc);
+                        // SQLite ignores a column repeated in the key with the same collation.
+                        if pk_unique_set_columns.iter().any(|c: &UniqueSetColumn| {
+                            c.name.eq_ignore_ascii_case(&col_name) && c.collation == collation
+                        }) {
+                            continue;
+                        }
                         pk_unique_set_columns.try_push(UniqueSetColumn {
                             name: col_name.clone(),
                             sort_order,
@@ -6870,6 +6981,7 @@ pub fn create_table(
 
                 let mut default = None;
                 let mut generated: Option<Box<Expr>> = None;
+                let mut stored = false;
                 let mut primary_key = false;
                 let mut notnull = false;
                 let mut explicit_notnull = false;
@@ -6889,12 +7001,9 @@ pub fn create_table(
                             ))?;
                         }
                         ast::ColumnConstraint::Generated { expr, typ, .. } => {
-                            if typ
+                            stored = typ
                                 .as_ref()
-                                .is_some_and(|t| matches!(t, ast::GeneratedColumnType::Stored))
-                            {
-                                bail_parse_error!("Stored generated columns are not supported");
-                            }
+                                .is_some_and(|t| matches!(t, ast::GeneratedColumnType::Stored));
                             validate_generated_expr(expr)?;
                             generated = Some(expr.clone());
                         }
@@ -7110,6 +7219,9 @@ pub fn create_table(
                         }
                     )
                 });
+                if stored {
+                    col.set_generated_stored();
+                }
                 col.ty_params = ty_params;
                 col.notnull_constraint_name = notnull_constraint_name;
                 if let Some(t) = col_type.as_ref() {
@@ -7229,7 +7341,16 @@ pub fn create_table(
                                 );
                             }
                         }
-                        unique_sets.remove(j);
+                        // The surviving set stands for the PRIMARY KEY if either was it.
+                        let removed = unique_sets.remove(j);
+                        if removed.is_primary_key && !unique_sets[i].is_primary_key {
+                            unique_sets[i].is_primary_key = true;
+                            unique_sets[i].conflict_clause =
+                                unique_sets[i].conflict_clause.or(removed.conflict_clause);
+                            if unique_sets[i].constraint_name.is_none() {
+                                unique_sets[i].constraint_name = removed.constraint_name;
+                            }
+                        }
                     } else {
                         j += 1;
                     }
@@ -7556,7 +7677,11 @@ pub enum GeneratedType {
         expr: Box<Expr>,
         original_sql: String,
     },
-    // Stored { resolved: Box<Expr>, original_sql: String },
+    /// Like `Virtual`, but the value is computed on write and kept in the record.
+    Stored {
+        expr: Box<Expr>,
+        original_sql: String,
+    },
     NotGenerated,
 }
 
@@ -7663,6 +7788,7 @@ impl Column {
         };
         let mut primary_key_order = SortOrder::Asc;
         let mut collation = None;
+        let mut stored = false;
 
         for ast::NamedColumnConstraint { constraint, .. } in &value.constraints {
             match constraint {
@@ -7696,8 +7822,9 @@ impl Column {
                     }
                     collation.replace(collation_seq);
                 }
-                ast::ColumnConstraint::Generated { expr, .. } => {
+                ast::ColumnConstraint::Generated { expr, typ, .. } => {
                     generated = Some(expr.clone());
+                    stored = matches!(typ, Some(ast::GeneratedColumnType::Stored));
                 }
                 _ => {}
             };
@@ -7763,6 +7890,9 @@ impl Column {
             } => c.name.as_ref().map(|n| n.as_str().to_owned()),
             _ => None,
         });
+        if stored {
+            col.set_generated_stored();
+        }
         col.ty_params = ty_params;
         if let Some(t) = value.col_type.as_ref() {
             col.apply_written_type(t);
@@ -7827,17 +7957,48 @@ impl Column {
     }
 
     #[inline]
+    pub fn is_stored_generated(&self) -> bool {
+        matches!(self.generated_type, GeneratedType::Stored { .. })
+    }
+
+    /// Turn a virtual generated column into a STORED one.
+    pub fn set_generated_stored(&mut self) {
+        let generated_type =
+            std::mem::replace(&mut self.generated_type, GeneratedType::NotGenerated);
+        self.generated_type = match generated_type {
+            GeneratedType::Virtual { expr, original_sql }
+            | GeneratedType::Stored { expr, original_sql } => {
+                GeneratedType::Stored { expr, original_sql }
+            }
+            GeneratedType::NotGenerated => GeneratedType::NotGenerated,
+        };
+    }
+
+    #[inline]
     pub fn generated_expr(&self) -> Option<&Expr> {
         match &self.generated_type {
-            GeneratedType::Virtual { expr, .. } => Some(expr.as_ref()),
+            GeneratedType::Virtual { expr, .. } | GeneratedType::Stored { expr, .. } => {
+                Some(expr.as_ref())
+            }
             GeneratedType::NotGenerated => None,
+        }
+    }
+
+    /// The expression of a VIRTUAL generated column, which index entries compute.
+    #[inline]
+    pub fn virtual_generated_expr(&self) -> Option<&Expr> {
+        match &self.generated_type {
+            GeneratedType::Virtual { expr, .. } => Some(expr.as_ref()),
+            _ => None,
         }
     }
 
     #[inline]
     pub fn generated_expr_mut(&mut self) -> Option<&mut Expr> {
         match &mut self.generated_type {
-            GeneratedType::Virtual { expr, .. } => Some(expr.as_mut()),
+            GeneratedType::Virtual { expr, .. } | GeneratedType::Stored { expr, .. } => {
+                Some(expr.as_mut())
+            }
             GeneratedType::NotGenerated => None,
         }
     }
@@ -7845,6 +8006,10 @@ impl Column {
     #[inline]
     pub fn set_generated_original_sql(&mut self, new_sql: String) {
         if let GeneratedType::Virtual {
+            ref mut original_sql,
+            ..
+        }
+        | GeneratedType::Stored {
             ref mut original_sql,
             ..
         } = self.generated_type
@@ -8069,6 +8234,9 @@ pub struct Index {
     pub on_conflict: Option<ResolveType>,
     /// Explicit constraint name from `CONSTRAINT name UNIQUE/PRIMARY KEY`, if any.
     pub constraint_name: Option<String>,
+    /// Number of declared key columns. An index on a WITHOUT ROWID table
+    /// appends the primary key columns it lacks after these (SQLite's nKeyCol).
+    pub n_key_col: usize,
 }
 
 #[allow(dead_code)]
@@ -8227,6 +8395,7 @@ impl Index {
                         name: index_name,
                         table_name: table.name.clone(),
                         root_page,
+                        n_key_col: index_columns.len(),
                         columns: index_columns,
                         unique: false,
                         ephemeral: false,
@@ -8241,6 +8410,7 @@ impl Index {
                         name: index_name,
                         table_name: table.name.clone(),
                         root_page,
+                        n_key_col: index_columns.len(),
                         columns: index_columns,
                         unique,
                         ephemeral: false,
@@ -8249,11 +8419,37 @@ impl Index {
                         index_method: None,
                         on_conflict: None,
                         constraint_name: None,
-                    })
+                    }
+                    .with_without_rowid_pk(table)?)
                 }
             }
             _ => todo!("Expected create index statement"),
         }
+    }
+
+    /// Append the primary key columns of a WITHOUT ROWID table that the key
+    /// lacks, as SQLite does: a secondary index entry ends with the row's key.
+    pub fn with_without_rowid_pk(mut self, table: &BTreeTable) -> Result<Self> {
+        if table.has_rowid || self.index_method.is_some() {
+            return Ok(self);
+        }
+        self.n_key_col = self.columns.len();
+        for pk_col in table.without_rowid_pk_columns()? {
+            let is_dup = self.columns[..self.n_key_col].iter().any(|c| {
+                c.expr.is_none()
+                    && c.pos_in_table == pk_col.pos_in_table
+                    && c.collation == pk_col.collation
+            });
+            if !is_dup {
+                self.columns.try_push(pk_col)?;
+            }
+        }
+        Ok(self)
+    }
+
+    /// The key columns that UNIQUE and index pragmas consider.
+    pub fn key_columns(&self) -> &[IndexColumn] {
+        &self.columns[..self.n_key_col.min(self.columns.len())]
     }
 
     /// Check if this is an expression index.
@@ -8316,6 +8512,7 @@ impl Index {
             name: index_name,
             table_name: table.name.clone(),
             root_page,
+            n_key_col: primary_keys.len(),
             columns: primary_keys,
             unique: true,
             ephemeral: false,
@@ -8366,10 +8563,11 @@ impl Index {
                 .expect("unique index columns vector was preallocated");
         }
 
-        Ok(Index {
+        Index {
             name: index_name,
             table_name: table.name.clone(),
             root_page,
+            n_key_col: unique_cols.len(),
             columns: unique_cols,
             unique: true,
             ephemeral: false,
@@ -8378,7 +8576,8 @@ impl Index {
             index_method: None,
             on_conflict: conflict_clause,
             constraint_name,
-        })
+        }
+        .with_without_rowid_pk(table)
     }
 
     /// Given a column position in the table, return the position in the index.
@@ -9051,6 +9250,16 @@ mod tests {
                             ..
                         },
                         GeneratedType::Virtual {
+                            original_sql: expected,
+                            ..
+                        },
+                    ) => assert_eq!(actual, expected, "{sql}"),
+                    (
+                        GeneratedType::Stored {
+                            original_sql: actual,
+                            ..
+                        },
+                        GeneratedType::Stored {
                             original_sql: expected,
                             ..
                         },

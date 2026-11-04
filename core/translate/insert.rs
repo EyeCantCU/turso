@@ -28,10 +28,10 @@ use crate::{
             NoConstantOptReason, ReturningBufferCtx, WalkControl,
         },
         fkeys::{
-            build_index_affinity_string, child_index_for_fk, emit_fk_restrict_halt,
-            emit_fk_violation, emit_guarded_fk_decrement, emit_skip_if_any_null,
-            fk_constraint_info, index_probe, index_scan_match_any, open_read_index,
-            open_read_table, table_scan_match_any, ForeignKeyActions,
+            build_index_affinity_string, child_index_for_fk, emit_fk_violation,
+            emit_guarded_fk_decrement, emit_skip_if_any_null, fk_constraint_info, index_probe,
+            index_scan_match_any, open_read_index, open_read_table, table_scan_match_any,
+            ForeignKeyActions,
         },
         plan::{
             ColumnMask, ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination,
@@ -168,6 +168,9 @@ pub struct InsertEmitCtx<'a> {
     pub yield_reg_opt: Option<usize>,
     /// The register to hold the rowid of a conflicting row
     pub conflict_rowid_reg: usize,
+    /// For a WITHOUT ROWID table, the registers holding the primary key of a
+    /// conflicting row.
+    pub conflict_pk_reg: usize,
     /// The cursor id of the table being inserted into
     pub cursor_id: usize,
 
@@ -238,6 +241,11 @@ impl<'a> InsertEmitCtx<'a> {
             statement_on_conflict: on_conflict,
             yield_reg_opt: None,
             conflict_rowid_reg: program.alloc_register(),
+            conflict_pk_reg: if table.has_rowid {
+                0
+            } else {
+                program.alloc_registers(super::without_rowid::pk_len(table)?)
+            },
             cursor_id: 0, // set later in emit_source_emission
             halt_label: program.allocate_label(),
             loop_labels,
@@ -267,6 +275,12 @@ pub fn translate_insert(
 ) -> Result<()> {
     let opts = ProgramBuilderOpts::new(1, 30, 5);
     program.extend(&opts);
+
+    if let Some((namespace, view)) = super::instead_of::view_target(resolver, &tbl_name)? {
+        return super::instead_of::translate_view_insert(
+            program, resolver, connection, namespace, &view, &columns, body, with,
+        );
+    }
 
     // Merge INSERT's WITH clause into the SELECT source's WITH clause.
     // For VALUES/DEFAULT VALUES with subqueries, we route through the multi-row
@@ -427,14 +441,6 @@ pub fn translate_insert(
             s.any_resolved_fks_referencing(namespace.id, table_name.as_str())
         }));
     if !btree_table.has_rowid {
-        if has_fks {
-            crate::bail_parse_error!("foreign keys on WITHOUT ROWID tables are not supported");
-        }
-        if on_conflict == Some(ResolveType::Replace) || !upsert_actions.is_empty() {
-            crate::bail_parse_error!(
-                "UPSERT and REPLACE on WITHOUT ROWID tables are not supported"
-            );
-        }
         if cdc_table.is_some() {
             crate::bail_parse_error!("CDC on WITHOUT ROWID tables is not supported");
         }
@@ -445,13 +451,6 @@ pub fn translate_insert(
             crate::bail_parse_error!(
                 "materialized views on WITHOUT ROWID tables are not supported"
             );
-        }
-        if resolver.with_schema(database_id, |s| {
-            s.get_indices(namespace.id, table_name.as_str())
-                .next()
-                .is_some()
-        }) {
-            crate::bail_parse_error!("secondary indexes on WITHOUT ROWID tables are not supported");
         }
     }
 
@@ -487,6 +486,7 @@ pub fn translate_insert(
         .catalog
         .dialect
         .upsert_rejects_row_written_by_same_statement()
+        && btree_table.has_rowid
         && upsert_actions
             .iter()
             .any(|(_, _, upsert)| matches!(upsert.do_clause, UpsertDo::Set { .. }))
@@ -550,10 +550,15 @@ pub fn translate_insert(
     // trigger bodies see affinity-applied values. Affinity is idempotent, so
     // applying it here means we can skip the per-trigger Copy+Affinity in fire_trigger.
     if !ctx.table.is_strict {
-        let affinity = insertion
+        // In register order, which differs from column order in a WITHOUT ROWID table.
+        let mut stored_cols: Vec<_> = insertion
             .col_mappings
             .iter()
             .filter(|cm| !cm.column.is_virtual_generated())
+            .collect();
+        stored_cols.sort_by_key(|cm| cm.register);
+        let affinity = stored_cols
+            .into_iter()
             .map(|col_mapping| col_mapping.column.affinity());
 
         // Only emit Affinity if there's meaningful affinity to apply
@@ -774,10 +779,12 @@ pub fn translate_insert(
             .schema()
             .column_has_custom_type(column, ctx.table.is_strict)
     };
-    let types_checked_first = has_before_triggers || insertion.has_virtual_columns();
+    let has_generated_columns =
+        insertion.has_virtual_columns() || ctx.table.has_stored_generated_columns();
+    let types_checked_first = has_before_triggers || has_generated_columns;
     if !types_checked_first {
         emit_notnulls(program, &ctx, &insertion, resolver, false, |column| {
-            !column.is_virtual_generated() && !has_custom_type(column)
+            !column.is_generated() && !has_custom_type(column)
         })?;
     }
     if let Some(type_check_table) = &maybe_type_check_table {
@@ -808,10 +815,10 @@ pub fn translate_insert(
         });
     }
     emit_notnulls(program, &ctx, &insertion, resolver, true, |column| {
-        !column.is_virtual_generated() && (types_checked_first || has_custom_type(column))
+        !column.is_generated() && (types_checked_first || has_custom_type(column))
     })?;
 
-    if insertion.has_virtual_columns() {
+    if has_generated_columns {
         //TODO only compute the necessary virtual columns for CHECK and NOT NULL evaluation
         compute_virtual_columns(
             program,
@@ -838,7 +845,7 @@ pub fn translate_insert(
             &insertion,
             resolver,
             true,
-            Column::is_virtual_generated,
+            Column::is_generated,
         )?;
     }
 
@@ -946,7 +953,7 @@ pub fn translate_insert(
     // Create and insert the record
     emit_make_record(
         program,
-        insertion.col_mappings.iter().map(|m| m.column),
+        ctx.table,
         insertion.base_reg,
         insertion.record_register(),
     );
@@ -1106,6 +1113,7 @@ pub fn translate_insert(
             &btree_table,
             &insertion,
             on_replace,
+            connection.defer_foreign_keys(),
             resolver,
             namespace,
         )?;
@@ -1481,7 +1489,8 @@ fn emit_commit_phase(
             emit_partial_index_check(program, resolver, index, insertion, ctx.table)?;
 
         let num_cols = index.columns.len();
-        let idx_start_reg = program.alloc_registers(num_cols + 1);
+        let rec_len = num_cols + ctx.table.has_rowid as usize;
+        let idx_start_reg = program.alloc_registers(rec_len);
 
         // Build [key cols..., rowid] from insertion registers
         for (i, idx_col) in index.columns.iter().enumerate() {
@@ -1494,16 +1503,18 @@ fn emit_commit_phase(
                 idx_start_reg + i,
             )?;
         }
-        program.emit_insn(Insn::Copy {
-            src_reg: insertion.key_register(),
-            dst_reg: idx_start_reg + num_cols,
-            extra_amount: 0,
-        });
+        if ctx.table.has_rowid {
+            program.emit_insn(Insn::Copy {
+                src_reg: insertion.key_register(),
+                dst_reg: idx_start_reg + num_cols,
+                extra_amount: 0,
+            });
+        }
 
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
             start_reg: to_u32(idx_start_reg),
-            count: to_u32(num_cols + 1),
+            count: to_u32(rec_len),
             dest_reg: to_u32(record_reg),
             index_name: Some(index.name.clone()),
             affinity_str: None,
@@ -1512,7 +1523,7 @@ fn emit_commit_phase(
             cursor_id: idx_cursor_id,
             record_reg,
             unpacked_start: Some(idx_start_reg),
-            unpacked_count: Some((num_cols + 1) as u32),
+            unpacked_count: Some(rec_len as u32),
             flags: IdxInsertFlags::new().nchange(true),
         });
 
@@ -3071,9 +3082,27 @@ fn emit_pk_uniqueness_check(
             num_regs: ctx.table.primary_key_columns.len(),
         });
         if let Some(position) = position.or(upsert_catch_all) {
+            program.emit_insn(Insn::Copy {
+                src_reg: pk_regs,
+                dst_reg: ctx.conflict_pk_reg,
+                extra_amount: ctx.table.primary_key_columns.len() - 1,
+            });
             program.emit_insn(Insn::Goto {
                 target_pc: preflight.upsert_actions[position].1,
             });
+        } else if preflight.on_replace {
+            program.emit_insn(Insn::Copy {
+                src_reg: pk_regs,
+                dst_reg: ctx.conflict_pk_reg,
+                extra_amount: ctx.table.primary_key_columns.len() - 1,
+            });
+            emit_replace_delete_conflicting_row(
+                program,
+                resolver,
+                preflight.connection,
+                ctx,
+                preflight.table_references,
+            )?;
         } else if matches!(preflight.effective_on_conflict, ResolveType::Ignore) {
             program.emit_insn(Insn::Goto {
                 target_pc: ctx.loop_labels.row_done,
@@ -3205,8 +3234,9 @@ fn emit_index_uniqueness_check(
         emit_partial_index_check(program, resolver, index, insertion, ctx.table)?;
 
     let num_cols = index.columns.len();
+    let rec_len = num_cols + ctx.table.has_rowid as usize;
     // allocate scratch registers for the index columns plus rowid
-    let idx_start_reg = program.alloc_registers(num_cols + 1);
+    let idx_start_reg = program.alloc_registers(rec_len);
 
     // build unpacked key [idx_start_reg .. idx_start_reg+num_cols-1], and rowid in last reg,
     // copy each index column from the table's column registers into these scratch regs
@@ -3221,11 +3251,13 @@ fn emit_index_uniqueness_check(
         )?;
     }
     // last register is the rowid
-    program.emit_insn(Insn::Copy {
-        src_reg: insertion.key_register(),
-        dst_reg: idx_start_reg + num_cols,
-        extra_amount: 0,
-    });
+    if ctx.table.has_rowid {
+        program.emit_insn(Insn::Copy {
+            src_reg: insertion.key_register(),
+            dst_reg: idx_start_reg + num_cols,
+            extra_amount: 0,
+        });
+    }
 
     if index.unique {
         emit_unique_index_check(
@@ -3235,7 +3267,7 @@ fn emit_index_uniqueness_check(
             index,
             idx_cursor_id,
             idx_start_reg,
-            num_cols,
+            index.n_key_col,
             position,
             upsert_catch_all,
             preflight,
@@ -3247,7 +3279,7 @@ fn emit_index_uniqueness_check(
             let record_reg = program.alloc_register();
             program.emit_insn(Insn::MakeRecord {
                 start_reg: to_u32(idx_start_reg),
-                count: to_u32(num_cols + 1),
+                count: to_u32(rec_len),
                 dest_reg: to_u32(record_reg),
                 index_name: Some(index.name.clone()),
                 affinity_str: None,
@@ -3256,7 +3288,7 @@ fn emit_index_uniqueness_check(
                 cursor_id: idx_cursor_id,
                 record_reg,
                 unpacked_start: Some(idx_start_reg),
-                unpacked_count: Some((num_cols + 1) as u32),
+                unpacked_count: Some(rec_len as u32),
                 flags: IdxInsertFlags::new().nchange(true),
             });
         }
@@ -3267,6 +3299,31 @@ fn emit_index_uniqueness_check(
         program.preassign_label_to_next_insn(lbl);
     }
     Ok(())
+}
+
+/// Store the key of the row whose entry `idx_cursor_id` points at: the rowid,
+/// or the primary key of a WITHOUT ROWID table.
+fn emit_conflict_row_key(
+    program: &mut ProgramBuilder,
+    ctx: &InsertEmitCtx,
+    index: &Index,
+    idx_cursor_id: usize,
+) -> Result<()> {
+    if ctx.table.has_rowid {
+        program.emit_insn(Insn::IdxRowId {
+            cursor_id: idx_cursor_id,
+            dest: ctx.conflict_rowid_reg,
+        });
+        Ok(())
+    } else {
+        super::without_rowid::emit_pk_from_index(
+            program,
+            ctx.table,
+            index,
+            idx_cursor_id,
+            ctx.conflict_pk_reg,
+        )
+    }
 }
 
 /// Emit bytecode for unique index conflict detection and handling.
@@ -3283,6 +3340,9 @@ fn emit_unique_index_check(
     upsert_catch_all: Option<usize>,
     preflight: &mut PreflightCtx,
 ) -> Result<()> {
+    // `num_cols` is the key; the entry also holds the rowid or, for a WITHOUT
+    // ROWID table, the primary key columns the key lacks.
+    let rec_len = index.columns.len() + ctx.table.has_rowid as usize;
     let aff = index
         .columns
         .iter()
@@ -3296,7 +3356,7 @@ fn emit_unique_index_check(
         .collect::<String>();
     program.emit_insn(Insn::Affinity {
         start_reg: idx_start_reg,
-        count: NonZeroUsize::new(num_cols).expect("nonzero col count"),
+        count: NonZeroUsize::new(index.columns.len()).expect("nonzero col count"),
         affinities: aff,
     });
 
@@ -3319,10 +3379,7 @@ fn emit_unique_index_check(
                 }
                 UpsertDo::Set { .. } => {
                     // Route to DO UPDATE: capture conflicting rowid then jump
-                    program.emit_insn(Insn::IdxRowId {
-                        cursor_id: idx_cursor_id,
-                        dest: ctx.conflict_rowid_reg,
-                    });
+                    emit_conflict_row_key(program, ctx, index, idx_cursor_id)?;
                     program.emit_insn(Insn::Goto {
                         target_pc: preflight.upsert_actions[position].1,
                     });
@@ -3359,10 +3416,7 @@ fn emit_unique_index_check(
         });
         if preflight.on_replace {
             // REPLACE: delete conflicting row immediately, then insert eagerly.
-            program.emit_insn(Insn::IdxRowId {
-                cursor_id: idx_cursor_id,
-                dest: ctx.conflict_rowid_reg,
-            });
+            emit_conflict_row_key(program, ctx, index, idx_cursor_id)?;
             emit_replace_delete_conflicting_row(
                 program,
                 resolver,
@@ -3401,7 +3455,7 @@ fn emit_unique_index_check(
             let record_reg = program.alloc_register();
             program.emit_insn(Insn::MakeRecord {
                 start_reg: to_u32(idx_start_reg),
-                count: to_u32(num_cols + 1),
+                count: to_u32(rec_len),
                 dest_reg: to_u32(record_reg),
                 index_name: Some(index.name.clone()),
                 affinity_str: None,
@@ -3410,7 +3464,7 @@ fn emit_unique_index_check(
                 cursor_id: idx_cursor_id,
                 record_reg,
                 unpacked_start: Some(idx_start_reg),
-                unpacked_count: Some((num_cols + 1) as u32),
+                unpacked_count: Some(rec_len as u32),
                 flags: IdxInsertFlags::new().nchange(true),
             });
         }
@@ -3893,7 +3947,7 @@ fn emit_vtab_returning_subqueries(
 /// `t.c1`, or `t.k, t.c1` for several columns.
 pub fn format_unique_violation_desc(table_name: &str, index: &Index) -> String {
     index
-        .columns
+        .key_columns()
         .iter()
         .map(|c| format!("{table_name}.{}", c.name))
         .collect::<Vec<_>>()
@@ -4168,11 +4222,21 @@ fn emit_replace_delete_conflicting_row(
     ctx: &mut InsertEmitCtx,
     table_references: &mut TableReferences,
 ) -> Result<()> {
-    program.emit_insn(Insn::SeekRowid {
-        cursor_id: ctx.cursor_id,
-        src_reg: ctx.conflict_rowid_reg,
-        target_pc: ctx.halt_label,
-    });
+    if ctx.table.has_rowid {
+        program.emit_insn(Insn::SeekRowid {
+            cursor_id: ctx.cursor_id,
+            src_reg: ctx.conflict_rowid_reg,
+            target_pc: ctx.halt_label,
+        });
+    } else {
+        super::without_rowid::emit_seek_row(
+            program,
+            ctx.table,
+            ctx.cursor_id,
+            ctx.conflict_pk_reg,
+            ctx.halt_label,
+        )?;
+    }
 
     // Phase 1: Before Delete - build parent key registers and handle NoAction/Restrict.
     // CASCADE/SetNull/SetDefault actions are prepared but deferred until after Delete.
@@ -4233,7 +4297,7 @@ fn emit_replace_delete_conflicting_row(
             skip_label
         });
 
-        let num_regs = index.columns.len() + 1;
+        let num_regs = index.columns.len() + table.has_rowid as usize;
         let start_reg = program.alloc_registers(num_regs);
 
         for (reg_offset, column_index) in index.columns.iter().enumerate() {
@@ -4247,11 +4311,13 @@ fn emit_replace_delete_conflicting_row(
                 start_reg + reg_offset,
             )?;
         }
-        program.emit_insn(Insn::Copy {
-            src_reg: ctx.conflict_rowid_reg,
-            dst_reg: start_reg + num_regs - 1,
-            extra_amount: 0,
-        });
+        if table.has_rowid {
+            program.emit_insn(Insn::Copy {
+                src_reg: ctx.conflict_rowid_reg,
+                dst_reg: start_reg + num_regs - 1,
+                extra_amount: 0,
+            });
+        }
         program.emit_insn(Insn::IdxDelete {
             start_reg,
             num_regs,
@@ -4412,7 +4478,7 @@ pub fn emit_fk_child_insert_checks(
                     .collect();
                 let constraint_info =
                     fk_constraint_info(program, resolver, child_tbl, &fk_ref.fk, fk_col_regs)?;
-                emit_fk_restrict_halt(program, Some(Box::new(constraint_info)))?;
+                emit_fk_immediate_check(program, constraint_info);
             }
             program.preassign_label_to_next_insn(fk_ok);
         } else {
@@ -4527,7 +4593,7 @@ pub fn emit_fk_child_insert_checks(
                             .collect();
                         let constraint_info =
                             fk_constraint_info(p, resolver, child_tbl, &fk_ref.fk, fk_col_regs)?;
-                        emit_fk_restrict_halt(p, Some(Box::new(constraint_info)))?;
+                        emit_fk_immediate_check(p, constraint_info);
                     }
                     Ok(())
                 },
@@ -4622,6 +4688,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
     parent_table: &BTreeTable,
     insertion: &Insertion,
     force_immediate: bool,
+    defer_all: bool,
     resolver: &Resolver,
     namespace: NamespaceRef,
 ) -> crate::Result<()> {
@@ -4634,14 +4701,16 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 .child_table
                 .name
                 .eq_ignore_ascii_case(&parent_table.name);
+        // PRAGMA defer_foreign_keys (as of prepare time) makes every FK deferred.
+        let deferred = pref.fk.deferred || defer_all;
         // Skip only when it cannot repair anything: non-deferred and not self-referencing
-        if !force_immediate && !pref.fk.deferred && !is_self_ref {
+        if !force_immediate && !deferred && !is_self_ref {
             continue;
         }
         // Nothing to do if the parent counter is 0
         let skip_fk = program.allocate_label();
         program.emit_insn(Insn::FkIfZero {
-            deferred: pref.fk.deferred,
+            deferred,
             target_pc: skip_fk,
         });
 
@@ -4680,7 +4749,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
             // Decrement once per matching child row
             index_scan_match_any(program, icur, probe_start, n_cols, new_row_rowid, |p| {
                 let next = p.allocate_label();
-                emit_guarded_fk_decrement(p, next, pref.fk.deferred);
+                emit_guarded_fk_decrement(p, next, deferred);
                 p.preassign_label_to_next_insn(next);
                 Ok(())
             })?;
@@ -4694,7 +4763,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 resolver,
                 |p| {
                     let next = p.allocate_label();
-                    emit_guarded_fk_decrement(p, next, pref.fk.deferred);
+                    emit_guarded_fk_decrement(p, next, deferred);
                     p.preassign_label_to_next_insn(next);
                     Ok(())
                 },
@@ -4738,4 +4807,15 @@ fn emit_custom_type_encode(
         table_name,
         &layout,
     )
+}
+
+/// Fail the statement now for a missing parent key, unless PRAGMA
+/// defer_foreign_keys, checked at run time, defers it to the commit.
+fn emit_fk_immediate_check(program: &mut ProgramBuilder, constraint_info: ConstraintInfo) {
+    program.emit_insn(Insn::FkCounter {
+        constraint_info: Some(Box::new(constraint_info)),
+        increment_value: 1,
+        deferred: false,
+    });
+    program.emit_insn(Insn::FkCheck { deferred: false });
 }

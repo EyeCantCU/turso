@@ -4223,6 +4223,75 @@ mod tests {
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
     }
+
+    #[test]
+    fn without_rowid_tables_work_by_default() {
+        unsafe {
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+
+            // The schema and statements subversion uses for rep-cache.db.
+            let rc = sqlite3_exec(
+                db,
+                c"CREATE TABLE rep_cache (hash TEXT NOT NULL PRIMARY KEY, revision INTEGER NOT NULL, \
+                  offset INTEGER NOT NULL, size INTEGER NOT NULL, expanded_size INTEGER NOT NULL) WITHOUT ROWID;\
+                  CREATE INDEX rep_cache_rev ON rep_cache(revision);\
+                  INSERT OR IGNORE INTO rep_cache VALUES('b', 2, 0, 1, 1);\
+                  INSERT OR IGNORE INTO rep_cache VALUES('a', 1, 0, 1, 1);\
+                  INSERT OR IGNORE INTO rep_cache VALUES('a', 9, 9, 9, 9);\
+                  INSERT OR REPLACE INTO rep_cache VALUES('c', 3, 0, 1, 1);\
+                  UPDATE rep_cache SET size = 5 WHERE hash = 'b';\
+                  DELETE FROM rep_cache WHERE revision > 2;"
+                    .as_ptr(),
+                None,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            assert_eq!(
+                rc,
+                SQLITE_OK,
+                "{:?}",
+                std::ffi::CStr::from_ptr(sqlite3_errmsg(db))
+            );
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT revision, size FROM rep_cache ORDER BY hash".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            let mut rows = Vec::new();
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                rows.push((sqlite3_column_int(stmt, 0), sqlite3_column_int(stmt, 1)));
+            }
+            assert_eq!(rows, vec![(1, 1), (2, 5)]);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"PRAGMA integrity_check".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let text = std::ffi::CStr::from_ptr(sqlite3_column_text(stmt, 0));
+            assert_eq!(text.to_str().unwrap(), "ok");
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
 }
 
 mod wrappers {

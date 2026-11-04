@@ -119,6 +119,7 @@ pub fn create_dbsp_state_index(
         name: "dbsp_state_pk".to_string(),
         table_name: state_table.name.clone(),
         root_page,
+        n_key_col: columns.len(),
         columns,
         unique: true,
         ephemeral: false,

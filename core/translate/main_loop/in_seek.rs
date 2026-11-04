@@ -160,6 +160,7 @@ pub(super) fn open_in_seek_source_cursor(
                 index_method: None,
                 on_conflict: None,
                 constraint_name: None,
+                n_key_col: 1,
             });
             let eph_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(ephemeral_index));
             program.emit_insn(Insn::OpenEphemeral {

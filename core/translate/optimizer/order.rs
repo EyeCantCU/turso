@@ -985,7 +985,7 @@ fn temporary_index_order_consumed(
             order: SortOrder::Asc,
             nulls_order: None,
             collation: column.collation(),
-            expr: column.generated_expr(),
+            expr: column.virtual_generated_expr(),
         }
     });
 

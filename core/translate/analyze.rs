@@ -272,10 +272,6 @@ pub fn translate_analyze(
     });
 
     for (target_table, target_index) in analyze_targets {
-        if !target_table.has_rowid {
-            bail_parse_error!("ANALYZE on tables without rowid is not supported");
-        }
-
         // Remove existing stat rows for this target before inserting fresh ones.
         let rewind_done = program.allocate_label();
         program.emit_insn(Insn::Rewind {
@@ -388,7 +384,7 @@ pub fn translate_analyze(
         program.mark_last_insn_constant();
         // Emit index stats for this table (or for a single index target).
         let is_specific_index_target = target_index.is_some();
-        let indexes: Vec<Arc<Index>> = match target_index {
+        let mut indexes: Vec<Arc<Index>> = match target_index {
             Some(idx) => vec![idx],
             None => resolver.with_schema(database_id, |s| {
                 s.get_indices(namespace.id, &target_table.name)
@@ -397,6 +393,25 @@ pub fn translate_analyze(
                     .collect()
             }),
         };
+        // The primary key of a WITHOUT ROWID table is the table b-tree; SQLite
+        // records its stats under the table's own name.
+        if !target_table.has_rowid && !is_specific_index_target {
+            let pk_cols = target_table.without_rowid_pk_columns()?;
+            indexes.push(Arc::new(Index {
+                name: target_table.name.clone(),
+                table_name: target_table.name.clone(),
+                root_page: target_table.root_page,
+                n_key_col: pk_cols.len(),
+                columns: pk_cols,
+                unique: true,
+                ephemeral: false,
+                has_rowid: false,
+                where_clause: None,
+                index_method: None,
+                on_conflict: None,
+                constraint_name: None,
+            }));
+        }
         // Match SQLite: emit the table-level sqlite_stat1 row only when ANALYZE
         // targets a table and there are no non-partial indexes contributing stats.
         let emit_table_stat =
@@ -486,7 +501,8 @@ fn emit_index_stats(
     index: &Arc<Index>,
     database_id: usize,
 ) {
-    let n_cols = index.columns.len();
+    // Stats cover the declared key, not a WITHOUT ROWID index's primary key suffix.
+    let n_cols = index.n_key_col;
     if n_cols == 0 {
         return;
     }

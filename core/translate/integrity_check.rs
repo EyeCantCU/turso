@@ -485,7 +485,11 @@ fn translate_integrity_check_for_schema(
                 value: 1,
             });
 
-            let key_start_reg = program.alloc_registers(bound_index.columns.len() + 1);
+            // A WITHOUT ROWID index entry ends with the primary key, not a rowid.
+            let has_rowid = bound_index.index.has_rowid;
+            let entry_len = bound_index.columns.len() + has_rowid as usize;
+            let key_len = bound_index.index.n_key_col;
+            let key_start_reg = program.alloc_registers(entry_len);
             for (i, col) in bound_index.columns.iter().enumerate() {
                 let target = key_start_reg + i;
                 match col {
@@ -529,11 +533,12 @@ fn translate_integrity_check_for_schema(
                 }
             }
 
-            let rowid_reg = key_start_reg + bound_index.columns.len();
-            program.emit_insn(Insn::RowId {
-                cursor_id: table_cursor_id,
-                dest: rowid_reg,
-            });
+            if has_rowid {
+                program.emit_insn(Insn::RowId {
+                    cursor_id: table_cursor_id,
+                    dest: key_start_reg + bound_index.columns.len(),
+                });
+            }
 
             if !quick {
                 let found_label = program.allocate_label();
@@ -542,7 +547,7 @@ fn translate_integrity_check_for_schema(
                     cursor_id: bound_index.cursor_id,
                     target_pc: found_label,
                     record_reg: key_start_reg,
-                    num_regs: bound_index.columns.len() + 1,
+                    num_regs: entry_len,
                 });
                 //TODO these 3 registers are always used together, need to package them in a struct
                 emit_row_missing_from_index_error(
@@ -563,7 +568,9 @@ fn translate_integrity_check_for_schema(
                     //   unique key is valid if any key column is NULL, OR
                     //   the next index entry is strictly greater on key columns.
                     let unique_ok = program.allocate_label();
-                    for (i, is_nullable) in bound_index.unique_nullable.iter().enumerate() {
+                    for (i, is_nullable) in
+                        bound_index.unique_nullable.iter().enumerate().take(key_len)
+                    {
                         if *is_nullable {
                             program.emit_insn(Insn::IsNull {
                                 reg: key_start_reg + i,
@@ -587,7 +594,7 @@ fn translate_integrity_check_for_schema(
                     program.emit_insn(Insn::IdxGT {
                         cursor_id: bound_index.cursor_id,
                         start_reg: key_start_reg,
-                        num_regs: bound_index.columns.len(),
+                        num_regs: key_len,
                         target_pc: unique_ok,
                     });
                     program.emit_string8(

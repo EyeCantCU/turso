@@ -5,7 +5,7 @@ use crate::{Arc, Result};
 
 use super::{ProgramBuilder, Resolver};
 
-/// Emit bytecode to compute virtual generated columns for a row.
+/// Emit bytecode to compute the generated columns (VIRTUAL and STORED) of a row.
 #[turso_macros::trace_stack]
 pub fn compute_virtual_columns(
     program: &mut ProgramBuilder,
@@ -20,7 +20,7 @@ pub fn compute_virtual_columns(
     };
     resolver.with_self_table_context(program, Some(&ctx), |program, _| {
         for (idx, column) in columns.iter() {
-            let GeneratedType::Virtual { expr, .. } = column.generated_type() else {
+            let Some(expr) = column.generated_expr() else {
                 continue;
             };
             let target_reg = dml_ctx.to_column_reg(idx);

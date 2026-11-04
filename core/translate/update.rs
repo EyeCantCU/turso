@@ -66,6 +66,11 @@ pub fn translate_update(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<()> {
+    if let Some((namespace, view)) = super::instead_of::view_target(resolver, &body.tbl_name)? {
+        return super::instead_of::translate_view_update(
+            program, resolver, connection, namespace, &view, &body,
+        );
+    }
     let plan = prepare_and_optimize_update_plan(program, resolver, body, connection, false, None)?;
     let Plan::Update(ref update_plan) = plan else {
         unreachable!("prepare_and_optimize_update_plan must return Plan::Update");
@@ -280,9 +285,6 @@ fn prepare_update_plan(
             "unsafe use of virtual table \"{}\"",
             body.tbl_name.name.as_str()
         );
-    }
-    if table.btree().is_some_and(|bt| !bt.has_rowid) {
-        bail_parse_error!("UPDATE of WITHOUT ROWID tables is not supported");
     }
     if table.virtual_table().is_some() && !body.returning.is_empty() {
         bail_parse_error!("UPDATE RETURNING is not available on virtual tables");

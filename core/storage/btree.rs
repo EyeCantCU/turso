@@ -12297,6 +12297,7 @@ mod tests {
             let index_def = Index {
                 name: "testindex".to_string(),
                 where_clause: None,
+                n_key_col: IndexColumn::new_many((0..10).map(|i| format!("test{i}"))).len(),
                 columns: IndexColumn::new_many((0..10).map(|i| format!("test{i}"))),
                 table_name: "test".to_string(),
                 root_page: index_root_page,
@@ -12474,6 +12475,7 @@ mod tests {
             let index_def = Index {
                 name: "testindex".to_string(),
                 where_clause: None,
+                n_key_col: IndexColumn::new_many(vec!["testcol"]).len(),
                 columns: IndexColumn::new_many(vec!["testcol"]),
                 table_name: "test".to_string(),
                 root_page: index_root_page,
@@ -12881,6 +12883,7 @@ mod tests {
             let index_def = Index {
                 name: "testindex".to_string(),
                 where_clause: None,
+                n_key_col: IndexColumn::new_many(vec!["testcol"]).len(),
                 columns: IndexColumn::new_many(vec!["testcol"]),
                 table_name: "test".to_string(),
                 root_page: index_root_page,
@@ -14705,6 +14708,7 @@ mod tests {
         let index = Index {
             name: "seek_empty_index".to_string(),
             where_clause: None,
+            n_key_col: IndexColumn::new_many(["value".to_string()]).len(),
             columns: IndexColumn::new_many(["value".to_string()]),
             table_name: "seek_empty_table".to_string(),
             root_page,
@@ -15499,6 +15503,7 @@ mod tests {
             let index = Index {
                 name: "peer_index".to_string(),
                 where_clause: None,
+                n_key_col: IndexColumn::new_many(["k".to_string(), "v".to_string()]).len(),
                 columns: IndexColumn::new_many(["k".to_string(), "v".to_string()]),
                 table_name: "peer_table".to_string(),
                 root_page,
