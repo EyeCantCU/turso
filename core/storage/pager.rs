@@ -5119,6 +5119,14 @@ impl Pager {
                         || sync_mode == crate::SyncMode::Off
                     {
                         state.phase = CheckpointPhase::Finalize { clear_page_cache };
+                    } else if !res.everything_backfilled() {
+                        // Like walCheckpoint: the database file is synced only
+                        // once the whole WAL is backfilled. The frames stay in
+                        // the WAL, so no durability proof is recorded either.
+                        state.phase = CheckpointPhase::PublishBackfill {
+                            clear_page_cache,
+                            max_frame: res.wal_total_backfilled,
+                        };
                     } else {
                         state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
                     }
@@ -7471,8 +7479,9 @@ mod checkpoint_phase_tests {
         );
 
         let pager = conn.pager.load();
+        // Only a complete checkpoint syncs the database file, as in SQLite.
         let mode = CheckpointMode::Passive {
-            upper_bound_inclusive: Some(1),
+            upper_bound_inclusive: None,
         };
 
         loop {
@@ -7516,8 +7525,8 @@ mod checkpoint_phase_tests {
             .block(|| pager.checkpoint(mode, crate::SyncMode::Full, true))
             .unwrap();
         assert!(
-            result.wal_total_backfilled > 0 && !result.everything_backfilled(),
-            "resumed checkpoint should complete the partial checkpoint after proof installation"
+            result.wal_total_backfilled > 0 && result.everything_backfilled(),
+            "resumed checkpoint should complete after proof installation"
         );
 
         let snapshot_after_publish = authority.snapshot();
@@ -7534,5 +7543,61 @@ mod checkpoint_phase_tests {
             ),
             "resuming after the post-sync gap must install a valid durable backfill proof"
         );
+    }
+
+    #[test]
+    fn partial_passive_checkpoint_publishes_backfill_without_syncing_db() {
+        let (db, dir) = open_checkpoint_test_database();
+        let db_path = dir.path().join("test.db");
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.wal_auto_actions_disable();
+        conn.execute("create table test(id integer primary key, value blob)")
+            .unwrap();
+        conn.execute("begin immediate").unwrap();
+        for _ in 0..32 {
+            conn.execute("insert into test(value) values (randomblob(2048))")
+                .unwrap();
+        }
+        conn.execute("commit").unwrap();
+
+        let pager = conn.pager.load();
+        let mode = CheckpointMode::Passive {
+            upper_bound_inclusive: Some(1),
+        };
+        let mut synced = false;
+        let result = loop {
+            match pager.checkpoint(mode, crate::SyncMode::Full, true).unwrap() {
+                IOResult::Done(result) => break result,
+                IOResult::IO(io) => io.wait(pager.io.as_ref()).unwrap(),
+            }
+            let state = pager.checkpoint_state.read();
+            synced |= state.result.as_ref().is_some_and(|r| r.db_sync_sent);
+        };
+        assert!(result.wal_total_backfilled > 0 && !result.everything_backfilled());
+        // Like walCheckpoint: no database sync until the whole WAL is
+        // backfilled, so no durable proof either, but nbackfills advances.
+        assert!(
+            !synced,
+            "a partial checkpoint must not sync the database file"
+        );
+        let authority = db.shared_wal_coordination().unwrap().unwrap();
+        let snapshot = authority.snapshot();
+        assert_eq!(snapshot.nbackfills, result.wal_total_backfilled);
+        let (db_size_pages, db_header_crc32c) = db_identity(&db_path);
+        assert!(!authority.validate_backfill_proof(snapshot, db_size_pages, db_header_crc32c));
+
+        let complete = pager
+            .io
+            .block(|| {
+                pager.checkpoint(
+                    CheckpointMode::Passive {
+                        upper_bound_inclusive: None,
+                    },
+                    crate::SyncMode::Full,
+                    true,
+                )
+            })
+            .unwrap();
+        assert!(complete.everything_backfilled() && complete.db_sync_sent);
     }
 }

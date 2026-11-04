@@ -9599,15 +9599,17 @@ pub mod test {
         bulk_inserts(&conn, 8, 2);
 
         let pager = conn.pager.load();
-        let partial = run_checkpoint_until_done(
+        // Only a complete checkpoint syncs the database file and so records
+        // a proof, as in SQLite.
+        let complete = run_checkpoint_until_done(
             &pager,
             CheckpointMode::Passive {
-                upper_bound_inclusive: Some(1),
+                upper_bound_inclusive: None,
             },
         );
         assert!(
-            partial.wal_total_backfilled > 0 && !partial.everything_backfilled(),
-            "setup must create a partial checkpoint with a positive durable backfill proof"
+            complete.wal_total_backfilled > 0 && complete.everything_backfilled(),
+            "setup must create a checkpoint with a positive durable backfill proof"
         );
 
         let authority = db.shared_wal_coordination().unwrap().unwrap();
@@ -9647,12 +9649,12 @@ pub mod test {
         let replacement = run_checkpoint_until_done(
             &pager,
             CheckpointMode::Passive {
-                upper_bound_inclusive: Some(1),
+                upper_bound_inclusive: None,
             },
         );
         assert!(
-            replacement.wal_total_backfilled > 0 && !replacement.everything_backfilled(),
-            "replacement setup must create a new partial checkpoint after RESTART"
+            replacement.wal_total_backfilled > 0 && replacement.everything_backfilled(),
+            "replacement setup must create a new complete checkpoint after RESTART"
         );
 
         let snapshot_after_replacement = authority.snapshot();
@@ -9666,7 +9668,7 @@ pub mod test {
                 db_size_after,
                 db_crc_after
             ),
-            "partial checkpoint after RESTART must install a replacement proof for the new generation"
+            "checkpoint after RESTART must install a replacement proof for the new generation"
         );
         assert_ne!(
             snapshot_after_replacement.checkpoint_seq, snapshot_before_restart.checkpoint_seq,
@@ -9687,15 +9689,17 @@ pub mod test {
         bulk_inserts(&conn, 8, 2);
 
         let pager = conn.pager.load();
-        let partial = run_checkpoint_until_done(
+        // Only a complete checkpoint syncs the database file and so records
+        // a proof, as in SQLite.
+        let complete = run_checkpoint_until_done(
             &pager,
             CheckpointMode::Passive {
-                upper_bound_inclusive: Some(1),
+                upper_bound_inclusive: None,
             },
         );
         assert!(
-            partial.wal_total_backfilled > 0 && !partial.everything_backfilled(),
-            "setup must create a partial checkpoint with a positive durable backfill proof"
+            complete.wal_total_backfilled > 0 && complete.everything_backfilled(),
+            "setup must create a checkpoint with a positive durable backfill proof"
         );
 
         let authority = db.shared_wal_coordination().unwrap().unwrap();
@@ -9745,12 +9749,12 @@ pub mod test {
         let replacement = run_checkpoint_until_done(
             &pager,
             CheckpointMode::Passive {
-                upper_bound_inclusive: Some(1),
+                upper_bound_inclusive: None,
             },
         );
         assert!(
-            replacement.wal_total_backfilled > 0 && !replacement.everything_backfilled(),
-            "replacement setup must create a new partial checkpoint after TRUNCATE"
+            replacement.wal_total_backfilled > 0 && replacement.everything_backfilled(),
+            "replacement setup must create a new complete checkpoint after TRUNCATE"
         );
 
         let snapshot_after_replacement = authority.snapshot();
@@ -9764,7 +9768,7 @@ pub mod test {
                 db_size_after,
                 db_crc_after
             ),
-            "partial checkpoint after TRUNCATE must install a replacement proof for the new generation"
+            "checkpoint after TRUNCATE must install a replacement proof for the new generation"
         );
         assert_ne!(
             snapshot_after_replacement.checkpoint_seq, snapshot_before_truncate.checkpoint_seq,

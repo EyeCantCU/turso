@@ -2072,6 +2072,9 @@ fn database_open_reopen_with_live_child_reader_does_not_clobber_authority() {
         .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
         .env("TURSO_MULTIPROCESS_READY_FILE", &ready_file)
         .env("TURSO_MULTIPROCESS_RELEASE_FILE", &release_file)
+        // A partial checkpoint does not sync the database file (as in
+        // SQLite), so it leaves no durable proof: reopens scan the WAL.
+        .env("TURSO_MULTIPROCESS_EXPECT_DISK_SCAN", "1")
         .spawn()
         .unwrap();
 
@@ -2086,7 +2089,10 @@ fn database_open_reopen_with_live_child_reader_does_not_clobber_authority() {
 
     let reopened = open_multiprocess_db(io, db_path_str).unwrap();
     let reopened_authority = reopened.shared_wal_coordination().unwrap().unwrap();
-    assert_eq!(reopened_authority.snapshot(), snapshot_before);
+    // The unproven positive nbackfills is cleared; nothing else changes.
+    let mut expected_snapshot = snapshot_before;
+    expected_snapshot.nbackfills = 0;
+    assert_eq!(reopened_authority.snapshot(), expected_snapshot);
     assert_eq!(
         reopened_authority.iter_latest_frames(0, snapshot_before.max_frame),
         frames_before,
