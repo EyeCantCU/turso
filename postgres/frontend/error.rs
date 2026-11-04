@@ -261,7 +261,7 @@ fn sqlstate(error: &LimboError) -> &'static str {
         LimboError::OutOfMemory => SQLSTATE_OUT_OF_MEMORY,
         LimboError::TableLocked | LimboError::Busy => SQLSTATE_LOCK_NOT_AVAILABLE,
         LimboError::Interrupt => SQLSTATE_QUERY_CANCELED,
-        LimboError::Raise(_, msg) => raise_sqlstate(msg),
+        LimboError::Raise(_, msg, _) => raise_sqlstate(msg),
         LimboError::RaiseIgnore => SQLSTATE_ASSERT_FAILURE,
         LimboError::Corrupt(_) | LimboError::NotADB => SQLSTATE_DATA_CORRUPTED,
         LimboError::Dialect(error) => error.code,

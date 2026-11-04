@@ -737,7 +737,7 @@ impl From<LimboError> for TursoError {
             // resolution, and SQLite reports it as SQLITE_CONSTRAINT.
             LimboError::ForeignKeyConstraint(e)
             | LimboError::Constraint(e)
-            | LimboError::Raise(_, e) => TursoError::Constraint(e),
+            | LimboError::Raise(_, e, _) => TursoError::Constraint(e),
             LimboError::ConstraintViolation(violation) => TursoError::Constraint(violation.message),
             LimboError::Corrupt(e) => TursoError::Corrupt(e),
             LimboError::NotADB => TursoError::NotAdb("file is not a database".to_string()),
