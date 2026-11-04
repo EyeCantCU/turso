@@ -1039,7 +1039,7 @@ fn find_best_access_method_for_btree(
 
     // Skip alternative access methods (in-seek, multi-index) when INDEXED BY or NOT INDEXED
     // is specified — the user explicitly requested a specific index or no index.
-    if rhs_table.indexed.is_none() && rhs_table.btree().is_some_and(|b| b.has_rowid) {
+    if rhs_table.indexed.is_none() && rhs_table.btree().is_some() {
         if let Some(in_seek_method) = consider_in_seek_access_method(
             rhs_table,
             rhs_constraints,

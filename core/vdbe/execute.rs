@@ -2005,6 +2005,14 @@ fn op_column_deferred(
                 if state.get_cursor(cursor_id).get_null_flag() {
                     fetch.write_null_regs(state);
                     break 'outer;
+                } else if let Some(key) = state.deferred_seeks[cursor_id]
+                    .as_ref()
+                    .and_then(|d| d.key.clone())
+                {
+                    return_if_io!(state, seek_deferred_key(state, cursor_id, &key));
+                    state.deferred_seeks[cursor_id] = None;
+                    count_deferred_seek(state);
+                    *state.active_op_state.column() = OpColumnState::GetColumn;
                 } else if let Some(deferred) = state.deferred_seeks[cursor_id].take() {
                     *state.active_op_state.column() = OpColumnState::Seek {
                         rowid: deferred.rowid,
@@ -6403,7 +6411,7 @@ pub fn op_seek_rowid(
 }
 
 pub fn op_deferred_seek(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -6415,6 +6423,37 @@ pub fn op_deferred_seek(
         },
         insn
     );
+    // A WITHOUT ROWID row is found by the primary key at the end of the entry.
+    if let (Some((_, CursorType::BTreeIndex(index))), Some((_, CursorType::BTreeTable(table)))) = (
+        program.cursor_ref.get(*index_cursor_id),
+        program.cursor_ref.get(*table_cursor_id),
+    ) {
+        if !index.has_rowid && !table.has_rowid {
+            let positions = crate::translate::without_rowid::pk_positions_in_index(table, index)?;
+            let cursor = state.get_cursor(*index_cursor_id);
+            let cursor = cursor.as_btree_mut();
+            let Some(record) = return_if_io!(state, cursor.record()) else {
+                return Err(LimboError::InternalError(
+                    "DeferredSeek index cursor has no entry".to_string(),
+                )
+                .into());
+            };
+            let mut values = Vec::with_capacity(positions.len());
+            for pos in &positions {
+                values.push(record.get_value(*pos)?.to_owned()?);
+            }
+            let key = ImmutableRecord::from_values(&values, values.len())?;
+            state.get_cursor(*table_cursor_id).set_null_flag(false);
+            state.deferred_seeks[*table_cursor_id] = Some(DeferredSeekState {
+                index_cursor_id: *index_cursor_id,
+                table_cursor_id: *table_cursor_id,
+                rowid: 0,
+                key: Some(crate::sync::Arc::new(key)),
+            });
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
     let rowid = {
         let index_cursor = state.get_cursor(*index_cursor_id);
         match index_cursor {
@@ -6432,6 +6471,7 @@ pub fn op_deferred_seek(
         index_cursor_id: *index_cursor_id,
         table_cursor_id: *table_cursor_id,
         rowid,
+        key: None,
     });
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -6448,6 +6488,16 @@ pub fn op_finish_seek(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(FinishSeek { cursor_id }, insn);
+    if let Some(key) = state.deferred_seeks[*cursor_id]
+        .as_ref()
+        .and_then(|d| d.key.clone())
+    {
+        return_if_io!(state, seek_deferred_key(state, *cursor_id, &key));
+        state.deferred_seeks[*cursor_id] = None;
+        count_deferred_seek(state);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
     let Some(rowid) = state.deferred_seeks[*cursor_id]
         .as_ref()
         .map(|deferred| deferred.rowid)
@@ -6472,6 +6522,18 @@ fn seek_deferred_row(
         .get_cursor(table_cursor_id)
         .as_btree_mut()
         .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
+}
+
+/// Move a WITHOUT ROWID table cursor to the row with the saved primary key.
+fn seek_deferred_key(
+    state: &mut ProgramState,
+    table_cursor_id: usize,
+    key: &ImmutableRecord,
+) -> IOResultOr<SeekResult> {
+    state.get_cursor(table_cursor_id).as_btree_mut().seek(
+        SeekKey::IndexKey(key.as_record_ref()),
+        SeekOp::GE { eq_only: true },
+    )
 }
 
 fn count_deferred_seek(state: &mut ProgramState) {

@@ -25,7 +25,7 @@ use crate::{
             emit_partial_index_where_old_image, emit_program_for_select, OperationMode, Resolver,
             UpdateRowSource,
         },
-        eqp::eqp_detail_for_table_op,
+        eqp::eqp_detail_for_dml_target,
         expr::{
             emit_constraint_values_decode, emit_dml_expr_index_value, emit_returning_results,
             emit_returning_scan_back, emit_table_column, restore_returning_row_image_in_cache,
@@ -337,7 +337,7 @@ pub fn emit_program_for_update(
         emit_explain!(
             program,
             true,
-            eqp_detail_for_table_op(&plan.target_table, None, None)
+            eqp_detail_for_dml_target(&plan.target_table, None)
         );
     }
 

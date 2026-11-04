@@ -33,11 +33,11 @@ fn is_operator_uses_index_seek() {
         ),
         (
             "DELETE FROM t WHERE a IS ? AND b IS ?",
-            "SEARCH t USING COVERING INDEX sqlite_autoindex_t_1 (a=? AND b=?)",
+            "SEARCH t USING INDEX sqlite_autoindex_t_1 (a=? AND b=?)",
         ),
         (
             "UPDATE t SET c = ? WHERE a IS ? AND b IS ?",
-            "SEARCH t USING COVERING INDEX sqlite_autoindex_t_1 (a=? AND b=?)",
+            "SEARCH t USING INDEX sqlite_autoindex_t_1 (a=? AND b=?)",
         ),
     ] {
         let plan = query_plan(&conn, query);

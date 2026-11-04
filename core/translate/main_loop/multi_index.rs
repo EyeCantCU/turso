@@ -1,9 +1,11 @@
 use super::*;
+use crate::schema::BTreeTable;
 use crate::translate::plan::{MultiIndexBranch, MultiIndexBranchAccess};
 
 #[expect(clippy::too_many_arguments)]
 fn emit_multi_index_rowset_update(
     program: &mut ProgramBuilder,
+    pk: Option<&PkSet>,
     is_intersection: bool,
     branch_idx: usize,
     rowid_reg: usize,
@@ -13,6 +15,44 @@ fn emit_multi_index_rowset_update(
     skip_row_label: BranchOffset,
     found_in_prev_label: Option<BranchOffset>,
 ) {
+    if let Some(pk) = pk {
+        // The sets are ephemeral indexes of primary keys; `rowid_reg` starts the key.
+        let add = |program: &mut ProgramBuilder, set: usize| {
+            let record_reg = program.alloc_register();
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: to_u32(rowid_reg),
+                count: to_u32(pk.n),
+                dest_reg: to_u32(record_reg),
+                index_name: None,
+                affinity_str: None,
+            });
+            // An equal key overwrites, so each row is kept once.
+            program.emit_insn(Insn::IdxInsert {
+                cursor_id: set,
+                record_reg,
+                unpacked_start: Some(rowid_reg),
+                unpacked_count: Some(pk.n as u32),
+                flags: IdxInsertFlags::new(),
+            });
+        };
+        if is_intersection && branch_idx > 0 {
+            let found = found_in_prev_label.expect("intersection branch must have found label");
+            program.emit_insn(Insn::Found {
+                cursor_id: current_read_rowset,
+                target_pc: found,
+                record_reg: rowid_reg,
+                num_regs: pk.n,
+            });
+            program.emit_insn(Insn::Goto {
+                target_pc: skip_row_label,
+            });
+            program.preassign_label_to_next_insn(found);
+            add(program, current_write_rowset);
+        } else {
+            add(program, rowset1_reg);
+        }
+        return;
+    }
     if is_intersection {
         if branch_idx == 0 {
             program.emit_insn(Insn::RowSetAdd {
@@ -44,6 +84,42 @@ fn emit_multi_index_rowset_update(
             value_reg: rowid_reg,
         });
     }
+}
+
+/// Primary key sets for a WITHOUT ROWID table, used in place of rowid sets.
+struct PkSet {
+    table: Arc<BTreeTable>,
+    index: Arc<Index>,
+    n: usize,
+}
+
+/// Store the key of the row a branch cursor is on: the rowid, or the primary
+/// key of a WITHOUT ROWID table.
+fn emit_branch_row_key(
+    program: &mut ProgramBuilder,
+    pk: Option<&PkSet>,
+    branch_index: Option<&Arc<Index>>,
+    cursor_id: CursorID,
+    dest: usize,
+) -> Result<()> {
+    match (pk, branch_index) {
+        (Some(pk), Some(index)) => crate::translate::without_rowid::emit_pk_from_index(
+            program, &pk.table, index, cursor_id, dest,
+        )?,
+        (Some(pk), None) => {
+            for i in 0..pk.n {
+                program.emit_insn(Insn::Column {
+                    cursor_id,
+                    column: i,
+                    dest: dest + i,
+                    default: None,
+                });
+            }
+        }
+        (None, Some(_)) => program.emit_insn(Insn::IdxRowId { cursor_id, dest }),
+        (None, None) => program.emit_insn(Insn::RowId { cursor_id, dest }),
+    }
+    Ok(())
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -97,6 +173,7 @@ fn emit_seek_multi_index_branch(
     branch: &MultiIndexBranch,
     table_cursor_id: CursorID,
     rowid_reg: usize,
+    pk: Option<&PkSet>,
     is_intersection: bool,
     branch_idx: usize,
     rowset1_reg: usize,
@@ -147,17 +224,13 @@ fn emit_seek_multi_index_branch(
     )
     .emit(branch_loop_start, false)?;
 
-    if is_index {
-        program.emit_insn(Insn::IdxRowId {
-            cursor_id: branch_cursor_id,
-            dest: rowid_reg,
-        });
-    } else {
-        program.emit_insn(Insn::RowId {
-            cursor_id: branch_cursor_id,
-            dest: rowid_reg,
-        });
-    }
+    emit_branch_row_key(
+        program,
+        pk,
+        branch.index.as_ref(),
+        branch_cursor_id,
+        rowid_reg,
+    )?;
 
     if let Some(r) = &branch.union_residuals {
         emit_multi_index_or_residual_filters(
@@ -174,6 +247,7 @@ fn emit_seek_multi_index_branch(
 
     emit_multi_index_rowset_update(
         program,
+        pk,
         is_intersection,
         branch_idx,
         rowid_reg,
@@ -213,6 +287,7 @@ fn emit_in_seek_multi_index_branch(
     branch: &MultiIndexBranch,
     table_cursor_id: CursorID,
     rowid_reg: usize,
+    pk: Option<&PkSet>,
     is_intersection: bool,
     branch_idx: usize,
     rowset1_reg: usize,
@@ -288,10 +363,13 @@ fn emit_in_seek_multi_index_branch(
             num_regs: 1,
             target_pc: next_value_label,
         });
-        program.emit_insn(Insn::IdxRowId {
-            cursor_id: branch_cursor_id,
-            dest: rowid_reg,
-        });
+        emit_branch_row_key(
+            program,
+            pk,
+            branch.index.as_ref(),
+            branch_cursor_id,
+            rowid_reg,
+        )?;
         if let Some(r) = &branch.union_residuals {
             emit_multi_index_or_residual_filters(
                 program,
@@ -306,6 +384,7 @@ fn emit_in_seek_multi_index_branch(
         }
         emit_multi_index_rowset_update(
             program,
+            pk,
             is_intersection,
             branch_idx,
             rowid_reg,
@@ -346,6 +425,7 @@ fn emit_in_seek_multi_index_branch(
         }
         emit_multi_index_rowset_update(
             program,
+            pk,
             is_intersection,
             branch_idx,
             rowid_reg,
@@ -380,24 +460,52 @@ pub(super) fn emit_multi_index_scan_loop(
     loop_end: BranchOffset,
 ) -> Result<()> {
     let table_cursor_id = program.resolve_cursor_id(&CursorKey::table(table.internal_id));
-    let rowid_reg = program.alloc_register();
     let is_intersection = matches!(multi_idx_op.set_op, SetOperation::Intersection { .. });
-    let rowset1_reg = program.alloc_register();
+    // A WITHOUT ROWID table collects primary keys in ephemeral indexes; the
+    // "rowset" slots then hold their cursors and `rowid_reg` starts the key.
+    let pk = match table.btree().filter(|t| !t.has_rowid) {
+        Some(btree) => {
+            let (_, index) =
+                crate::translate::without_rowid::pk_set_columns(&btree, table.internal_id)?;
+            let n = index.columns.len();
+            Some(PkSet {
+                table: btree,
+                index,
+                n,
+            })
+        }
+        None => None,
+    };
+    let rowid_reg = program.alloc_registers(pk.as_ref().map_or(1, |pk| pk.n));
+    let clear_set = |program: &mut ProgramBuilder, set: usize| {
+        if pk.is_some() {
+            program.emit_insn(Insn::OpenEphemeral {
+                cursor_id: set,
+                is_table: false,
+            });
+        } else {
+            program.emit_insn(Insn::Null {
+                dest: set,
+                dest_end: None,
+            });
+        }
+    };
+    let alloc_set = |program: &mut ProgramBuilder| -> Result<usize> {
+        match &pk {
+            Some(pk) => program.alloc_cursor_index(None, &pk.index),
+            None => Ok(program.alloc_register()),
+        }
+    };
+    let rowset1_reg = alloc_set(program)?;
     let rowset2_reg = if is_intersection {
-        program.alloc_register()
+        alloc_set(program)?
     } else {
         rowset1_reg
     };
 
-    program.emit_insn(Insn::Null {
-        dest: rowset1_reg,
-        dest_end: None,
-    });
+    clear_set(program, rowset1_reg);
     if is_intersection {
-        program.emit_insn(Insn::Null {
-            dest: rowset2_reg,
-            dest_end: None,
-        });
+        clear_set(program, rowset2_reg);
     }
 
     let mut current_read_rowset = rowset1_reg;
@@ -422,6 +530,7 @@ pub(super) fn emit_multi_index_scan_loop(
                 branch,
                 table_cursor_id,
                 rowid_reg,
+                pk.as_ref(),
                 is_intersection,
                 branch_idx,
                 rowset1_reg,
@@ -437,6 +546,7 @@ pub(super) fn emit_multi_index_scan_loop(
                 branch,
                 table_cursor_id,
                 rowid_reg,
+                pk.as_ref(),
                 is_intersection,
                 branch_idx,
                 rowset1_reg,
@@ -448,10 +558,7 @@ pub(super) fn emit_multi_index_scan_loop(
 
         if is_intersection && branch_idx > 0 && branch_idx < multi_idx_op.branches.len() - 1 {
             std::mem::swap(&mut current_read_rowset, &mut current_write_rowset);
-            program.emit_insn(Insn::Null {
-                dest: current_write_rowset,
-                dest_end: None,
-            });
+            clear_set(program, current_write_rowset);
         }
     }
 
@@ -465,6 +572,37 @@ pub(super) fn emit_multi_index_scan_loop(
     } else {
         rowset1_reg
     };
+
+    if let Some(pk) = &pk {
+        // Take the smallest key out of the set, then find its row.
+        program.preassign_label_to_next_insn(loop_start);
+        program.emit_insn(Insn::Rewind {
+            cursor_id: final_rowset,
+            pc_if_empty: loop_end,
+        });
+        for i in 0..pk.n {
+            program.emit_insn(Insn::Column {
+                cursor_id: final_rowset,
+                column: i,
+                dest: rowid_reg + i,
+                default: None,
+            });
+        }
+        program.emit_insn(Insn::IdxDelete {
+            start_reg: rowid_reg,
+            num_regs: pk.n,
+            cursor_id: final_rowset,
+            raise_error_if_no_matching_entry: false,
+        });
+        crate::translate::without_rowid::emit_seek_row(
+            program,
+            &pk.table,
+            table_cursor_id,
+            rowid_reg,
+            loop_start,
+        )?;
+        return Ok(());
+    }
 
     program.preassign_label_to_next_insn(loop_start);
     program.emit_insn(Insn::RowSetRead {

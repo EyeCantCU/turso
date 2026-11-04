@@ -1004,10 +1004,6 @@ pub fn consider_multi_index_union(
     analyze_stats: &AnalyzeStats,
     resolver: &Resolver,
 ) -> Result<Option<AccessMethod>> {
-    // Multi-index plans combine rowids; a WITHOUT ROWID table has none.
-    if rhs_table.btree().is_some_and(|t| !t.has_rowid) {
-        return Ok(None);
-    }
     for (where_term_idx, term) in where_clause.iter().enumerate() {
         if term.consumed {
             continue;
@@ -1154,10 +1150,6 @@ pub fn consider_multi_index_intersection(
     analyze_stats: &AnalyzeStats,
     resolver: &Resolver,
 ) -> Result<Option<AccessMethod>> {
-    // Multi-index plans combine rowids; a WITHOUT ROWID table has none.
-    if rhs_table.btree().is_some_and(|t| !t.has_rowid) {
-        return Ok(None);
-    }
     let Some(decomposition) = analyze_and_terms_for_multi_index(
         rhs_table,
         where_clause,

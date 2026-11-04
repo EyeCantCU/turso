@@ -96,14 +96,19 @@ pub(crate) mod unnest;
 #[derive(Debug, Default)]
 pub(crate) struct AvailableIndexes {
     indexes_by_table_id: HashMap<TableInternalId, VecDeque<Arc<Index>>>,
-    /// Indexes of WITHOUT ROWID tables that a write cannot plan with; an
+    /// Indexes of WITHOUT ROWID tables a RIGHT/FULL join cannot plan with; an
     /// INDEXED BY naming one is accepted and the table is scanned instead.
     unplannable_indexes: HashMap<TableInternalId, std::vec::Vec<String>>,
 }
 
 impl AvailableIndexes {
     fn for_table_references(resolver: &Resolver, table_references: &TableReferences) -> Self {
-        Self::build(resolver, table_references, false)
+        // A RIGHT/FULL join records matched WITHOUT ROWID rows from the table cursor.
+        Self::build(
+            resolver,
+            table_references,
+            !table_references.has_right_or_full_join(),
+        )
     }
 
     /// Like `for_table_references`, and a read-only query can also use the
