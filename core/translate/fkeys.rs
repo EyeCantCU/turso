@@ -226,12 +226,8 @@ fn emit_parent_key_change_probes(
     let changed = program.allocate_label();
     let deferred_new_key_probe =
         if matches!(new_key_probe_mode, ParentKeyNewProbeMode::AfterReplace) {
-            let deferred_fks: Vec<_> = incoming
-                .iter()
-                .copied()
-                .filter(|fk_ref| fk_ref.fk.deferred)
-                .cloned()
-                .collect();
+            // Immediate FKs too: PRAGMA defer_foreign_keys may defer them at run time.
+            let deferred_fks: Vec<_> = incoming.iter().copied().cloned().collect();
             if deferred_fks.is_empty() {
                 None
             } else {
@@ -1012,8 +1008,13 @@ fn emit_fk_parent_key_probe(
                 emit_guarded_fk_decrement(p, skip, fk_ref.fk.deferred);
                 p.preassign_label_to_next_insn(skip);
             }
-            // Immediate FK on NEW pass: nothing to cancel; do nothing.
-            (false, ParentProbePass::New) => {}
+            // Immediate FK on NEW pass: repays a violation only when PRAGMA
+            // defer_foreign_keys counted it as deferred, decided at run time.
+            (false, ParentProbePass::New) => {
+                let skip = p.allocate_label();
+                emit_guarded_fk_decrement(p, skip, false);
+                p.preassign_label_to_next_insn(skip);
+            }
         }
         Ok(())
     };
@@ -2825,16 +2826,8 @@ pub fn emit_fk_drop_table_check(
 
     // Only check for violations if there are RESTRICT/NO ACTION FKs
     if !check_fk_refs.is_empty() {
-        // FkIfZero: if counter == 0, skip the halt
-        let no_violations = program.allocate_label();
-        program.emit_insn(Insn::FkIfZero {
-            deferred: false,
-            target_pc: no_violations,
-        });
-
-        // There were violations, halt with FK error
-        emit_fk_restrict_halt(program, None)?;
-        program.preassign_label_to_next_insn(no_violations);
+        // Halt if this statement left immediate violations.
+        program.emit_insn(Insn::FkCheck { deferred: false });
     }
 
     Ok(())

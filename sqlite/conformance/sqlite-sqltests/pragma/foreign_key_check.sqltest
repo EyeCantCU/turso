@@ -54,3 +54,38 @@ test foreign-key-check-no-such-table {
 expect error {
     no such table: nosuch
 }
+
+# Like SQLite's table hash for a small schema: newest table first.
+test foreign-key-check-table-order {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c1(x REFERENCES p);
+    CREATE TABLE c2(x REFERENCES p);
+    INSERT INTO c1 VALUES (1);
+    INSERT INTO c2 VALUES (2);
+    PRAGMA foreign_key_check;
+}
+expect {
+    c2|1|p|0
+    c1|1|p|0
+}
+
+test foreign-key-check-mismatch {
+    CREATE TABLE p(id INTEGER PRIMARY KEY, nu);
+    CREATE TABLE bad(r REFERENCES p(nu));
+    INSERT INTO bad VALUES (1);
+    PRAGMA foreign_key_check(bad);
+}
+expect error {
+    foreign key mismatch - "bad" referencing "p"
+}
+
+test foreign-key-check-without-rowid-child {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE w(k PRIMARY KEY, x REFERENCES p) WITHOUT ROWID;
+    INSERT INTO w VALUES (5, 9), (3, 8);
+    PRAGMA foreign_key_check(w);
+}
+expect {
+    w||p|0
+    w||p|0
+}
