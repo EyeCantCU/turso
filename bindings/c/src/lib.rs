@@ -12,6 +12,8 @@ use turso_core::{CheckpointMode, ConnectOpts, DatabaseOpts, LimboError, Value};
 use turso_ext::ScalarFunction;
 use turso_ext::Value as ExtValue;
 
+mod hooks;
+
 /// Global flag: when set, all subsequently opened databases enable experimental features.
 static EXPERIMENTAL_ENABLED: AtomicBool = AtomicBool::new(false);
 static SQLITE_VERSION_C_STRING: OnceLock<CString> = OnceLock::new();
@@ -200,6 +202,7 @@ pub const SQLITE_DBCONFIG_TRUSTED_SCHEMA: ffi::c_int = 1017;
 
 pub struct sqlite3 {
     pub(crate) inner: Mutex<sqlite3Inner>,
+    pub(crate) hooks: hooks::HookState,
 }
 
 struct sqlite3Inner {
@@ -258,6 +261,7 @@ impl sqlite3 {
         };
         Self {
             inner: Mutex::new(inner),
+            hooks: hooks::HookState::new(),
         }
     }
 
@@ -295,6 +299,9 @@ pub struct sqlite3_stmt {
     /// High-water mark of `search_count` already published to the global
     /// counter, so each step contributes only the delta.
     pub(crate) prev_search_count: i64,
+    /// Error a WAL hook returned after this statement committed; reported
+    /// by the next reset or finalize, as in SQLite.
+    pub(crate) wal_hook_rc: ffi::c_int,
 }
 
 #[cfg(feature = "csv")]
@@ -321,6 +328,7 @@ impl sqlite3_stmt {
             text_cache: vec![vec![]; n_cols],
             value_cache: (0..n_cols).map(|_| None).collect(),
             prev_search_count: 0,
+            wal_hook_rc: SQLITE_OK,
         }
     }
     #[inline]
@@ -1028,35 +1036,6 @@ pub unsafe extern "C" fn sqlite3_busy_timeout(db: *mut sqlite3, ms: ffi::c_int) 
     SQLITE_OK
 }
 
-/// Callback type for sqlite3_set_authorizer: (userData, actionCode, arg1,
-/// arg2, database, trigger-or-view) -> SQLITE_OK / SQLITE_DENY / SQLITE_IGNORE.
-pub type sqlite3_authorizer_callback = unsafe extern "C" fn(
-    *mut ffi::c_void,
-    ffi::c_int,
-    *const ffi::c_char,
-    *const ffi::c_char,
-    *const ffi::c_char,
-    *const ffi::c_char,
-) -> ffi::c_int;
-
-/// Refused with SQLITE_ERROR: turso_core has no prepare-time authorization
-/// hook, so a stored callback would never be invoked and callers (e.g. PHP,
-/// which routes its open_basedir checks through the authorizer) would
-/// silently lose the enforcement they registered for. PHP ignores this
-/// return value when it installs its authorizer at open, so refusing does
-/// not break it. Implement for real once core grows an authorization hook.
-#[no_mangle]
-pub unsafe extern "C" fn sqlite3_set_authorizer(
-    db: *mut sqlite3,
-    _callback: Option<sqlite3_authorizer_callback>,
-    _context: *mut ffi::c_void,
-) -> ffi::c_int {
-    if db.is_null() {
-        return SQLITE_MISUSE;
-    }
-    SQLITE_ERROR
-}
-
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_context_db_handle(context: *mut ffi::c_void) -> *mut ffi::c_void {
     if context.is_null() {
@@ -1103,7 +1082,13 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
             return set_db_err_code(&mut db, SQLITE_MISUSE);
         }
     };
-    let stmt = match db.conn.prepare(sql_str) {
+    // Prepare without the handle lock: an authorizer callback may re-enter
+    // the API on this handle.
+    let conn = db.conn.clone();
+    drop(db);
+    let prepared = conn.prepare(sql_str);
+    let mut db = db_handle.inner.lock().unwrap();
+    let stmt = match prepared {
         Ok(stmt) => stmt,
         // The C API contract (https://www.sqlite.org/c3ref/prepare.html)
         // treats SQL with nothing to compile (empty string, whitespace,
@@ -1177,15 +1162,16 @@ unsafe fn stmt_run_to_completion(stmt: *mut sqlite3_stmt) -> ffi::c_int {
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> ffi::c_int {
+    // Finalizing a NULL statement is a harmless no-op in SQLite.
     if stmt.is_null() {
-        return SQLITE_MISUSE;
+        return SQLITE_OK;
     }
     let stmt_ref = &mut *stmt;
 
     // first, finalize any execution if it was unfinished
     // (for example, many drivers can consume just one row and finalize statement after that, while there still can be work to do)
     // (this is necessary because queries like INSERT INTO t VALUES (1), (2), (3) RETURNING id return values within a transaction)
-    let result = stmt_run_to_completion(stmt);
+    let result = hooks::take_wal_hook_error(stmt, stmt_run_to_completion(stmt));
 
     {
         let mut db_inner = stmt_ref.db.inner.lock().unwrap();
@@ -1217,8 +1203,12 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> ffi::c_int
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
+    // SQLite answers a NULL statement (e.g. trailing whitespace) with MISUSE.
+    if stmt.is_null() {
+        return SQLITE_MISUSE;
+    }
     let stmt = &mut *stmt;
-    let db = &stmt.db;
+    let db = stmt.db.clone();
     // Do not hold the handle lock across the step. A user-defined function
     // invoked mid-step may re-enter the C API on the same handle (SQLite
     // allows e.g. a nested prepare/step from inside a scalar callback), and
@@ -1234,7 +1224,15 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
         }
         Ok(None) => {
             stmt.clear_text_cache();
-            SQLITE_DONE
+            // A WAL hook that failed after the commit makes the step fail
+            // with SQLITE_ERROR, as in SQLite.
+            match db.hooks.take_wal_rc() {
+                SQLITE_OK => SQLITE_DONE,
+                rc => {
+                    stmt.wal_hook_rc = rc;
+                    set_db_err_code(&mut db.inner.lock().unwrap(), SQLITE_ERROR)
+                }
+            }
         }
         Err(LimboError::Busy) => set_db_err_code(&mut db.inner.lock().unwrap(), SQLITE_BUSY),
         Err(LimboError::Interrupt) => {
@@ -1358,7 +1356,7 @@ pub unsafe extern "C" fn sqlite3_reset(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     // first, finalize any execution if it was unfinished
     // (for example, many drivers can consume just one row and finalize statement after that, while there still can be work to do)
     // (this is necessary because queries like INSERT INTO t VALUES (1), (2), (3) RETURNING id return values within a transaction)
-    let result = stmt_run_to_completion(stmt);
+    let result = hooks::take_wal_hook_error(stmt, stmt_run_to_completion(stmt));
     if let Err(err) = stmt.stmt.reset() {
         if result == SQLITE_OK {
             return handle_limbo_err(err, std::ptr::null_mut());
@@ -3738,6 +3736,8 @@ fn limbo_err_code(err: &LimboError) -> i32 {
         | LimboError::ConstraintViolation(_)
         | LimboError::ForeignKeyConstraint(_)
         | LimboError::Raise(..) => SQLITE_CONSTRAINT,
+        LimboError::CommitHookVeto => hooks::SQLITE_CONSTRAINT_COMMITHOOK,
+        LimboError::AuthDenied(_) => SQLITE_AUTH,
         LimboError::DatabaseFull | LimboError::SequenceExhausted { .. } => SQLITE_FULL,
         LimboError::TableLocked => SQLITE_LOCKED,
         LimboError::ReadOnly => SQLITE_READONLY,
@@ -3763,8 +3763,9 @@ fn handle_limbo_err(err: LimboError, container: *mut *mut ffi::c_char) -> i32 {
 }
 
 /// Store a LimboError on the database handle, returning the SQLite error code.
+/// Like SQLite, the result is masked unless extended result codes are on.
 unsafe fn set_db_err(db: &mut sqlite3Inner, err: LimboError) -> i32 {
-    set_db_err_msg(db, limbo_err_code(&err), &format!("{err}"))
+    set_db_err_msg(db, limbo_err_code(&err), &format!("{err}")) & db.err_mask
 }
 
 unsafe fn set_db_err_msg(db: &mut sqlite3Inner, code: i32, err_msg: &str) -> i32 {

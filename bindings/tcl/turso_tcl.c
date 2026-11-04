@@ -71,7 +71,143 @@ typedef struct TursoDb {
     int             progress_nops;
     int             in_progress_cb;   /* the script above is running */
     int             progress_pending; /* [db progress] changed inside it */
+    /* [db commit_hook|rollback_hook|update_hook|wal_hook|preupdate hook]
+     * and [db authorizer] scripts, as in upstream tclsqlite.c */
+    Tcl_Obj        *commit_hook;
+    Tcl_Obj        *rollback_hook;
+    Tcl_Obj        *update_hook;
+    Tcl_Obj        *wal_hook;
+    Tcl_Obj        *preupdate_hook;
+    Tcl_Obj        *auth_script;
 } TursoDb;
+
+static int tcl_commit_bridge(void *pArg)
+{
+    TursoDb *tdb = (TursoDb *)pArg;
+    int rc = Tcl_EvalObjEx(tdb->interp, tdb->commit_hook, 0);
+    return rc != TCL_OK || atoi(Tcl_GetStringResult(tdb->interp)) ? 1 : 0;
+}
+
+static void tcl_rollback_bridge(void *pArg)
+{
+    TursoDb *tdb = (TursoDb *)pArg;
+    if (Tcl_EvalObjEx(tdb->interp, tdb->rollback_hook, 0) != TCL_OK)
+        Tcl_BackgroundException(tdb->interp, TCL_ERROR);
+}
+
+static const char *hook_op_name(int op)
+{
+    return op == SQLITE_DELETE ? "DELETE" : op == SQLITE_INSERT ? "INSERT" : "UPDATE";
+}
+
+static void tcl_update_bridge(void *pArg, int op, const char *zDb,
+                              const char *zTbl, sqlite3_int64 rowid)
+{
+    TursoDb *tdb = (TursoDb *)pArg;
+    Tcl_Obj *cmd = Tcl_DuplicateObj(tdb->update_hook);
+    Tcl_IncrRefCount(cmd);
+    Tcl_ListObjAppendElement(0, cmd, Tcl_NewStringObj(hook_op_name(op), -1));
+    Tcl_ListObjAppendElement(0, cmd, Tcl_NewStringObj(zDb, -1));
+    Tcl_ListObjAppendElement(0, cmd, Tcl_NewStringObj(zTbl, -1));
+    Tcl_ListObjAppendElement(0, cmd, Tcl_NewWideIntObj(rowid));
+    Tcl_EvalObjEx(tdb->interp, cmd, TCL_EVAL_DIRECT);
+    Tcl_DecrRefCount(cmd);
+}
+
+static void tcl_preupdate_bridge(void *pArg, sqlite3 *db, int op,
+                                 const char *zDb, const char *zTbl,
+                                 sqlite3_int64 k1, sqlite3_int64 k2)
+{
+    TursoDb *tdb = (TursoDb *)pArg;
+    (void)db;
+    Tcl_Obj *cmd = Tcl_DuplicateObj(tdb->preupdate_hook);
+    Tcl_IncrRefCount(cmd);
+    Tcl_ListObjAppendElement(0, cmd, Tcl_NewStringObj(hook_op_name(op), -1));
+    Tcl_ListObjAppendElement(0, cmd, Tcl_NewStringObj(zDb, -1));
+    Tcl_ListObjAppendElement(0, cmd, Tcl_NewStringObj(zTbl, -1));
+    Tcl_ListObjAppendElement(0, cmd, Tcl_NewWideIntObj(k1));
+    Tcl_ListObjAppendElement(0, cmd, Tcl_NewWideIntObj(k2));
+    Tcl_EvalObjEx(tdb->interp, cmd, TCL_EVAL_DIRECT);
+    Tcl_DecrRefCount(cmd);
+}
+
+static int tcl_wal_bridge(void *pArg, sqlite3 *db, const char *zDb, int n)
+{
+    TursoDb *tdb = (TursoDb *)pArg;
+    int ret = SQLITE_OK;
+    (void)db;
+    Tcl_Obj *cmd = Tcl_DuplicateObj(tdb->wal_hook);
+    Tcl_IncrRefCount(cmd);
+    Tcl_ListObjAppendElement(tdb->interp, cmd, Tcl_NewStringObj(zDb, -1));
+    Tcl_ListObjAppendElement(tdb->interp, cmd, Tcl_NewIntObj(n));
+    if (Tcl_EvalObjEx(tdb->interp, cmd, 0) != TCL_OK ||
+        Tcl_GetIntFromObj(tdb->interp, Tcl_GetObjResult(tdb->interp), &ret) != TCL_OK)
+        Tcl_BackgroundException(tdb->interp, TCL_ERROR);
+    Tcl_DecrRefCount(cmd);
+    return ret;
+}
+
+static const char *auth_code_names[] = {
+    "SQLITE_COPY", "SQLITE_CREATE_INDEX", "SQLITE_CREATE_TABLE",
+    "SQLITE_CREATE_TEMP_INDEX", "SQLITE_CREATE_TEMP_TABLE",
+    "SQLITE_CREATE_TEMP_TRIGGER", "SQLITE_CREATE_TEMP_VIEW",
+    "SQLITE_CREATE_TRIGGER", "SQLITE_CREATE_VIEW", "SQLITE_DELETE",
+    "SQLITE_DROP_INDEX", "SQLITE_DROP_TABLE", "SQLITE_DROP_TEMP_INDEX",
+    "SQLITE_DROP_TEMP_TABLE", "SQLITE_DROP_TEMP_TRIGGER",
+    "SQLITE_DROP_TEMP_VIEW", "SQLITE_DROP_TRIGGER", "SQLITE_DROP_VIEW",
+    "SQLITE_INSERT", "SQLITE_PRAGMA", "SQLITE_READ", "SQLITE_SELECT",
+    "SQLITE_TRANSACTION", "SQLITE_UPDATE", "SQLITE_ATTACH", "SQLITE_DETACH",
+    "SQLITE_ALTER_TABLE", "SQLITE_REINDEX", "SQLITE_ANALYZE",
+    "SQLITE_CREATE_VTABLE", "SQLITE_DROP_VTABLE", "SQLITE_FUNCTION",
+    "SQLITE_SAVEPOINT", "SQLITE_RECURSIVE",
+};
+
+static int tcl_auth_bridge(void *pArg, int code, const char *a1,
+                           const char *a2, const char *a3, const char *a4)
+{
+    TursoDb *tdb = (TursoDb *)pArg;
+    Tcl_DString str;
+    const char *reply;
+    int rc;
+    Tcl_DStringInit(&str);
+    Tcl_DStringAppend(&str, Tcl_GetString(tdb->auth_script), -1);
+    Tcl_DStringAppendElement(&str, code >= 0 && code <= SQLITE_RECURSIVE
+                                       ? auth_code_names[code] : "????");
+    Tcl_DStringAppendElement(&str, a1 ? a1 : "");
+    Tcl_DStringAppendElement(&str, a2 ? a2 : "");
+    Tcl_DStringAppendElement(&str, a3 ? a3 : "");
+    Tcl_DStringAppendElement(&str, a4 ? a4 : "");
+    rc = Tcl_EvalEx(tdb->interp, Tcl_DStringValue(&str), -1, TCL_EVAL_GLOBAL);
+    Tcl_DStringFree(&str);
+    reply = rc == TCL_OK ? Tcl_GetStringResult(tdb->interp) : "SQLITE_DENY";
+    if (strcmp(reply, "SQLITE_OK") == 0) return SQLITE_OK;
+    if (strcmp(reply, "SQLITE_DENY") == 0) return SQLITE_DENY;
+    if (strcmp(reply, "SQLITE_IGNORE") == 0) return SQLITE_IGNORE;
+    return 999;
+}
+
+/* [db X_hook ?SCRIPT?]: return the current script; with SCRIPT, replace it
+ * ("" clears), then re-register every hook, as upstream DbHookCmd does. */
+static void tcl_hook_cmd(Tcl_Interp *interp, TursoDb *tdb, Tcl_Obj *arg,
+                         Tcl_Obj **slot)
+{
+    if (*slot) {
+        Tcl_SetObjResult(interp, *slot);
+        if (arg) {
+            Tcl_DecrRefCount(*slot);
+            *slot = NULL;
+        }
+    }
+    if (arg && Tcl_GetString(arg)[0]) {
+        *slot = arg;
+        Tcl_IncrRefCount(arg);
+    }
+    tdb->interp = interp;
+    sqlite3_preupdate_hook(tdb->db, tdb->preupdate_hook ? tcl_preupdate_bridge : NULL, tdb);
+    sqlite3_update_hook(tdb->db, tdb->update_hook ? tcl_update_bridge : NULL, tdb);
+    sqlite3_rollback_hook(tdb->db, tdb->rollback_hook ? tcl_rollback_bridge : NULL, tdb);
+    sqlite3_wal_hook(tdb->db, tdb->wal_hook ? tcl_wal_bridge : NULL, tdb);
+}
 
 /* The engine calls this every N virtual machine steps; a non-zero result
  * from the script interrupts the statement, as in the upstream binding.
@@ -547,6 +683,10 @@ static void TursoDbFree(ClientData cd)
     }
     if (tdb->null_obj) Tcl_DecrRefCount(tdb->null_obj);
     if (tdb->progress_script) Tcl_DecrRefCount(tdb->progress_script);
+    Tcl_Obj *hooks[] = {tdb->commit_hook, tdb->rollback_hook, tdb->update_hook,
+                        tdb->wal_hook, tdb->preupdate_hook, tdb->auth_script};
+    for (size_t i = 0; i < sizeof(hooks) / sizeof(hooks[0]); i++)
+        if (hooks[i]) Tcl_DecrRefCount(hooks[i]);
     Tcl_Free((char *)tdb);
 }
 
@@ -855,14 +995,112 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
         return TCL_OK;
     }
 
+    /* No busy-handler support: accepted and ignored, as before. */
     case CMD_BUSY:
+        Tcl_ResetResult(interp);
+        return TCL_OK;
+
     case CMD_AUTH:
-    case CMD_AUTHORIZER:
-    case CMD_COMMIT_HOOK:
+    case CMD_AUTHORIZER: {
+        if (objc > 3) {
+            Tcl_WrongNumArgs(interp, 2, objv, "?CALLBACK?");
+            return TCL_ERROR;
+        }
+        if (objc == 2) {
+            if (tdb->auth_script) Tcl_SetObjResult(interp, tdb->auth_script);
+            return TCL_OK;
+        }
+        if (tdb->auth_script) Tcl_DecrRefCount(tdb->auth_script);
+        tdb->auth_script = NULL;
+        if (Tcl_GetString(objv[2])[0]) {
+            tdb->auth_script = objv[2];
+            Tcl_IncrRefCount(objv[2]);
+            tdb->interp = interp;
+            sqlite3_set_authorizer(tdb->db, tcl_auth_bridge, tdb);
+        } else {
+            sqlite3_set_authorizer(tdb->db, NULL, NULL);
+        }
+        return TCL_OK;
+    }
+
+    case CMD_COMMIT_HOOK: {
+        if (objc > 3) {
+            Tcl_WrongNumArgs(interp, 2, objv, "?CALLBACK?");
+            return TCL_ERROR;
+        }
+        if (tdb->commit_hook) Tcl_SetObjResult(interp, tdb->commit_hook);
+        if (objc == 3) {
+            if (tdb->commit_hook) Tcl_DecrRefCount(tdb->commit_hook);
+            tdb->commit_hook = NULL;
+            if (Tcl_GetString(objv[2])[0]) {
+                tdb->commit_hook = objv[2];
+                Tcl_IncrRefCount(objv[2]);
+            }
+            tdb->interp = interp;
+            sqlite3_commit_hook(tdb->db, tdb->commit_hook ? tcl_commit_bridge : NULL, tdb);
+        }
+        return TCL_OK;
+    }
+
     case CMD_UPDATE_HOOK:
     case CMD_ROLLBACK_HOOK:
-    case CMD_WAL_HOOK:
-    case CMD_PREUPDATE:
+    case CMD_WAL_HOOK: {
+        if (objc > 3) {
+            Tcl_WrongNumArgs(interp, 2, objv, "?SCRIPT?");
+            return TCL_ERROR;
+        }
+        Tcl_Obj **slot = cmdIdx == CMD_UPDATE_HOOK ? &tdb->update_hook
+                       : cmdIdx == CMD_ROLLBACK_HOOK ? &tdb->rollback_hook
+                       : &tdb->wal_hook;
+        tcl_hook_cmd(interp, tdb, objc == 3 ? objv[2] : NULL, slot);
+        return TCL_OK;
+    }
+
+    case CMD_PREUPDATE: {
+        static const char *subs[] = {"count", "depth", "hook", "new", "old", NULL};
+        enum { PRE_COUNT, PRE_DEPTH, PRE_HOOK, PRE_NEW, PRE_OLD };
+        int sub;
+        if (objc < 3) {
+            Tcl_WrongNumArgs(interp, 2, objv, "SUB-COMMAND ?ARGS?");
+            return TCL_ERROR;
+        }
+        if (Tcl_GetIndexFromObj(interp, objv[2], subs, "sub-command", 0, &sub) != TCL_OK)
+            return TCL_ERROR;
+        switch (sub) {
+        case PRE_COUNT:
+            Tcl_SetObjResult(interp, Tcl_NewIntObj(sqlite3_preupdate_count(tdb->db)));
+            return TCL_OK;
+        case PRE_DEPTH:
+            Tcl_SetObjResult(interp, Tcl_NewIntObj(sqlite3_preupdate_depth(tdb->db)));
+            return TCL_OK;
+        case PRE_HOOK:
+            if (objc > 4) {
+                Tcl_WrongNumArgs(interp, 2, objv, "hook ?SCRIPT?");
+                return TCL_ERROR;
+            }
+            tcl_hook_cmd(interp, tdb, objc == 4 ? objv[3] : NULL, &tdb->preupdate_hook);
+            return TCL_OK;
+        default: {
+            int idx;
+            void *value = NULL;
+            if (objc != 4) {
+                Tcl_WrongNumArgs(interp, 3, objv, "INDEX");
+                return TCL_ERROR;
+            }
+            if (Tcl_GetIntFromObj(interp, objv[3], &idx) != TCL_OK) return TCL_ERROR;
+            int rc = sub == PRE_OLD ? sqlite3_preupdate_old(tdb->db, idx, &value)
+                                    : sqlite3_preupdate_new(tdb->db, idx, &value);
+            if (rc != SQLITE_OK) {
+                Tcl_AppendResult(interp, sqlite3_errmsg(tdb->db), (char *)0);
+                return TCL_ERROR;
+            }
+            const unsigned char *text = sqlite3_value_text(value);
+            Tcl_SetObjResult(interp, Tcl_NewStringObj(text ? (const char *)text : "", -1));
+            return TCL_OK;
+        }
+        }
+    }
+
     case CMD_TRACE:
     case CMD_TRACE_V2:
     case CMD_PROFILE:
@@ -1298,6 +1536,7 @@ static int TursoConnectionPointerCmd(ClientData cd, Tcl_Interp *interp,
  * the blob tests match on these (e.g. {1 SQLITE_ERROR}). */
 static const char *turso_err_name(int rc)
 {
+    if (rc == (19 | (2 << 8))) return "SQLITE_CONSTRAINT_COMMITHOOK";
     switch (rc & 0xff) {
     case 0:   return "SQLITE_OK";
     case 1:   return "SQLITE_ERROR";

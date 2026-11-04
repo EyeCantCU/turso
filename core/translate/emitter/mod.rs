@@ -181,7 +181,18 @@ pub struct Resolver<'a> {
     /// The statement is compiled for a role that is not a superuser, which may
     /// not use a sequence or a PRAGMA anywhere, including inside a view.
     pub(crate) role_is_not_superuser: bool,
+    /// `sqlite3_set_authorizer` callback; only set for user statements.
+    pub(crate) authorizer: Option<crate::authorizer::AuthorizerCallback>,
+    /// Attached databases exist, so denied-read messages name the database.
+    pub(crate) auth_has_attached: bool,
+    /// The authorizer answered IGNORE for a DELETE: no truncate optimization.
+    pub(crate) auth_no_truncate: bool,
+    /// Column reads already authorized, so each reference is asked about once.
+    pub(crate) auth_reads: AuthorizedReads,
 }
+
+/// Column reads (table, column; `None` for the rowid) already authorized.
+pub(crate) type AuthorizedReads = Rc<RefCell<HashSet<(ast::TableInternalId, Option<usize>)>>>;
 
 /// The column a register stands for in [Resolver::register_columns].
 #[derive(Debug, Clone)]
@@ -392,6 +403,10 @@ impl<'a> Resolver<'a> {
             subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
             fk_action_compile_stack: FkActionCompileStack::default(),
             role_is_not_superuser: false,
+            authorizer: None,
+            auth_has_attached: false,
+            auth_no_truncate: false,
+            auth_reads: Rc::default(),
         }
     }
 
@@ -427,6 +442,10 @@ impl<'a> Resolver<'a> {
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             role_is_not_superuser: self.role_is_not_superuser,
+            authorizer: self.authorizer.clone(),
+            auth_has_attached: self.auth_has_attached,
+            auth_no_truncate: false,
+            auth_reads: self.auth_reads.clone(),
         }
     }
 
@@ -444,6 +463,10 @@ impl<'a> Resolver<'a> {
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             role_is_not_superuser: self.role_is_not_superuser,
+            authorizer: self.authorizer.clone(),
+            auth_has_attached: self.auth_has_attached,
+            auth_no_truncate: false,
+            auth_reads: self.auth_reads.clone(),
         }
     }
 

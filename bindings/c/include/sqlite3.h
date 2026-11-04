@@ -461,6 +461,34 @@ int sqlite3_table_column_metadata(
 );
 
 /*
+** Data-change and transaction hooks (hooks.rs).
+*/
+void *sqlite3_commit_hook(sqlite3 *db, int (*xCallback)(void *), void *pArg);
+void *sqlite3_rollback_hook(sqlite3 *db, void (*xCallback)(void *), void *pArg);
+void *sqlite3_update_hook(
+    sqlite3 *db,
+    void (*xCallback)(void *, int, char const *, char const *, sqlite3_int64),
+    void *pArg
+);
+void *sqlite3_wal_hook(
+    sqlite3 *db,
+    int (*xCallback)(void *, sqlite3 *, const char *, int),
+    void *pArg
+);
+void *sqlite3_preupdate_hook(
+    sqlite3 *db,
+    void (*xPreUpdate)(void *pCtx, sqlite3 *db, int op, char const *zDb,
+                       char const *zName, sqlite3_int64 iKey1, sqlite3_int64 iKey2),
+    void *pCtx
+);
+int sqlite3_preupdate_old(sqlite3 *db, int i, void **ppValue);
+int sqlite3_preupdate_new(sqlite3 *db, int i, void **ppValue);
+int sqlite3_preupdate_count(sqlite3 *db);
+int sqlite3_preupdate_depth(sqlite3 *db);
+int sqlite3_preupdate_blobwrite(sqlite3 *db);
+int sqlite3_wal_autocheckpoint(sqlite3 *db, int N);
+
+/*
 ** Enable all Turso experimental features for subsequently opened databases.
 */
 void turso_enable_experimental(void);

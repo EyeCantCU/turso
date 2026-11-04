@@ -36,6 +36,7 @@ pub mod insn;
 pub mod metrics;
 #[cfg(test)]
 mod native_extension_tests;
+pub(crate) mod row_hooks;
 pub mod rowset;
 pub mod sorter;
 #[cfg(test)]
@@ -882,6 +883,8 @@ impl ActiveOpStateSlot {
             sub_state: OpDeleteSubState::MaybeCaptureRecord,
             route: None,
             deleted_record: None,
+            hooks_done: false,
+            update_hook_row: None,
         }
     );
     active_state_accessor!(
@@ -1200,6 +1203,8 @@ pub struct ProgramState {
     /// Cached subprogram Statements keyed by the PC of the Program instruction.
     /// Avoids re-allocating ProgramState on each trigger/FK-action fire.
     pub(crate) subprogram_stmt_cache: HashMap<usize, Box<Statement>>,
+    /// Rows removed by an UPDATE/REPLACE Delete, for the preupdate hook.
+    pub(crate) pending_old_rows: Vec<row_hooks::PendingOldRow>,
     /// RowSet objects stored by register index
     rowsets: HashMap<usize, RowSet>,
     // Cache of unused allocated Vecs
@@ -1341,6 +1346,7 @@ impl ProgramState {
             halt_in_progress: false,
             pending_cdc_info: None,
             subprogram_stmt_cache: HashMap::default(),
+            pending_old_rows: Vec::new(),
             mv_store_cache: None,
             pending_fresh_tx: None,
         }
@@ -1402,6 +1408,7 @@ impl ProgramState {
 
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         self.io_completions = None;
+        self.pending_old_rows.clear();
         self.extension_state = crate::native_ext::ExtensionState::None;
         self.pc = 0;
 
@@ -3089,14 +3096,30 @@ impl Program {
                 return Ok(IOResult::Done(()));
             }
         }
-        if self.connection.is_nested_stmt() {
+        // Nor on statements the commit hook runs while the commit waits on it.
+        if self.connection.is_nested_stmt() || self.connection.data_hooks.in_commit_hook() {
             // We don't want to commit on nested statements. Let parent handle it.
             return Ok(IOResult::Done(()));
         }
+        // sqlite3_commit_hook: runs once, before a transaction that wrote to
+        // any database commits. A veto rolls the whole transaction back.
+        if !rollback
+            && matches!(program_state.commit_state, CommitState::Ready)
+            && self.connection.auto_commit.load(Ordering::SeqCst)
+        {
+            let main_writes = matches!(tx_state, TransactionState::Write { .. });
+            let (any_writes, wal_dbs) = self.connection.hook_write_targets(main_writes, &pager);
+            if any_writes {
+                if self.connection.data_hooks.before_commit() {
+                    return Err(LimboError::CommitHookVeto.into());
+                }
+                self.connection.data_hooks.set_pending_wal(wal_dbs);
+            }
+        }
         let res = if let Some(mv_store) = mv_store {
-            self.commit_txn_mvcc(pager, program_state, mv_store, rollback)
+            self.commit_txn_mvcc(pager.clone(), program_state, mv_store, rollback)
         } else {
-            self.commit_txn_wal(pager, program_state, rollback)
+            self.commit_txn_wal(pager.clone(), program_state, rollback)
         }?;
         if !res.is_io() {
             if self.change_cnt_on {
@@ -3117,6 +3140,20 @@ impl Program {
                     self.connection.rollback_temp_schema();
                 } else {
                     self.connection.commit_temp_schema();
+                }
+            }
+            // sqlite3_wal_hook: once per WAL database the commit wrote to.
+            if transaction_finished
+                && !rollback
+                && self.connection.data_hooks.take_commit_in_progress()
+            {
+                for (name, pager) in self.connection.data_hooks.take_pending_wal() {
+                    let frames = pager
+                        .wal
+                        .as_ref()
+                        .map(|wal| wal.get_max_frame_in_wal())
+                        .unwrap_or(0);
+                    self.connection.data_hooks.on_wal_commit(&name, frames);
                 }
             }
         }
@@ -3782,6 +3819,12 @@ impl Program {
                         );
                     }
                     self.rollback_current_txn(pager);
+                    self.connection.set_changes(0);
+                }
+                // A vetoed commit rolls the whole transaction back.
+                Some(LimboError::CommitHookVeto) => {
+                    self.rollback_current_txn(pager);
+                    self.connection.clear_deferred_foreign_key_violations();
                     self.connection.set_changes(0);
                 }
                 // Foreign key constraint errors: ON CONFLICT does NOT apply to FK violations.

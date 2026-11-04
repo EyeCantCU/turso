@@ -172,6 +172,20 @@ pub fn translate(
         roles::check_statement_privileges(&stmt)?;
     }
 
+    let mut stmt = stmt;
+    if check_privileges {
+        resolver.authorizer = connection.authorizer();
+        if resolver.authorizer.is_some() {
+            resolver.auth_has_attached = !connection.attached_database_names().is_empty();
+            if crate::authorizer::authorize_statement(&mut resolver, &mut stmt)?
+                == crate::authorizer::Auth::Ignore
+            {
+                program.epilogue(schema);
+                return program.build(connection, change_cnt_on, input);
+            }
+        }
+    }
+
     match stmt {
         // There can be no nesting with pragma, so lift it up here
         ast::Stmt::Pragma { name, body } => {

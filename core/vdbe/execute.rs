@@ -5330,6 +5330,7 @@ pub fn op_auto_commit(
                 conn.auto_commit.store(true, Ordering::SeqCst);
                 conn.set_tx_read_only(false);
                 conn.set_cdc_transaction_id(-1);
+                conn.data_hooks.on_rollback();
             }
             TxOp::Commit => {
                 if conn.tx_is_poisoned() {
@@ -6014,7 +6015,10 @@ pub fn op_program(
                         .current_time
                         .get_or_insert_with(|| pager.io.current_time_wall_clock());
                     statement.set_current_time(now);
+                    // sqlite3_preupdate_depth counts trigger levels.
+                    program.connection.data_hooks.enter_subprogram();
                     let res = statement.step_subprogram();
+                    program.connection.data_hooks.leave_subprogram();
                     match res {
                         Ok(step_result) => match step_result {
                             StepResult::Done => break,
@@ -12733,6 +12737,8 @@ pub enum OpInsertSubState {
     /// Must complete before Insert so that cursor.rowid()/record() are never
     /// interleaved with a partially-completed cursor.insert().
     NoopCheck,
+    /// Run the preupdate hook for the row about to be written.
+    PreUpdateHook,
     /// Insert the row into the table.
     Insert,
     /// Updating last_insert_rowid may return IO, so we need a separate state for it so that we don't
@@ -12790,7 +12796,7 @@ fn materialized_view_record_change(
     Ok((physical_values, weight))
 }
 
-fn normalize_table_change_record(
+pub(super) fn normalize_table_change_record(
     table: &crate::schema::BTreeTable,
     rowid: i64,
     mut values: crate::alloc::Vec<Value>,
@@ -13046,6 +13052,150 @@ pub fn op_insert(
                         }
                     }
                 }
+                state.active_op_state.insert().sub_state =
+                    if program.connection.data_hooks.has_preupdate_hook() {
+                        OpInsertSubState::PreUpdateHook
+                    } else {
+                        OpInsertSubState::Insert
+                    };
+                continue;
+            }
+            OpInsertSubState::PreUpdateHook => {
+                let (has_rowid, root_page) = {
+                    let cursor = state.get_cursor(*cursor_id);
+                    let cursor = cursor.as_btree_mut();
+                    (cursor.has_rowid(), cursor.root_page())
+                };
+                let is_schema_root = root_page == 1
+                    || root_page == i64::from(crate::mvcc::database::SQLITE_SCHEMA_MVCC_TABLE_ID);
+                let target = if has_rowid
+                    && !is_schema_root
+                    && !flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT)
+                    && !flag.has(InsertFlags::SKIP_ALL_CHANGE_COUNTS)
+                {
+                    super::row_hooks::hook_target(program, state, *cursor_id, true)
+                } else {
+                    None
+                };
+                let Some(target) = target else {
+                    state.pending_old_rows.retain(|r| r.cursor_id != *cursor_id);
+                    state.active_op_state.insert().sub_state = OpInsertSubState::Insert;
+                    continue;
+                };
+                let key = match &state.registers[*key_reg].get_value() {
+                    Value::Numeric(Numeric::Integer(i)) => *i,
+                    _ => unreachable!("expected integer key"),
+                };
+                let is_update = flag.has(InsertFlags::SKIP_LAST_ROWID);
+                // The UPDATE's own Delete, if it removed the old row first.
+                let own = if !is_update {
+                    None
+                } else if flag.has(InsertFlags::UPDATE_ROWID_CHANGE) {
+                    state
+                        .pending_old_rows
+                        .iter()
+                        .rposition(|r| r.cursor_id == *cursor_id)
+                } else {
+                    state
+                        .pending_old_rows
+                        .iter()
+                        .position(|r| r.cursor_id == *cursor_id && r.rowid == key)
+                };
+                let has_pending = state
+                    .pending_old_rows
+                    .iter()
+                    .any(|r| r.cursor_id == *cursor_id);
+                // Otherwise the old row is still under the cursor and is overwritten.
+                let mut overwritten = None;
+                if (is_update && own.is_none()) || (!is_update && !has_pending) {
+                    let cursor = state.get_cursor(*cursor_id);
+                    let cursor = cursor.as_btree_mut();
+                    if return_if_io!(state, cursor.rowid()) == Some(key) {
+                        let cursor = state.get_cursor(*cursor_id);
+                        let cursor = cursor.as_btree_mut();
+                        if let Some(record) = return_if_io!(state, cursor.record()) {
+                            let values = record.get_values_owned()?;
+                            overwritten =
+                                Some(super::row_hooks::row_values(&target.table, key, values)?);
+                        }
+                    }
+                }
+                let new_values = match &state.registers[*record_reg] {
+                    Register::Record(r) => r.get_values_owned()?,
+                    Register::Value(v) => crate::alloc::vec![v.clone()],
+                    Register::Aggregate(..) => unreachable!("Cannot insert an aggregate value."),
+                };
+                let new_values = super::row_hooks::row_values(&target.table, key, new_values)?;
+                let mut own_row = None;
+                let mut replaced = Vec::new();
+                let mut i = 0;
+                state.pending_old_rows.retain_mut(|r| {
+                    let idx = i;
+                    i += 1;
+                    if r.cursor_id != *cursor_id {
+                        return true;
+                    }
+                    let row = super::row_hooks::PendingOldRow {
+                        cursor_id: r.cursor_id,
+                        rowid: r.rowid,
+                        values: std::mem::take(&mut r.values),
+                    };
+                    if Some(idx) == own {
+                        own_row = Some(row);
+                    } else {
+                        replaced.push(row);
+                    }
+                    false
+                });
+                use crate::data_hooks::UpdateHookOp;
+                // Rows removed by REPLACE are reported as deleted first, as in SQLite.
+                for row in &replaced {
+                    super::row_hooks::fire_preupdate(
+                        program,
+                        &target,
+                        UpdateHookOp::Delete,
+                        row.rowid,
+                        row.rowid,
+                        Some(&row.values),
+                        None,
+                    );
+                }
+                if is_update {
+                    let (old_rowid, old_values) = match own_row {
+                        Some(row) => (row.rowid, Some(row.values)),
+                        None => (key, overwritten),
+                    };
+                    super::row_hooks::fire_preupdate(
+                        program,
+                        &target,
+                        UpdateHookOp::Update,
+                        old_rowid,
+                        key,
+                        old_values.as_deref(),
+                        Some(&new_values),
+                    );
+                } else {
+                    if let Some(old) = &overwritten {
+                        super::row_hooks::fire_preupdate(
+                            program,
+                            &target,
+                            UpdateHookOp::Delete,
+                            key,
+                            key,
+                            Some(old),
+                            None,
+                        );
+                    }
+                    super::row_hooks::fire_preupdate(
+                        program,
+                        &target,
+                        UpdateHookOp::Insert,
+                        key,
+                        key,
+                        None,
+                        Some(&new_values),
+                    );
+                }
                 state.active_op_state.insert().sub_state = OpInsertSubState::Insert;
                 continue;
             }
@@ -13118,6 +13268,33 @@ pub fn op_insert(
                             _ => unreachable!("expected integer key"),
                         };
                         program.connection.update_last_rowid(rowid);
+                    }
+                    if program.connection.data_hooks.has_update_hook()
+                        && !flag.has(InsertFlags::SKIP_ALL_CHANGE_COUNTS)
+                    {
+                        if let Some(target) =
+                            super::row_hooks::hook_target(program, state, *cursor_id, false)
+                        {
+                            if let Value::Numeric(Numeric::Integer(rowid)) =
+                                state.registers[*key_reg].get_value()
+                            {
+                                // UPDATE (and upsert DO UPDATE) writes are the
+                                // only user-table inserts that leave
+                                // last_insert_rowid() alone.
+                                let op = if flag.has(InsertFlags::SKIP_LAST_ROWID) {
+                                    crate::data_hooks::UpdateHookOp::Update
+                                } else {
+                                    crate::data_hooks::UpdateHookOp::Insert
+                                };
+                                let rowid = *rowid;
+                                program.connection.data_hooks.on_row_change(
+                                    op,
+                                    &target.db_name,
+                                    &target.table.name,
+                                    rowid,
+                                );
+                            }
+                        }
                     }
                     if !flag.has(InsertFlags::SKIP_ALL_CHANGE_COUNTS) {
                         if flag.has(InsertFlags::SKIP_STATEMENT_CHANGE_COUNT) {
@@ -13313,6 +13490,10 @@ pub struct OpDeleteState {
     /// list on every sub-state transition.
     pub(crate) route: Option<ChangeLogRoute>,
     pub deleted_record: Option<(i64, crate::alloc::Vec<Value>)>,
+    /// Row hooks already ran for this row (the opcode may re-enter on IO).
+    pub hooks_done: bool,
+    /// Row to report to the update hook once the delete is done.
+    pub update_hook_row: Option<(String, String, i64)>,
 }
 
 #[derive(Clone, Copy)]
@@ -13347,6 +13528,64 @@ pub fn op_delete(
     loop {
         match state.active_op_state.delete().sub_state {
             OpDeleteSubState::MaybeCaptureRecord => {
+                if program.connection.data_hooks.has_row_hook()
+                    && !state.active_op_state.delete().hooks_done
+                {
+                    let preupdate = program.connection.data_hooks.has_preupdate_hook();
+                    if let Some(target) =
+                        super::row_hooks::hook_target(program, state, *cursor_id, preupdate)
+                    {
+                        let cursor = state.get_cursor(*cursor_id);
+                        let cursor = cursor.as_btree_mut();
+                        if let Some(rowid) = return_if_io!(state, cursor.rowid()) {
+                            let values = if program.connection.data_hooks.has_preupdate_hook() {
+                                let cursor = state.get_cursor(*cursor_id);
+                                let cursor = cursor.as_btree_mut();
+                                match return_if_io!(state, cursor.record()) {
+                                    Some(record) => Some(super::row_hooks::row_values(
+                                        &target.table,
+                                        rowid,
+                                        record.get_values_owned()?,
+                                    )?),
+                                    None => None,
+                                }
+                            } else {
+                                None
+                            };
+                            if *is_part_of_update {
+                                // Reported by the Insert that follows (UPDATE or REPLACE).
+                                if let Some(values) = values {
+                                    state
+                                        .pending_old_rows
+                                        .push(super::row_hooks::PendingOldRow {
+                                            cursor_id: *cursor_id,
+                                            rowid,
+                                            values,
+                                        });
+                                }
+                            } else {
+                                if let Some(values) = &values {
+                                    super::row_hooks::fire_preupdate(
+                                        program,
+                                        &target,
+                                        crate::data_hooks::UpdateHookOp::Delete,
+                                        rowid,
+                                        rowid,
+                                        Some(values),
+                                        None,
+                                    );
+                                }
+                                if program.connection.data_hooks.has_update_hook()
+                                    && crate::data_hooks::hook_reports_table(&target.table.name)
+                                {
+                                    state.active_op_state.delete().update_hook_row =
+                                        Some((target.db_name, target.table.name.clone(), rowid));
+                                }
+                            }
+                        }
+                    }
+                    state.active_op_state.delete().hooks_done = true;
+                }
                 let route = if program.prepared().has_materialized_views {
                     change_log_route(program, state, *cursor_id)?
                 } else {
@@ -13459,7 +13698,16 @@ pub fn op_delete(
         }
     }
 
+    let update_hook_row = state.active_op_state.delete().update_hook_row.take();
     state.active_op_state.clear();
+    if let Some((db_name, name, rowid)) = update_hook_row {
+        program.connection.data_hooks.on_row_change(
+            crate::data_hooks::UpdateHookOp::Delete,
+            &db_name,
+            &name,
+            rowid,
+        );
+    }
     if !is_part_of_update {
         // DELETEs do not count towards the total changes if they are part of an UPDATE statement,
         // i.e. the DELETE and subsequent INSERT of a row are the same "change".

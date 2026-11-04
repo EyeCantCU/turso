@@ -347,7 +347,11 @@ fn emit_clear_btree_delete(
     program: &mut ProgramBuilder,
     plan: &DeletePlan,
 ) -> Result<bool> {
+    // As in SQLite, a preupdate hook or an authorizer IGNORE for the DELETE
+    // forces row-by-row deletion.
     if !plan.where_clause.is_empty()
+        || connection.data_hooks.has_preupdate_hook()
+        || resolver.auth_no_truncate
         || !plan.result_columns.is_empty()
         || plan.rowset_plan.is_some()
         || plan.safety.requires_stable_write_set()
