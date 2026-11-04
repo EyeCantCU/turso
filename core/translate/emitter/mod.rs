@@ -1015,6 +1015,8 @@ pub struct TranslateCtx<'a> {
     pub meta_window: Option<WindowMetadata<'a>>,
     /// Metadata stored during `open_loop` for `Search::InSeek`, consumed by `close_loop`.
     pub meta_in_seeks: Vec<Option<InSeekMetadata>>,
+    /// Per table: the IN loops around a virtual table's xFilter, outermost first.
+    pub meta_vtab_in_loops: Vec<Vec<InSeekMetadata>>,
     pub unsafe_testing: bool,
 }
 
@@ -1055,6 +1057,7 @@ impl<'a> TranslateCtx<'a> {
             cdc_cursor_id: None,
             meta_window: None,
             meta_in_seeks: (0..table_count).map(|_| None).collect(),
+            meta_vtab_in_loops: (0..table_count).map(|_| Vec::new()).collect(),
             unsafe_testing,
         }
     }

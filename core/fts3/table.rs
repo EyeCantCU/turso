@@ -658,7 +658,8 @@ impl VirtualTable for Fts3Vtab {
                 }
                 continue;
             }
-            let docid = c.column_index == ncol + 1;
+            // The rowid (column u32::MAX) is the docid, as is the docid column.
+            let docid = c.column_index == ncol + 1 || c.column_index == u32::MAX;
             if icons.is_none() && c.op == ConstraintOp::Eq && docid {
                 idx_num = DOCID_SEARCH;
                 cost = 1.0;
@@ -736,15 +737,15 @@ impl VirtualTable for Fts3Vtab {
         idx_num & 0xffff == DOCID_SEARCH
     }
 
-    fn find_function(&self, name: &str, _nargs: usize) -> Option<Arc<ExternalFunc>> {
-        find_aux(name)
+    fn find_function(&self, _n_arg: i32, name: &str) -> Option<(i32, Arc<ExternalFunc>)> {
+        find_aux(name).map(|f| (1, f))
     }
 
     fn create_update(&mut self, _args: Vec<Value>) -> Result<Box<dyn TableUpdate>> {
         Err(LimboError::ReadOnly)
     }
 
-    fn create_update_conn(
+    fn create_update_with_connection(
         &mut self,
         conn: &Arc<Connection>,
         args: Vec<Value>,
@@ -1200,8 +1201,10 @@ impl ScalarCall for AuxCall {
             }
             Aux::Offsets => {
                 st.seek()?;
-                let s = super::snippet::offsets(&mut st)?;
-                Value::build_text(s)
+                match super::snippet::offsets(&mut st)? {
+                    Some(s) => Value::build_text(s),
+                    None => Value::Null,
+                }
             }
             Aux::Matchinfo => {
                 let fmt = vals.get(1).map(|v| value_text(v).unwrap_or_default());

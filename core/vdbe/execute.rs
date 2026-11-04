@@ -1452,6 +1452,7 @@ pub fn op_vcreate(
             module_name,
             table_name,
             args_reg,
+            db,
         },
         insn
     );
@@ -1472,24 +1473,50 @@ pub fn op_vcreate(
         vec![]
     };
     let conn = program.connection.clone();
-    // Look the module up first: its constructor may query this connection.
+    let schema_name = conn
+        .namespace_name(*db)
+        .unwrap_or_else(|| "main".to_string());
+    // No lock is held while the module's constructor runs: it may run
+    // statements on this connection.
     let module = conn.syms.read().vtab_module(&module_name).cloned();
-    let mut syms = crate::SymbolTable::new();
-    if let Some(module) = module {
-        syms.vtab_modules
-            .insert(crate::util::normalize_ident(&module_name), module);
-    }
-    let table =
-        crate::VirtualTable::table_for(Some(&table_name), &module_name, args, &syms, Some(&conn))?;
+    let create = (!conn.vtab_connect_only.load(Ordering::SeqCst)).then_some(&conn);
+    let table = crate::VirtualTable::table_in(
+        Some(&table_name),
+        &module_name,
+        &schema_name,
+        args,
+        module.as_ref(),
+        create,
+    )?;
     // A table that asks for it joins the transaction, as in SQLite (commit, no begin).
     if table.commits_after_create() {
-        conn.vtab_txn_states
-            .write()
-            .insert(table.id(), table.clone());
+        conn.vtab_txn_states.write().insert(table.id());
     }
     {
         conn.syms.write().vtabs.insert(table_name, table);
     }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_vcheck(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(VCheck { data }, insn);
+    let message = data.table.integrity(
+        &program.connection,
+        &data.schema,
+        &data.table.name,
+        data.quick,
+    )?;
+    let value = match message {
+        Some(text) => Value::build_text(text),
+        None => Value::Null,
+    };
+    state.registers[data.dest].set_value(value);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -1508,9 +1535,34 @@ pub fn op_vfilter(
             args_reg,
             idx_str,
             idx_num,
+            in_lists,
         },
         insn
     );
+    // IN lists handled all at once: collect each one's values.
+    let mut lists: Vec<Option<Vec<Value>>> = Vec::new();
+    if !in_lists.is_empty() {
+        lists.resize_with(*arg_count, || None);
+        for (arg, list_cursor) in in_lists {
+            let mut values = Vec::new();
+            let cursor = state.get_cursor(*list_cursor).as_btree_mut();
+            return_if_io!(state, cursor.rewind());
+            let mut more = !cursor.is_empty();
+            while more {
+                let cursor = state.get_cursor(*list_cursor).as_btree_mut();
+                if let Some(record) = return_if_io!(state, cursor.record()) {
+                    values.push(match record.get_value_opt(0) {
+                        Some(v) => v.to_owned()?,
+                        None => Value::Null,
+                    });
+                }
+                let cursor = state.get_cursor(*list_cursor).as_btree_mut();
+                return_if_io!(state, cursor.next());
+                more = cursor.has_record();
+            }
+            lists[*arg] = Some(values);
+        }
+    }
     let has_rows = {
         let cursor = get_cursor!(state, *cursor_id);
         let cursor = cursor.as_virtual_mut();
@@ -1523,10 +1575,17 @@ pub fn op_vfilter(
         } else {
             None
         };
-        return_if_io!(
-            state,
-            cursor.filter(*idx_num as i32, idx_str, *arg_count, args)
-        )
+        if lists.is_empty() {
+            return_if_io!(
+                state,
+                cursor.filter(*idx_num as i32, idx_str, *arg_count, args)
+            )
+        } else {
+            return_if_io!(
+                state,
+                cursor.filter_in(*idx_num as i32, idx_str, args, &lists)
+            )
+        }
     };
     // Increment filter_operations metric for virtual table filter
     state.metrics.filter_operations = state.metrics.filter_operations.wrapping_add(1);
@@ -1551,13 +1610,18 @@ pub fn op_vcolumn(
             cursor_id,
             column,
             dest,
+            nochange,
         },
         insn
     );
     let (value, pointer) = {
         let cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_virtual_mut();
-        let value = return_if_io!(state, cursor.column(*column));
+        let value = if *nochange {
+            return_if_io!(state, cursor.column_nochange(*column))
+        } else {
+            return_if_io!(state, cursor.column(*column))
+        };
         // A pointer-typed NULL (sqlite3_result_pointer in xColumn).
         let pointer = if matches!(value, Value::Null) {
             cursor.column_pointer(*column)
@@ -1667,11 +1731,18 @@ pub fn op_vupdate(
             if matches!(argv[0], Value::Null) {
                 program.connection.update_last_rowid(new_rowid);
             }
+            // Each successful xUpdate counts as a change, as in SQLite.
+            state.record_statement_change();
             state.pc += 1;
         }
         Ok(IOResult::Done(None)) => {
             // no-op or successful update without rowid return
             state.record_rows_written(1);
+            state.record_statement_change();
+            state.pc += 1;
+        }
+        // The module skipped the row under OR IGNORE: not a change.
+        Err(e) if matches!(*e, LimboError::RaiseIgnore) => {
             state.pc += 1;
         }
         Err(e)
@@ -1774,30 +1845,33 @@ pub fn op_vbegin(
     load_insn!(VBegin { cursor_id }, insn);
     let cursor = state.get_cursor(*cursor_id);
     let cursor = cursor.as_virtual_mut();
-    let vtab_id = cursor
-        .vtab_id()
-        .expect("VBegin on non ext-virtual table cursor");
+    // Built-in tables (pragma functions, ...) have no transaction hooks.
+    let Some(vtab_id) = cursor.vtab_id() else {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    };
     let mut states = program.connection.vtab_txn_states.write();
-    if let std::collections::hash_map::Entry::Vacant(slot) = states.entry(vtab_id) {
-        // Only begin a new transaction if one is not already active for this virtual table module
+    // Only begin a new transaction if one is not already active for this virtual table module
+    if states.insert(vtab_id) {
         let (_, cursor_type) = program
             .cursor_ref
             .get(*cursor_id)
             .expect("cursor_id should exist in cursor_ref");
-        // A table loaded from sqlite_schema is only known to the program.
         let vtab = match cursor_type {
             CursorType::VirtualTable(vtab) if vtab.id() == vtab_id => Some(vtab.clone()),
-            _ => program.connection.syms.read().vtab_by_id(vtab_id),
+            _ => program.connection.vtab_by_id(vtab_id),
         };
-        let Some(vtab) = vtab else {
-            return Err(LimboError::InternalError(
-                "Could not find virtual table for VBegin".to_string(),
-            )
-            .into());
-        };
-        slot.insert(vtab.clone());
-        drop(states);
-        vtab.hook(&program.connection, crate::native_ext::TableHook::Begin)?;
+        match vtab {
+            // No lock is held while the hook runs: it may query the connection.
+            Some(vtab) => {
+                drop(states);
+                vtab.hook(&program.connection, crate::native_ext::TableHook::Begin)?;
+            }
+            // A table that has gone away has nothing to begin.
+            None => {
+                states.remove(&vtab_id);
+            }
+        }
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -1819,24 +1893,16 @@ pub fn op_vrename(
     let name = state.registers[*new_name_reg].get_value().to_string();
     let cursor = state.get_cursor(*cursor_id);
     let cursor = cursor.as_virtual_mut();
-    let (_, cursor_type) = program
-        .cursor_ref
-        .get(*cursor_id)
-        .expect("cursor_id should exist in cursor_ref");
-    let vtab = match (cursor.vtab_id(), cursor_type) {
-        (Some(id), CursorType::VirtualTable(vtab)) if vtab.id() == id => Some(vtab.clone()),
-        (id, _) => id.and_then(|id| program.connection.syms.read().vtab_by_id(id)),
-    };
+    let vtab = cursor
+        .vtab_id()
+        .and_then(|id| program.connection.vtab_by_id(id));
     let Some(vtab) = vtab else {
         return Err(LimboError::InternalError(
             "Could not find virtual table for VRename".to_string(),
         )
         .into());
     };
-    vtab.hook(
-        &program.connection,
-        crate::native_ext::TableHook::Rename(&name),
-    )?;
+    vtab.rename(&program.connection, &name)?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -4044,17 +4110,20 @@ fn vtab_hook_all(
     end: bool,
     hook: crate::native_ext::TableHook<'_>,
 ) -> crate::Result<()> {
-    let vtabs: Vec<Arc<crate::VirtualTable>> = if end {
-        conn.vtab_txn_states
-            .write()
-            .drain()
-            .map(|(_, t)| t)
-            .collect()
+    let ids: Vec<u64> = if end {
+        let mut set = conn.vtab_txn_states.write();
+        if set.is_empty() {
+            return Ok(());
+        }
+        set.drain().collect()
     } else {
-        conn.vtab_txn_states.read().values().cloned().collect()
+        conn.vtab_txn_states.read().iter().copied().collect()
     };
-    for vtab in vtabs {
-        vtab.hook(conn, hook)?;
+    for id in ids {
+        // A table can be dropped (or its module replaced) mid-transaction.
+        if let Some(vtab) = conn.vtab_by_id(id) {
+            vtab.hook(conn, hook)?;
+        }
     }
     Ok(())
 }
@@ -4301,6 +4370,18 @@ pub(crate) fn vtab_savepoint_all(
 /// Rollback all virtual tables that are part of the current transaction.
 pub(crate) fn vtab_rollback_all(conn: &Arc<Connection>) -> crate::Result<()> {
     vtab_hook_all(conn, true, crate::native_ext::TableHook::Rollback)
+}
+
+/// Like [`vtab_rollback_all`], where only a plain connection reference is
+/// available (closing it): modules get xRollback without the connection.
+pub(crate) fn vtab_rollback_all_closing(conn: &Connection) -> crate::Result<()> {
+    let ids: Vec<u64> = conn.vtab_txn_states.write().drain().collect();
+    for id in ids {
+        if let Some(vtab) = conn.vtab_by_id(id) {
+            vtab.rollback()?;
+        }
+    }
+    Ok(())
 }
 
 pub fn op_halt(

@@ -5,7 +5,7 @@ use crate::sync::Arc;
 use crate::types::IOResultOr;
 use crate::vtab::{ExtVirtualTable, ExtVirtualTableCursor, VirtualTableType};
 use crate::{Connection, IOResult, LimboError, Result, Value};
-use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind, VTabModuleImpl};
+use turso_ext::{VTabKind, VTabModuleImpl};
 
 #[derive(Clone, Debug)]
 pub(crate) enum ModuleImplementation {
@@ -83,14 +83,26 @@ impl ExtensionTable {
         }
     }
 
-    pub(crate) fn best_index(
+    pub(crate) fn best_index_plan(
         &self,
-        constraints: &[ConstraintInfo],
-        order_by: &[OrderByInfo],
-    ) -> Result<IndexInfo, ResultCode> {
+        req: &crate::native_ext::IndexRequest,
+    ) -> Result<Option<crate::native_ext::IndexPlan>> {
         match self {
-            Self::C(table) => table.best_index(constraints, order_by),
-            Self::Native(table) => table.best_index(constraints, order_by),
+            Self::C(table) => {
+                crate::native_ext::best_index_via_legacy(req, |c, o| table.best_index(c, o))
+            }
+            Self::Native(table) => table.best_index_plan(req),
+        }
+    }
+
+    pub(crate) fn find_function(
+        &self,
+        n_arg: i32,
+        name: &str,
+    ) -> Option<(i32, Arc<crate::function::ExternalFunc>)> {
+        match self {
+            Self::C(_) => None,
+            Self::Native(table) => table.find_function(n_arg, name),
         }
     }
 
@@ -103,14 +115,14 @@ impl ExtensionTable {
 
     pub(crate) fn update(
         &self,
-        conn: &Arc<Connection>,
+        connection: &Arc<Connection>,
         args: &[Value],
         state: &mut ExtensionState,
         on_conflict: u8,
     ) -> IOResultOr<Option<i64>> {
         match self {
             Self::C(table) => table.update(args).map(IOResult::Done).map_err(Into::into),
-            Self::Native(table) => table.update(conn, state, args, on_conflict),
+            Self::Native(table) => table.update(connection, state, args, on_conflict),
         }
     }
 
@@ -126,6 +138,53 @@ impl ExtensionTable {
                 _ => Ok(()),
             },
             Self::Native(table) => table.hook(conn, hook),
+        }
+    }
+
+    /// Savepoint hooks (`xSavepoint`, `xRelease`, `xRollbackTo`); `op` is 0, 1 or 2.
+    pub(crate) fn savepoint_op(&self, op: u8, level: usize) -> Result<()> {
+        match self {
+            Self::C(_) => Ok(()),
+            Self::Native(table) => match op {
+                0 => table.savepoint(level),
+                1 => table.release(level),
+                _ => table.rollback_to(level),
+            },
+        }
+    }
+
+    pub(crate) fn begin(&self) -> Result<()> {
+        match self {
+            Self::C(table) => table.begin(),
+            Self::Native(table) => table.begin(),
+        }
+    }
+
+    pub(crate) fn commit(&self) -> Result<()> {
+        match self {
+            Self::C(table) => table.commit(),
+            Self::Native(table) => table.commit(),
+        }
+    }
+
+    pub(crate) fn rollback(&self) -> Result<()> {
+        match self {
+            Self::C(table) => table.rollback(),
+            Self::Native(table) => table.rollback(),
+        }
+    }
+
+    pub(crate) fn rename(&self, connection: &Arc<Connection>, name: &str) -> Result<()> {
+        match self {
+            Self::C(table) => table.rename(name),
+            Self::Native(table) => table.rename(connection, name),
+        }
+    }
+
+    pub(crate) fn destroy(&self, connection: &Arc<Connection>) -> Result<()> {
+        match self {
+            Self::C(table) => table.destroy(),
+            Self::Native(table) => table.destroy(connection),
         }
     }
 }
@@ -164,6 +223,13 @@ impl ExtensionCursor {
         }
     }
 
+    pub(crate) fn column_nochange(&mut self, column: usize) -> IOResultOr<Value> {
+        match self {
+            Self::Native(cursor) => cursor.cursor.column_nochange(column),
+            Self::C(_) => self.column(column),
+        }
+    }
+
     pub(crate) fn filter(
         &mut self,
         idx_num: i32,
@@ -177,6 +243,27 @@ impl ExtensionCursor {
                 .map(IOResult::Done)
                 .map_err(Into::into),
             Self::Native(cursor) => cursor.cursor.filter(&args, idx_str.as_deref(), idx_num),
+        }
+    }
+
+    /// `filter` with IN lists handled all at once (native modules only).
+    pub(crate) fn filter_in(
+        &mut self,
+        idx_num: i32,
+        idx_str: Option<String>,
+        args: crate::alloc::Vec<Value>,
+        in_lists: &[Option<Vec<Value>>],
+    ) -> IOResultOr<bool> {
+        match self {
+            Self::Native(cursor) => {
+                cursor
+                    .cursor
+                    .filter_in(&args, in_lists, idx_str.as_deref(), idx_num)
+            }
+            Self::C(_) => {
+                let n = args.len();
+                self.filter(idx_num, idx_str, n, args)
+            }
         }
     }
 

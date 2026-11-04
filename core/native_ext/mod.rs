@@ -1,10 +1,16 @@
 mod function;
+mod index;
 mod vtab;
 
 pub use crate::function::ReturnType;
 
 pub use function::{
     Aggregate, AggregateFunction, FunctionArity, ScalarCall, ScalarFunction, ScalarReturn,
+};
+pub(crate) use index::best_index_via_legacy;
+pub use index::{
+    index_op, IndexConstraint, IndexOrderBy, IndexPlan, IndexRequest, INDEX_SCAN_HEX,
+    INDEX_SCAN_UNIQUE,
 };
 pub use turso_ext::{ConstraintInfo, ConstraintUsage, IndexInfo, OrderByInfo, VTabKind};
 pub use vtab::{

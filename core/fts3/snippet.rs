@@ -318,9 +318,11 @@ pub(crate) fn snippet(
 }
 
 /// `sqlite3Fts3Offsets`.
-pub(crate) fn offsets(st: &mut CursorState) -> Result<String> {
+/// offsets(): None (NULL) when no term was found in the row, as SQLite
+/// returns its unallocated result buffer.
+pub(crate) fn offsets(st: &mut CursorState) -> Result<Option<String>> {
     if st.eval.as_ref().is_none_or(|e| e.expr.root.is_none()) {
-        return Ok(String::new());
+        return Ok(Some(String::new()));
     }
     st.eval.as_mut().unwrap().cancel_incr();
     let ncol = st.tab.ncol();
@@ -395,10 +397,11 @@ pub(crate) fn offsets(st: &mut CursorState) -> Result<String> {
             }
         }
     }
-    if !res.is_empty() {
-        res.pop();
+    if res.is_empty() {
+        return Ok(None);
     }
-    Ok(res)
+    res.pop();
+    Ok(Some(res))
 }
 
 fn doctotal(st: &CursorState) -> Result<(i64, Vec<u8>)> {

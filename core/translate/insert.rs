@@ -89,6 +89,14 @@ fn validate(
     {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
+    if crate::translate::planner::is_protected_shadow_table(
+        resolver,
+        conn,
+        namespace.database_id,
+        table_name,
+    ) {
+        crate::bail_parse_error!("table {} may not be modified", table_name);
+    }
     // Check if this table has any incompatible dependent views
     // Check if this is a materialized view. Must look up the schema of the
     // table's own database: a table in an attached database can share a name
@@ -290,16 +298,19 @@ pub fn translate_insert(
     let namespace = resolver.resolve_queried_table(&tbl_name)?;
     let database_id = namespace.database_id;
     let table_name = &tbl_name.name;
-    let table = match resolver.with_schema(database_id, |s| {
-        s.get_table(namespace.id, table_name.as_str())
-    }) {
+    let table = match crate::translate::planner::table_or_eponymous(
+        resolver,
+        namespace,
+        table_name.as_str(),
+    )? {
         Some(table) => table,
         None => crate::bail_parse_error!(
             "no such table: {}",
             crate::util::table_name_for_error(&tbl_name)
         ),
     };
-    if program.trigger.is_some() && table.virtual_table().is_some() {
+    // Triggers may write innocuous virtual tables (e.g. R*Tree), as in SQLite.
+    if program.trigger.is_some() && table.virtual_table().is_some_and(|vt| !vt.innocuous) {
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name.name.as_str());
     }
     validate(table_name.as_str(), resolver, &table, namespace, connection)?;
@@ -313,9 +324,11 @@ pub fn translate_insert(
             virtual_table.clone(),
             columns,
             body,
+            returning,
             on_conflict,
             resolver,
             connection,
+            namespace,
         )?;
         return Ok(());
     }
@@ -3491,14 +3504,17 @@ fn emit_preflight_constraint_checks(
 }
 
 // TODO: comeback here later to apply the same improvements on select
+#[allow(clippy::too_many_arguments)]
 fn translate_virtual_table_insert(
     program: &mut ProgramBuilder,
     virtual_table: Arc<VirtualTable>,
     columns: Vec<ast::Name>,
     mut body: InsertBody,
+    mut returning: Vec<ResultColumn>,
     on_conflict: Option<ResolveType>,
-    resolver: &Resolver,
+    resolver: &mut Resolver,
     connection: &Arc<crate::Connection>,
+    namespace: NamespaceRef,
 ) -> Result<()> {
     #[cfg(not(feature = "cli_only"))]
     let _ = connection;
@@ -3522,35 +3538,264 @@ fn translate_virtual_table_insert(
             if select.body.compounds.is_empty()
                 && matches!(select.body.select, OneSelect::Values(_))
     );
-    if !is_values {
-        if let InsertBody::Select(select, None) = body {
-            return translate_virtual_table_insert_select(
-                program,
-                virtual_table,
-                columns,
-                select,
-                on_conflict,
-                resolver,
-                connection,
-            );
+    let table = Table::Virtual(virtual_table.clone());
+    let cursor_id = program.alloc_cursor_id(CursorType::VirtualTable(virtual_table.clone()));
+    // RETURNING reads the inserted row's registers; rows are buffered so
+    // every xUpdate runs before the first row is returned, as in SQLite.
+    let mut returning_refs = TableReferences::new(
+        vec![JoinedTable {
+            table: table.clone(),
+            identifier: normalize_ident(&virtual_table.name),
+            has_alias: false,
+            internal_id: program.table_reference_counter.next(),
+            op: Operation::default_scan_for(&table),
+            unmatched_right_rows_plan: None,
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            namespace,
+            indexed: None,
+            plan_estimate: None,
+        }],
+        vec![],
+    );
+    let mut returning_subqueries = vec![];
+    plan_subqueries_from_returning(
+        program,
+        &mut returning_subqueries,
+        &mut returning_refs,
+        &mut returning,
+        resolver,
+        connection,
+    )?;
+    let returning_columns =
+        process_returning_clause(&mut returning, &mut returning_refs, resolver)?;
+    let returning_buffer = (!returning_columns.is_empty()).then(|| {
+        let columns = (0..returning_columns.len())
+            .map(|i| {
+                Column::new(
+                    Some(format!("__returning_{i}")),
+                    "BLOB".to_string(),
+                    None,
+                    None,
+                    schema::Type::Blob,
+                    None,
+                    ColDef::default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let buffer_table = Arc::new(BTreeTable::new(
+            0,
+            "vtab_returning_buffer".to_string(),
+            crate::alloc::vec![],
+            columns.into_iter().collect(),
+            schema::BTreeCharacteristics::HAS_ROWID,
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            None,
+        ));
+        let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(buffer_table));
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id,
+            is_table: true,
+        });
+        ReturningBufferCtx {
+            cursor_id,
+            num_columns: returning_columns.len(),
         }
+    });
+    let layout = ColumnLayout::from_table(&table)?;
+    // SQLite's RETURNING reports -1 as the rowid of a virtual table insert.
+    let returning_rowid = program.alloc_register();
+    if !returning_columns.is_empty() {
+        program.emit_insn(Insn::Integer {
+            value: -1,
+            dest: returning_rowid,
+        });
     }
+    program.emit_insn(Insn::VOpen { cursor_id });
+    if !allow_dbpage_write {
+        program.emit_insn(Insn::VBegin { cursor_id });
+    }
+    let conflict_action = on_conflict.as_ref().map(|c| c.bit_value()).unwrap_or(0) as u16;
+    let halt_label = program.allocate_label();
+
+    if !is_values && !matches!(body, InsertBody::DefaultValues) {
+        let InsertBody::Select(select, None) = body else {
+            crate::bail_parse_error!("Unsupported INSERT body for virtual tables");
+        };
+        // INSERT ... SELECT: like SQLite, the rows go through a temporary
+        // table first, so the SELECT may read the table being written.
+        // A SELECT can produce many rows.
+        program.set_multi_write(true);
+        program.set_may_abort(true);
+        let yield_reg = program.alloc_register();
+        let jump_on_definition = program.allocate_label();
+        let start_offset = program.allocate_label();
+        program.emit_insn(Insn::InitCoroutine {
+            yield_reg,
+            jump_on_definition,
+            start_offset,
+        });
+        program.preassign_label_to_next_insn(start_offset);
+        let query_destination = QueryDestination::CoroutineYield {
+            yield_reg,
+            coroutine_implementation_start: halt_label,
+        };
+        let num_values = program.nested(|program| {
+            translate_select(select, resolver, program, query_destination, connection)
+        })?;
+        program.emit_insn(Insn::EndCoroutine { yield_reg });
+        program.preassign_label_to_next_insn(jump_on_definition);
+
+        let columns_for_temp = (0..num_values)
+            .map(|i| {
+                Column::new(
+                    Some(format!("__vtab_insert_{i}")),
+                    "BLOB".to_string(),
+                    None,
+                    None,
+                    schema::Type::Blob,
+                    None,
+                    ColDef::default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let temp_table = Arc::new(BTreeTable::new(
+            0,
+            "vtab_insert_buffer".to_string(),
+            crate::alloc::vec![],
+            columns_for_temp.into_iter().collect(),
+            schema::BTreeCharacteristics::HAS_ROWID,
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            None,
+        ));
+        let temp_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(temp_table));
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id: temp_cursor_id,
+            is_table: true,
+        });
+        let fill_loop = program.allocate_label();
+        let fill_done = program.allocate_label();
+        program.preassign_label_to_next_insn(fill_loop);
+        program.emit_insn(Insn::Yield {
+            yield_reg,
+            end_offset: fill_done,
+            subtype_clear_start_reg: 0,
+            subtype_clear_count: 0,
+        });
+        let record_reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(program.reg_result_cols_start.unwrap_or(yield_reg + 1)),
+            count: to_u32(num_values),
+            dest_reg: to_u32(record_reg),
+            index_name: None,
+            affinity_str: None,
+        });
+        let temp_rowid_reg = program.alloc_register();
+        program.emit_insn(Insn::NewRowid {
+            cursor: temp_cursor_id,
+            rowid_reg: temp_rowid_reg,
+            prev_largest_reg: 0,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: temp_cursor_id,
+            key_reg: temp_rowid_reg,
+            record_reg,
+            flag: InsertFlags::new()
+                .require_seek()
+                .is_ephemeral_table_insert(),
+            table_name: String::new(),
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: fill_loop,
+        });
+        program.preassign_label_to_next_insn(fill_done);
+
+        // argv[0] = NULL (insert), argv[1] = rowid, argv[2..] = columns.
+        let registers_start = program.alloc_register();
+        program.emit_insn(Insn::Null {
+            dest: registers_start,
+            dest_end: None,
+        });
+        let insertion = build_insertion(program, &table, &columns, num_values)?;
+        let loop_start_label = program.allocate_label();
+        let loop_end_label = program.allocate_label();
+        translate_rows_multiple(
+            program,
+            &insertion,
+            yield_reg,
+            resolver,
+            &Some(TempTableCtx {
+                cursor_id: temp_cursor_id,
+                loop_start_label,
+                loop_end_label,
+            }),
+            false,
+        )?;
+        program.emit_insn(Insn::VUpdate {
+            cursor_id,
+            arg_count: insertion.col_mappings.len() + 2,
+            start_reg: registers_start,
+            conflict_action,
+        });
+        emit_vtab_returning_subqueries(
+            program,
+            resolver,
+            &returning_refs,
+            &mut returning_subqueries,
+            &insertion,
+            returning_rowid,
+            &layout,
+        )?;
+        emit_returning_results(
+            program,
+            &returning_refs,
+            &returning_columns,
+            insertion.first_col_register(),
+            returning_rowid,
+            resolver,
+            returning_buffer.as_ref(),
+            &layout,
+        )?;
+        program.emit_insn(Insn::Next {
+            cursor_id: temp_cursor_id,
+            pc_if_next: loop_start_label,
+            fullscan: false,
+            is_index: false,
+        });
+        program.preassign_label_to_next_insn(loop_end_label);
+        program.emit_insn(Insn::Close { cursor_id });
+        if let Some(buf) = &returning_buffer {
+            emit_returning_scan_back(program, buf);
+        }
+        program.preassign_label_to_next_insn(halt_label);
+        program.result_columns = returning_columns;
+        program.table_references.extend(returning_refs);
+        return Ok(());
+    }
+
     let (num_values, rows) = match &mut body {
         InsertBody::Select(select, None) => match &mut select.body.select {
             OneSelect::Values(values) => (values[0].len(), std::mem::take(values)),
             _ => crate::bail_parse_error!("Virtual tables only support VALUES clause in INSERT"),
         },
-        InsertBody::DefaultValues => (0, vec![vec![]]),
+        // A virtual table has no column defaults: every column is NULL.
+        InsertBody::DefaultValues => {
+            let n = table.columns().iter().filter(|c| !c.hidden()).count();
+            (
+                n,
+                vec![vec![Box::new(ast::Expr::Literal(ast::Literal::Null)); n]],
+            )
+        }
         _ => crate::bail_parse_error!("Unsupported INSERT body for virtual tables"),
     };
     // As in SQLite, one VALUES row is a single write: no statement savepoint.
     program.set_vtab_single_write(rows.len() <= 1);
-    let table = Table::Virtual(virtual_table.clone());
-    let cursor_id = program.alloc_cursor_id(CursorType::VirtualTable(virtual_table));
-    program.emit_insn(Insn::VOpen { cursor_id });
-    if !allow_dbpage_write {
-        program.emit_insn(Insn::VBegin { cursor_id });
-    }
     /* *
      * Inserts for virtual tables are done in a single step.
      * argv[0] = (NULL for insert)
@@ -3566,8 +3811,6 @@ fn translate_virtual_table_insert(
      * */
     let insertion = build_insertion(program, &table, &columns, num_values)?;
 
-    let conflict_action = on_conflict.as_ref().map(|c| c.bit_value()).unwrap_or(0) as u16;
-
     // One xUpdate per VALUES row.
     for value in &rows {
         translate_rows_single(program, value, &insertion, resolver, false)?;
@@ -3577,95 +3820,78 @@ fn translate_virtual_table_insert(
             start_reg: registers_start,
             conflict_action,
         });
+        emit_vtab_returning_subqueries(
+            program,
+            resolver,
+            &returning_refs,
+            &mut returning_subqueries,
+            &insertion,
+            returning_rowid,
+            &layout,
+        )?;
+        emit_returning_results(
+            program,
+            &returning_refs,
+            &returning_columns,
+            insertion.first_col_register(),
+            returning_rowid,
+            resolver,
+            returning_buffer.as_ref(),
+            &layout,
+        )?;
     }
 
     program.emit_insn(Insn::Close { cursor_id });
+    if let Some(buf) = &returning_buffer {
+        emit_returning_scan_back(program, buf);
+    }
+    program.result_columns = returning_columns;
+    program.table_references.extend(returning_refs);
 
-    let halt_label = program.allocate_label();
     program.preassign_label_to_next_insn(halt_label);
 
     Ok(())
 }
 
-/// `INSERT INTO vtab SELECT ...`: one xUpdate per row of the SELECT, which
-/// runs as a coroutine (SQLite's insert template 3).
-fn translate_virtual_table_insert_select(
+/// Evaluates the RETURNING subqueries of a virtual table insert against the
+/// inserted row. A plan is emitted once; later VALUES rows reuse its result.
+#[allow(clippy::too_many_arguments)]
+fn emit_vtab_returning_subqueries(
     program: &mut ProgramBuilder,
-    virtual_table: Arc<VirtualTable>,
-    columns: Vec<ast::Name>,
-    select: ast::Select,
-    on_conflict: Option<ResolveType>,
-    resolver: &Resolver,
-    connection: &Arc<crate::Connection>,
+    resolver: &mut Resolver,
+    table_references: &TableReferences,
+    subqueries: &mut [crate::translate::plan::NonFromClauseSubquery],
+    insertion: &Insertion,
+    rowid_reg: usize,
+    layout: &ColumnLayout,
 ) -> Result<()> {
-    // A SELECT can produce many rows.
-    program.set_multi_write(true);
-    program.set_may_abort(true);
-    let table = Table::Virtual(virtual_table.clone());
-    let required = if columns.is_empty() {
-        table.columns().iter().filter(|c| !c.hidden()).count()
-    } else {
-        columns.len()
-    };
-    let halt_label = program.allocate_label();
-    let yield_reg = program.alloc_register();
-    let jump_on_definition = program.allocate_label();
-    let start_offset = program.allocate_label();
-    program.emit_insn(Insn::InitCoroutine {
-        yield_reg,
-        jump_on_definition,
-        start_offset,
-    });
-    program.preassign_label_to_next_insn(start_offset);
-    let destination = QueryDestination::CoroutineYield {
-        yield_reg,
-        coroutine_implementation_start: halt_label,
-    };
-    let num_result_cols = program
-        .nested(|program| translate_select(select, resolver, program, destination, connection))?;
-    if num_result_cols != required {
-        crate::bail_parse_error!(
-            "table {} has {required} columns but {num_result_cols} values were supplied",
-            table.get_name()
-        );
+    if subqueries.iter().all(|s| s.has_been_evaluated()) {
+        return Ok(());
     }
-    program.emit_insn(Insn::EndCoroutine { yield_reg });
-    program.preassign_label_to_next_insn(jump_on_definition);
-    let result_start = program.reg_result_cols_start.unwrap_or(yield_reg + 1);
-
-    let cursor_id = program.alloc_cursor_id(CursorType::VirtualTable(virtual_table));
-    program.emit_insn(Insn::VOpen { cursor_id });
-    program.emit_insn(Insn::VBegin { cursor_id });
-    let registers_start = program.alloc_register();
-    program.emit_insn(Insn::Null {
-        dest: registers_start,
-        dest_end: None,
-    });
-    let insertion = build_insertion(program, &table, &columns, num_result_cols)?;
-    let conflict_action = on_conflict.as_ref().map(|c| c.bit_value()).unwrap_or(0) as u16;
-    let loop_start = program.allocate_label();
-    let done = program.allocate_label();
-    program.preassign_label_to_next_insn(loop_start);
-    program.emit_insn(Insn::Yield {
-        yield_reg,
-        end_offset: done,
-        subtype_clear_start_reg: 0,
-        subtype_clear_count: 0,
-    });
-    translate_rows_multiple(program, &insertion, result_start, resolver, &None, false)?;
-    program.emit_insn(Insn::VUpdate {
-        cursor_id,
-        arg_count: insertion.col_mappings.len() + 2,
-        start_reg: registers_start,
-        conflict_action,
-    });
-    program.emit_insn(Insn::Goto {
-        target_pc: loop_start,
-    });
-    program.preassign_label_to_next_insn(done);
-    program.emit_insn(Insn::Close { cursor_id });
-    program.preassign_label_to_next_insn(halt_label);
-    Ok(())
+    let cache_state = seed_returning_row_image_in_cache(
+        program,
+        table_references,
+        insertion.first_col_register(),
+        rowid_reg,
+        resolver,
+        layout,
+    )?;
+    let result: Result<()> = (|| {
+        for subquery in subqueries.iter_mut().filter(|s| !s.has_been_evaluated()) {
+            let correlated = subquery.correlated;
+            let plan = subquery.consume_plan(EvalAt::Loop(0));
+            emit_non_from_clause_subquery(
+                program,
+                resolver,
+                *plan,
+                &subquery.query_type,
+                correlated,
+            )?;
+        }
+        Ok(())
+    })();
+    restore_returning_row_image_in_cache(resolver, cache_state);
+    result
 }
 
 /// Build the UNIQUE constraint error description to match sqlite

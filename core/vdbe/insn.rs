@@ -312,6 +312,17 @@ pub struct IntegrityCkData {
     pub message_register: usize,
 }
 
+/// Data for VCheck (boxed to keep Insn small).
+#[derive(Debug, Clone)]
+pub struct VCheckData {
+    pub table: Arc<crate::vtab::VirtualTable>,
+    /// Schema name handed to xIntegrity.
+    pub schema: String,
+    pub quick: bool,
+    /// Receives the error text, or NULL.
+    pub dest: usize,
+}
+
 /// Data for AddSequence instruction (boxed to keep Insn small).
 #[derive(Debug, Clone)]
 pub struct AddSequenceData {
@@ -843,6 +854,8 @@ pub enum Insn {
         module_name: usize, // P1: Name of the module that contains the virtual table implementation
         table_name: usize,  // P2: Name of the virtual table
         args_reg: Option<usize>,
+        /// The database the table is created in.
+        db: usize,
     },
 
     /// Initialize the position of the virtual table cursor.
@@ -853,6 +866,9 @@ pub enum Insn {
         args_reg: usize,
         idx_str: Option<usize>,
         idx_num: usize,
+        /// (argument, cursor): IN arguments passed whole, read from the
+        /// ephemeral index of their values.
+        in_lists: Vec<(usize, CursorID)>,
     },
 
     /// Read a column from the current row of the virtual table cursor.
@@ -860,6 +876,9 @@ pub enum Insn {
         cursor_id: CursorID,
         column: usize,
         dest: usize,
+        /// UPDATE passes the column through unchanged (OPFLAG_NOCHANGE):
+        /// `sqlite3_vtab_nochange` is true while the table reads it.
+        nochange: bool,
     },
 
     /// `VUpdate`: Virtual Table Insert/Update/Delete Instruction
@@ -2133,6 +2152,10 @@ pub enum Insn {
     IntegrityCk {
         data: Box<IntegrityCkData>,
     },
+    /// Run a virtual table's xIntegrity (SQLite's OP_VCheck).
+    VCheck {
+        data: Box<VCheckData>,
+    },
     RenameTable {
         db: usize,
         namespace: NamespaceId,
@@ -2448,6 +2471,7 @@ impl InsnVariants {
             InsnVariants::VOpen => execute::op_vopen,
             InsnVariants::VCreate => execute::op_vcreate,
             InsnVariants::VFilter => execute::op_vfilter,
+            InsnVariants::VCheck => execute::op_vcheck,
             InsnVariants::VColumn => execute::op_vcolumn,
             InsnVariants::VUpdate => execute::op_vupdate,
             InsnVariants::VNext => execute::op_vnext,

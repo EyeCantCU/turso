@@ -219,6 +219,14 @@ fn validate_update(
     {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
+    if crate::translate::planner::is_protected_shadow_table(
+        resolver,
+        conn,
+        namespace.database_id,
+        table_name,
+    ) {
+        crate::bail_parse_error!("table {} may not be modified", table_name);
+    }
     // Check if this is a materialized view. Must look up the schema of the
     // table's own database: a table in an attached database can share a name
     // with a materialized view in a different database.
@@ -253,16 +261,18 @@ fn prepare_update_plan(
     let namespace = resolver.resolve_queried_table(&body.tbl_name)?;
     let database_id = namespace.database_id;
     let target_name = &body.tbl_name.name;
-    let table = match resolver.with_schema(database_id, |s| {
-        s.get_table(namespace.id, target_name.as_str())
-    }) {
+    let table = match crate::translate::planner::table_or_eponymous(
+        resolver,
+        namespace,
+        target_name.as_str(),
+    )? {
         Some(table) => table,
         None => bail_parse_error!(
             "no such table: {}",
             crate::util::table_name_for_error(&body.tbl_name)
         ),
     };
-    if program.trigger.is_some() && table.virtual_table().is_some() {
+    if program.trigger.is_some() && table.virtual_table().is_some_and(|vt| !vt.innocuous) {
         bail_parse_error!(
             "unsafe use of virtual table \"{}\"",
             body.tbl_name.name.as_str()
@@ -270,6 +280,9 @@ fn prepare_update_plan(
     }
     if table.btree().is_some_and(|bt| !bt.has_rowid) {
         bail_parse_error!("UPDATE of WITHOUT ROWID tables is not supported");
+    }
+    if table.virtual_table().is_some() && !body.returning.is_empty() {
+        bail_parse_error!("UPDATE RETURNING is not available on virtual tables");
     }
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;

@@ -132,6 +132,7 @@ fn emit_integrity_result_row(program: &mut ProgramBuilder, registers: &Registers
     program.preassign_label_to_next_insn(continue_label);
 }
 
+/// Reports what a virtual table's xIntegrity finds, as one result row.
 fn emit_row_missing_from_index_error(
     program: &mut ProgramBuilder,
     registers: &Registers,
@@ -251,8 +252,28 @@ fn translate_integrity_check_for_schema(
             .tables(namespace)
             .map(move |table| (namespace, table))
     }) {
-        let Table::BTree(btree_table) = table.as_ref() else {
-            continue;
+        let btree_table = match table.as_ref() {
+            Table::BTree(btree_table) => btree_table,
+            Table::Virtual(vtab) if vtab.has_integrity() => {
+                // SQLite's OP_VCheck: xIntegrity reports problems as text.
+                let ok = program.allocate_label();
+                program.emit_insn(Insn::VCheck {
+                    data: Box::new(crate::vdbe::insn::VCheckData {
+                        table: vtab.clone(),
+                        schema: database_name.clone(),
+                        quick,
+                        dest: registers.message,
+                    }),
+                });
+                program.emit_insn(Insn::IsNull {
+                    reg: registers.message,
+                    target_pc: ok,
+                });
+                emit_integrity_result_row(program, &registers);
+                program.preassign_label_to_next_insn(ok);
+                continue;
+            }
+            _ => continue,
         };
 
         if btree_table.root_page <= 0 || !connection_root_pages.contains(&btree_table.root_page) {

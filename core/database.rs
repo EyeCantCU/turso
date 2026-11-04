@@ -58,7 +58,7 @@ use crate::{
 };
 use crate::{Statement, Value};
 use arc_swap::{ArcSwap, ArcSwapOption};
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::any::Any;
 #[cfg(host_shared_wal)]
 use std::path::Path;
@@ -2772,6 +2772,7 @@ impl Database {
                 crate::incremental::vdbe_maintenance::MaintenanceProgramCache::new(),
             metrics: RwLock::new(ConnectionMetrics::new()),
             nestedness: AtomicI32::new(0),
+            defensive: crate::sync::atomic::AtomicBool::new(false),
             compiling_triggers: RwLock::new(Vec::new()),
             executing_triggers: RwLock::new(Vec::new()),
             encryption_key: RwLock::new(encryption_key),
@@ -2801,7 +2802,8 @@ impl Database {
                 crate::connection::StatementActivity::default(),
             )),
             check_constraints_pragma: AtomicBool::new(false),
-            vtab_txn_states: RwLock::new(HashMap::default()),
+            vtab_txn_states: RwLock::new(HashSet::default()),
+            vtab_connect_only: AtomicBool::new(false),
             index_method_tx_cursors: crate::sync::Mutex::new(Vec::new()),
             has_index_method_tx_cursors: crate::sync::atomic::AtomicBool::new(false),
             named_savepoints: RwLock::new(Vec::new()),

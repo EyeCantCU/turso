@@ -3,7 +3,6 @@ use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
 use std::iter;
 
-use turso_ext::{ConstraintInfo, ConstraintUsage, ResultCode};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
@@ -16,9 +15,8 @@ use crate::translate::expr::{
 };
 use crate::translate::expr_context::ExprContext;
 use crate::translate::optimizer::constraints::{
-    convert_to_vtab_constraint, ordered_ephemeral_key_columns, partial_index,
-    partial_index_predicate_terms, BinaryExprSide, Constraint, ConstraintOperator,
-    RangeConstraintRef,
+    ordered_ephemeral_key_columns, partial_index, partial_index_predicate_terms, BinaryExprSide,
+    Constraint, ConstraintOperator, RangeConstraintRef,
 };
 use crate::translate::optimizer::cost::{rows_per_leaf_page_for_index, RowCountEstimate};
 use crate::translate::optimizer::cost_params::CostModelParams;
@@ -33,7 +31,6 @@ use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
 use crate::{
     schema::{FromClauseSubquery, Index, IndexColumn, Table},
     translate::plan::{IndexMethodQuery, IterationDirection, JoinOrderMember, JoinedTable},
-    vtab::VirtualTable,
     LimboError, Result,
 };
 
@@ -89,16 +86,10 @@ pub enum AccessMethodParams {
         constraint_refs: Vec<RangeConstraintRef>,
     },
     VirtualTable {
-        /// Index identifier returned by the table's `best_index` method.
-        idx_num: i32,
-        /// Optional index string returned by the table's `best_index` method.
-        idx_str: Option<String>,
-        /// Constraint descriptors passed to the virtual table’s `filter` method.
-        /// Each corresponds to a column/operator pair from the WHERE clause.
-        constraints: Vec<ConstraintInfo>,
-        /// Information returned by the virtual table's `best_index` method
-        /// describing how each constraint will be used.
-        constraint_usages: Vec<ConstraintUsage>,
+        /// The planned xBestIndex calls of the table.
+        candidates: Arc<super::vtab::VtabCandidates>,
+        /// The chosen plan in `candidates.loops`.
+        loop_idx: usize,
     },
     /// FROM-subquery scan. Coroutine-backed scans run forwards; materialized
     /// subqueries may also be scanned backwards when their intrinsic order
@@ -807,11 +798,11 @@ pub fn find_best_access_method_for_join_order(
             params,
             planning_context.resolver,
         ),
-        Table::Virtual(vtab) => find_best_access_method_for_vtab(
-            vtab,
-            vtab_order_by(rhs_table.internal_id, planning_context.maybe_order_target),
-            &rhs_constraints.constraints,
-            join_order,
+        Table::Virtual(_) => find_best_access_method_for_vtab(
+            rhs_constraints,
+            lhs_mask,
+            planning_context.maybe_order_target,
+            rhs_table.internal_id,
             input_cardinality,
             base_row_count,
             params,
@@ -1154,109 +1145,86 @@ fn has_two_local_constraint_terms(
     false
 }
 
-/// The ORDER BY terms SQLite offers to xBestIndex: only when every term is
-/// a column (or the rowid, as column `u32::MAX`) of this table.
-fn vtab_order_by(
-    table_id: TableInternalId,
-    maybe_order_target: Option<&super::order::OrderTarget>,
-) -> Vec<turso_ext::OrderByInfo> {
-    use super::order::{ColumnTarget, EliminatesSortBy, OrderTargetPurpose};
-    let Some(target) = maybe_order_target else {
-        return Vec::new();
-    };
-    if !matches!(
-        target.purpose,
-        OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order)
-    ) {
-        return Vec::new();
-    }
-    let mut out = Vec::with_capacity(target.columns.len());
-    for c in &target.columns {
-        if c.table_id != table_id {
-            return Vec::new();
-        }
-        let column_index = match c.target {
-            ColumnTarget::Column(i) => i as u32,
-            ColumnTarget::RowId => u32::MAX,
-            ColumnTarget::Expr(_) => return Vec::new(),
-        };
-        out.push(turso_ext::OrderByInfo {
-            column_index,
-            desc: c.order == ast::SortOrder::Desc,
-        });
-    }
-    out
-}
-
 fn find_best_access_method_for_vtab(
-    vtab: &VirtualTable,
-    order_by: Vec<turso_ext::OrderByInfo>,
-    constraints: &[Constraint],
-    join_order: &[JoinOrderMember],
+    rhs_constraints: &TableConstraints,
+    lhs_mask: &TableMask,
+    maybe_order_target: Option<&OrderTarget>,
+    rhs_table_id: TableInternalId,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
-    let vtab_constraints = convert_to_vtab_constraint(constraints, join_order)?;
-
-    // The ORDER BY is offered, but a consumed order does not yet remove the sort.
-    let best_index_result = vtab.best_index(&vtab_constraints, &order_by);
-
-    match best_index_result {
-        Ok(index_info) => {
-            if index_info.constraint_usages.len() != vtab_constraints.len() {
-                return Err(LimboError::ExtensionError(format!(
-                    "Constraint usage count mismatch (expected {}, got {})",
-                    vtab_constraints.len(),
-                    index_info.constraint_usages.len()
-                )));
-            }
-            let has_row_estimate = index_info.estimated_rows != u32::MAX;
-            let estimated_rows_per_outer_row = if has_row_estimate {
-                f64::from(index_info.estimated_rows)
-            } else {
-                *base_row_count
-            };
-            // A row estimate includes each condition passed to the virtual table.
-            // Do not apply the same row cut again in the join planner.
-            let consumed_where_terms = if has_row_estimate {
-                vtab_constraints
-                    .iter()
-                    .zip(&index_info.constraint_usages)
-                    .filter(|(_, usage)| usage.argv_index.is_some())
-                    .map(|(vtab_constraint, _)| {
-                        constraints[vtab_constraint.index].where_clause_pos.0
-                    })
-                    .try_collect()?
-            } else {
-                BitSet::default()
-            };
-            Ok(Some(AccessMethod {
-                // TODO: Base cost on `IndexInfo::estimated_cost`.
-                cost: estimate_cost_for_scan_or_seek(
-                    None,
-                    &[],
-                    &[],
-                    input_cardinality,
-                    base_row_count,
-                    false,
-                    params,
-                    None,
-                ),
-                estimated_rows_per_outer_row,
-                consumed_where_terms,
-                params: AccessMethodParams::VirtualTable {
-                    idx_num: index_info.idx_num,
-                    idx_str: index_info.idx_str,
-                    constraints: vtab_constraints,
-                    constraint_usages: index_info.constraint_usages,
-                },
-            }))
+    let Some(candidates) = rhs_constraints.vtab.as_ref() else {
+        return Ok(None);
+    };
+    let ready: u64 = lhs_mask
+        .iter()
+        .filter(|i| *i < 64)
+        .fold(0, |acc, i| acc | (1 << i));
+    // The ORDER BY can only be consumed if it is all on this table.
+    let order_is_ours = maybe_order_target.is_some_and(|target| {
+        !candidates.order_by.is_empty() && target.columns.iter().all(|c| c.table_id == rhs_table_id)
+    });
+    let mut best: Option<(f64, usize, AccessMethod)> = None;
+    for (loop_idx, l) in candidates.loops.iter().enumerate() {
+        if l.prereq & !ready != 0 {
+            continue;
         }
-        Err(ResultCode::ConstraintViolation) => Ok(None),
-        Err(e) => Err(LimboError::from(e)),
+        let rows = if l.plan.estimated_rows >= 0 {
+            l.plan.estimated_rows as f64
+        } else {
+            *base_row_count
+        };
+        let cost = if l.plan.legacy {
+            estimate_cost_for_scan_or_seek(
+                None,
+                &[],
+                &[],
+                input_cardinality,
+                base_row_count,
+                false,
+                params,
+                None,
+            )
+        } else {
+            // SQLite runs xFilter once per outer row at estimatedCost each.
+            Cost(input_cardinality * l.plan.estimated_cost * VTAB_COST_SCALE)
+        };
+        let mut rank = cost.0;
+        if order_is_ours && !l.order_consumed {
+            let n = (rows * input_cardinality).max(2.0);
+            rank += n * n.log2() * params.sort_cpu_per_row;
+        }
+        let consumed_where_terms = if l.plan.estimated_rows >= 0 {
+            l.args
+                .iter()
+                .filter_map(|&t| {
+                    let term = &candidates.terms[t];
+                    (term.where_idx != usize::MAX).then_some(term.where_idx)
+                })
+                .try_collect()?
+        } else {
+            BitSet::default()
+        };
+        let method = AccessMethod {
+            cost,
+            estimated_rows_per_outer_row: if l.unique { rows.min(1.0) } else { rows },
+            consumed_where_terms,
+            params: AccessMethodParams::VirtualTable {
+                candidates: candidates.clone(),
+                loop_idx,
+            },
+        };
+        if best.as_ref().is_none_or(|(r, _, _)| rank < *r) {
+            best = Some((rank, loop_idx, method));
+        }
     }
+    Ok(best.map(|(_, _, m)| m))
 }
+
+/// SQLite's estimatedCost units per Turso cost unit: a full scan of N rows is
+/// about 3N in SQLite and about N / 50 + 0.003 N here.
+const VTAB_COST_SCALE: f64 = 0.023 / 3.0;
 
 /// Return the one table read by an expression.
 fn one_table_in_expr(expr: &ast::Expr) -> Option<TableInternalId> {

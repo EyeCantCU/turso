@@ -4,7 +4,9 @@
 use std::ptr;
 
 mod fts3;
+mod rtree;
 mod vtab;
+mod vtab_plan;
 
 #[repr(C)]
 struct sqlite3 {

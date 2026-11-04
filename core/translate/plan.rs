@@ -958,6 +958,8 @@ pub enum DmlSafetyReason {
     /// so writes could invalidate the live iterator.
     IndexMethodNotMaterialized,
     FkCascade,
+    /// A virtual table must not be written while its cursor is scanning it.
+    VirtualTable,
 }
 
 /// Safety decisions made while planning UPDATE/DELETE.
@@ -3070,7 +3072,10 @@ impl Operation {
             Table::Virtual(_) => Operation::Scan(Scan::VirtualTable {
                 idx_num: -1,
                 idx_str: None,
+                explain: String::new(),
                 constraints: Vec::new(),
+                in_args: Vec::new(),
+                omit_offset: false,
             }),
             Table::FromClauseSubquery(_) => Operation::Scan(Scan::Subquery {
                 iter_dir: IterationDirection::Forwards,
@@ -3962,9 +3967,16 @@ pub enum Scan {
         idx_num: i32,
         /// Optional index name returned by the table’s `best_index` method.
         idx_str: Option<String>,
+        /// `idxNum:idxStr` as EXPLAIN QUERY PLAN shows it.
+        explain: String,
         /// Constraining expressions to be passed to the table’s `filter` method.
         /// The order of expressions matches the argument order expected by the virtual table.
+        /// An IN argument is its whole `IN` expression; see `in_args`.
         constraints: Vec<Expr>,
+        /// The arguments that are IN constraints.
+        in_args: Vec<VtabInArg>,
+        /// The table skips the OFFSET rows itself.
+        omit_offset: bool,
     },
     /// A scan of a subquery in the `FROM` clause.
     Subquery {
@@ -3995,6 +4007,17 @@ pub enum Search {
         index: Option<Arc<Index>>,
         source: InSeekSource,
     },
+}
+
+/// An `IN` argument of a virtual table scan.
+#[derive(Clone, Debug)]
+pub struct VtabInArg {
+    /// Position in the xFilter arguments.
+    pub arg: usize,
+    /// Passed whole (`sqlite3_vtab_in`); otherwise one xFilter per value.
+    pub all_at_once: bool,
+    /// Per-value loop whose rows must still match the current value.
+    pub recheck: bool,
 }
 
 /// Where IN-seek values come from.
