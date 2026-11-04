@@ -1125,6 +1125,8 @@ pub struct ProgramState {
     pub(crate) param_pointers: Vec<Option<crate::sync::Arc<crate::pointer::PointerValue>>>,
     /// Registers holding a pointer value (valid while the register is NULL).
     pub(crate) reg_pointers: HashMap<usize, crate::sync::Arc<crate::pointer::PointerValue>>,
+    /// Function auxiliary data (sqlite3_set_auxdata), freed at halt and reset.
+    pub(crate) aux_data: crate::auxdata::AuxList,
     commit_state: CommitState,
     /// In-flight commit-state-machine for an autonomous sequence
     /// inner-tx. `Insn::SequenceCommitInnerTx` constructs this on first
@@ -1310,6 +1312,7 @@ impl ProgramState {
             parameters: Vec::new(),
             param_pointers: Vec::new(),
             reg_pointers: HashMap::new(),
+            aux_data: Default::default(),
             commit_state: CommitState::Ready,
             sequence_inner_commit: None,
             sequence_inner_tx_pending: None,
@@ -1437,6 +1440,7 @@ impl ProgramState {
         self.reg_pointers.clear();
         self.extension_state = crate::native_ext::ExtensionState::None;
         self.pc = 0;
+        self.aux_data.clear();
 
         if let Some(max_cursors) = max_cursors {
             self.cursors.resize_with(max_cursors, || None);
@@ -2757,6 +2761,7 @@ impl Program {
                     Ok(InsnFunctionStepResult::Done) => {
                         // Instruction completed execution
                         state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
+                        state.aux_data.clear();
                         state.auto_txn_cleanup = TxnCleanup::None;
                         Some(ProgramStep::Done)
                     }
