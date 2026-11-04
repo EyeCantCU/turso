@@ -4499,35 +4499,61 @@ impl Connection {
         encoding: u8,
     ) {
         let normalized_name = crate::util::normalize_ident(&name);
-        self.syms.write().collations.insert(
+        let collation = function::ExternalCollation::new_with_encoding(
             normalized_name.clone(),
-            function::ExternalCollation::new_with_encoding(
-                normalized_name,
-                context,
-                callback,
-                context_destructor,
-                encoding,
-            ),
+            context,
+            callback,
+            context_destructor,
+            encoding,
         );
+        let mut syms = self.syms.write();
+        let slots = syms
+            .collation_versions
+            .entry(normalized_name.clone())
+            .or_default();
+        slots[collation_slot(encoding)] = Some(collation);
+        syms.refresh_collation(&normalized_name);
+        drop(syms);
         self.bump_prepare_context_generation();
     }
 
     pub fn unregister_external_collation(&self, name: &str) {
-        if self
-            .syms
-            .write()
-            .collations
-            .remove(&crate::util::normalize_ident(name))
-            .is_some()
-        {
+        let name = crate::util::normalize_ident(name);
+        let mut syms = self.syms.write();
+        let removed = syms.collations.remove(&name).is_some();
+        syms.collation_versions.remove(&name);
+        drop(syms);
+        if removed {
             self.bump_prepare_context_generation();
         }
+    }
+
+    /// Removes the version of a collation registered for `encoding`
+    /// (sqlite3_create_collation with a NULL callback); other encodings stay.
+    pub fn unregister_external_collation_encoding(&self, name: &str, encoding: u8) {
+        let name = crate::util::normalize_ident(name);
+        let mut syms = self.syms.write();
+        if let Some(slots) = syms.collation_versions.get_mut(&name) {
+            slots[collation_slot(encoding)] = None;
+        }
+        syms.refresh_collation(&name);
+        drop(syms);
+        self.bump_prepare_context_generation();
+    }
+
+    /// The database text encoding: SQLITE_UTF8 (1), SQLITE_UTF16LE (2) or SQLITE_UTF16BE (3).
+    pub fn text_encoding(&self) -> u8 {
+        self.db.text_encoding() as u8
     }
 
     /// The custom collations registered on this connection. A program keeps
     /// them so that their callbacks live as long as it does.
     pub(crate) fn custom_collations(&self) -> Vec<Arc<function::ExternalCollation>> {
-        self.syms.read().collations.values().cloned().collect()
+        let syms = self.syms.read();
+        syms.collation_versions
+            .values()
+            .flat_map(|slots| slots.iter().flatten().cloned())
+            .collect()
     }
 
     pub(crate) fn database_ptr(&self) -> usize {
@@ -5247,8 +5273,15 @@ pub type StepResult = vdbe::StepResult;
 #[derive(Default)]
 pub struct SymbolTable {
     pub functions: HashMap<String, Arc<function::ExternalFunc>>,
-    /// Custom collations by normalized name.
+    /// Custom collations by normalized name: the version chosen for the
+    /// database encoding.
     pub collations: HashMap<String, Arc<function::ExternalCollation>>,
+    /// Every registered version of each collation, by encoding
+    /// (UTF-8, UTF-16LE, UTF-16BE), as SQLite keeps them.
+    pub collation_versions: HashMap<String, [Option<Arc<function::ExternalCollation>>; 3]>,
+    /// The database text encoding (shared with the Database), which selects
+    /// the collation version a statement uses.
+    pub db_encoding: Arc<crate::sync::atomic::AtomicU8>,
     pub vtabs: HashMap<String, Arc<VirtualTable>>,
     pub vtab_modules: HashMap<String, Arc<crate::ext::VTabImpl>>,
     pub index_methods: HashMap<String, Arc<dyn IndexMethod>>,
@@ -5285,11 +5318,22 @@ pub fn resolve_ext_path(extpath: &str) -> Result<std::path::PathBuf> {
     }
 }
 
+/// Index of the encoding slot (SQLITE_UTF8 = 1, UTF16LE = 2, UTF16BE = 3).
+fn collation_slot(encoding: u8) -> usize {
+    match encoding {
+        2 => 1,
+        3 => 2,
+        _ => 0,
+    }
+}
+
 impl SymbolTable {
     pub fn new() -> Self {
         Self {
             functions: HashMap::default(),
             collations: HashMap::default(),
+            collation_versions: HashMap::default(),
+            db_encoding: Arc::new(crate::sync::atomic::AtomicU8::new(1)),
             vtabs: HashMap::default(),
             vtab_modules: HashMap::default(),
             index_methods: HashMap::default(),
@@ -5311,9 +5355,43 @@ impl SymbolTable {
             .filter(|func| func.func.matches_arg_count(arg_count))
     }
 
+    /// A symbol table whose collations follow the given database encoding.
+    pub(crate) fn with_db_encoding(db_encoding: Arc<crate::sync::atomic::AtomicU8>) -> Self {
+        Self {
+            db_encoding,
+            ..Self::new()
+        }
+    }
+
+    /// The version of collation `name` for the database encoding, as SQLite
+    /// picks it: the exact encoding, else UTF-16BE, UTF-16LE, UTF-8.
+    fn chosen_collation(&self, name: &str) -> Option<&Arc<function::ExternalCollation>> {
+        let slots = self.collation_versions.get(name)?;
+        let enc = self
+            .db_encoding
+            .load(crate::sync::atomic::Ordering::Acquire);
+        slots[collation_slot(enc)]
+            .as_ref()
+            .or_else(|| [2, 1, 0].iter().find_map(|&i| slots[i].as_ref()))
+    }
+
+    /// Updates `collations` after the versions of `name` changed.
+    pub(crate) fn refresh_collation(&mut self, name: &str) {
+        match self.chosen_collation(name).cloned() {
+            Some(collation) => {
+                self.collations.insert(name.to_string(), collation);
+            }
+            None => {
+                self.collations.remove(name);
+                self.collation_versions.remove(name);
+            }
+        }
+    }
+
     pub fn resolve_collation(&self, name: &str) -> Option<TextCollation> {
-        self.collations
-            .get(&crate::util::normalize_ident(name))
+        let name = crate::util::normalize_ident(name);
+        self.chosen_collation(&name)
+            .or_else(|| self.collations.get(&name))
             .map(|external| external.collation)
     }
 
@@ -5323,6 +5401,10 @@ impl SymbolTable {
         }
         for (name, collation) in &other.collations {
             self.collations.insert(name.clone(), collation.clone());
+        }
+        for (name, versions) in &other.collation_versions {
+            self.collation_versions
+                .insert(name.clone(), versions.clone());
         }
         for (name, vtab) in &other.vtabs {
             self.vtabs.insert(name.clone(), vtab.clone());

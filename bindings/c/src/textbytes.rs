@@ -22,3 +22,16 @@ pub unsafe extern "C" fn sqlite3_value_encoding(value: *mut std::ffi::c_void) ->
         1
     }
 }
+
+/// The sqlite3_value for a column's UTF-8 text; in a UTF-16 database
+/// (`encoding` 2 or 3) it also carries the stored UTF-16 bytes.
+pub(crate) fn text_value(text: &str, encoding: u8) -> turso_ext::Value {
+    match encoding {
+        2 | 3 => {
+            let be = encoding == 3;
+            let utf16 = turso_core::utf8_to_utf16(text.as_bytes(), be);
+            turso_ext::Value::from_text_with_utf16(text.to_string(), utf16, be)
+        }
+        _ => turso_ext::Value::from_text(text.to_string()),
+    }
+}

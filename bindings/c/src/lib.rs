@@ -2321,8 +2321,13 @@ pub unsafe extern "C" fn sqlite3_column_blob(
     stmt: *mut sqlite3_stmt,
     idx: ffi::c_int,
 ) -> *const ffi::c_void {
-    if matches!(column_value(stmt, idx), Some(Value::Null) | None) {
-        return std::ptr::null();
+    match column_value(stmt, idx) {
+        Some(Value::Null) | None => return std::ptr::null(),
+        // In a UTF-16 database text reads as its stored UTF-16 bytes.
+        Some(Value::Text(t)) if t.is_utf8() && (*stmt).stmt.text_encoding() != 1 => {
+            return sqlite3_value_blob(sqlite3_column_value(stmt, idx));
+        }
+        _ => {}
     }
     match column_text_cache(stmt, idx) {
         // A zero-length result (only the cache's NUL) reports NULL, as
@@ -2402,9 +2407,10 @@ pub unsafe extern "C" fn sqlite3_value_blob(value: *mut ffi::c_void) -> *const f
         return std::ptr::null();
     }
     let v = &*(value as *const ExtValue);
-    match v.blob_ref() {
-        Some(b) => b.as_ptr() as *const ffi::c_void,
-        None => std::ptr::null(),
+    // Text reads as its stored bytes (UTF-16 in a UTF-16 database), as in SQLite.
+    match v.blob_ref().or_else(|| v.text_stored_bytes()) {
+        Some(b) if !b.is_empty() => b.as_ptr() as *const ffi::c_void,
+        _ => std::ptr::null(),
     }
 }
 
@@ -2500,7 +2506,7 @@ pub unsafe extern "C" fn sqlite3_column_value(
             ExtValue::from_float(f64::from(*f))
         }
         Ok(turso_core::Value::Text(t)) if t.is_utf8() => {
-            ExtValue::from_text(t.as_str().to_string())
+            textbytes::text_value(t.as_str(), stmt.stmt.text_encoding())
         }
         Ok(turso_core::Value::Text(t)) => ExtValue::from_text_bytes(t.as_bytes().to_vec()),
         Ok(turso_core::Value::Blob(b)) => ExtValue::from_blob(b.clone()),
@@ -3068,7 +3074,10 @@ pub unsafe extern "C" fn sqlite3_create_collation_v2(
     };
     let inner = (*db).inner.lock().unwrap();
     let Some(cmp) = cmp else {
-        inner.conn.unregister_external_collation(&name);
+        // Removes only the version for this encoding, as SQLite does.
+        inner
+            .conn
+            .unregister_external_collation_encoding(&name, enc);
         return SQLITE_OK;
     };
     let bridge = Box::new(CollationBridge {

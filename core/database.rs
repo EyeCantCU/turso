@@ -724,7 +724,7 @@ pub struct Database<
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
     /// Text encoding of the records (text_bytes::DbEncoding as u8).
-    pub(crate) text_encoding: AtomicU8,
+    pub(crate) text_encoding: Arc<AtomicU8>,
     page_codec_id: Option<PageCodecId>,
 }
 
@@ -883,7 +883,7 @@ impl Database {
             opts,
             buffer_pool: BufferPool::begin_init(io, arena_size),
             n_connections: AtomicUsize::new(0),
-            text_encoding: AtomicU8::new(crate::text_bytes::DbEncoding::Utf8 as u8),
+            text_encoding: Arc::new(AtomicU8::new(crate::text_bytes::DbEncoding::Utf8 as u8)),
             incarnation: {
                 // Deliberately std, not crate::sync: this static outlives a
                 // shuttle test execution, and a shuttle-tracked atomic that
@@ -2740,7 +2740,9 @@ impl Database {
             last_insert_rowid: AtomicI64::new(0),
             changes: AtomicI64::new(0),
             total_changes: AtomicI64::new(0),
-            syms: parking_lot::RwLock::new(SymbolTable::new()),
+            syms: parking_lot::RwLock::new(SymbolTable::with_db_encoding(
+                self.text_encoding.clone(),
+            )),
             _shared_cache: false,
             cache_size: AtomicI32::new(default_cache_size),
             next_page_size: AtomicU32::new(0),
