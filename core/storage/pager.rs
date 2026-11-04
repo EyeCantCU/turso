@@ -2095,6 +2095,29 @@ impl Pager {
     /// Invalidate every cursor's page stack. Called from rollback — pinned
     /// pages may now hold pre-rollback bytes (cf. saveAllCursors in
     /// sqlite3BtreeRollback, btree.c:4485).
+    /// Save the position of every registered cursor so it re-seeks by key
+    /// on its next use, like SQLite's saveAllCursors. A position that cannot
+    /// be saved without I/O falls back to invalidation.
+    fn save_all_cursor_positions(&self) {
+        let snapshot: smallvec::SmallVec<[RegisteredCursor; 8]> = {
+            let registry = self.cursor_registry.lock();
+            registry.values().flat_map(|b| b.iter().copied()).collect()
+        };
+        for peer in snapshot {
+            // SAFETY: see RegisteredCursor's invariant.
+            let saved = unsafe { peer.as_mut().try_save_position_for_external_balance() };
+            if !matches!(
+                saved,
+                Ok(IOResult::Done(
+                    crate::storage::btree::SavePositionResult::Saved
+                ))
+            ) {
+                // SAFETY: see RegisteredCursor's invariant.
+                unsafe { peer.as_mut().invalidate_btree_cache() };
+            }
+        }
+    }
+
     pub(crate) fn invalidate_all_cursors(&self) {
         let snapshot: smallvec::SmallVec<[RegisteredCursor; 8]> = {
             let registry = self.cursor_registry.lock();
@@ -2568,6 +2591,8 @@ impl Pager {
         savepoint: &SavepointSnapshot,
         journal_end_offset: u64,
     ) -> Result<()> {
+        // Other statements' cursors re-seek to their saved keys afterwards.
+        self.save_all_cursor_positions();
         self.reset_internal_states();
 
         let subjournal = self.subjournal.read();
@@ -2625,7 +2650,8 @@ impl Pager {
             "memory IO should complete immediately"
         );
 
-        // saveAllCursors at sqlite3BtreeSavepoint (btree.c:4580).
+        // saveAllCursors at sqlite3BtreeSavepoint (btree.c:4580): positions
+        // were saved above, so dropping the page stacks keeps them.
         self.invalidate_all_cursors();
 
         // Discard all dirty pages allocated after the savepoint. These pages
@@ -3605,7 +3631,7 @@ impl Pager {
             self.clear_savepoints()
                 .expect("clear_savepoints should not fail for attached DB");
             wal.rollback(None);
-            self.discard_uncommitted_pages();
+            self.discard_uncommitted_pages(false);
             self.reset_internal_states();
             self.set_schema_cookie(None);
             wal.end_write_tx();
@@ -6148,7 +6174,10 @@ impl Pager {
             if let Some(wal) = self.wal.as_ref() {
                 wal.rollback(None);
             }
-            self.discard_uncommitted_pages();
+            // Like SQLite's sqlite3BtreeTripAllCursors with writeOnly: when
+            // the schema is unchanged, read cursors of other statements keep
+            // their positions and continue on the rolled-back contents.
+            self.discard_uncommitted_pages(!schema_did_change);
         } else {
             turso_assert!(
                 self.dirty_pages.read().is_empty(),
@@ -6175,7 +6204,7 @@ impl Pager {
         verify = "full",
         id = "wal_rollback_runs_before_cache_discard"
     )]
-    fn discard_uncommitted_pages(&self) {
+    fn discard_uncommitted_pages(&self, save_cursor_positions: bool) {
         // Without the write lock, another connection can commit frames with the
         // numbers this transaction used. A page tagged with such a frame looks
         // committed, so it would stay in the cache with uncommitted contents.
@@ -6183,6 +6212,9 @@ impl Pager {
             self.wal.as_ref().is_none_or(|wal| wal.holds_write_lock()),
             "rollback must discard pages while holding the WAL write lock"
         );
+        if save_cursor_positions {
+            self.save_all_cursor_positions();
+        }
         self.invalidate_all_cursors();
         let committed_max_frame = self.wal.as_ref().map_or(0, |wal| wal.get_max_frame());
         let mut dirty_pages = self.dirty_pages.write();

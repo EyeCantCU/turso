@@ -371,6 +371,26 @@ fn test_failed_statement_inside_callback_rolls_back_alone() {
         }
         assert_eq!(rows(other, "SELECT a FROM t"), v(&["3"]));
         assert_eq!(rows(other, "SELECT x FROM log"), v(&["2"]));
+
+        // The scan that called the function keeps its position across the
+        // failed statement's rollback (tkt3718).
+        exec(db, "INSERT INTO t VALUES (4, 4), (5, 5)");
+        for explicit in [false, true] {
+            if explicit {
+                exec(db, "BEGIN");
+            }
+            assert_eq!(
+                rows(
+                    db,
+                    "SELECT a, swallow(CASE a WHEN 4 THEN 'INSERT INTO log VALUES (1), (2)' \
+                     ELSE 'SELECT 1' END) FROM t"
+                ),
+                v(&["3:0", "4:19", "5:0"])
+            );
+            if explicit {
+                exec(db, "COMMIT");
+            }
+        }
         sqlite3_close(other);
         sqlite3_close(db);
     }
@@ -390,6 +410,35 @@ fn test_scan_ends_when_another_statement_clears_the_table() {
             assert_eq!(drain(sel), Vec::<String>::new());
             assert_eq!(sqlite3_finalize(sel), SQLITE_OK);
             assert_eq!(rows(db, "SELECT count(*) FROM t"), v(&["0"]));
+        }
+        sqlite3_close(db);
+    }
+}
+
+#[test]
+fn test_reader_continues_after_rollback() {
+    unsafe {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(&dir);
+        exec(db, "CREATE TABLE t(a INTEGER PRIMARY KEY, b)");
+        exec(
+            db,
+            "INSERT INTO t VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8)",
+        );
+        // ROLLBACK keeps a reader's position; it continues on the restored
+        // rows, as with SQLite.
+        for (order, expected) in [
+            ("ASC", v(&["2", "3", "4", "5", "6", "7", "8"])),
+            ("DESC", v(&["8", "7", "6", "5", "4", "3", "2", "1"])),
+        ] {
+            exec(db, "BEGIN");
+            exec(db, "DELETE FROM t WHERE a % 2 = 1");
+            let sel = prepare(db, &format!("SELECT a FROM t ORDER BY a {order}"));
+            let mut got = vec![next(sel).unwrap()];
+            exec(db, "ROLLBACK");
+            got.extend(drain(sel));
+            assert_eq!(got, expected, "{order}");
+            assert_eq!(sqlite3_finalize(sel), SQLITE_OK);
         }
         sqlite3_close(db);
     }
