@@ -1523,7 +1523,10 @@ impl ShmWalCoordination {
         authority: Arc<MappedSharedWalCoordination>,
     ) -> Self {
         let coordination = Self::new_unseeded(shared, authority);
-        coordination.seed_or_sync_authority();
+        coordination
+            .authority
+            .clone()
+            .with_open_lock(|| coordination.seed_or_sync_authority());
         coordination
     }
 
@@ -1555,6 +1558,14 @@ impl ShmWalCoordination {
         sqlite: Option<Arc<crate::storage::sqlite_shm_interlock::SqliteShmInterlock>>,
     ) -> Self {
         self.sqlite = sqlite;
+        let authority = self.authority.clone();
+        authority.with_open_lock(|| self.seed_with_sqlite_index());
+        self
+    }
+
+    /// See [`Self::with_sqlite_index`]; runs under the open lock.
+    #[cfg(target_os = "linux")]
+    fn seed_with_sqlite_index(&self) {
         if self.sqlite.is_some() {
             let locked = self.lock_authority_for_seed();
             self.seed_or_sync_authority_locked(locked);
@@ -1592,7 +1603,6 @@ impl ShmWalCoordination {
                 }
             }
         }
-        self
     }
 
     /// Take the tshm writer and checkpoint locks to seed the authority. A

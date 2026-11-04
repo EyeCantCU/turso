@@ -59,6 +59,9 @@ const WRITER_LOCK_OFFSET: u64 = 1;
 const CHECKPOINT_LOCK_OFFSET: u64 = 2;
 /// Byte range starting at 3: one reader-byte lock per shared reader slot.
 const READER_LOCK_START_OFFSET: u64 = 3;
+/// Held while a process opens the mapping and seeds it from its WAL view, so
+/// no other process sees a half-built authority. Far past the reader bytes.
+const OPEN_LOCK_OFFSET: u64 = 0x7fff_0000;
 /// Entries per frame-index block in the append-only shared page->frame index.
 const FRAME_INDEX_BLOCK_CAPACITY: u32 = 4096;
 /// Open-addressing hash slots per frame-index block.
@@ -691,6 +694,12 @@ pub(crate) struct MappedSharedWalCoordination {
     /// Process that created the mapping. A forked child must not release the
     /// parent's OFD locks (shared via the inherited descriptors) on drop.
     opened_pid: u32,
+    /// Whether this mapping holds the open lock, and whether it may take it
+    /// exclusively (a read-only descriptor can only take it shared).
+    open_lock_held: Mutex<bool>,
+    open_lock_exclusive: bool,
+    /// Same-process serialization of [`Self::with_open_lock`].
+    open_section: Mutex<()>,
     #[cfg(test)]
     frame_index_blocks_scanned: AtomicU64,
 }
@@ -737,6 +746,7 @@ impl Drop for MappedSharedWalCoordination {
             return;
         }
         self.release_owned_locks_on_drop();
+        self.release_open_lock();
         if let Some(path) = self.registry_path.as_ref() {
             let mut opens = PROCESS_LOCAL_COORDINATION_OPENS.lock();
             let count = opens
@@ -818,6 +828,9 @@ impl MappedSharedWalCoordination {
             sanitized_backfill_proof_on_open: false,
             registry_path: None,
             opened_pid: std::process::id(),
+            open_lock_held: Mutex::new(false),
+            open_lock_exclusive: false,
+            open_section: Mutex::new(()),
             #[cfg(test)]
             frame_index_blocks_scanned: AtomicU64::new(0),
         }
@@ -896,6 +909,23 @@ impl MappedSharedWalCoordination {
         path: &Path,
         reader_slot_count: u32,
     ) -> Result<Self> {
+        let region = Self::create_or_open_with_mode(
+            io,
+            path,
+            reader_slot_count,
+            Self::default_ownership_mode(),
+        )?;
+        region.release_open_lock();
+        Ok(region)
+    }
+
+    /// [`Self::create_or_open`], still holding the open lock: the caller seeds
+    /// the authority, then calls [`Self::release_open_lock`].
+    pub(crate) fn create_or_open_holding_open_lock(
+        io: &Arc<dyn IO>,
+        path: &Path,
+        reader_slot_count: u32,
+    ) -> Result<Self> {
         Self::create_or_open_with_mode(io, path, reader_slot_count, Self::default_ownership_mode())
     }
 
@@ -903,6 +933,19 @@ impl MappedSharedWalCoordination {
     ///
     /// Returns `Ok(None)` when the file does not exist yet.
     pub(crate) fn open_existing(
+        io: &Arc<dyn IO>,
+        path: &Path,
+        reader_slot_count: u32,
+    ) -> Result<Option<Self>> {
+        let region = Self::open_existing_holding_open_lock(io, path, reader_slot_count)?;
+        if let Some(region) = region.as_ref() {
+            region.release_open_lock();
+        }
+        Ok(region)
+    }
+
+    /// [`Self::open_existing`], still holding the open lock (shared).
+    pub(crate) fn open_existing_holding_open_lock(
         io: &Arc<dyn IO>,
         path: &Path,
         reader_slot_count: u32,
@@ -916,12 +959,14 @@ impl MappedSharedWalCoordination {
         path: &Path,
         reader_slot_count: u32,
     ) -> Result<Self> {
-        Self::create_or_open_with_mode(
+        let region = Self::create_or_open_with_mode(
             io,
             path,
             reader_slot_count,
             SharedWalOwnershipMode::ProcessScopedFcntl,
-        )
+        )?;
+        region.release_open_lock();
+        Ok(region)
     }
 
     #[cfg(test)]
@@ -943,6 +988,31 @@ impl MappedSharedWalCoordination {
         reader_slot_count: u32,
         ownership_mode: SharedWalOwnershipMode,
     ) -> Result<Self> {
+        let file = io.open_shared_wal_file(path.to_str().ok_or_else(|| {
+            LimboError::InternalError("shared WAL coordination path is not valid UTF-8".into())
+        })?)?;
+        let lock_kind = Self::lock_kind_for_mode(ownership_mode);
+        // Held until the caller has seeded the authority (release_open_lock).
+        file.shared_wal_lock_byte(OPEN_LOCK_OFFSET, true, lock_kind)?;
+        match Self::create_or_open_locked(file.clone(), path, reader_slot_count, ownership_mode) {
+            Ok(mut region) => {
+                region.open_lock_exclusive = true;
+                *region.open_lock_held.get_mut() = true;
+                Ok(region)
+            }
+            Err(err) => {
+                let _ = file.shared_wal_unlock_byte(OPEN_LOCK_OFFSET, lock_kind);
+                Err(err)
+            }
+        }
+    }
+
+    fn create_or_open_locked(
+        file: Arc<dyn File>,
+        path: &Path,
+        reader_slot_count: u32,
+        ownership_mode: SharedWalOwnershipMode,
+    ) -> Result<Self> {
         turso_assert!(
             reader_slot_count >= 64 && reader_slot_count % 64 == 0,
             "reader_slot_count must be a non-zero multiple of 64"
@@ -951,9 +1021,6 @@ impl MappedSharedWalCoordination {
         let base_len = Self::base_mapped_len(reader_slot_count);
         let initial_file_len =
             Self::file_len_for_blocks(reader_slot_count, INITIAL_FRAME_INDEX_BLOCKS);
-        let file = io.open_shared_wal_file(path.to_str().ok_or_else(|| {
-            LimboError::InternalError("shared WAL coordination path is not valid UTF-8".into())
-        })?)?;
         let lock_kind = Self::lock_kind_for_mode(ownership_mode);
         let open_mode = Self::detect_open_mode(&file, lock_kind, base_len)?;
         let metadata_len = file.size()? as usize;
@@ -1019,7 +1086,6 @@ impl MappedSharedWalCoordination {
             "reader_slot_count must be a non-zero multiple of 64"
         );
 
-        let base_len = Self::base_mapped_len(reader_slot_count);
         let file = match io.open_file(
             path.to_str().ok_or_else(|| {
                 LimboError::InternalError("shared WAL coordination path is not valid UTF-8".into())
@@ -1034,6 +1100,27 @@ impl MappedSharedWalCoordination {
             ))) => return Ok(None),
             Err(err) => return Err(err),
         };
+        let lock_kind = Self::lock_kind_for_mode(ownership_mode);
+        file.shared_wal_lock_byte(OPEN_LOCK_OFFSET, false, lock_kind)?;
+        match Self::open_existing_locked(file.clone(), path, reader_slot_count, ownership_mode) {
+            Ok(mut region) => {
+                *region.open_lock_held.get_mut() = true;
+                Ok(Some(region))
+            }
+            Err(err) => {
+                let _ = file.shared_wal_unlock_byte(OPEN_LOCK_OFFSET, lock_kind);
+                Err(err)
+            }
+        }
+    }
+
+    fn open_existing_locked(
+        file: Arc<dyn File>,
+        path: &Path,
+        reader_slot_count: u32,
+        ownership_mode: SharedWalOwnershipMode,
+    ) -> Result<Self> {
+        let base_len = Self::base_mapped_len(reader_slot_count);
         let lock_kind = Self::lock_kind_for_mode(ownership_mode);
         let open_mode = Self::detect_open_mode(&file, lock_kind, base_len)?;
         let metadata_len = file.size()? as usize;
@@ -1071,7 +1158,7 @@ impl MappedSharedWalCoordination {
         region.frame_index_publish_lock = frame_index_publish_lock;
         region.process_local_ownership = process_local_ownership;
         region.registry_path = Some(registry_path);
-        Ok(Some(region))
+        Ok(region)
     }
 
     fn process_lock_offset_for_reader(slot_index: u32) -> u64 {
@@ -1099,6 +1186,44 @@ impl MappedSharedWalCoordination {
                 Ok(SharedWalCoordinationOpenMode::MultiProcess)
             }
         }
+    }
+
+    /// Take the open lock (blocking) for an open of the database; it is held
+    /// already when this mapping was just created.
+    pub(crate) fn acquire_open_lock(&self) -> Result<()> {
+        let mut held = self.open_lock_held.lock();
+        if !*held {
+            self.file.shared_wal_lock_byte(
+                OPEN_LOCK_OFFSET,
+                self.open_lock_exclusive,
+                self.lock_kind(),
+            )?;
+            *held = true;
+        }
+        Ok(())
+    }
+
+    /// Release the open lock once the opener's view is seeded.
+    pub(crate) fn release_open_lock(&self) {
+        let mut held = self.open_lock_held.lock();
+        if std::mem::take(&mut *held) {
+            let _ = self
+                .file
+                .shared_wal_unlock_byte(OPEN_LOCK_OFFSET, self.lock_kind());
+        }
+    }
+
+    /// Run `f` (seeding a connection's WAL view) under the open lock, so it
+    /// never interleaves with another process's open.
+    pub(crate) fn with_open_lock<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _section = self.open_section.lock();
+        let held = *self.open_lock_held.lock();
+        if held || self.acquire_open_lock().is_err() {
+            return f();
+        }
+        let result = f();
+        self.release_open_lock();
+        result
     }
 
     /// Return whether dropping this mapping would leave no other process with
@@ -3163,6 +3288,39 @@ mod tests {
         {
             Arc::new(PlatformIO::new().unwrap())
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_waits_for_another_mappings_open_and_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("open-lock.tshm");
+        let first = MappedSharedWalCoordination::create_or_open_holding_open_lock(
+            &test_shared_wal_io(),
+            &path,
+            64,
+        )
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let second_path = path.clone();
+        let opener = std::thread::spawn(move || {
+            let second = create_mapping(&second_path);
+            tx.send(second.open_mode()).unwrap();
+        });
+        // A second opener (another descriptor, as in another process) must
+        // not see the mapping until the first opener has seeded it.
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_err());
+        first.release_open_lock();
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap(),
+            SharedWalCoordinationOpenMode::MultiProcess
+        );
+        opener.join().unwrap();
+        // Seeding later connections takes the lock for its own duration only.
+        assert_eq!(first.with_open_lock(|| 7), 7);
+        create_mapping(&path);
     }
 
     fn create_mapping(path: &Path) -> MappedSharedWalCoordination {

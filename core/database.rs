@@ -2354,6 +2354,8 @@ impl Database {
                 } => {
                     // Always open shared WAL and set it in the Database and Pager.
                     // MVCC currently requires a WAL open to function.
+                    #[cfg(host_shared_wal)]
+                    let _open_lock_guard: OpenLockGuard;
                     let mut shared_wal = {
                         #[cfg(not(host_shared_wal))]
                         {
@@ -2374,6 +2376,7 @@ impl Database {
                             let _ = &driver;
                             let flags = self.open_flags;
                             let shared_authority = self.open_shared_wal_coordination_for_open()?;
+                            _open_lock_guard = OpenLockGuard(shared_authority.clone());
                             if let Some(authority) = shared_authority.as_ref() {
                                 if !authority.frame_index_overflowed() {
                                     WalFileShared::open_shared_from_authority_if_exists(
@@ -2512,6 +2515,8 @@ impl Database {
         let flags = self.open_flags;
         #[cfg(host_shared_wal)]
         let shared_authority = self.open_shared_wal_coordination_for_open()?;
+        #[cfg(host_shared_wal)]
+        let _open_lock_guard = OpenLockGuard(shared_authority.clone());
         #[cfg(not(host_shared_wal))]
         let shared_authority: Option<()> = None;
 
@@ -3147,7 +3152,7 @@ impl Database {
             return Ok(None);
         }
         drop(shared_wal);
-        self.open_shared_wal_coordination_inner()
+        self.open_shared_wal_coordination_inner(false)
     }
 
     #[cfg(not(host_shared_wal))]
@@ -3156,15 +3161,22 @@ impl Database {
     }
 
     #[cfg(host_shared_wal)]
+    /// The authority with its open lock held: release it (OpenLockGuard)
+    /// once the WAL view is loaded and seeded.
     pub(crate) fn open_shared_wal_coordination_for_open(
         &self,
     ) -> Result<Option<Arc<MappedSharedWalCoordination>>> {
-        self.open_shared_wal_coordination_inner()
+        let authority = self.open_shared_wal_coordination_inner(true)?;
+        if let Some(authority) = authority.as_ref() {
+            authority.acquire_open_lock()?;
+        }
+        Ok(authority)
     }
 
     #[cfg(host_shared_wal)]
     fn open_shared_wal_coordination_inner(
         &self,
+        hold_open_lock: bool,
     ) -> Result<Option<Arc<MappedSharedWalCoordination>>> {
         if !self.opts.enable_multiprocess_wal {
             return Ok(None);
@@ -3193,7 +3205,7 @@ impl Database {
 
         let path = storage::wal::coordination_path_for_wal_path(&self.wal_path);
         let authority = if self.open_flags.contains(OpenFlags::ReadOnly) {
-            let Some(authority) = MappedSharedWalCoordination::open_existing(
+            let Some(authority) = MappedSharedWalCoordination::open_existing_holding_open_lock(
                 &self.io,
                 std::path::Path::new(&path),
                 64,
@@ -3208,11 +3220,13 @@ impl Database {
             };
             Arc::new(authority)
         } else {
-            Arc::new(MappedSharedWalCoordination::create_or_open(
-                &self.io,
-                std::path::Path::new(&path),
-                64,
-            )?)
+            Arc::new(
+                MappedSharedWalCoordination::create_or_open_holding_open_lock(
+                    &self.io,
+                    std::path::Path::new(&path),
+                    64,
+                )?,
+            )
         };
         #[cfg(target_os = "linux")]
         if self.sqlite_shm_interlock.get().is_none() {
@@ -3222,6 +3236,9 @@ impl Database {
                 || !authority.is_last_process_mapping(),
             )?;
             let _ = self.sqlite_shm_interlock.set(Arc::new(interlock));
+        }
+        if !hold_open_lock {
+            authority.release_open_lock();
         }
         let _ = self.shared_wal_coordination.set(authority.clone());
         Ok(Some(
@@ -3845,6 +3862,19 @@ impl DatabaseCatalog {
 
         // Use trailing zeros count (compiles to single instruction on most CPUs)
         inverted.trailing_zeros() as usize
+    }
+}
+
+/// Releases the authority's open lock when an open's WAL view is in place.
+#[cfg(host_shared_wal)]
+struct OpenLockGuard(Option<Arc<MappedSharedWalCoordination>>);
+
+#[cfg(host_shared_wal)]
+impl Drop for OpenLockGuard {
+    fn drop(&mut self) {
+        if let Some(authority) = self.0.as_ref() {
+            authority.release_open_lock();
+        }
     }
 }
 
