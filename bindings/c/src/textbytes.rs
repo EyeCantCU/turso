@@ -1,5 +1,7 @@
 //! Text helpers for the C API.
 
+use turso_macros::capi_guard;
+
 /// The encoding a collation callback receives, as sqlite3_create_collation
 /// resolves `eTextRep`: SQLITE_UTF16 and SQLITE_UTF16_ALIGNED mean native
 /// UTF-16. None is SQLITE_MISUSE.
