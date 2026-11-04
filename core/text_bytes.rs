@@ -373,7 +373,7 @@ impl Drop for EncodingGuard {
 
 /// UTF-16 to UTF-8, as sqlite3VdbeMemTranslate does it (an odd trailing byte
 /// is dropped; a surrogate always pairs with the next unit).
-pub(crate) fn utf16_to_utf8(bytes: &[u8], big_endian: bool) -> Vec<u8> {
+pub fn utf16_to_utf8(bytes: &[u8], big_endian: bool) -> Vec<u8> {
     let n = bytes.len() & !1;
     let mut out = Vec::with_capacity(n + n / 2);
     let unit = |i: usize| -> u32 {
@@ -415,7 +415,7 @@ pub(crate) fn utf16_to_utf8(bytes: &[u8], big_endian: bool) -> Vec<u8> {
 }
 
 /// UTF-8 (possibly invalid) to UTF-16, as sqlite3VdbeMemTranslate does it.
-pub(crate) fn utf8_to_utf16(bytes: &[u8], big_endian: bool) -> Vec<u8> {
+pub fn utf8_to_utf16(bytes: &[u8], big_endian: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len() * 2);
     let mut push = |u: u16| {
         let b = if big_endian {
