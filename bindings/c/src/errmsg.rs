@@ -148,7 +148,9 @@ fn strip_code_suffix(msg: &str) -> &str {
     msg
 }
 
-/// Extended result code for a constraint or collation error, or `None`.
+const SQLITE_CORRUPT_VTAB: i32 = 11 | (1 << 8);
+
+/// Extended result code for a constraint, collation or vtab corruption error, or `None`.
 pub fn extended_code(err: &LimboError) -> Option<i32> {
     match err {
         LimboError::ConstraintViolation(v) => Some(match v.kind {
@@ -163,6 +165,7 @@ pub fn extended_code(err: &LimboError) -> Option<i32> {
             ConstraintKind::Other => return None,
         }),
         LimboError::ForeignKeyConstraint(_) => Some(SQLITE_CONSTRAINT_FOREIGNKEY),
+        LimboError::CorruptVtab(_) => Some(SQLITE_CORRUPT_VTAB),
         LimboError::Constraint(msg) if msg.starts_with("cannot store ") => {
             Some(SQLITE_CONSTRAINT_DATATYPE)
         }

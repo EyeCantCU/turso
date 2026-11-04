@@ -408,6 +408,7 @@ impl ProgramBuilderFlags {
     const SUPPRESS_COLUMN_DEFAULT: u16 = 1 << 7;
     const SKIP_EXPRESSION_INDEX_VALUES: u16 = 1 << 8;
     const KEEP_ARRAY_RESULTS_AS_BLOBS: u16 = 1 << 9;
+    const VTAB_SINGLE_WRITE: u16 = 1 << 10;
 
     const fn new(is_subprogram: bool) -> Self {
         let mut new = Self(0);
@@ -1067,6 +1068,13 @@ impl ProgramBuilder {
     /// When false, statement journals are skipped since single-write statements are atomic.
     pub const fn set_multi_write(&mut self, is_multi_write: bool) {
         self.flags.set_is_multi_write(is_multi_write);
+    }
+
+    /// Mark a virtual table write that SQLite runs without a statement
+    /// journal (one VALUES row or a unique scan), so virtual tables get no
+    /// statement savepoint. Turso still journals it for its own rollback.
+    pub const fn set_vtab_single_write(&mut self, v: bool) {
+        self.flags.set(ProgramBuilderFlags::VTAB_SINGLE_WRITE, v);
     }
 
     /// Mark that this statement may throw an ABORT exception (mirrors SQLite's sqlite3MayAbort).
@@ -2567,6 +2575,7 @@ impl ProgramBuilder {
                 needs_stmt_subtransactions,
             )),
             is_multi_write: self.flags.is_multi_write(),
+            vtab_single_write: self.flags.get(ProgramBuilderFlags::VTAB_SINGLE_WRITE),
             trigger: self.trigger.take(),
             is_subprogram: self.flags.is_subprogram(),
             has_materialized_views: self.has_materialized_views,

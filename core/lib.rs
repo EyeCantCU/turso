@@ -64,6 +64,8 @@ pub mod dialect;
 mod error;
 mod ext;
 mod fast_lock;
+#[cfg(feature = "fts3")]
+mod fts3;
 mod function;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
 mod functions;

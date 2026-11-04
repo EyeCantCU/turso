@@ -17,7 +17,13 @@ pub struct ConnectInfo<'a> {
     pub create: bool,
     /// The connection running `CREATE VIRTUAL TABLE`, when there is one.
     pub connection: Option<&'a Arc<Connection>>,
+    /// Column names of another table in the schema being loaded, for
+    /// modules that derive their columns from one.
+    pub lookup_columns: Option<&'a ColumnLookup<'a>>,
 }
+
+/// Finds the column names of a table by name.
+pub type ColumnLookup<'a> = dyn Fn(&str) -> Option<Vec<String>> + 'a;
 
 impl Debug for ConnectInfo<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -26,8 +32,23 @@ impl Debug for ConnectInfo<'_> {
             .field("schema_name", &self.schema_name)
             .field("table_name", &self.table_name)
             .field("create", &self.create)
-            .finish()
+            .finish_non_exhaustive()
     }
+}
+
+/// A transaction, rename or destroy hook, as passed to [`VirtualTable::hook`].
+#[derive(Debug, Clone, Copy)]
+pub enum TableHook<'a> {
+    Begin,
+    /// xSync: before commit, while the transaction is still open.
+    Sync,
+    Commit,
+    Rollback,
+    Savepoint(usize),
+    Release(usize),
+    RollbackTo(usize),
+    Rename(&'a str),
+    Destroy,
 }
 
 pub trait VirtualTableModule: Debug + Send + Sync {
@@ -160,13 +181,40 @@ pub trait VirtualTable: Debug + Send + Sync {
     fn destroy(&mut self) -> Result<()> {
         Ok(())
     }
+    /// Runs a hook for `conn`. Modules that need the calling connection for
+    /// every hook override this; the default dispatches to the methods above.
+    fn hook(&mut self, conn: &Arc<Connection>, hook: TableHook<'_>) -> Result<()> {
+        match hook {
+            TableHook::Begin => self.begin(),
+            TableHook::Sync => self.sync(conn),
+            TableHook::Commit => self.commit(),
+            TableHook::Rollback => self.rollback(),
+            TableHook::Savepoint(level) => self.savepoint_with_connection(conn, level),
+            TableHook::Release(level) => self.release(level),
+            TableHook::RollbackTo(level) => self.rollback_to(level),
+            TableHook::Rename(name) => self.rename_with_connection(conn, name),
+            TableHook::Destroy => self.destroy_with_connection(conn),
+        }
+    }
+    /// Whether the plan `idx_num` visits at most one row
+    /// (`SQLITE_INDEX_SCAN_UNIQUE`), so a write through it is a single write.
+    fn unique_scan(&self, _idx_num: i32) -> bool {
+        false
+    }
     /// Like `destroy`, with the connection running `DROP TABLE`.
     fn destroy_with_connection(&mut self, _connection: &Arc<Connection>) -> Result<()> {
         self.destroy()
     }
 }
 
+/// A pointer value for a column (`sqlite3_result_pointer` in xColumn).
+pub type PointerPayload = Arc<crate::pointer::PointerValue>;
+
 pub trait VirtualTableCursor: Send + Sync {
+    /// A pointer-typed NULL for `column`, read before `column`.
+    fn column_pointer(&mut self, _column: usize) -> Option<PointerPayload> {
+        None
+    }
     fn filter(&mut self, args: &[Value], idx_str: Option<&str>, idx_num: i32) -> IOResultOr<bool>;
     /// Like `filter`; `in_lists[i]` holds the values of argument `i` when it
     /// is an IN handled all at once.
@@ -283,44 +331,20 @@ impl NativeTable {
         result
     }
 
-    pub(crate) fn begin(&self) -> Result<()> {
-        self.0.write().begin()
-    }
-
-    pub(crate) fn commit(&self) -> Result<()> {
-        self.0.write().commit()
-    }
-
-    pub(crate) fn sync(&self, connection: &Arc<Connection>) -> Result<()> {
-        self.0.write().sync(connection)
+    pub(crate) fn hook(&self, conn: &Arc<Connection>, hook: TableHook<'_>) -> Result<()> {
+        self.0.write().hook(conn, hook)
     }
 
     pub(crate) fn rollback(&self) -> Result<()> {
         self.0.write().rollback()
     }
 
-    pub(crate) fn rename(&self, connection: &Arc<Connection>, name: &str) -> Result<()> {
-        self.0.write().rename_with_connection(connection, name)
-    }
-
     pub(crate) fn commits_after_create(&self) -> bool {
         self.0.read().commits_after_create()
     }
 
-    pub(crate) fn savepoint(&self, connection: &Arc<Connection>, level: usize) -> Result<()> {
-        self.0.write().savepoint_with_connection(connection, level)
-    }
-
-    pub(crate) fn release(&self, level: usize) -> Result<()> {
-        self.0.write().release(level)
-    }
-
-    pub(crate) fn rollback_to(&self, level: usize) -> Result<()> {
-        self.0.write().rollback_to(level)
-    }
-
-    pub(crate) fn destroy(&self, connection: &Arc<Connection>) -> Result<()> {
-        self.0.write().destroy_with_connection(connection)
+    pub(crate) fn unique_scan(&self, idx_num: i32) -> bool {
+        self.0.read().unique_scan(idx_num)
     }
 }
 
@@ -345,19 +369,9 @@ trait TableInstance: Debug + Send + Sync {
         on_conflict: u8,
     ) -> Result<Box<dyn TableUpdate>>;
     fn commits_after_create(&self) -> bool;
-    fn sync(&mut self, connection: &Arc<Connection>) -> Result<()>;
-    fn savepoint_with_connection(
-        &mut self,
-        connection: &Arc<Connection>,
-        level: usize,
-    ) -> Result<()>;
-    fn release(&mut self, level: usize) -> Result<()>;
-    fn rollback_to(&mut self, level: usize) -> Result<()>;
-    fn begin(&mut self) -> Result<()>;
-    fn commit(&mut self) -> Result<()>;
+    fn unique_scan(&self, idx_num: i32) -> bool;
+    fn hook(&mut self, conn: &Arc<Connection>, hook: TableHook<'_>) -> Result<()>;
     fn rollback(&mut self) -> Result<()>;
-    fn rename_with_connection(&mut self, connection: &Arc<Connection>, name: &str) -> Result<()>;
-    fn destroy_with_connection(&mut self, connection: &Arc<Connection>) -> Result<()>;
 }
 
 impl<T: VirtualTable> TableInstance for T {
@@ -408,44 +422,16 @@ impl<T: VirtualTable> TableInstance for T {
         VirtualTable::commits_after_create(self)
     }
 
-    fn sync(&mut self, connection: &Arc<Connection>) -> Result<()> {
-        VirtualTable::sync(self, connection)
+    fn unique_scan(&self, idx_num: i32) -> bool {
+        VirtualTable::unique_scan(self, idx_num)
     }
 
-    fn savepoint_with_connection(
-        &mut self,
-        connection: &Arc<Connection>,
-        level: usize,
-    ) -> Result<()> {
-        VirtualTable::savepoint_with_connection(self, connection, level)
-    }
-
-    fn release(&mut self, level: usize) -> Result<()> {
-        VirtualTable::release(self, level)
-    }
-
-    fn rollback_to(&mut self, level: usize) -> Result<()> {
-        VirtualTable::rollback_to(self, level)
-    }
-
-    fn begin(&mut self) -> Result<()> {
-        VirtualTable::begin(self)
-    }
-
-    fn commit(&mut self) -> Result<()> {
-        VirtualTable::commit(self)
+    fn hook(&mut self, conn: &Arc<Connection>, hook: TableHook<'_>) -> Result<()> {
+        VirtualTable::hook(self, conn, hook)
     }
 
     fn rollback(&mut self) -> Result<()> {
         VirtualTable::rollback(self)
-    }
-
-    fn rename_with_connection(&mut self, connection: &Arc<Connection>, name: &str) -> Result<()> {
-        VirtualTable::rename_with_connection(self, connection, name)
-    }
-
-    fn destroy_with_connection(&mut self, connection: &Arc<Connection>) -> Result<()> {
-        VirtualTable::destroy_with_connection(self, connection)
     }
 }
 

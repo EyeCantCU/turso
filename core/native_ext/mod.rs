@@ -13,7 +13,10 @@ pub use index::{
     INDEX_SCAN_UNIQUE,
 };
 pub use turso_ext::{ConstraintInfo, ConstraintUsage, IndexInfo, OrderByInfo, VTabKind};
-pub use vtab::{ConnectInfo, TableUpdate, VirtualTable, VirtualTableCursor, VirtualTableModule};
+pub use vtab::{
+    ColumnLookup, ConnectInfo, PointerPayload, TableHook, TableUpdate, VirtualTable,
+    VirtualTableCursor, VirtualTableModule,
+};
 
 pub use function::AggregateState;
 pub(crate) use function::{

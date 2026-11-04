@@ -1741,6 +1741,18 @@ pub unsafe extern "C" fn turso_db_config_int(
         // accept + enforce is safe only if every feature above gains a
         // per-connection defensive gate in core first.
         SQLITE_DBCONFIG_DEFENSIVE => unsafe { vtab::db_config_defensive(db, value, p_out) },
+        SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER => {
+            // SAFETY: db was checked for NULL; p_out is NULL or writable.
+            let db: &sqlite3 = unsafe { &*db };
+            let inner = db.inner.lock().unwrap();
+            let on = inner
+                .conn
+                .fts3_tokenizer_enabled((value >= 0).then_some(value != 0));
+            if !p_out.is_null() {
+                unsafe { *p_out = on as ffi::c_int };
+            }
+            SQLITE_OK
+        }
         _ => unsafe { compat_config::db_config_bool(db, op, value, p_out) },
     }
 }

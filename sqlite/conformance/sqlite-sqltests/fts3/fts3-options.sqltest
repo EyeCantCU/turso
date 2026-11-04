@@ -1,0 +1,272 @@
+@database :memory:
+
+# FTS4 options, tokenizers, fts3tokenize and fts4aux.
+# Expected output is SQLite 3.54's.
+
+test fts4-option-prefix {
+    CREATE VIRTUAL TABLE t USING fts4(x, prefix='2,3');
+    INSERT INTO t VALUES('apple application apply');
+    SELECT level, idx, hex(root) FROM t_segdir ORDER BY level;
+    SELECT rowid FROM t WHERE t MATCH 'ap*';
+    SELECT rowid FROM t WHERE t MATCH 'app*';
+    SELECT rowid FROM t WHERE t MATCH 'appl*';
+}
+expect {
+    0|0|00056170706C6503010200040769636174696F6E0301030004017903010400
+    1024|0|00026170050102030300
+    2048|0|0003617070050102030300
+    1
+    1
+    1
+}
+
+test fts4-option-order-desc {
+    CREATE VIRTUAL TABLE t USING fts4(x, order=DESC);
+    INSERT INTO t VALUES('a b');
+    INSERT INTO t VALUES('a c');
+    INSERT INTO t VALUES('a');
+    SELECT hex(root) FROM t_segdir;
+    SELECT rowid FROM t WHERE t MATCH 'a';
+    INSERT INTO t(t) VALUES('optimize');
+    SELECT hex(root) FROM t_segdir;
+}
+expect {
+    0001610301020000016203010300
+    0001610302020000016303020300
+    00016103030200
+    3
+    2
+    1
+    000161090302000102000102000001620301030000016303020300
+}
+
+test fts4-option-languageid {
+    CREATE VIRTUAL TABLE t USING fts4(x, languageid=lid);
+    INSERT INTO t(x, lid) VALUES('hello', 0), ('hello', 1), ('hello', 1);
+    SELECT level, idx, hex(root) FROM t_segdir ORDER BY level;
+    SELECT rowid FROM t WHERE t MATCH 'hello';
+    SELECT rowid FROM t WHERE t MATCH 'hello' AND lid = 1;
+    SELECT rowid, lid FROM t;
+}
+expect {
+    0|0|000568656C6C6F03010200
+    1024|0|000568656C6C6F06020200010200
+    1
+    2
+    3
+    1|0
+    2|1
+    3|1
+}
+
+test fts4-option-languageid-negative {
+    CREATE VIRTUAL TABLE t USING fts4(x, languageid=lid);
+    INSERT INTO t(x, lid) VALUES('hello', -1);
+}
+expect error {
+    constraint failed
+}
+
+test fts4-option-contentless {
+    CREATE VIRTUAL TABLE t USING fts4(x, content='');
+    INSERT INTO t(docid, x) VALUES(4, 'alpha beta');
+    SELECT docid FROM t WHERE t MATCH 'beta';
+    SELECT name FROM sqlite_schema WHERE name LIKE 't%' ORDER BY name;
+}
+expect {
+    4
+    t
+    t_docsize
+    t_segdir
+    t_segments
+    t_stat
+}
+
+test fts4-option-contentless-read {
+    CREATE VIRTUAL TABLE t USING fts4(x, content='');
+    INSERT INTO t(docid, x) VALUES(4, 'alpha beta');
+    SELECT x FROM t WHERE t MATCH 'beta';
+}
+expect error {
+    SQL logic error
+}
+
+test fts4-option-external-content {
+    CREATE TABLE src(a, b);
+    INSERT INTO src VALUES('red apple', 'fruit'), ('green leaf', 'plant');
+    CREATE VIRTUAL TABLE t USING fts4(content=src);
+    INSERT INTO t(t) VALUES('rebuild');
+    SELECT docid, a, b FROM t WHERE t MATCH 'apple OR plant';
+    PRAGMA table_info(t);
+}
+expect {
+    1|red apple|fruit
+    2|green leaf|plant
+    0|a||0||0
+    1|b||0||0
+}
+
+test fts4-option-notindexed {
+    CREATE VIRTUAL TABLE t USING fts4(a, b, notindexed=b);
+    INSERT INTO t VALUES('seen', 'hidden');
+    SELECT count(*) FROM t WHERE t MATCH 'hidden';
+    SELECT a, b FROM t WHERE t MATCH 'seen';
+}
+expect {
+    0
+    seen|hidden
+}
+
+test fts4-option-matchinfo-fts3 {
+    CREATE VIRTUAL TABLE t USING fts4(a, matchinfo=fts3);
+    SELECT name FROM sqlite_schema WHERE name LIKE 't%' ORDER BY name;
+}
+expect {
+    t
+    t_content
+    t_segdir
+    t_segments
+    t_stat
+}
+
+test fts4-option-errors-order {
+    CREATE VIRTUAL TABLE t USING fts4(a, order=sideways);
+}
+expect error {
+    unrecognized order: sideways
+}
+
+test fts4-option-errors-unknown {
+    CREATE VIRTUAL TABLE t USING fts4(a, colour=blue);
+}
+expect error {
+    unrecognized parameter: colour=blue
+}
+
+test fts4-option-errors-notindexed {
+    CREATE VIRTUAL TABLE t USING fts4(a, notindexed=z);
+}
+expect error {
+    no such column: z
+}
+
+test fts4-option-errors-compress {
+    CREATE VIRTUAL TABLE t USING fts4(a, compress=zip);
+}
+expect error {
+    missing uncompress parameter in fts4 constructor
+}
+
+test fts4-option-errors-tokenizer {
+    CREATE VIRTUAL TABLE t USING fts4(a, tokenize=nosuch);
+}
+expect error {
+    unknown tokenizer: nosuch
+}
+
+test fts3-tokenizer-simple {
+    CREATE VIRTUAL TABLE tk USING fts3tokenize(simple);
+    SELECT token, start, end, position FROM tk WHERE input = 'Hello, WORLD! x_y 42';
+}
+expect {
+    hello|0|5|0
+    world|7|12|1
+    x|14|15|2
+    y|16|17|3
+    42|18|20|4
+}
+
+test fts3-tokenizer-porter {
+    CREATE VIRTUAL TABLE tk USING fts3tokenize(porter);
+    SELECT token FROM tk WHERE input = 'running connections generalization happiness agreed';
+}
+expect {
+    run
+    connect
+    gener
+    happi
+    agre
+}
+
+test fts3-tokenizer-unicode61 {
+    CREATE VIRTUAL TABLE tk USING fts3tokenize(unicode61);
+    SELECT token FROM tk WHERE input = 'Café NAÏVE Straße Ωmega';
+}
+expect {
+    cafe
+    naive
+    straße
+    ωmega
+}
+
+test fts3-tokenizer-unicode61-options {
+    CREATE VIRTUAL TABLE tk USING fts3tokenize(unicode61, "remove_diacritics=0", "tokenchars=-", "separators=x");
+    SELECT token FROM tk WHERE input = 'Café well-known boxed';
+}
+expect {
+    café
+    well-known
+    bo
+    ed
+}
+
+test fts3-tokenizer-in-table {
+    CREATE VIRTUAL TABLE t USING fts4(x, tokenize=unicode61 "remove_diacritics=2");
+    INSERT INTO t VALUES('ǅemal résumé');
+    SELECT rowid FROM t WHERE t MATCH 'resume';
+    SELECT rowid FROM t WHERE t MATCH 'dzemal';
+}
+expect {
+    1
+}
+
+test fts4aux-terms {
+    CREATE VIRTUAL TABLE t USING fts4(a, b);
+    INSERT INTO t VALUES('x y x', 'y z');
+    INSERT INTO t VALUES('z', 'x');
+    CREATE VIRTUAL TABLE a USING fts4aux(t);
+    SELECT term, col, documents, occurrences FROM a;
+    SELECT term, col, documents, occurrences FROM a WHERE term = 'x';
+    SELECT term, col, documents FROM a WHERE term > 'x' AND term <= 'z';
+}
+expect {
+    x|*|2|3
+    x|0|1|2
+    x|1|1|1
+    y|*|1|2
+    y|0|1|1
+    y|1|1|1
+    z|*|2|2
+    z|0|1|1
+    z|1|1|1
+    x|*|2|3
+    x|0|1|2
+    x|1|1|1
+    y|*|1
+    y|0|1
+    y|1|1
+    z|*|2
+    z|0|1
+    z|1|1
+}
+
+test fts4aux-languageid {
+    CREATE VIRTUAL TABLE t USING fts4(a, languageid=lid);
+    INSERT INTO t(a, lid) VALUES('one two', 0), ('two three', 1);
+    CREATE VIRTUAL TABLE a USING fts4aux(t);
+    SELECT term, col, documents, languageid FROM a WHERE col = '*';
+    SELECT term, col, documents, languageid FROM a WHERE col = '*' AND languageid = 1;
+}
+expect {
+    one|*|1|0
+    two|*|1|0
+    three|*|1|1
+    two|*|1|1
+}
+
+test fts4aux-bad-arguments {
+    CREATE VIRTUAL TABLE a USING fts4aux(x, y);
+}
+expect error {
+    invalid arguments to fts4aux constructor
+}

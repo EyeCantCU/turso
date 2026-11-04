@@ -104,11 +104,8 @@ pub(super) fn translate_like_base(
                 },
             });
         }
-        #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-        ast::LikeOperator::Match => {
-            crate::bail_parse_error!("unable to use function MATCH in the requested context")
-        }
-        #[cfg(any(not(feature = "fts"), target_family = "wasm"))]
+        // A virtual table that consumed the term never gets here. Otherwise
+        // `x MATCH y` is `match(y, x)`, which SQLite only lets modules overload.
         ast::LikeOperator::Match => {
             crate::bail_parse_error!("unable to use function MATCH in the requested context")
         }

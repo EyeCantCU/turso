@@ -2674,6 +2674,19 @@ impl Schema {
         }
     }
 
+    /// The visible column names of a main-schema table.
+    pub(crate) fn column_names(&self, name: &str) -> Option<Vec<String>> {
+        let table = self.get_table(NamespaceId::ROOT, name)?;
+        Some(
+            table
+                .columns()
+                .iter()
+                .filter(|c| !c.hidden())
+                .filter_map(|c| c.name.clone())
+                .collect(),
+        )
+    }
+
     pub fn get_btree_table(&self, namespace: NamespaceId, name: &str) -> Option<Arc<BTreeTable>> {
         let name = self.normalize_table_lookup_name(name);
         if let Some(table) = self.namespace(namespace).tables.get(&name) {
@@ -3889,11 +3902,15 @@ impl Schema {
                             .iter()
                             .map(|a| crate::Value::from_text(a.to_string()))
                             .collect();
-                        crate::VirtualTable::table(
+                        // A module may take its columns from a table loaded before it.
+                        let schema: &Schema = self;
+                        let lookup = |tbl: &str| schema.column_names(tbl);
+                        crate::VirtualTable::table_with_lookup(
                             Some(name),
                             create_vtab.module_name.as_str(),
                             args,
                             syms,
+                            &lookup,
                         )?
                     };
                     self.add_virtual_table(NamespaceId::ROOT, vtab)?;
