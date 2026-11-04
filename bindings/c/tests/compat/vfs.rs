@@ -611,6 +611,8 @@ struct Counts {
     lock: AtomicUsize,
     unlock: AtomicUsize,
     close: AtomicUsize,
+    shm_map: AtomicUsize,
+    shm_lock: AtomicUsize,
 }
 
 impl Counts {
@@ -627,6 +629,8 @@ impl Counts {
             lock: AtomicUsize::new(0),
             unlock: AtomicUsize::new(0),
             close: AtomicUsize::new(0),
+            shm_map: AtomicUsize::new(0),
+            shm_lock: AtomicUsize::new(0),
         }
     }
     fn get(c: &AtomicUsize) -> usize {
@@ -704,9 +708,11 @@ unsafe extern "C" fn shim_shm_map(
     e: c_int,
     o: *mut *mut c_void,
 ) -> c_int {
+    SHIM.shm_map.fetch_add(1, Ordering::SeqCst);
     (real_m(f).x_shm_map.unwrap())(real(f), r, s, e, o)
 }
 unsafe extern "C" fn shim_shm_lock(f: *mut sqlite3_file, o: c_int, n: c_int, fl: c_int) -> c_int {
+    SHIM.shm_lock.fetch_add(1, Ordering::SeqCst);
     (real_m(f).x_shm_lock.unwrap())(real(f), o, n, fl)
 }
 unsafe extern "C" fn shim_shm_barrier(f: *mut sqlite3_file) {
@@ -1129,5 +1135,51 @@ fn default_vfs_methods_work() {
         let mut now = 0i64;
         assert_eq!(((*v).x_current_time_int64.unwrap())(v, &mut now), SQLITE_OK);
         assert!(now > 210_866_760_000_000 + 1_600_000_000_000);
+    }
+}
+
+/// Run SQL in the system `sqlite3` shell (real SQLite); None if absent.
+fn sqlite_shell(path: &str, sql: &str) -> Option<String> {
+    let out = std::process::Command::new("sqlite3")
+        .args(["-batch", "-cmd", ".timeout 5000", path, sql])
+        .output()
+        .ok()?;
+    assert!(out.status.success(), "sqlite3 failed on: {sql}");
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+#[test]
+fn shim_vfs_shares_a_wal_database_with_other_processes() {
+    let _g = lock();
+    unsafe {
+        let name = c"compat-shim-mp";
+        let vfs = shim_vfs(name);
+        assert_eq!(sqlite3_vfs_register(vfs, 0), SQLITE_OK);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shim-mp.db");
+        let p = path.to_str().unwrap();
+        let (rc, db) = open_v2(p, OPEN_READWRITE | OPEN_CREATE, Some(name));
+        assert_eq!(rc, SQLITE_OK);
+        assert_eq!(rows(db, "PRAGMA journal_mode=WAL"), "wal");
+        exec(db, "CREATE TABLE t(x); INSERT INTO t VALUES (1)");
+        // Another process writes while this connection is open: the
+        // database is shared (no lifetime EXCLUSIVE lock), through the
+        // VFS's locks and shared-memory wal-index.
+        let Some(_) = sqlite_shell(p, "INSERT INTO t VALUES (2); INSERT INTO t VALUES (3);") else {
+            eprintln!("sqlite3 shell not available, skipping");
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            sqlite3_vfs_unregister(vfs);
+            return;
+        };
+        assert_eq!(rows(db, "SELECT count(*), sum(x) FROM t"), "3|6");
+        exec(db, "INSERT INTO t VALUES (4)");
+        assert_eq!(
+            sqlite_shell(p, "SELECT count(*), sum(x) FROM t; PRAGMA integrity_check").unwrap(),
+            "4|10\nok"
+        );
+        assert!(Counts::get(&SHIM.shm_map) > 0, "xShmMap through the VFS");
+        assert!(Counts::get(&SHIM.shm_lock) > 0, "xShmLock through the VFS");
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+        assert_eq!(sqlite3_vfs_unregister(vfs), SQLITE_OK);
     }
 }

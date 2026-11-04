@@ -282,6 +282,11 @@ pub trait File: Send + Sync {
         ))
     }
 
+    /// Memory barrier for a shared mapping (a VFS's xShmBarrier).
+    fn shared_wal_barrier(&self) {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn shared_wal_set_len(&self, _len: u64) -> Result<()> {
         Err(crate::LimboError::InternalError(
             "shared WAL coordination resizing is not supported for this file".into(),

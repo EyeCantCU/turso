@@ -1061,7 +1061,8 @@ impl Database {
         if opts.enable_multiprocess_wal
             || is_memory_like(path)
             || !io.supports_shared_wal_coordination()
-            || !Self::path_allows_shared_wal_coordination(Path::new(path))?
+            // A VFS name that is no host path has no coordination file.
+            || !Self::path_allows_shared_wal_coordination(Path::new(path)).unwrap_or(false)
         {
             return Ok(());
         }
