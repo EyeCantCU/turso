@@ -2959,6 +2959,15 @@ fn translate_rename_virtual_table(
 ) -> Result<()> {
     let database_id = namespace.database_id;
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
+    // SQLite checks the new name before calling xRename, as for other tables.
+    let new_name_taken = resolver.with_schema(database_id, |s| {
+        s.get_object_type(namespace.id, &new_name_norm).is_some()
+    });
+    if new_name_taken {
+        return Err(LimboError::ParseError(format!(
+            "there is already another table or index with this name: {new_name_norm}"
+        )));
+    }
     program.begin_write_operation()?;
     let vtab_cur = program.alloc_cursor_id(CursorType::VirtualTable(vtab));
     program.emit_insn(Insn::VOpen {

@@ -940,7 +940,20 @@ fn translate_function_call_expr(
         crate::bail_parse_error!("no such function: {}", name.as_str());
     }
 
-    let func = func_type.unwrap();
+    let mut func = func_type.unwrap();
+    // xFindFunction: a virtual table may overload a function whose first
+    // argument is one of its columns.
+    if let (Some(ast::Expr::Column { table, .. }), Some(tables)) =
+        (args.first().map(|a| a.as_ref()), referenced_tables)
+    {
+        if let Some((_, crate::schema::Table::Virtual(vtab))) =
+            tables.find_table_by_internal_id(*table)
+        {
+            if let Some(f) = vtab.find_function(name.as_str(), args_count) {
+                func = Func::External(f);
+            }
+        }
+    }
     let collation = if func.needs_collation() {
         first_collation(
             args.iter()

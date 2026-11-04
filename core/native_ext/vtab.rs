@@ -136,6 +136,15 @@ pub trait VirtualTable: Debug + Send + Sync {
             TableHook::Destroy => self.destroy(),
         }
     }
+    /// `xFindFunction`: a function that replaces the global `name` when its
+    /// first argument is a column of this table.
+    fn find_function(
+        &self,
+        _name: &str,
+        _nargs: usize,
+    ) -> Option<Arc<crate::function::ExternalFunc>> {
+        None
+    }
     /// Whether the plan `idx_num` visits at most one row
     /// (`SQLITE_INDEX_SCAN_UNIQUE`), so a write through it is a single write.
     fn unique_scan(&self, _idx_num: i32) -> bool {
@@ -152,7 +161,14 @@ pub trait VirtualTable: Debug + Send + Sync {
     }
 }
 
+/// A pointer value (`sqlite3_result_pointer`): a type tag and the object.
+pub type PointerPayload = (&'static str, Arc<dyn std::any::Any + Send + Sync>);
+
 pub trait VirtualTableCursor: Send + Sync {
+    /// A pointer-typed NULL for `column`, read before `column`.
+    fn column_pointer(&mut self, _column: usize) -> Option<PointerPayload> {
+        None
+    }
     fn filter(&mut self, args: &[Value], idx_str: Option<&str>, idx_num: i32) -> IOResultOr<bool>;
     fn next(&mut self) -> IOResultOr<bool>;
     fn column(&mut self, column: usize) -> IOResultOr<Value>;
@@ -246,6 +262,14 @@ impl NativeTable {
     pub(crate) fn unique_scan(&self, idx_num: i32) -> bool {
         self.0.read().unique_scan(idx_num)
     }
+
+    pub(crate) fn find_function(
+        &self,
+        name: &str,
+        nargs: usize,
+    ) -> Option<Arc<crate::function::ExternalFunc>> {
+        self.0.read().find_function(name, nargs)
+    }
 }
 
 trait TableInstance: Debug + Send + Sync {
@@ -264,6 +288,8 @@ trait TableInstance: Debug + Send + Sync {
     ) -> Result<Box<dyn TableUpdate>>;
     fn commits_after_create(&self) -> bool;
     fn unique_scan(&self, idx_num: i32) -> bool;
+    fn find_function(&self, name: &str, nargs: usize)
+        -> Option<Arc<crate::function::ExternalFunc>>;
     fn hook(&mut self, conn: &Arc<Connection>, hook: TableHook<'_>) -> Result<()>;
 }
 
@@ -299,6 +325,14 @@ impl<T: VirtualTable> TableInstance for T {
 
     fn unique_scan(&self, idx_num: i32) -> bool {
         VirtualTable::unique_scan(self, idx_num)
+    }
+
+    fn find_function(
+        &self,
+        name: &str,
+        nargs: usize,
+    ) -> Option<Arc<crate::function::ExternalFunc>> {
+        VirtualTable::find_function(self, name, nargs)
     }
 
     fn hook(&mut self, conn: &Arc<Connection>, hook: TableHook<'_>) -> Result<()> {

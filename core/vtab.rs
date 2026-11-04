@@ -44,6 +44,20 @@ impl VirtualTable {
         )
     }
 
+    /// `xFindFunction` for a function whose first argument is a column here.
+    pub(crate) fn find_function(
+        &self,
+        name: &str,
+        nargs: usize,
+    ) -> Option<Arc<crate::function::ExternalFunc>> {
+        match &self.vtab_type {
+            VirtualTableType::External(crate::ext::ExtensionTable::Native(table)) => {
+                table.find_function(name, nargs)
+            }
+            _ => None,
+        }
+    }
+
     /// Whether scan plan `idx_num` visits at most one row.
     pub(crate) fn unique_scan(&self, idx_num: i32) -> bool {
         matches!(
@@ -428,6 +442,20 @@ impl VirtualTableCursor {
             VirtualTableCursorInner::External(cursor) => cursor.rowid(),
             VirtualTableCursorInner::Internal(cursor) => cursor.read().rowid(),
         })
+    }
+
+    pub(crate) fn column_pointer(
+        &mut self,
+        column: usize,
+    ) -> Option<crate::native_ext::PointerPayload> {
+        match &mut self.inner {
+            VirtualTableCursorInner::External(crate::ext::ExtensionCursor::Native(c))
+                if !self.null_flag =>
+            {
+                c.cursor.column_pointer(column)
+            }
+            _ => None,
+        }
     }
 
     pub(crate) fn column(&mut self, column: usize) -> IOResultOr<Value> {
