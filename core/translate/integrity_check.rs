@@ -47,6 +47,7 @@ pub fn translate_integrity_check(
     database_id: usize,
     max_errors: usize,
     connection: &crate::Connection,
+    table: Option<&str>,
 ) -> crate::Result<()> {
     translate_integrity_check_impl(
         program,
@@ -55,6 +56,7 @@ pub fn translate_integrity_check(
         max_errors,
         false,
         connection,
+        table,
     )
 }
 
@@ -65,8 +67,17 @@ pub fn translate_quick_check(
     database_id: usize,
     max_errors: usize,
     connection: &crate::Connection,
+    table: Option<&str>,
 ) -> crate::Result<()> {
-    translate_integrity_check_impl(program, resolver, database_id, max_errors, true, connection)
+    translate_integrity_check_impl(
+        program,
+        resolver,
+        database_id,
+        max_errors,
+        true,
+        connection,
+        table,
+    )
 }
 
 fn translate_integrity_check_impl(
@@ -76,6 +87,7 @@ fn translate_integrity_check_impl(
     max_errors: usize,
     quick: bool,
     connection: &crate::Connection,
+    table: Option<&str>,
 ) -> crate::Result<()> {
     match connection.mv_store_for_db(database_id) {
         Some(mv_store) => {
@@ -94,6 +106,7 @@ fn translate_integrity_check_impl(
                     max_errors,
                     quick,
                     Some(mv_store.as_ref()),
+                    table,
                 )
             })
         }
@@ -107,6 +120,7 @@ fn translate_integrity_check_impl(
                 max_errors,
                 quick,
                 None,
+                table,
             )
         }),
     }
@@ -186,20 +200,35 @@ fn translate_integrity_check_for_schema(
     max_errors: usize,
     quick: bool,
     mv_store: Option<&crate::MvStore>,
+    table: Option<&str>,
 ) -> crate::Result<()> {
+    // integrity_check(T): only table T and its indexes, without the
+    // whole-file page accounting (SQLite's partial check).
+    if let Some(name) = table {
+        let found = schema.namespace_ids().any(|ns| {
+            schema
+                .tables(ns)
+                .any(|t| t.get_name().eq_ignore_ascii_case(name))
+        });
+        if !found {
+            crate::bail_parse_error!("no such table: {}", name);
+        }
+    }
+    let in_scope = |name: &str| table.is_none_or(|t| t.eq_ignore_ascii_case(name));
     // 1) Run low-level btree/freelist/overflow verification first. This mirrors
     // SQLite's OP_IntegrityCk front-pass and can already emit corruption errors
     // before any row-by-row semantic checks run.
-    let mut root_pages = resolved_root_pages(schema, mv_store);
+    let mut root_pages = resolved_root_pages(schema, mv_store, &in_scope);
     let live_root_pages: HashSet<i64> = root_pages.iter().copied().collect();
-    let connection_root_pages: HashSet<i64> = resolved_root_pages(connection_schema, mv_store)
-        .into_iter()
-        .collect();
+    let connection_root_pages: HashSet<i64> =
+        resolved_root_pages(connection_schema, mv_store, &in_scope)
+            .into_iter()
+            .collect();
 
     let passive = mv_store.is_some_and(|mv_store| mv_store.uses_passive_checkpoint());
     let mut dropped_roots = Vec::new();
     for &dropped_root in &schema.dropped_root_pages {
-        if live_root_pages.contains(&dropped_root) {
+        if table.is_some() || live_root_pages.contains(&dropped_root) {
             continue;
         }
         if passive {
@@ -218,6 +247,7 @@ fn translate_integrity_check_for_schema(
             roots: root_pages,
             dropped_roots,
             message_register: registers.message,
+            partial: table.is_some(),
         }),
     });
 
@@ -671,7 +701,11 @@ fn translate_integrity_check_for_schema(
     Ok(())
 }
 
-fn resolved_root_pages(schema: &Schema, mv_store: Option<&crate::MvStore>) -> Vec<i64> {
+fn resolved_root_pages(
+    schema: &Schema,
+    mv_store: Option<&crate::MvStore>,
+    in_scope: &dyn Fn(&str) -> bool,
+) -> Vec<i64> {
     let mut root_pages = Vec::new();
 
     // integrity_check verifies the physical file, so a placeholder (negative) root for an
@@ -689,6 +723,9 @@ fn resolved_root_pages(schema: &Schema, mv_store: Option<&crate::MvStore>) -> Ve
             .map(move |table| (namespace, table))
     }) {
         if let Table::BTree(btree_table) = table.as_ref() {
+            if !in_scope(&btree_table.name) {
+                continue;
+            }
             let table_root = resolve_root(btree_table.root_page);
             if table_root < 0 {
                 continue;

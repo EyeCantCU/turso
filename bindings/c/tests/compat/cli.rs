@@ -1595,3 +1595,49 @@ fn test_cli_table_column_metadata_schemas() {
         sqlite3_close(db);
     }
 }
+
+#[test]
+fn test_cli_integrity_check_table_argument() {
+    unsafe {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_file(&dir);
+        // strict2.test: every table made to share t1's root page.
+        exec_ok(
+            db,
+            "CREATE TABLE t1(a INT, b TEXT) STRICT; CREATE TABLE t2(a, b);
+             INSERT INTO t1 VALUES(1, 'x');
+             PRAGMA writable_schema=ON;
+             UPDATE sqlite_schema SET rootpage=(SELECT rootpage FROM sqlite_schema WHERE name='t1');
+             PRAGMA writable_schema=OFF",
+        );
+        sqlite3_close(db);
+        let db = open_file(&dir);
+        assert_eq!(query(db, "PRAGMA quick_check('t1')"), ["ok"]);
+        assert_eq!(query(db, "PRAGMA integrity_check(t2)"), ["ok"]);
+        assert_ne!(query(db, "PRAGMA quick_check"), ["ok"]);
+        assert!(query_err(db, "PRAGMA quick_check('nosuch')").ends_with("no such table: nosuch"));
+        sqlite3_close(db);
+    }
+}
+
+#[test]
+fn test_cli_unsupported_file_format() {
+    unsafe {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_file(&dir);
+        exec_ok(db, "CREATE TABLE t(a)");
+        sqlite3_close(db);
+        // Schema format 5 and a new schema cookie, written behind SQLite's back.
+        let path = dir.path().join("t.db");
+        let mut bytes = std::fs::read(&path).unwrap();
+        let cookie = u32::from_be_bytes(bytes[40..44].try_into().unwrap()) + 1;
+        bytes[40..44].copy_from_slice(&cookie.to_be_bytes());
+        bytes[44..48].copy_from_slice(&5u32.to_be_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        // The open succeeds; reading the schema fails.
+        let db = open_file(&dir);
+        let msg = query_err(db, "SELECT * FROM sqlite_schema");
+        assert!(msg.ends_with("unsupported file format"), "{msg}");
+        sqlite3_close(db);
+    }
+}

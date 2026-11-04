@@ -3331,12 +3331,17 @@ impl Pager {
     }
 
     pub fn get_schema_cookie(&self) -> IOResultOr<u32> {
-        self.with_header(|header| {
+        let (cookie, format) = return_if_io!(self.with_header(|header| {
             if self.db_initialized() {
                 self.set_reserved_space(header.reserved_space);
             }
-            header.schema_cookie.get()
-        })
+            (header.schema_cookie.get(), header.schema_format.get())
+        }));
+        // SQLITE_MAX_FILE_FORMAT is 4.
+        if format > 4 {
+            return Err(LimboError::SqlError("unsupported file format".into()).into());
+        }
+        Ok(IOResult::Done(cookie))
     }
 
     /// This connection's frozen WAL position `(checkpoint_seq, max_frame)` — the read mark for a
