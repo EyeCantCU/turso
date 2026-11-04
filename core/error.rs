@@ -181,6 +181,10 @@ pub enum LimboError {
     /// SQLITE_ABORT until the handle is closed.
     #[error("blob handle expired")]
     BlobHandleExpired,
+    /// A statement's write cursor was faulted by a ROLLBACK (or a rollback
+    /// forced by an I/O error) run while it was active: SQLITE_ABORT_ROLLBACK.
+    #[error("abort due to ROLLBACK")]
+    AbortRollback,
     #[error("Planning error: {0}")]
     PlanningError(String),
     #[error("Checkpoint failed: {0}")]
@@ -247,7 +251,7 @@ impl LimboError {
             Self::TooBig => 18,
             Self::PermissionDenied(_) => 23,
             Self::NotADB => 26,
-            Self::BlobHandleExpired => 4,
+            Self::BlobHandleExpired | Self::AbortRollback => 4,
             _ => 1,
         }
     }

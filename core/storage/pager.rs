@@ -2118,6 +2118,33 @@ impl Pager {
         }
     }
 
+    /// sqlite3BtreeTripAllCursors with SQLITE_ABORT_ROLLBACK: fault the
+    /// write cursors of every statement (all cursors unless `write_only`),
+    /// and save the positions of the others.
+    pub(crate) fn trip_cursors(&self, write_only: bool) {
+        let snapshot: smallvec::SmallVec<[RegisteredCursor; 8]> = {
+            let registry = self.cursor_registry.lock();
+            registry.values().flat_map(|b| b.iter().copied()).collect()
+        };
+        for peer in snapshot {
+            // SAFETY: see RegisteredCursor's invariant.
+            let cursor = unsafe { peer.as_mut() };
+            if write_only && !cursor.is_write_cursor() {
+                let saved = cursor.try_save_position_for_external_balance();
+                if !matches!(
+                    saved,
+                    Ok(IOResult::Done(
+                        crate::storage::btree::SavePositionResult::Saved
+                    ))
+                ) {
+                    cursor.invalidate_btree_cache();
+                }
+            } else {
+                cursor.trip();
+            }
+        }
+    }
+
     pub(crate) fn invalidate_all_cursors(&self) {
         let snapshot: smallvec::SmallVec<[RegisteredCursor; 8]> = {
             let registry = self.cursor_registry.lock();

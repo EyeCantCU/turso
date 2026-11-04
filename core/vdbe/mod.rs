@@ -1569,7 +1569,12 @@ impl ProgramState {
                     == i32::from(self_counted)
                 && (self.is_active_write || active_writers == 0);
         }
-        if self.auto_txn_cleanup == TxnCleanup::RollbackTxn && self.is_active_write {
+        // A writer that started inside BEGIN finds autocommit back on when a
+        // ROLLBACK ran while it was active; it then finishes like any other.
+        let finishes_shared_txn = self.auto_txn_cleanup == TxnCleanup::RollbackTxn
+            || (self.auto_txn_cleanup == TxnCleanup::RollbackSavepoint
+                && connection.get_auto_commit());
+        if finishes_shared_txn && self.is_active_write {
             // Pager/WAL writers can finish while sibling readers remain
             // active, like SQLite commits when the halting statement is the
             // only writer (the nVdbeWrite check in sqlite3VdbeHalt). The
@@ -3688,6 +3693,19 @@ impl Program {
                 err.is_none() && state.execution_state.is_running();
             let inside_explicit_transaction = !self.connection.get_auto_commit();
             let unfinished_writer = state.is_active_write;
+            // SQLite's "special errors" (sqlite3VdbeHalt): an I/O error, an
+            // interrupted writer, or a full disk / out of memory without a
+            // statement journal may leave pages other statements share in an
+            // unknown state, so the whole transaction rolls back and the
+            // other statements' write cursors are tripped.
+            let special_error = err.is_some_and(|err| match err {
+                LimboError::CompletionError(_) => true,
+                LimboError::Interrupt => unfinished_writer,
+                LimboError::DatabaseFull | LimboError::OutOfMemory => {
+                    state.stmt_savepoint.is_none()
+                }
+                _ => false,
+            });
             let can_rollback_just_this_statement =
                 state.auto_txn_cleanup == TxnCleanup::RollbackSavepoint;
 
@@ -3926,6 +3944,8 @@ impl Program {
                     TxnCleanup::RollbackTxn => {
                         if must_rollback_tx_if_needed {
                             self.rollback_current_txn(pager);
+                        } else if special_error && !is_mvcc {
+                            self.rollback_current_txn_tripping(pager);
                         } else if err.is_none() && unfinished_writer && !pager.is_checkpointing() {
                             // An unfinished writer reset while other writers
                             // still share the transaction: undo just its own
@@ -3949,8 +3969,11 @@ impl Program {
                         // statements dirtied — so the statement savepoint is
                         // not enough: roll back the whole transaction, like
                         // SQLite on SQLITE_IOERR.
-                        let io_error = matches!(err, Some(LimboError::CompletionError(_)));
-                        if can_autocommit_now || io_error {
+                        let io_error = matches!(err, Some(LimboError::CompletionError(_)))
+                            || (special_error && !matches!(err, Some(LimboError::Interrupt)));
+                        if io_error && !is_mvcc {
+                            self.rollback_current_txn_tripping(pager);
+                        } else if can_autocommit_now || io_error {
                             self.rollback_current_txn(pager);
                         } else if err.is_none() && !pager.is_checkpointing() {
                             if let Err(end_stmt_err) = state.end_statement(
@@ -4037,6 +4060,14 @@ impl Program {
             return Err(err);
         }
         Ok(())
+    }
+
+    /// Full rollback while other statements may be active: their write
+    /// cursors fail with SQLITE_ABORT_ROLLBACK afterwards.
+    fn rollback_current_txn_tripping(&self, pager: &Arc<Pager>) {
+        self.connection
+            .trip_cursors(pager, !self.connection.tx_schema_did_change());
+        self.rollback_current_txn(pager);
     }
 
     fn rollback_current_txn(&self, pager: &Arc<Pager>) {

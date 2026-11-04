@@ -867,6 +867,15 @@ pub trait CursorTrait: Any + Send + Sync {
     fn try_save_position_for_external_balance(&mut self) -> IOResultOr<SavePositionResult> {
         Ok(IOResult::Done(SavePositionResult::MustInvalidate))
     }
+    /// Marks a cursor opened for writing (SQLite's BTCF_WriteFlag).
+    fn mark_write_cursor(&mut self) {}
+    fn is_write_cursor(&self) -> bool {
+        false
+    }
+    /// Faults the cursor after a rollback, like SQLite's
+    /// sqlite3BtreeTripAllCursors: every later use fails with
+    /// [`LimboError::AbortRollback`].
+    fn trip(&mut self) {}
     // --- end: BTreeCursor specific functions ----
 }
 
@@ -987,6 +996,10 @@ pub struct BTreeCursor {
     /// itself into the registry). Direct BTreeCursor::new callers (tests,
     /// internal utilities) bypass that path; their Drop skips unregister.
     did_register: crate::sync::atomic::AtomicBool,
+    /// Opened for writing (SQLite's BTCF_WriteFlag).
+    write_cursor: bool,
+    /// Faulted by a rollback (SQLite's CURSOR_FAULT with SQLITE_ABORT_ROLLBACK).
+    tripped: bool,
     #[cfg(any(test, injected_yields))]
     yield_injector: Option<Arc<dyn crate::mvcc::yield_points::YieldInjector>>,
     #[cfg(any(test, injected_yields))]
@@ -1338,6 +1351,8 @@ impl BTreeCursor {
             pending_peer_save: None,
             has_peers: crate::sync::atomic::AtomicBool::new(false),
             did_register: crate::sync::atomic::AtomicBool::new(false),
+            write_cursor: false,
+            tripped: false,
             #[cfg(any(test, injected_yields))]
             yield_injector: None,
             #[cfg(any(test, injected_yields))]
@@ -6750,16 +6765,28 @@ impl CursorTrait for BTreeCursor {
         len: usize,
         out: &mut crate::ValueBlob,
     ) -> IOResultOr<()> {
+        if self.tripped {
+            return Err(Box::new(LimboError::AbortRollback));
+        }
         self.blob_read_column_inherent(column, off, len, out)
     }
     fn blob_write_column(&mut self, column: usize, off: usize, data: &[u8]) -> IOResultOr<()> {
+        if self.tripped {
+            return Err(Box::new(LimboError::AbortRollback));
+        }
         self.blob_write_column_inherent(column, off, data)
     }
     fn blob_column_len(&mut self, column: usize) -> IOResultOr<usize> {
+        if self.tripped {
+            return Err(Box::new(LimboError::AbortRollback));
+        }
         self.blob_column_len_inherent(column)
     }
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn next(&mut self) -> IOResultOr<()> {
+        if self.tripped {
+            return Err(Box::new(LimboError::AbortRollback));
+        }
         if self.can_advance_within_leaf() {
             self.stack.advance();
             self.invalidate_record();
@@ -6812,6 +6839,9 @@ impl CursorTrait for BTreeCursor {
 
     #[inline(always)]
     fn next_row(&mut self) -> CursorStep {
+        if self.tripped {
+            return CursorStep::Error(Box::new(LimboError::AbortRollback));
+        }
         if self.null_flag {
             self.null_flag = false;
             return CursorStep::Empty;
@@ -6829,6 +6859,9 @@ impl CursorTrait for BTreeCursor {
     }
 
     fn prev_row(&mut self) -> CursorStep {
+        if self.tripped {
+            return CursorStep::Error(Box::new(LimboError::AbortRollback));
+        }
         if self.null_flag {
             self.null_flag = false;
             return CursorStep::Empty;
@@ -6842,6 +6875,9 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn last(&mut self) -> IOResultOr<()> {
+        if self.tripped {
+            return Err(Box::new(LimboError::AbortRollback));
+        }
         self.set_null_flag(false);
         if self.valid_state == CursorValidState::Invalid {
             return Ok(IOResult::Done(()));
@@ -6856,6 +6892,9 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn prev(&mut self) -> IOResultOr<()> {
+        if self.tripped {
+            return Err(Box::new(LimboError::AbortRollback));
+        }
         loop {
             match self.advance_state {
                 AdvanceState::Start => {
@@ -6881,6 +6920,9 @@ impl CursorTrait for BTreeCursor {
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
     #[inline(always)]
     fn rowid(&mut self) -> IOResultOr<Option<i64>> {
+        if self.tripped {
+            return Err(Box::new(LimboError::AbortRollback));
+        }
         if self.needs_restore() {
             return rowid_general(self);
         }
@@ -6931,6 +6973,9 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip(self, key), level = Level::DEBUG))]
     fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult> {
+        if self.tripped {
+            return Err(Box::new(LimboError::AbortRollback));
+        }
         self.skip_advance = false;
         // Empty trace to capture the span information
         tracing::trace!("");
@@ -6949,6 +6994,9 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip(self, registers), level = Level::DEBUG))]
     fn seek_unpacked(&mut self, registers: &[Register], op: SeekOp) -> IOResultOr<SeekResult> {
+        if self.tripped {
+            return Err(Box::new(LimboError::AbortRollback));
+        }
         self.skip_advance = false;
         // Empty trace to capture the span information
         tracing::trace!("");
@@ -6967,6 +7015,9 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
     fn record(&mut self) -> IOResultOr<Option<&ImmutableRecord>> {
+        if self.tripped {
+            return Err(Box::new(LimboError::AbortRollback));
+        }
         // Mirrors sqlite3BtreeRestoreCursorPosition called at btree read
         // entry points (btree.c:5315, etc).
         if self.needs_restore() {
@@ -7003,6 +7054,9 @@ impl CursorTrait for BTreeCursor {
 
     #[inline(always)]
     fn record_payload(&mut self) -> IOResultOr<Option<&[u8]>> {
+        if self.tripped {
+            return Err(Box::new(LimboError::AbortRollback));
+        }
         let Some((local, payload_size)) = return_if_io!(self.fetch_payload_static()) else {
             return Ok(IOResult::Done(None));
         };
@@ -7015,6 +7069,9 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn insert(&mut self, key: &BTreeKey) -> IOResultOr<()> {
+        if self.tripped {
+            return Err(Box::new(LimboError::AbortRollback));
+        }
         tracing::debug!(valid_state = ?self.valid_state, cursor_state = ?self.state, is_write_in_progress = self.is_write_in_progress());
         self.noted_payload = NotedPayload::NONE;
         // invalidateOverflowCache in sqlite3BtreeInsert and sqlite3BtreeDelete:
@@ -7044,6 +7101,9 @@ impl CursorTrait for BTreeCursor {
     /// 9. SeekAfterBalancing -> adjust the cursor to a node that is closer to the deleted value. go to Finish
     /// 10. Finish -> Delete operation is done. Return CursorResult(Ok())
     fn delete(&mut self) -> IOResultOr<()> {
+        if self.tripped {
+            return Err(Box::new(LimboError::AbortRollback));
+        }
         self.noted_payload = NotedPayload::NONE;
         self.blob_cache.reset();
         if let CursorState::None = &self.state {
@@ -7441,6 +7501,9 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn exists(&mut self, key: &Value) -> IOResultOr<bool> {
+        if self.tripped {
+            return Err(Box::new(LimboError::AbortRollback));
+        }
         let int_key = match key {
             Value::Numeric(Numeric::Integer(i)) => i,
             _ => unreachable!("btree tables are indexed by integers!"),
@@ -7458,6 +7521,9 @@ impl CursorTrait for BTreeCursor {
     /// this method only clears the tree’s contents. The root page remains
     /// allocated and is reset to an empty leaf page.
     fn clear_btree(&mut self) -> IOResultOr<u64> {
+        if self.tripped {
+            return Err(Box::new(LimboError::AbortRollback));
+        }
         // First entry only — destroy_btree_contents yields IO and resumes
         // through this method, so guard with the same state==None gate it
         // uses for its own state machine. Every page in this btree is about
@@ -7483,6 +7549,9 @@ impl CursorTrait for BTreeCursor {
     /// For cases where the B-Tree should remain allocated but emptied, see [`btree_clear`].
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
     fn btree_destroy(&mut self) -> IOResultOr<Option<usize>> {
+        if self.tripped {
+            return Err(Box::new(LimboError::AbortRollback));
+        }
         // See clear_btree for the state==None gate rationale.
         if matches!(self.state, CursorState::None) {
             self.pager.invalidate_peer_cursors(self);
@@ -7498,6 +7567,9 @@ impl CursorTrait for BTreeCursor {
     ///
     /// Only supposed to be used in the context of a simple Count Select Statement
     fn count(&mut self) -> IOResultOr<usize> {
+        if self.tripped {
+            return Err(Box::new(LimboError::AbortRollback));
+        }
         let mut mem_page;
         let mut contents;
 
@@ -7652,6 +7724,9 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn rewind(&mut self) -> IOResultOr<()> {
+        if self.tripped {
+            return Err(Box::new(LimboError::AbortRollback));
+        }
         self.set_null_flag(false);
         if self.valid_state == CursorValidState::Invalid {
             return Ok(IOResult::Done(()));
@@ -7754,6 +7829,20 @@ impl CursorTrait for BTreeCursor {
             Box::from_raw(raw.cast::<std::mem::MaybeUninit<BTreeCursor>>())
         };
         pager.recycle_cursor_allocation(allocation);
+    }
+
+    fn mark_write_cursor(&mut self) {
+        self.write_cursor = true;
+    }
+
+    fn is_write_cursor(&self) -> bool {
+        self.write_cursor
+    }
+
+    fn trip(&mut self) {
+        self.invalidate_btree_cache();
+        self.context = None;
+        self.tripped = true;
     }
 
     fn set_has_peers_for_external_writes(&self, has_peers: bool) {
@@ -7880,6 +7969,9 @@ impl CursorTrait for BTreeCursor {
     }
 
     fn seek_end(&mut self) -> IOResultOr<()> {
+        if self.tripped {
+            return Err(Box::new(LimboError::AbortRollback));
+        }
         if self.valid_state == CursorValidState::Invalid {
             return Ok(IOResult::Done(()));
         }
@@ -7922,6 +8014,9 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn seek_to_last(&mut self) -> IOResultOr<()> {
+        if self.tripped {
+            return Err(Box::new(LimboError::AbortRollback));
+        }
         loop {
             match self.seek_to_last_state {
                 SeekToLastState::Start => {

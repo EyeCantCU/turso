@@ -1244,7 +1244,8 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
         }
         Err(err) => {
             let mut db_inner = db.inner.lock().unwrap();
-            set_db_err(&mut db_inner, err)
+            let rc = set_db_err(&mut db_inner, err);
+            rc & db_inner.err_mask
         }
     };
     let current = stmt.stmt.metrics().search_count;
@@ -3747,6 +3748,9 @@ fn limbo_err_code(err: &LimboError) -> i32 {
         // SQLite reports operations on an expired blob handle (its row's table was
         // written after sqlite3_blob_open) as SQLITE_ABORT.
         LimboError::BlobHandleExpired => SQLITE_ABORT,
+        // A write cursor tripped by a ROLLBACK run while its statement was
+        // active (sqlite3BtreeTripAllCursors).
+        LimboError::AbortRollback => SQLITE_ABORT_ROLLBACK,
         // SQLite reports its "SQL statements in progress" rejections as
         // error-class SQLITE_BUSY (vdbe.c, OP_AutoCommit / OP_Savepoint).
         LimboError::StatementsInProgress(_) => SQLITE_BUSY,

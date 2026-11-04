@@ -320,6 +320,27 @@ fn test_interleaved_writers_in_explicit_transaction_roll_back_together() {
 
 extern "C" {
     fn sqlite3_user_data(ctx: *mut libc::c_void) -> *mut libc::c_void;
+    fn sqlite3_extended_errcode(db: *mut sqlite3) -> i32;
+}
+
+const SQLITE_ABORT: i32 = 4;
+const SQLITE_ABORT_ROLLBACK: i32 = 516;
+
+unsafe fn register_swallow(db: *mut sqlite3) {
+    assert_eq!(
+        sqlite3_create_function_v2(
+            db,
+            c"swallow".as_ptr(),
+            1,
+            SQLITE_UTF8,
+            db as *mut libc::c_void,
+            Some(swallow_fn),
+            None,
+            None,
+            None,
+        ),
+        SQLITE_OK
+    );
 }
 
 /// `swallow(sql)`: runs `sql` on the function's own connection and returns
@@ -336,20 +357,7 @@ fn test_failed_statement_inside_callback_rolls_back_alone() {
     unsafe {
         let dir = tempfile::tempdir().unwrap();
         let (db, other) = setup(&dir);
-        assert_eq!(
-            sqlite3_create_function_v2(
-                db,
-                c"swallow".as_ptr(),
-                1,
-                SQLITE_UTF8,
-                db as *mut libc::c_void,
-                Some(swallow_fn),
-                None,
-                None,
-                None,
-            ),
-            SQLITE_OK
-        );
+        register_swallow(db);
         exec(db, "CREATE TABLE log(x UNIQUE)");
         exec(db, "INSERT INTO log VALUES (2)");
         // The trigger's statement writes 1, then fails on 2; the function
@@ -440,6 +448,111 @@ fn test_reader_continues_after_rollback() {
             assert_eq!(got, expected, "{order}");
             assert_eq!(sqlite3_finalize(sel), SQLITE_OK);
         }
+        sqlite3_close(db);
+    }
+}
+
+#[test]
+fn test_rollback_with_active_writer() {
+    unsafe {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, other) = setup(&dir);
+        // A RETURNING writer only reads its buffered rows after its first
+        // row, so it keeps returning them after the ROLLBACK.
+        exec(db, "BEGIN");
+        let ins = prepare(db, "INSERT INTO t(b) VALUES (10), (11) RETURNING b");
+        assert_eq!(next(ins).as_deref(), Some("10"));
+        exec(db, "ROLLBACK");
+        assert_eq!(sqlite3_get_autocommit(db), 1);
+        assert_eq!(drain(ins), v(&["11"]));
+        assert_eq!(sqlite3_finalize(ins), SQLITE_OK);
+        assert_eq!(rows(db, "SELECT a FROM t"), v(&["1", "2", "3"]));
+        assert_eq!(rows(other, "SELECT a FROM t"), v(&["1", "2", "3"]));
+
+        // A writer that still uses its write cursor fails with
+        // SQLITE_ABORT_ROLLBACK: here a function called by the UPDATE runs
+        // ROLLBACK at the second row.
+        register_swallow(db);
+        exec(db, "BEGIN");
+        exec(db, "INSERT INTO t VALUES (4, 4)");
+        let upd = prepare(
+            db,
+            "UPDATE t SET b = b + 100 + swallow(CASE a WHEN 2 THEN 'ROLLBACK' ELSE 'SELECT 1' END)",
+        );
+        assert_eq!(sqlite3_step(upd), SQLITE_ABORT);
+        assert_eq!(sqlite3_extended_errcode(db), SQLITE_ABORT_ROLLBACK);
+        assert_eq!(errmsg(db), "abort due to ROLLBACK");
+        sqlite3_finalize(upd);
+        assert_eq!(sqlite3_get_autocommit(db), 1);
+        assert_eq!(rows(db, "SELECT a, b FROM t"), v(&["1:1", "2:2", "3:3"]));
+        exec(db, "INSERT INTO t VALUES (5, 5)");
+        assert_eq!(rows(other, "SELECT count(*) FROM t"), v(&["4"]));
+        sqlite3_close(other);
+        sqlite3_close(db);
+    }
+}
+
+#[test]
+fn test_rollback_to_with_active_writer() {
+    unsafe {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, other) = setup(&dir);
+        exec(db, "BEGIN");
+        exec(db, "INSERT INTO t VALUES (4, 4)");
+        exec(db, "SAVEPOINT s");
+        exec(db, "INSERT INTO t VALUES (5, 5)");
+        let ins = prepare(db, "INSERT INTO t(b) VALUES (10), (11) RETURNING b");
+        assert_eq!(next(ins).as_deref(), Some("10"));
+        // RELEASE and SAVEPOINT wait for the writer; ROLLBACK TO does not.
+        assert_eq!(try_exec(db, "RELEASE s"), SQLITE_BUSY);
+        assert_eq!(
+            errmsg(db),
+            "cannot release savepoint - SQL statements in progress"
+        );
+        exec(db, "ROLLBACK TO s");
+        assert_eq!(drain(ins), v(&["11"]));
+        assert_eq!(sqlite3_finalize(ins), SQLITE_OK);
+        assert_eq!(rows(db, "SELECT a FROM t"), v(&["1", "2", "3", "4"]));
+        exec(db, "COMMIT");
+        assert_eq!(rows(other, "SELECT a FROM t"), v(&["1", "2", "3", "4"]));
+
+        // A writer still using its write cursor fails after ROLLBACK TO.
+        register_swallow(db);
+        exec(db, "BEGIN");
+        exec(db, "SAVEPOINT s");
+        let upd = prepare(
+            db,
+            "UPDATE t SET b = b + 100 + swallow(CASE a WHEN 2 THEN 'ROLLBACK TO s' ELSE 'SELECT 1' END)",
+        );
+        assert_eq!(sqlite3_step(upd), SQLITE_ABORT);
+        assert_eq!(sqlite3_extended_errcode(db), SQLITE_ABORT_ROLLBACK);
+        sqlite3_finalize(upd);
+        assert_eq!(sqlite3_get_autocommit(db), 0);
+        exec(db, "COMMIT");
+        assert_eq!(
+            rows(other, "SELECT a, b FROM t"),
+            v(&["1:1", "2:2", "3:3", "4:4"])
+        );
+        sqlite3_close(other);
+        sqlite3_close(db);
+    }
+}
+
+#[test]
+fn test_rollback_of_schema_change_trips_readers() {
+    unsafe {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _other) = setup(&dir);
+        exec(db, "BEGIN");
+        exec(db, "CREATE TABLE u(x)");
+        let sel = prepare(db, "SELECT a FROM t");
+        assert_eq!(next(sel).as_deref(), Some("1"));
+        exec(db, "ROLLBACK");
+        // With the schema rolled back, readers are tripped too.
+        assert_eq!(sqlite3_step(sel), SQLITE_ABORT);
+        assert_eq!(sqlite3_extended_errcode(db), SQLITE_ABORT_ROLLBACK);
+        sqlite3_finalize(sel);
+        sqlite3_close(_other);
         sqlite3_close(db);
     }
 }
