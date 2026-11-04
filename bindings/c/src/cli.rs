@@ -160,8 +160,12 @@ pub(crate) fn on_open(db: *mut sqlite3, conn: &Arc<Connection>) {
             true,
         );
     }
-    let _ =
-        conn.register_vtab_module_local_at_open("sqlite_stmt", StmtModule { db: db as usize }, false, true);
+    let _ = conn.register_vtab_module_local_at_open(
+        "sqlite_stmt",
+        StmtModule { db: db as usize },
+        false,
+        true,
+    );
 }
 
 /// Disconnects the eponymous virtual tables, as sqlite3_close does before

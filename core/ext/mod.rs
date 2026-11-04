@@ -459,7 +459,10 @@ impl Connection {
     /// Connects the tables in sqlite_schema that use `module_name` and are
     /// not loaded yet. No lock is held while the module's constructor runs,
     /// since it may query this connection.
-    pub(crate) fn connect_stored_vtabs(self: &Arc<Connection>, module_name: &str) -> crate::Result<()> {
+    pub(crate) fn connect_stored_vtabs(
+        self: &Arc<Connection>,
+        module_name: &str,
+    ) -> crate::Result<()> {
         let mut rows: Vec<(String, String)> = Vec::new();
         {
             let mut stmt = self
