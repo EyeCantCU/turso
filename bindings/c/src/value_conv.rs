@@ -190,7 +190,11 @@ pub unsafe extern "C" fn sqlite3_value_blob(value: *mut ffi::c_void) -> *const f
     // Text reads as its stored bytes (UTF-16 in a UTF-16 database), as in SQLite.
     let v = &*(value as *const ExtValue);
     if let Some(b) = v.text_stored_bytes() {
-        return if b.is_empty() { std::ptr::null() } else { b.as_ptr().cast() };
+        return if b.is_empty() {
+            std::ptr::null()
+        } else {
+            b.as_ptr().cast()
+        };
     }
     match converted(value, Enc::Utf8) {
         Some((p, n)) if n > 0 => p.cast(),
