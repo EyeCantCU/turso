@@ -17,15 +17,8 @@
 #define sqlite3ErrName turso_err_name
 void *sqlite3_malloc(int);
 
-static int getDbPointer(Tcl_Interp *interp, const char *zName, sqlite3 **pp){
-  TursoDb *p = find_turso_db(interp, zName);
-  if( p==0 ){
-    Tcl_AppendResult(interp, "no such database: ", zName, (char*)0);
-    return TCL_ERROR;
-  }
-  *pp = p->db;
-  return TCL_OK;
-}
+/* Defined in turso_tcl.c (shared with the testvfs glue). */
+int getDbPointer(Tcl_Interp *interp, const char *zName, sqlite3 **pp);
 
 /* ---- src/test_rtree.c ---- */
 /*
@@ -869,3 +862,5 @@ int Sqlitetestrtreedoc_Init(Tcl_Interp *interp){
 #endif /* SQLITE_ENABLE_RTREE */
   return TCL_OK;
 }
+
+#undef sqlite3ErrName
