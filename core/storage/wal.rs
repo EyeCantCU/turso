@@ -1916,10 +1916,17 @@ impl ShmWalCoordination {
             .metadata
             .loaded_from_disk_scan
             .load(Ordering::Acquire);
+        let first_in_process = !self
+            .shared
+            .read()
+            .runtime
+            .authority_reconciled
+            .swap(true, Ordering::AcqRel);
         if Self::authority_is_uninitialized(snapshot) {
             self.sync_authority_from_local();
             self.sync_authority_frames_from_local();
         } else if local_wal_view_loaded_from_disk
+            && first_in_process
             && !self.authority.writer_or_checkpoint_lock_active()
         {
             self.repair_or_reseed_authority_from_local_disk_scan(snapshot);
@@ -3125,6 +3132,9 @@ pub struct WalSharedRuntime {
     /// Tracks how far the process-local `frame_cache` is known to be complete
     /// for overflow fallback in the current WAL generation.
     pub overflow_fallback_coverage: Arc<SpinLock<OverflowFallbackCoverage>>,
+    /// The first coordination of this process reconciled the shared
+    /// authority with the disk scan; later connections share the live state.
+    pub authority_reconciled: AtomicBool,
     #[cfg(test)]
     pub(crate) frames_compared: AtomicU64,
 }
@@ -6079,6 +6089,7 @@ impl WalFileShared {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
+                authority_reconciled: AtomicBool::new(false),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
             },
@@ -6157,6 +6168,7 @@ impl WalFileShared {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
+                authority_reconciled: AtomicBool::new(false),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
             },
@@ -6201,6 +6213,7 @@ impl WalFileShared {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
+                authority_reconciled: AtomicBool::new(false),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
             },
