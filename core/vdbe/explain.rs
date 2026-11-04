@@ -2545,6 +2545,7 @@ pub fn insn_to_row(
                     roots,
                     dropped_roots,
                     message_register,
+                    ..
                 } = data.as_ref();
                 (
                     "IntegrityCk",

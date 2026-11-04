@@ -17600,6 +17600,7 @@ pub fn op_integrity_check(
         roots,
         dropped_roots,
         message_register,
+        partial,
     } = data.as_ref();
 
     let mv_store = program.connection.mv_store_for_db(*db);
@@ -17629,7 +17630,7 @@ pub fn op_integrity_check(
             let mut integrity_check_state = IntegrityCheckState::new(db_size as usize);
             let mut current_root_idx = 0;
 
-            if freelist_trunk_page > 0 {
+            if freelist_trunk_page > 0 && !*partial {
                 let expected_freelist_count = return_if_io!(
                     state,
                     with_header(
@@ -17709,7 +17710,8 @@ pub fn op_integrity_check(
                 return Ok(InsnFunctionStepResult::Step);
             }
 
-            if !has_freelist_error(errors)
+            if !*partial
+                && !has_freelist_error(errors)
                 && integrity_check_state.freelist_count.actual_count
                     != integrity_check_state.freelist_count.expected_count
             {
@@ -17731,7 +17733,7 @@ pub fn op_integrity_check(
             let skip_page_never_used = false;
 
             if !skip_page_never_used {
-                for page_number in 2..=integrity_check_state.db_size {
+                for page_number in (2..=integrity_check_state.db_size).filter(|_| !*partial) {
                     if !integrity_check_state
                         .page_reference
                         .contains_key(&(page_number as i64))

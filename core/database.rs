@@ -2153,14 +2153,9 @@ impl Database {
                         ))
                         .into());
                     }
-                    let schema_format = header_mut.schema_format.get();
-                    // If the database is completely empty, if it has no schema, then the schema format number can be zero.
-                    if !(0..=4).contains(&schema_format) {
-                        return Err(LimboError::Corrupt(format!(
-                            "Invalid schema_format: expected 1-4, got {schema_format}"
-                        ))
-                        .into());
-                    }
+                    // A schema format above 4 is not refused here: as in
+                    // SQLite, reading the schema fails with "unsupported file
+                    // format" (Pager::get_schema_cookie).
                     if !matches!(
                         header_mut.text_encoding,
                         TextEncoding::Unset

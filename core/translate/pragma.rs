@@ -63,6 +63,15 @@ fn list_pragmas(program: &mut ProgramBuilder) {
 
 /// Parse max_errors from an optional value expression.
 /// Returns the parsed integer if value is a numeric literal, otherwise returns the default.
+/// The table argument of integrity_check/quick_check, if it is not a count.
+fn integrity_check_table(value: &Option<Expr>) -> Option<String> {
+    match value {
+        Some(Expr::Name(n)) | Some(Expr::Id(n)) => Some(n.as_str().to_string()),
+        Some(Expr::Literal(Literal::String(s))) => Some(s.trim_matches('\'').replace("''", "'")),
+        _ => None,
+    }
+}
+
 fn parse_max_errors_from_value(value: &Option<Expr>) -> usize {
     match value {
         Some(Expr::Literal(Literal::Numeric(n))) => {
@@ -1702,6 +1711,7 @@ fn query_pragma(
                 database_id,
                 max_errors,
                 connection.as_ref(),
+                integrity_check_table(&value).as_deref(),
             )?;
             Ok(TransactionMode::Read)
         }
@@ -1713,6 +1723,7 @@ fn query_pragma(
                 database_id,
                 max_errors,
                 connection.as_ref(),
+                integrity_check_table(&value).as_deref(),
             )?;
             Ok(TransactionMode::Read)
         }

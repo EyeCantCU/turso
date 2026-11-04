@@ -310,6 +310,8 @@ pub struct IntegrityCkData {
     pub roots: Vec<i64>,
     pub dropped_roots: Vec<i64>,
     pub message_register: usize,
+    /// Only some b-trees are checked: no freelist or page-usage checks.
+    pub partial: bool,
 }
 
 /// Data for VCheck (boxed to keep Insn small).
