@@ -233,7 +233,7 @@ fn emit_table_list_rows_for_schema(
         emit_table_row(
             program,
             &bt.name,
-            table_list_type(schema, &table),
+            table_list_type(schema, table),
             bt.columns().len(),
             !bt.has_rowid,
             bt.is_strict,
