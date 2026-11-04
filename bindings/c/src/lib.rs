@@ -27,6 +27,7 @@ mod hooks;
 mod session;
 
 mod fts5;
+mod cli;
 mod rtree;
 pub mod vfs;
 pub mod vfs_unix;
@@ -258,6 +259,7 @@ impl Drop for sqlite3Inner {
         // Run the engine's close so the last connection on a database
         // checkpoints its WAL, as SQLite does when a connection closes.
         let _ = self.conn.close();
+        cli::on_close(&self.conn);
         if let Some(path) = &self.temp_path {
             let base = path.to_string_lossy().into_owned();
             for suffix in ["", "-wal", "-shm"] {
@@ -307,7 +309,10 @@ impl sqlite3 {
     fn into_raw(self) -> *mut sqlite3 {
         #[allow(clippy::arc_with_non_send_sync)]
         let handle = Arc::new(self);
-        Arc::into_raw(handle) as *mut sqlite3
+        let conn = handle.inner.lock().unwrap().conn.clone();
+        let db = Arc::into_raw(handle) as *mut sqlite3;
+        cli::on_open(db, &conn);
+        db
     }
 
     unsafe fn clone_from_raw(db: *mut sqlite3) -> Arc<sqlite3> {
@@ -418,7 +423,7 @@ unsafe impl Send for SqliteContext {}
 
 mod reentrancy;
 
-static INIT_DONE: std::sync::Once = std::sync::Once::new();
+static INIT_DONE: cli::InitState = cli::InitState::new();
 
 #[capi_guard]
 #[no_mangle]
@@ -436,6 +441,7 @@ pub unsafe extern "C" fn sqlite3_initialize() -> ffi::c_int {
 #[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_shutdown() -> ffi::c_int {
+    INIT_DONE.reset();
     SQLITE_OK
 }
 
@@ -447,6 +453,15 @@ pub unsafe extern "C" fn sqlite3_open(
     db_out: *mut *mut sqlite3,
 ) -> ffi::c_int {
     trace!("sqlite3_open");
+    if !filename.is_null() && *filename == 0 {
+        // "" is a private temporary database, which sqlite3_open_v2 creates.
+        return sqlite3_open_v2(
+            filename,
+            db_out,
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+            std::ptr::null(),
+        );
+    }
     let rc = sqlite3_initialize();
     if rc != SQLITE_OK {
         return rc;
@@ -803,6 +818,7 @@ pub unsafe extern "C" fn sqlite3_close(db: *mut sqlite3) -> ffi::c_int {
     if db.is_null() {
         return SQLITE_OK;
     }
+    cli::disconnect_vtabs(db);
     {
         let mut inner = (*db).inner.lock().unwrap();
         if inner.e_open_state == SQLITE_STATE_ZOMBIE {
@@ -833,6 +849,7 @@ pub unsafe extern "C" fn sqlite3_close_v2(db: *mut sqlite3) -> ffi::c_int {
     if db.is_null() {
         return SQLITE_OK;
     }
+    cli::disconnect_vtabs(db);
     {
         let mut inner = (*db).inner.lock().unwrap();
         if inner.e_open_state == SQLITE_STATE_ZOMBIE {
@@ -3645,6 +3662,9 @@ pub unsafe extern "C" fn sqlite3_table_column_metadata(
                     rc = SQLITE_ERROR;
                 }
             }
+        } else if !cli::table_exists(&db_inner.conn, table_name) {
+            // A NULL column only checks that the table exists.
+            rc = SQLITE_ERROR;
         }
     }
 

@@ -4,6 +4,7 @@
 #![allow(unused_imports)]
 use std::ptr;
 
+mod cli;
 mod dbstat;
 mod ext_codes;
 mod fts3;

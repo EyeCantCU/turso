@@ -13,6 +13,7 @@
 #![recursion_limit = "256"]
 
 pub mod alloc;
+pub mod auxdata;
 pub mod busy;
 pub mod cdc;
 #[cfg(feature = "cli_only")]
@@ -21,6 +22,7 @@ pub mod dbstat;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod functions;
 pub mod index_method;
+pub mod introspect;
 pub mod io;
 #[cfg(all(feature = "json", any(feature = "fuzz", feature = "bench")))]
 pub mod json;
@@ -41,12 +43,14 @@ pub mod pointer;
 pub mod schema;
 pub mod security;
 pub mod skiplist;
+pub mod sqlite_dbpage;
 pub mod state_machine;
 pub mod storage;
 pub mod type_ordering;
 pub mod types;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod vdbe;
+pub mod vdbevtab;
 pub mod vector;
 
 #[cfg(feature = "cli_only")]

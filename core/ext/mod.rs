@@ -136,6 +136,14 @@ impl SymbolTable {
         Ok(Some(vtab))
     }
 
+    /// Empties every eponymous slot; the tables reconnect on next use.
+    pub(crate) fn take_eponymous_tables(&self) -> Vec<Arc<VirtualTable>> {
+        self.vtab_modules
+            .values()
+            .filter_map(|m| m.eponymous.as_ref()?.table.lock().take())
+            .collect()
+    }
+
     /// Finds a connected virtual table (created or eponymous) by its id.
     pub(crate) fn vtab_by_id(&self, id: u64) -> Option<Arc<VirtualTable>> {
         self.vtabs

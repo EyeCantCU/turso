@@ -53,7 +53,7 @@ impl Subprogram {
     /// reaches the instruction. If it has not been filled, compilation emitted
     /// a recursive foreign-key action call without connecting it to the
     /// finished action program.
-    pub(super) fn prepared_program(&self) -> crate::Result<Arc<PreparedProgram>> {
+    pub(crate) fn prepared_program(&self) -> crate::Result<Arc<PreparedProgram>> {
         match self {
             Self::PreparedProgram(program) => Ok(program.clone()),
             Self::Pending(program) => program.get().and_then(Weak::upgrade).ok_or_else(|| {

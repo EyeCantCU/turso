@@ -76,7 +76,7 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
         }
         ModuleList => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::SchemaReq,
-            &["module_list"],
+            &["name"],
         ),
         PageCount => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::SchemaReq,
@@ -521,7 +521,17 @@ impl PragmaVirtualTableCursor {
 
         // TODO: only synchronous supports a schema arg so far. Unblock the
         // rest one by one, then delete this check.
-        if schema.is_some() && self.pragma_name != "synchronous" {
+        let takes_schema = matches!(
+            self.pragma_name.as_str(),
+            "synchronous"
+                | "table_info"
+                | "table_xinfo"
+                | "index_list"
+                | "index_info"
+                | "index_xinfo"
+                | "foreign_key_list"
+        );
+        if schema.is_some() && !takes_schema {
             return Err(LimboError::ParseError(format!(
                 "Schema argument is not supported yet (got schema: '{}')",
                 schema.unwrap()

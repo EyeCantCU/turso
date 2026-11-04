@@ -1024,6 +1024,27 @@ fn translate_function_call_expr(
                 func_ctx.arg_count += 1;
             }
 
+            if matches!(func_ctx.func, Func::External(_)) {
+                // P1 of OP_Function: constant arguments keep their auxdata.
+                let constant_mask = args
+                    .iter()
+                    .take(32)
+                    .enumerate()
+                    .filter(|(_, a)| a.is_constant(resolver))
+                    .fold(0u32, |m, (i, _)| m | (1 << i));
+                program.emit_insn(Insn::Function {
+                    constant_mask: constant_mask as i32,
+                    start_reg: if args_count == 0 {
+                        target_register
+                    } else {
+                        regs
+                    },
+                    dest: target_register,
+                    func: func_ctx,
+                });
+                return Ok(target_register);
+            }
+
             // Use shared function call helper
             let arg_registers: Vec<usize> = (regs..regs + nregs).collect();
             emit_function_call(program, func_ctx, &arg_registers, target_register)?;

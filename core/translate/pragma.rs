@@ -23,8 +23,7 @@ use crate::storage::wal::CheckpointMode;
 use crate::translate::emitter::{Resolver, TransactionMode};
 use crate::translate::plan::BitSet;
 use crate::util::{
-    normalize_ident, parse_signed_number, parse_string, IOExt as _,
-    PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
+    normalize_ident, parse_string, IOExt as _, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
 };
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
@@ -34,6 +33,24 @@ use crate::{
 };
 use std::str::FromStr;
 use strum::IntoEnumIterator;
+
+/// A numeric pragma value. SQLite also reads it from a string ('4096'),
+/// as `.recover` output does, taking its leading integer like sqlite3Atoi.
+fn parse_signed_number(expr: &ast::Expr) -> Result<Value> {
+    let quoted = match expr {
+        ast::Expr::Name(name) if name.quoted_with('\'') => Some(name.as_str().to_string()),
+        ast::Expr::Literal(ast::Literal::String(s)) => {
+            Some(s.trim_matches('\'').replace("''", "'"))
+        }
+        _ => None,
+    };
+    match quoted {
+        Some(s) => Ok(Value::from_i64(
+            crate::numeric::str_to_i64(s.trim()).unwrap_or(0),
+        )),
+        None => crate::util::parse_signed_number(expr),
+    }
+}
 
 fn list_pragmas(program: &mut ProgramBuilder) {
     for x in PragmaName::iter() {
@@ -1118,7 +1135,7 @@ fn query_pragma(
                 program.emit_result_row(register, 1);
             }
 
-            program.add_pragma_result_column(pragma.to_string());
+            program.add_pragma_result_column("name".to_string());
             Ok(TransactionMode::None)
         }
         PragmaName::CollationList => {

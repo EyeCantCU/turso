@@ -10305,7 +10305,7 @@ pub fn op_function(
 ) -> InsnResult {
     load_insn!(
         Function {
-            constant_mask: _,
+            constant_mask,
             func,
             start_reg,
             dest,
@@ -11967,15 +11967,22 @@ pub fn op_function(
                     .collect()
             };
             crate::pointer::take_result();
-            let value = return_if_io!(
-                state,
-                f.func.call_scalar(
-                    &mut state.extension_state,
-                    &program.connection,
-                    &state.registers[*start_reg..*start_reg + arg_count],
-                    &ptrs,
+            // SAFETY: aux_data is not otherwise touched during the call.
+            let aux = unsafe {
+                crate::auxdata::AuxScope::enter(
+                    std::ptr::addr_of_mut!(state.aux_data),
+                    state.pc as usize,
+                    *constant_mask as u32,
                 )
+            };
+            let result = f.func.call_scalar(
+                &mut state.extension_state,
+                &program.connection,
+                &state.registers[*start_reg..*start_reg + arg_count],
+                &ptrs,
             );
+            aux.finish(result.is_err());
+            let value = return_if_io!(state, result);
             let result_ptr = crate::pointer::take_result();
             match result_ptr {
                 Some(p) if matches!(value, Value::Null) => {
