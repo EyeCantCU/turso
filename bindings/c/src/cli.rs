@@ -127,7 +127,19 @@ impl InitState {
 // ------------------------------------------------------------ connection
 
 /// Registers the built-in virtual tables on a new handle.
+fn stmt_from_pointer(p: usize) -> Option<*const turso_core::Statement> {
+    // SAFETY: a "stmt-pointer" is a live sqlite3_stmt the caller bound.
+    (p != 0).then(|| unsafe { &(*(p as *const sqlite3_stmt)).stmt as *const _ })
+}
+
 pub(crate) fn on_open(db: *mut sqlite3, conn: &Arc<Connection>) {
+    turso_core::vdbevtab::set_stmt_pointer_resolver(stmt_from_pointer);
+    // SAFETY: db was just created.
+    let name = unsafe { (*db).inner.lock().unwrap().filename.as_ptr() as usize };
+    db_filenames()
+        .lock()
+        .unwrap()
+        .insert(Arc::as_ptr(conn) as usize, name);
     let _ = conn.register_vtab_module_local(
         turso_core::sqlite_dbpage::DBPAGE_MODULE_NAME,
         turso_core::sqlite_dbpage::DbpageModule,
@@ -155,8 +167,22 @@ pub(crate) fn on_open(db: *mut sqlite3, conn: &Arc<Connection>) {
 /// it checks for unfinalized statements: their xDisconnect may finalize
 /// statements of their own. They reconnect on next use.
 pub(crate) unsafe fn disconnect_vtabs(db: *mut sqlite3) {
-    let conn = (*db).inner.lock().unwrap().conn.clone();
+    let (conn, busy) = {
+        let inner = (*db).inner.lock().unwrap();
+        (inner.conn.clone(), !inner.stmt_list.is_null())
+    };
     conn.disconnect_eponymous_vtabs();
+    // Created tables too, when statements are still open (with none, close
+    // drops them anyway).
+    if busy
+        && !(*db).inner.lock().unwrap().stmt_list.is_null()
+        && conn.disconnect_created_vtabs().unwrap_or(false)
+        && !(*db).inner.lock().unwrap().stmt_list.is_null()
+    {
+        // Close will fail: reconnect them for the handle's further use
+        // (SQLite reconnects on next use).
+        let _ = conn.force_reparse_schema();
+    }
 }
 
 /// SQLITE_DBCONFIG_WRITABLE_SCHEMA: same switch as PRAGMA writable_schema.
@@ -178,6 +204,7 @@ pub(crate) unsafe fn db_config_writable_schema(
 /// Runs the client-data destructors of a connection that is going away.
 pub(crate) fn on_close(conn: &Arc<Connection>) {
     let key = Arc::as_ptr(conn) as usize;
+    db_filenames().lock().unwrap().remove(&key);
     let entries = client_data().lock().unwrap().remove(&key);
     // Destructors run outside the lock.
     drop(entries);
@@ -483,11 +510,34 @@ pub unsafe extern "C" fn sqlite3_column_database_name(
         .map_or(std::ptr::null(), intern)
 }
 
-/// `sqlite3_db_filename` hands out the database name itself, so it is its
-/// own database filename.
+/// Filename pointers handed out by `sqlite3_db_filename`, by connection.
+fn db_filenames() -> &'static Mutex<HashMap<usize, usize>> {
+    static M: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+    M.get_or_init(Default::default)
+}
+
+/// `sqlite3_db_filename` hands out the bare database name, which is its own
+/// database filename. Other names (those a VFS gets in xOpen) live in
+/// SQLite's filename block, whose database name follows four zero bytes:
+/// walk back to it, as SQLite's databaseName() does.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_filename_database(f: *const c_char) -> *const c_char {
-    f
+    if f.is_null() {
+        return f;
+    }
+    if db_filenames()
+        .lock()
+        .unwrap()
+        .values()
+        .any(|&p| p == f as usize)
+    {
+        return f;
+    }
+    let mut p = f as *const u8;
+    while *p.sub(1) != 0 || *p.sub(2) != 0 || *p.sub(3) != 0 || *p.sub(4) != 0 {
+        p = p.sub(1);
+    }
+    p.cast()
 }
 
 #[no_mangle]

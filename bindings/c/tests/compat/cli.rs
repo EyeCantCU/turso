@@ -759,6 +759,43 @@ fn test_cli_overload_function() {
             SQLITE_OK
         );
         assert_eq!(query(db, "SELECT upper('a')"), ["A"]);
+        // A built-in with another argument count gets a placeholder.
+        assert_eq!(
+            sqlite3_overload_function(db, c("upper").as_ptr(), 3),
+            SQLITE_OK
+        );
+        // (Without compat/udf turso's built-in still wins and reports the
+        // argument count; either way the call fails.)
+        let msg = query_err(db, "SELECT upper(1, 2, 3)");
+        assert!(
+            msg.ends_with("unable to use function upper in the requested context")
+                || msg.ends_with("wrong number of arguments to function upper()"),
+            "{msg}"
+        );
+        assert_eq!(query(db, "SELECT upper('b')"), ["B"]);
+        // A variadic user function already covers any count.
+        let rc = sqlite3_create_function_v2(
+            db,
+            c("anyargs").as_ptr(),
+            -1,
+            SQLITE_UTF8,
+            ptr::null_mut(),
+            Some(getptr),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(rc, SQLITE_OK);
+        assert_eq!(
+            sqlite3_overload_function(db, c("anyargs").as_ptr(), 2),
+            SQLITE_OK
+        );
+        assert_eq!(query(db, "SELECT anyargs(1, 2)"), ["NULL"]);
+        // -1 needs a variadic function: a fixed-count one gets a placeholder.
+        assert_eq!(
+            sqlite3_overload_function(db, c("lower").as_ptr(), -1),
+            SQLITE_OK
+        );
         sqlite3_close(db);
     }
 }
@@ -1040,17 +1077,15 @@ fn test_cli_sqlite_stmt() {
         );
         let s1 = prepare(db, "SELECT a, a FROM t");
         let s2 = prepare(db, "INSERT INTO t VALUES(1)");
-        let mut rows = query(
-            db,
-            "SELECT sql, ncol, ro, sql LIKE '%sqlite_stmt' OR busy=0 FROM sqlite_stmt",
-        );
+        let mut rows = query(db, "SELECT sql, ncol, ro, busy FROM sqlite_stmt");
         rows.sort();
+        // The statement reading sqlite_stmt is busy during its own step.
         assert_eq!(
             rows,
             [
-                "INSERT INTO t VALUES(1)|0|0|1",
-                "SELECT a, a FROM t|2|1|1",
-                "SELECT sql, ncol, ro, sql LIKE '%sqlite_stmt' OR busy=0 FROM sqlite_stmt|4|1|1",
+                "INSERT INTO t VALUES(1)|0|0|0",
+                "SELECT a, a FROM t|2|1|0",
+                "SELECT sql, ncol, ro, busy FROM sqlite_stmt|4|1|1",
             ]
         );
         assert_eq!(sqlite3_step(s2), SQLITE_DONE);
@@ -1244,5 +1279,242 @@ fn test_cli_writable_schema() {
         let db = open_file(&dir);
         assert_eq!(columns_of(db, "t"), "a,b,c");
         sqlite3_close(db);
+    }
+}
+
+// A module whose tables hold a prepared statement on their own connection
+// until xDisconnect, like the shell's sqlite_dbdata.
+#[repr(C)]
+struct HolderVtab {
+    p_module: *const c_void,
+    n_ref: c_int,
+    z_err: *mut c_char,
+    stmt: *mut sqlite3_stmt,
+}
+
+#[repr(C)]
+struct HolderCursor {
+    p_vtab: *mut c_void,
+}
+
+#[repr(C)]
+struct Module {
+    version: c_int,
+    methods: [*const c_void; 24],
+}
+unsafe impl Sync for Module {}
+unsafe impl Send for Module {}
+
+static HOLDER_DISCONNECTS: AtomicI32 = AtomicI32::new(0);
+
+unsafe extern "C" fn holder_connect(
+    db: *mut sqlite3,
+    _aux: *mut c_void,
+    _argc: c_int,
+    _argv: *const *const c_char,
+    out: *mut *mut c_void,
+    _err: *mut *mut c_char,
+) -> c_int {
+    extern "C" {
+        fn sqlite3_declare_vtab(db: *mut sqlite3, sql: *const c_char) -> c_int;
+    }
+    let rc = sqlite3_declare_vtab(db, c("CREATE TABLE x(a)").as_ptr());
+    if rc != SQLITE_OK {
+        return rc;
+    }
+    let mut stmt = ptr::null_mut();
+    sqlite3_prepare_v2(db, c("SELECT 1").as_ptr(), -1, &mut stmt, ptr::null_mut());
+    let v = Box::new(HolderVtab {
+        p_module: ptr::null(),
+        n_ref: 0,
+        z_err: ptr::null_mut(),
+        stmt,
+    });
+    *out = Box::into_raw(v).cast();
+    SQLITE_OK
+}
+unsafe extern "C" fn holder_disconnect(v: *mut c_void) -> c_int {
+    HOLDER_DISCONNECTS.fetch_add(1, Ordering::SeqCst);
+    let v = Box::from_raw(v as *mut HolderVtab);
+    sqlite3_finalize(v.stmt);
+    SQLITE_OK
+}
+unsafe extern "C" fn holder_best_index(_v: *mut c_void, _info: *mut c_void) -> c_int {
+    SQLITE_OK
+}
+unsafe extern "C" fn holder_open(v: *mut c_void, out: *mut *mut c_void) -> c_int {
+    *out = Box::into_raw(Box::new(HolderCursor { p_vtab: v })).cast();
+    SQLITE_OK
+}
+unsafe extern "C" fn holder_close(cur: *mut c_void) -> c_int {
+    drop(Box::from_raw(cur as *mut HolderCursor));
+    SQLITE_OK
+}
+unsafe extern "C" fn holder_filter(
+    _cur: *mut c_void,
+    _n: c_int,
+    _s: *const c_char,
+    _argc: c_int,
+    _argv: *mut *mut c_void,
+) -> c_int {
+    SQLITE_OK
+}
+unsafe extern "C" fn holder_next(_cur: *mut c_void) -> c_int {
+    SQLITE_OK
+}
+unsafe extern "C" fn holder_eof(_cur: *mut c_void) -> c_int {
+    1
+}
+unsafe extern "C" fn holder_column(_cur: *mut c_void, ctx: *mut c_void, _i: c_int) -> c_int {
+    sqlite3_result_null(ctx);
+    SQLITE_OK
+}
+unsafe extern "C" fn holder_rowid(_cur: *mut c_void, r: *mut i64) -> c_int {
+    *r = 0;
+    SQLITE_OK
+}
+
+fn holder_module() -> &'static Module {
+    static M: std::sync::OnceLock<Module> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let mut methods = [ptr::null::<c_void>(); 24];
+        methods[0] = holder_connect as *const c_void; // xCreate
+        methods[1] = holder_connect as *const c_void; // xConnect
+        methods[2] = holder_best_index as *const c_void;
+        methods[3] = holder_disconnect as *const c_void; // xDisconnect
+        methods[4] = holder_disconnect as *const c_void; // xDestroy
+        methods[5] = holder_open as *const c_void;
+        methods[6] = holder_close as *const c_void;
+        methods[7] = holder_filter as *const c_void;
+        methods[8] = holder_next as *const c_void;
+        methods[9] = holder_eof as *const c_void;
+        methods[10] = holder_column as *const c_void;
+        methods[11] = holder_rowid as *const c_void;
+        Module {
+            version: 0,
+            methods,
+        }
+    })
+}
+
+unsafe fn open_with_holder(dir: &tempfile::TempDir) -> *mut sqlite3 {
+    extern "C" {
+        fn sqlite3_create_module(
+            db: *mut sqlite3,
+            name: *const c_char,
+            module: *const Module,
+            aux: *mut c_void,
+        ) -> c_int;
+    }
+    let db = open_file(dir);
+    let rc = sqlite3_create_module(db, c("holder").as_ptr(), holder_module(), ptr::null_mut());
+    assert_eq!(rc, SQLITE_OK);
+    db
+}
+
+#[test]
+fn test_cli_close_disconnects_created_vtabs() {
+    unsafe {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_with_holder(&dir);
+        exec_ok(db, "CREATE VIRTUAL TABLE h USING holder; CREATE TABLE t(a)");
+        assert_eq!(query(db, "SELECT count(*) FROM h"), ["0"]);
+        // The table's own statement is finalized by xDisconnect: close works.
+        HOLDER_DISCONNECTS.store(0, Ordering::SeqCst);
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+        assert_eq!(HOLDER_DISCONNECTS.load(Ordering::SeqCst), 1);
+
+        // With an application statement open, close is BUSY; the table
+        // reconnects on its next use.
+        let db = open_with_holder(&dir);
+        assert_eq!(query(db, "SELECT count(*) FROM h"), ["0"]);
+        let s = prepare(db, "SELECT a FROM t");
+        assert_eq!(sqlite3_close(db), SQLITE_BUSY);
+        assert_eq!(query(db, "SELECT count(*) FROM h"), ["0"]);
+        assert_eq!(query(db, "SELECT count(*) FROM t"), ["0"]);
+        sqlite3_finalize(s);
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}
+
+#[test]
+fn test_cli_sqlite_dbpage_other_schema_write() {
+    unsafe {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_file(&dir);
+        exec_ok(
+            db,
+            "CREATE TABLE m(x); CREATE TEMP TABLE tt(y); INSERT INTO tt VALUES(42)",
+        );
+        assert_eq!(
+            query1(db, "SELECT count(*) > 0 FROM sqlite_dbpage('temp')"),
+            "1"
+        );
+        // Rewriting a page of temp opens the write transaction on temp.
+        exec_ok(
+            db,
+            "UPDATE sqlite_dbpage SET data=data WHERE schema='temp' AND pgno=2",
+        );
+        exec_ok(
+            db,
+            "INSERT INTO sqlite_dbpage(pgno, data, schema)
+             SELECT pgno, data, 'temp' FROM sqlite_dbpage('temp') WHERE pgno=1",
+        );
+        assert_eq!(query1(db, "SELECT y FROM tt"), "42");
+        sqlite3_close(db);
+    }
+}
+
+#[test]
+fn test_cli_bytecode_stmt_pointer() {
+    unsafe {
+        let db = open();
+        exec_ok(db, "CREATE TABLE t(a)");
+        let target = prepare(db, "SELECT a FROM t");
+        let q = prepare(
+            db,
+            "SELECT (SELECT opcode FROM bytecode(?1) WHERE addr=0), (SELECT name FROM tables_used(?1))",
+        );
+        let tag = c("stmt-pointer");
+        assert_eq!(
+            sqlite3_bind_pointer(q, 1, target.cast(), tag.as_ptr(), None),
+            SQLITE_OK
+        );
+        assert_eq!(sqlite3_step(q), SQLITE_ROW);
+        assert_eq!(format!("{}|{}", text(q, 0), text(q, 1)), "Init|t");
+        sqlite3_finalize(q);
+        // Another pointer type is not a statement.
+        let q = prepare(db, "SELECT * FROM bytecode(?1)");
+        let other = c("other");
+        sqlite3_bind_pointer(q, 1, target.cast(), other.as_ptr(), None);
+        assert_eq!(sqlite3_step(q), SQLITE_ERROR);
+        assert_eq!(
+            errmsg(db),
+            "argument to bytecode() is not a valid SQL statement"
+        );
+        sqlite3_finalize(q);
+        sqlite3_finalize(target);
+        sqlite3_close(db);
+    }
+}
+
+#[test]
+fn test_cli_filename_database_block() {
+    unsafe {
+        // SQLite's filename block: 4 zero bytes, name, URI key/values, an
+        // empty key, the journal name, the WAL name.
+        let mut block = vec![0u8; 4];
+        let start = block.len();
+        block.extend_from_slice(b"/x/a.db\0mode\0rw\0\0");
+        let journal = block.len();
+        block.extend_from_slice(b"/x/a.db-journal\0");
+        let wal = block.len();
+        block.extend_from_slice(b"/x/a.db-wal\0\0\0\0\0");
+        let base = block.as_ptr() as *const c_char;
+        for off in [start, journal, wal] {
+            let p = sqlite3_filename_database(base.add(off));
+            assert_eq!(p, base.add(start));
+            assert_eq!(CStr::from_ptr(p).to_str().unwrap(), "/x/a.db");
+        }
     }
 }
