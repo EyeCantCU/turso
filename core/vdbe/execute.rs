@@ -11763,14 +11763,40 @@ pub fn op_function(
             }
         }
         crate::function::Func::External(f) => {
+            // Pointer values among the arguments (still-NULL registers).
+            let ptrs: Vec<_> = if state.reg_pointers.is_empty() {
+                Vec::new()
+            } else {
+                (*start_reg..*start_reg + arg_count)
+                    .map(|r| {
+                        state
+                            .reg_pointers
+                            .get(&r)
+                            .filter(|_| state.registers[r].is_null())
+                            .cloned()
+                    })
+                    .collect()
+            };
+            crate::pointer::take_result();
             let value = return_if_io!(
                 state,
                 f.func.call_scalar(
                     &mut state.extension_state,
                     &program.connection,
                     &state.registers[*start_reg..*start_reg + arg_count],
+                    &ptrs,
                 )
             );
+            let result_ptr = crate::pointer::take_result();
+            match result_ptr {
+                Some(p) if matches!(value, Value::Null) => {
+                    state.reg_pointers.insert(*dest, p);
+                }
+                _ if !state.reg_pointers.is_empty() => {
+                    state.reg_pointers.remove(dest);
+                }
+                _ => {}
+            }
             state.registers[*dest].set_value(value);
         }
         crate::function::Func::Math(math_func) => match math_func.arity() {
@@ -16849,6 +16875,11 @@ pub fn op_variable(
 ) -> InsnResult {
     load_insn!(Variable { index, dest }, insn);
     state.registers[*dest].set_value(state.get_parameter(*index));
+    if let Some(p) = state.parameter_pointer(*index) {
+        state.reg_pointers.insert(*dest, p);
+    } else if !state.reg_pointers.is_empty() {
+        state.reg_pointers.remove(dest);
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

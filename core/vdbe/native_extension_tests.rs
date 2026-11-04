@@ -119,7 +119,7 @@ fn native_scalar_borrows_the_same_registers_across_io() {
     .unwrap();
     let mut state = crate::native_ext::ExtensionState::None;
     let value = finish(&queue, || {
-        function.func.call_scalar(&mut state, &conn, &args)
+        function.func.call_scalar(&mut state, &conn, &args, &[])
     });
     assert_eq!(value, Value::from_i64(73));
     assert!(matches!(state, crate::native_ext::ExtensionState::None));
