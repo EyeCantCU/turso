@@ -704,6 +704,9 @@ pub struct Database<
     /// from the first non-EXCLUSIVE transaction on.
     #[cfg(all(host_shared_wal, target_os = "linux"))]
     sqlite_shm_interlock: storage::sqlite_shm_interlock::SqliteInterlockCell,
+    /// Autovacuum mode the last connection read from page 1, for a new
+    /// connection that cannot get a read transaction right now.
+    known_auto_vacuum_mode: Mutex<Option<AutoVacuumMode>>,
     /// The database file's SHARED-byte lock, from open on.
     #[cfg(all(host_shared_wal, target_os = "linux"))]
     db_lock: OnceLock<storage::sqlite_shm_interlock::DbLock>,
@@ -875,6 +878,7 @@ impl Database {
             shared_wal_coordination: OnceLock::new(),
             #[cfg(all(host_shared_wal, target_os = "linux"))]
             sqlite_shm_interlock: Default::default(),
+            known_auto_vacuum_mode: Mutex::new(None),
             #[cfg(all(host_shared_wal, target_os = "linux"))]
             db_lock: OnceLock::new(),
             exclusive_lock_holder: parking_lot::Mutex::new(None),
@@ -2011,6 +2015,13 @@ impl Database {
                             Err(LimboError::Busy) => {
                                 read_tx_attempts += 1;
                                 if read_tx_attempts > 1 {
+                                    // Another connection read page 1 already: open
+                                    // with its mode, like SQLite's lazy open (the
+                                    // first statement reports the lock instead).
+                                    if let Some(mode) = *self.known_auto_vacuum_mode.lock() {
+                                        pager.set_auto_vacuum_mode(mode);
+                                        return Ok(IOResult::Done(pager));
+                                    }
                                     return Err(LimboError::Busy.into());
                                 }
                                 pager.io.yield_now();
@@ -2092,6 +2103,7 @@ impl Database {
 
                     pager.end_read_tx();
                     pager.set_auto_vacuum_mode(mode);
+                    *self.known_auto_vacuum_mode.lock() = Some(mode);
 
                     let InitState::ReadPage1 { pager } = std::mem::take(st) else {
                         unreachable!("state is ReadPage1");

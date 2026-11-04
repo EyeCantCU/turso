@@ -1066,14 +1066,10 @@ impl File for VfsShmFile {
             if exclusive {
                 return Ok(false);
             }
-            // A VFS whose shared memory cannot be mapped (read-only, absent)
-            // gets the single-process mode, as before.
-            return match self.map_region(0) {
-                Ok(_) => Ok(true),
-                Err(err) => Err(LimboError::InvalidArgument(format!(
-                    "experimental multiprocess WAL is not supported: xShmMap failed ({err})"
-                ))),
-            };
+            // xShmMap's own error (e.g. SQLITE_READONLY) reaches the
+            // statement, as in SQLite.
+            self.map_region(0)?;
+            return Ok(true);
         }
         let slot = Self::slot(offset)?;
         let want = if exclusive {
