@@ -1063,6 +1063,7 @@ fn emit_update_column_values<'a>(
                             cursor_id: column_ctx.target_table_cursor_id,
                             column: idx,
                             dest: target_reg,
+                            nochange: true,
                         });
                     } else {
                         let cursor_id = column_ctx

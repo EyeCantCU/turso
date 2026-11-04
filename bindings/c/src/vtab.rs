@@ -10,11 +10,11 @@ use super::*;
 use std::cell::{Cell, RefCell};
 use std::ffi::{c_char, c_int, c_void};
 use turso_core::native_ext::{
-    ConnectInfo, ConstraintInfo, ConstraintUsage, IndexInfo, OrderByInfo, TableUpdate,
-    VirtualTable, VirtualTableCursor, VirtualTableModule,
+    ConnectInfo, ConstraintInfo, ConstraintUsage, IndexInfo, IndexPlan, IndexRequest, OrderByInfo,
+    TableUpdate, VirtualTable, VirtualTableCursor, VirtualTableModule,
 };
 use turso_core::IOResult;
-use turso_ext::{ConstraintOp, ResultCode};
+use turso_ext::ResultCode;
 
 type XCreateFn = unsafe extern "C" fn(
     *mut sqlite3,
@@ -28,6 +28,42 @@ type XVtabFn = unsafe extern "C" fn(*mut sqlite3_vtab) -> c_int;
 type XVtabIntFn = unsafe extern "C" fn(*mut sqlite3_vtab, c_int) -> c_int;
 type XCursorFn = unsafe extern "C" fn(*mut sqlite3_vtab_cursor) -> c_int;
 type XFuncFn = unsafe extern "C" fn(*mut c_void, c_int, *mut *mut c_void);
+type XSFunc = XFuncFn;
+
+/// The function an xFindFunction overload calls, with its user data.
+struct OverloadCtx {
+    x_func: XSFunc,
+    p_arg: *mut c_void,
+    db: usize,
+}
+
+unsafe extern "C" fn overload_call(
+    context: usize,
+    argc: i32,
+    argv: *const ExtValue,
+    _context_destructor: Option<turso_ext::ContextDestructor>,
+    _value_destructor: Option<turso_ext::ValueDestructor>,
+) -> ExtValue {
+    let o = &*(context as *const OverloadCtx);
+    let mut ptrs: Vec<*mut c_void> = (0..argc.max(0) as usize)
+        .map(|i| argv.add(i) as *mut c_void)
+        .collect();
+    let mut ctx = SqliteContext {
+        result: ExtValue::null(),
+        p_app: o.p_arg,
+        db: o.db as *mut sqlite3,
+    };
+    (o.x_func)(
+        &mut ctx as *mut SqliteContext as *mut c_void,
+        argc,
+        ptrs.as_mut_ptr(),
+    );
+    ctx.result
+}
+
+unsafe extern "C" fn overload_free(context: usize) {
+    drop(Box::from_raw(context as *mut OverloadCtx));
+}
 
 /// `struct sqlite3_module`. Fields after xRename exist only when
 /// `iVersion` is high enough and are read only then.
@@ -147,21 +183,6 @@ pub struct sqlite3_index_info {
     pub colUsed: u64,
 }
 
-const SQLITE_INDEX_CONSTRAINT_EQ: u8 = 2;
-const SQLITE_INDEX_CONSTRAINT_GT: u8 = 4;
-const SQLITE_INDEX_CONSTRAINT_LE: u8 = 8;
-const SQLITE_INDEX_CONSTRAINT_LT: u8 = 16;
-const SQLITE_INDEX_CONSTRAINT_GE: u8 = 32;
-const SQLITE_INDEX_CONSTRAINT_MATCH: u8 = 64;
-const SQLITE_INDEX_CONSTRAINT_LIKE: u8 = 65;
-const SQLITE_INDEX_CONSTRAINT_GLOB: u8 = 66;
-const SQLITE_INDEX_CONSTRAINT_REGEXP: u8 = 67;
-const SQLITE_INDEX_CONSTRAINT_NE: u8 = 68;
-const SQLITE_INDEX_CONSTRAINT_ISNOT: u8 = 69;
-const SQLITE_INDEX_CONSTRAINT_ISNOTNULL: u8 = 70;
-const SQLITE_INDEX_CONSTRAINT_ISNULL: u8 = 71;
-const SQLITE_INDEX_CONSTRAINT_IS: u8 = 72;
-
 const SQLITE_VTAB_CONSTRAINT_SUPPORT: c_int = 1;
 const SQLITE_VTAB_USES_ALL_SCHEMAS: c_int = 4;
 
@@ -170,10 +191,6 @@ const SQLITE_ROLLBACK: c_int = 1;
 const SQLITE_IGNORE: c_int = 2;
 const SQLITE_FAIL: c_int = 3;
 const SQLITE_REPLACE: c_int = 5;
-
-/// SQLite's initial estimatedCost (SQLITE_BIG_DBL / 2) and estimatedRows.
-const DEFAULT_COST: f64 = 1e99 / 2.0;
-const DEFAULT_ROWS: i64 = 25;
 
 /// Marks an idxStr encoded by this module (never valid UTF-8 text from C).
 const IDXSTR_PTR: char = '\u{1}';
@@ -185,7 +202,21 @@ std::thread_local! {
     static DECLARE: RefCell<Vec<(usize, Option<String>)>> = const { RefCell::new(Vec::new()) };
     /// ON CONFLICT mode of the xUpdate call in progress.
     static ON_CONFLICT: Cell<c_int> = const { Cell::new(SQLITE_ABORT) };
+    /// The context of the nochange xColumn call in progress.
+    static NOCHANGE_CTX: Cell<usize> = const { Cell::new(0) };
+    /// Per table: columns of the current row left unset in a nochange read.
+    /// Rows read with nochange, oldest first: table, cursor, row, unset columns.
+    /// UPDATE reads all rows before its xUpdate calls, which take them in order.
+    static NOCHANGE_COLS: RefCell<Vec<NochangeRow>> = const { RefCell::new(Vec::new()) };
+    /// xUpdate arguments that are unchanged columns.
+    static NOCHANGE_VALUES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
+
+/// A row read with nochange: table, cursor, row number, unset columns.
+type NochangeRow = (usize, usize, u64, Vec<usize>);
+
+/// Marks a nochange xColumn result the table did not set.
+const NOCHANGE_UNSET: &str = "\u{1}nochange";
 
 /// One `sqlite3_create_module_v2` registration. The client data destructor
 /// runs once the module and every table connected through it are gone.
@@ -373,31 +404,27 @@ impl Drop for CTable {
     }
 }
 
-fn map_op(op: ConstraintOp) -> u8 {
-    match op {
-        ConstraintOp::Eq | ConstraintOp::In => SQLITE_INDEX_CONSTRAINT_EQ,
-        ConstraintOp::Lt => SQLITE_INDEX_CONSTRAINT_LT,
-        ConstraintOp::Le => SQLITE_INDEX_CONSTRAINT_LE,
-        ConstraintOp::Gt => SQLITE_INDEX_CONSTRAINT_GT,
-        ConstraintOp::Ge => SQLITE_INDEX_CONSTRAINT_GE,
-        ConstraintOp::Match => SQLITE_INDEX_CONSTRAINT_MATCH,
-        ConstraintOp::Like => SQLITE_INDEX_CONSTRAINT_LIKE,
-        ConstraintOp::Glob => SQLITE_INDEX_CONSTRAINT_GLOB,
-        ConstraintOp::Regexp => SQLITE_INDEX_CONSTRAINT_REGEXP,
-        ConstraintOp::Ne => SQLITE_INDEX_CONSTRAINT_NE,
-        ConstraintOp::IsNot => SQLITE_INDEX_CONSTRAINT_ISNOT,
-        ConstraintOp::IsNotNull => SQLITE_INDEX_CONSTRAINT_ISNOTNULL,
-        ConstraintOp::IsNull => SQLITE_INDEX_CONSTRAINT_ISNULL,
-        ConstraintOp::Is => SQLITE_INDEX_CONSTRAINT_IS,
-    }
-}
-
 /// The index info passed to xBestIndex, followed by private state that the
 /// `sqlite3_vtab_*` planning helpers read (as SQLite's HiddenIndexInfo).
 #[repr(C)]
 struct IndexInfoBox {
     info: sqlite3_index_info,
     n_constraint: usize,
+    collations: Vec<CString>,
+    rhs: Vec<Option<Value>>,
+    /// `rhs` as sqlite3_values, made on first use; freed with the box.
+    rhs_values: Vec<Option<Box<ExtValue>>>,
+    is_in: Vec<bool>,
+    handle_in: Vec<bool>,
+    distinct: c_int,
+}
+
+impl Drop for IndexInfoBox {
+    fn drop(&mut self) {
+        for v in self.rhs_values.drain(..).flatten() {
+            unsafe { v.__free_internal_type() };
+        }
+    }
 }
 
 /// Turns the module's idxStr into a string that survives the plan; see
@@ -480,44 +507,55 @@ impl VirtualTable for CTable {
             cur,
             eof: true,
             idx_str: None,
+            row: 0,
         })
     }
 
     fn best_index(
         &self,
-        constraints: &[ConstraintInfo],
-        order_by: &[OrderByInfo],
+        _constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
     ) -> Result<IndexInfo, ResultCode> {
+        // The planner always calls best_index_plan.
+        Err(ResultCode::Error)
+    }
+
+    fn best_index_plan(&self, req: &IndexRequest) -> turso_core::Result<Option<IndexPlan>> {
         let Some(x_best_index) = self.inner.methods().xBestIndex else {
-            return Err(ResultCode::Error);
+            return Err(LimboError::SqlError(
+                "virtual table has no xBestIndex".into(),
+            ));
         };
-        let mut a_constraint: Vec<sqlite3_index_constraint> = constraints
+        let n = req.constraints.len();
+        let mut a_constraint: Vec<sqlite3_index_constraint> = req
+            .constraints
             .iter()
-            .map(|c| sqlite3_index_constraint {
-                iColumn: c.column_index as c_int,
-                op: map_op(c.op),
-                // IN lists are not passed through xFilter one value at a time.
-                usable: (c.usable && c.op != ConstraintOp::In) as u8,
-                iTermOffset: 0,
+            .enumerate()
+            .map(|(i, c)| sqlite3_index_constraint {
+                iColumn: c.column,
+                op: c.op,
+                usable: c.usable as u8,
+                iTermOffset: i as c_int,
             })
             .collect();
-        let mut a_order_by: Vec<sqlite3_index_orderby> = order_by
+        let mut a_order_by: Vec<sqlite3_index_orderby> = req
+            .order_by
             .iter()
             .map(|o| sqlite3_index_orderby {
-                iColumn: o.column_index as c_int,
+                iColumn: o.column,
                 desc: o.desc as u8,
             })
             .collect();
-        let mut a_usage: Vec<sqlite3_index_constraint_usage> = constraints
-            .iter()
+        let mut a_usage: Vec<sqlite3_index_constraint_usage> = (0..n)
             .map(|_| sqlite3_index_constraint_usage {
                 argvIndex: 0,
                 omit: 0,
             })
             .collect();
+        let defaults = IndexPlan::new(n);
         let mut boxed = IndexInfoBox {
             info: sqlite3_index_info {
-                nConstraint: a_constraint.len() as c_int,
+                nConstraint: n as c_int,
                 aConstraint: a_constraint.as_mut_ptr(),
                 nOrderBy: a_order_by.len() as c_int,
                 aOrderBy: a_order_by.as_mut_ptr(),
@@ -526,56 +564,133 @@ impl VirtualTable for CTable {
                 idxStr: std::ptr::null_mut(),
                 needToFreeIdxStr: 0,
                 orderByConsumed: 0,
-                estimatedCost: DEFAULT_COST,
-                estimatedRows: DEFAULT_ROWS,
+                estimatedCost: defaults.estimated_cost,
+                estimatedRows: defaults.estimated_rows,
                 idxFlags: 0,
-                colUsed: u64::MAX,
+                colUsed: req.col_used,
             },
-            n_constraint: constraints.len(),
+            n_constraint: n,
+            collations: req
+                .constraints
+                .iter()
+                .map(|c| CString::new(c.collation.as_str()).unwrap_or_default())
+                .collect(),
+            rhs: req.constraints.iter().map(|c| c.rhs.clone()).collect(),
+            rhs_values: (0..n).map(|_| None).collect(),
+            is_in: req.constraints.iter().map(|c| c.is_in).collect(),
+            handle_in: vec![false; n],
+            distinct: req.distinct,
         };
         let rc = unsafe { x_best_index(self.vtab, &mut boxed.info) };
         let info = &boxed.info;
+        let idx_str_display = (!info.idxStr.is_null())
+            .then(|| unsafe { CStr::from_ptr(info.idxStr).to_string_lossy().into_owned() });
         let idx_str = unsafe { encode_idx_str(info.idxStr, info.needToFreeIdxStr != 0) };
         if rc != SQLITE_OK {
             let err = unsafe { vtab_error(self.vtab, rc) };
-            tracing::debug!("xBestIndex: {err}");
-            return Err(if rc & 0xff == SQLITE_CONSTRAINT {
-                ResultCode::ConstraintViolation
-            } else {
-                ResultCode::Error
-            });
+            if rc & 0xff == SQLITE_CONSTRAINT {
+                return Ok(None);
+            }
+            return Err(err);
         }
-        // Reject what SQLite reports as "xBestIndex malfunction".
-        let mut seen = vec![false; constraints.len()];
-        let mut usages = Vec::with_capacity(constraints.len());
-        for (usage, c) in a_usage.iter().zip(&a_constraint) {
-            let argv_index = if usage.argvIndex > 0 {
-                let i = usage.argvIndex as usize;
-                if i > constraints.len() || seen[i - 1] || c.usable == 0 {
-                    return Err(ResultCode::Error);
-                }
-                seen[i - 1] = true;
-                Some(i as u32)
-            } else {
-                None
+        let mut plan = defaults;
+        for (i, usage) in a_usage.iter().enumerate() {
+            plan.usages[i] = ConstraintUsage {
+                argv_index: (usage.argvIndex > 0).then_some(usage.argvIndex as u32),
+                omit: usage.omit != 0,
             };
-            usages.push(ConstraintUsage {
-                argv_index,
-                omit: usage.omit != 0 && argv_index.is_some(),
-            });
         }
-        let used = seen.iter().filter(|s| **s).count();
-        if seen.iter().take(used).any(|s| !s) {
-            return Err(ResultCode::Error);
+        plan.in_all_at_once = boxed.handle_in.clone();
+        plan.idx_num = info.idxNum;
+        plan.idx_str = idx_str;
+        plan.idx_str_display = idx_str_display;
+        plan.order_by_consumed = info.orderByConsumed != 0;
+        plan.estimated_cost = info.estimatedCost;
+        plan.estimated_rows = info.estimatedRows;
+        plan.idx_flags = info.idxFlags;
+        Ok(Some(plan))
+    }
+
+    fn find_function(
+        &self,
+        n_arg: i32,
+        name: &str,
+    ) -> Option<(i32, Arc<turso_core::ExternalFunc>)> {
+        let f = self.inner.methods().xFindFunction?;
+        let cname = CString::new(name).ok()?;
+        let mut x_func: Option<XSFunc> = None;
+        let mut p_arg: *mut c_void = std::ptr::null_mut();
+        let rc = unsafe { f(self.vtab, n_arg, cname.as_ptr(), &mut x_func, &mut p_arg) };
+        if rc == 0 {
+            return None;
         }
-        Ok(IndexInfo {
-            idx_num: info.idxNum,
-            idx_str,
-            order_by_consumed: info.orderByConsumed != 0,
-            estimated_cost: info.estimatedCost,
-            estimated_rows: info.estimatedRows.clamp(0, u32::MAX as i64 - 1) as u32,
-            constraint_usages: usages,
-        })
+        let ctx = Box::new(OverloadCtx {
+            x_func: x_func?,
+            p_arg,
+            db: self.inner.db,
+        });
+        let func = turso_core::ExternalFunc::new_scalar(
+            name.to_string(),
+            n_arg,
+            false,
+            Box::into_raw(ctx) as usize,
+            overload_call,
+            Some(overload_free),
+            None,
+        )
+        .ok()?;
+        Some((rc, Arc::new(func)))
+    }
+
+    fn integrity(
+        &self,
+        _connection: &Arc<turso_core::Connection>,
+        schema: &str,
+        table: &str,
+        quick: bool,
+    ) -> turso_core::Result<Option<String>> {
+        if self.inner.version() < 4 {
+            return Ok(None);
+        }
+        let Some(f) = self.inner.methods().xIntegrity else {
+            return Ok(None);
+        };
+        let schema = CString::new(schema).unwrap_or_default();
+        let table = CString::new(table).unwrap_or_default();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe {
+            f(
+                self.vtab,
+                schema.as_ptr(),
+                table.as_ptr(),
+                quick as c_int,
+                &mut err,
+            )
+        };
+        let msg = (!err.is_null()).then(|| unsafe {
+            let s = CStr::from_ptr(err).to_string_lossy().into_owned();
+            sqlite3_free(err as *mut c_void);
+            s
+        });
+        if rc != SQLITE_OK {
+            return Err(rc_error(rc, None));
+        }
+        Ok(msg)
+    }
+
+    fn has_integrity(&self) -> bool {
+        self.inner.version() >= 4 && self.inner.methods().xIntegrity.is_some()
+    }
+
+    fn is_shadow_name(&self, suffix: &str) -> bool {
+        if self.inner.version() < 3 {
+            return false;
+        }
+        let Some(f) = self.inner.methods().xShadowName else {
+            return false;
+        };
+        let suffix = CString::new(suffix).unwrap_or_default();
+        unsafe { f(suffix.as_ptr()) != 0 }
     }
 
     fn readonly(&self) -> bool {
@@ -731,6 +846,16 @@ impl TableUpdate for CUpdate {
         let mut args = ExtArgs::new(args);
         let mut ptrs = args.ptrs();
         let mut rowid: i64 = 0;
+        // UPDATE: columns the table left unset in a nochange read.
+        let unchanged: Vec<usize> = if ptrs.len() > 2 && !matches!(self.args[0], Value::Null) {
+            take_unchanged(self.vtab as usize)
+                .into_iter()
+                .filter_map(|col| ptrs.get(col + 2).map(|p| *p as usize))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        NOCHANGE_VALUES.with(|v| v.borrow_mut().extend(&unchanged));
         let prev = ON_CONFLICT.with(|c| c.replace(self.on_conflict));
         let rc = unsafe {
             x_update(
@@ -741,6 +866,7 @@ impl TableUpdate for CUpdate {
             )
         };
         ON_CONFLICT.with(|c| c.set(prev));
+        NOCHANGE_VALUES.with(|v| v.borrow_mut().retain(|p| !unchanged.contains(p)));
         check(self.vtab, rc)?;
         let is_insert = self.args.len() > 1 && matches!(self.args[0], Value::Null);
         Ok(IOResult::Done(is_insert.then_some(rowid)))
@@ -753,6 +879,8 @@ struct CCursor {
     eof: bool,
     /// Decoded idxStr; kept alive for the module until the next xFilter.
     idx_str: Option<Vec<u8>>,
+    /// Counts the rows the cursor visits, to tell nochange reads apart.
+    row: u64,
 }
 
 unsafe impl Send for CCursor {}
@@ -791,6 +919,16 @@ impl VirtualTableCursor for CCursor {
         idx_str: Option<&str>,
         idx_num: i32,
     ) -> turso_core::types::IOResultOr<bool> {
+        self.filter_in(args, &[], idx_str, idx_num)
+    }
+
+    fn filter_in(
+        &mut self,
+        args: &[Value],
+        in_lists: &[Option<Vec<Value>>],
+        idx_str: Option<&str>,
+        idx_num: i32,
+    ) -> turso_core::types::IOResultOr<bool> {
         let x_filter = self
             .inner
             .methods()
@@ -810,8 +948,21 @@ impl VirtualTableCursor for CCursor {
                 bytes.as_ptr() as *const c_char
             }
         };
+        self.row += 1;
         let mut ext = ExtArgs::new(args);
         let mut ptrs = ext.ptrs();
+        // An IN passed whole: a NULL argument that sqlite3_vtab_in_first knows.
+        let registered: Vec<usize> = in_lists
+            .iter()
+            .enumerate()
+            .filter_map(|(i, list)| {
+                let list = list.as_ref()?;
+                let addr = *ptrs.get(i)? as usize;
+                let values = list.iter().map(Value::to_ffi).collect();
+                IN_LISTS.with(|l| l.borrow_mut().push((addr, values, 0)));
+                Some(addr)
+            })
+            .collect();
         let rc = unsafe {
             x_filter(
                 self.cur,
@@ -821,12 +972,23 @@ impl VirtualTableCursor for CCursor {
                 ptrs.as_mut_ptr(),
             )
         };
+        for addr in registered {
+            IN_LISTS.with(|l| {
+                let mut l = l.borrow_mut();
+                if let Some(pos) = l.iter().rposition(|(a, _, _)| *a == addr) {
+                    for v in l.remove(pos).1 {
+                        unsafe { v.__free_internal_type() };
+                    }
+                }
+            });
+        }
         drop(ext);
         self.check(rc)?;
         Ok(IOResult::Done(!self.at_eof()))
     }
 
     fn next(&mut self) -> turso_core::types::IOResultOr<bool> {
+        self.row += 1;
         if let Some(f) = self.inner.methods().xNext {
             self.check(unsafe { f(self.cur) })?;
         }
@@ -834,22 +996,70 @@ impl VirtualTableCursor for CCursor {
     }
 
     fn column(&mut self, column: usize) -> turso_core::types::IOResultOr<Value> {
+        self.read_column(column, false)
+    }
+
+    fn column_nochange(&mut self, column: usize) -> turso_core::types::IOResultOr<Value> {
+        self.read_column(column, true)
+    }
+
+    fn rowid(&self) -> i64 {
+        let Some(f) = self.inner.methods().xRowid else {
+            return 0;
+        };
+        let mut rowid: i64 = 0;
+        if unsafe { f(self.cur, &mut rowid) } != SQLITE_OK {
+            unsafe { vtab_error(self.vtab(), SQLITE_ERROR) };
+        }
+        rowid
+    }
+}
+
+impl CCursor {
+    fn read_column(
+        &mut self,
+        column: usize,
+        nochange: bool,
+    ) -> turso_core::types::IOResultOr<Value> {
         let Some(f) = self.inner.methods().xColumn else {
             return Ok(IOResult::Done(Value::Null));
         };
         let mut ctx = SqliteContext {
-            result: ExtValue::null(),
+            // In a nochange read, a result left unset means "unchanged".
+            result: if nochange {
+                ExtValue::error_with_message(NOCHANGE_UNSET.to_string())
+            } else {
+                ExtValue::null()
+            },
             p_app: std::ptr::null_mut(),
             db: self.inner.db as *mut sqlite3,
         };
-        let rc = unsafe {
-            f(
-                self.cur,
-                &mut ctx as *mut SqliteContext as *mut c_void,
-                column as c_int,
-            )
-        };
+        let ctx_ptr = &mut ctx as *mut SqliteContext as *mut c_void;
+        let prev = nochange.then(|| NOCHANGE_CTX.with(|c| c.replace(ctx_ptr as usize)));
+        let rc = unsafe { f(self.cur, ctx_ptr, column as c_int) };
+        if let Some(prev) = prev {
+            NOCHANGE_CTX.with(|c| c.set(prev));
+        }
         let result = std::mem::replace(&mut ctx.result, ExtValue::null());
+        if nochange {
+            let unset = result
+                .to_error_details()
+                .is_some_and(|(_, m)| m.as_deref() == Some(NOCHANGE_UNSET));
+            set_unchanged(
+                self.vtab() as usize,
+                self.cur as usize,
+                self.row,
+                column,
+                unset,
+            );
+            if unset {
+                unsafe { result.__free_internal_type() };
+                if rc != SQLITE_OK {
+                    return Err(Box::new(unsafe { vtab_error(self.vtab(), rc) }));
+                }
+                return Ok(IOResult::Done(Value::Null));
+            }
+        }
         if result.value_type() == turso_ext::ValueType::Error {
             let msg = result
                 .to_error_details()
@@ -863,17 +1073,6 @@ impl VirtualTableCursor for CCursor {
             return Err(Box::new(unsafe { vtab_error(self.vtab(), rc) }));
         }
         Ok(IOResult::Done(Value::from_ffi(result)?))
-    }
-
-    fn rowid(&self) -> i64 {
-        let Some(f) = self.inner.methods().xRowid else {
-            return 0;
-        };
-        let mut rowid: i64 = 0;
-        if unsafe { f(self.cur, &mut rowid) } != SQLITE_OK {
-            unsafe { vtab_error(self.vtab(), SQLITE_ERROR) };
-        }
-        rowid
     }
 }
 
@@ -1028,18 +1227,56 @@ pub unsafe extern "C" fn sqlite3_vtab_on_conflict(_db: *mut sqlite3) -> c_int {
     ON_CONFLICT.with(|c| c.get())
 }
 
-/// Unchanged UPDATE columns are always fetched, so this is never true.
+/// True inside xColumn when UPDATE passes the column through unchanged.
 #[capi_guard]
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_vtab_nochange(_ctx: *mut c_void) -> c_int {
-    0
+pub unsafe extern "C" fn sqlite3_vtab_nochange(ctx: *mut c_void) -> c_int {
+    (!ctx.is_null() && NOCHANGE_CTX.with(|c| c.get()) == ctx as usize) as c_int
 }
 
-unsafe fn index_box<'a>(p: *mut sqlite3_index_info, i: c_int) -> Option<&'a IndexInfoBox> {
+/// True for an xUpdate argument the table left unset in a nochange read.
+#[capi_guard]
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_value_nochange(value: *mut c_void) -> c_int {
+    (!value.is_null() && NOCHANGE_VALUES.with(|v| v.borrow().contains(&(value as usize)))) as c_int
+}
+
+/// Records whether `column` of the cursor's current row was left unset.
+fn set_unchanged(vtab: usize, cur: usize, row: u64, column: usize, unset: bool) {
+    NOCHANGE_COLS.with(|m| {
+        let mut m = m.borrow_mut();
+        let last = m.iter().rposition(|e| e.0 == vtab);
+        let i = match last {
+            Some(i) if m[i].1 == cur && m[i].2 == row => i,
+            _ => {
+                m.push((vtab, cur, row, Vec::new()));
+                m.len() - 1
+            }
+        };
+        let cols = &mut m[i].3;
+        cols.retain(|c| *c != column);
+        if unset {
+            cols.push(column);
+        }
+    });
+}
+
+/// The unset columns of the oldest row read with nochange.
+fn take_unchanged(vtab: usize) -> Vec<usize> {
+    NOCHANGE_COLS.with(|m| {
+        let mut m = m.borrow_mut();
+        match m.iter().position(|e| e.0 == vtab) {
+            Some(i) => m.remove(i).3,
+            None => Vec::new(),
+        }
+    })
+}
+
+unsafe fn index_box<'a>(p: *mut sqlite3_index_info, i: c_int) -> Option<&'a mut IndexInfoBox> {
     if p.is_null() {
         return None;
     }
-    let b = &*(p as *const IndexInfoBox);
+    let b = &mut *(p as *mut IndexInfoBox);
     (i >= 0 && (i as usize) < b.n_constraint).then_some(b)
 }
 
@@ -1049,49 +1286,43 @@ pub unsafe extern "C" fn sqlite3_vtab_collation(
     p: *mut sqlite3_index_info,
     i: c_int,
 ) -> *const c_char {
-    if index_box(p, i).is_none() {
-        return std::ptr::null();
+    match index_box(p, i) {
+        Some(b) => b.collations[i as usize].as_ptr(),
+        None => std::ptr::null(),
     }
-    c"BINARY".as_ptr()
 }
 
-/// The planner never asks a virtual table to deduplicate rows.
 #[capi_guard]
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_vtab_distinct(_p: *mut sqlite3_index_info) -> c_int {
-    0
+pub unsafe extern "C" fn sqlite3_vtab_distinct(p: *mut sqlite3_index_info) -> c_int {
+    if p.is_null() {
+        return 0;
+    }
+    (*(p as *const IndexInfoBox)).distinct
 }
 
-/// IN constraints are offered as unusable, so there is nothing to handle.
 #[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_vtab_in(
-    _p: *mut sqlite3_index_info,
-    _i: c_int,
-    _handle: c_int,
+    p: *mut sqlite3_index_info,
+    i: c_int,
+    handle: c_int,
 ) -> c_int {
-    0
-}
-
-#[capi_guard]
-#[no_mangle]
-pub unsafe extern "C" fn sqlite3_vtab_in_first(_val: *mut c_void, out: *mut *mut c_void) -> c_int {
-    if !out.is_null() {
-        *out = std::ptr::null_mut();
+    // SQLite tracks IN constraints in a 32-bit mask.
+    let Some(b) = index_box(p, i).filter(|_| i < 32) else {
+        return 0;
+    };
+    if !b.is_in[i as usize] {
+        return 0;
     }
-    SQLITE_ERROR
-}
-
-#[capi_guard]
-#[no_mangle]
-pub unsafe extern "C" fn sqlite3_vtab_in_next(_val: *mut c_void, out: *mut *mut c_void) -> c_int {
-    if !out.is_null() {
-        *out = std::ptr::null_mut();
+    if handle == 0 {
+        b.handle_in[i as usize] = false;
+    } else if handle > 0 {
+        b.handle_in[i as usize] = true;
     }
-    SQLITE_ERROR
+    1
 }
 
-/// Right-hand values are not available while planning.
 #[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_vtab_rhs_value(
@@ -1099,11 +1330,88 @@ pub unsafe extern "C" fn sqlite3_vtab_rhs_value(
     i: c_int,
     out: *mut *mut c_void,
 ) -> c_int {
+    let mut value: *mut c_void = std::ptr::null_mut();
+    let rc = match index_box(p, i) {
+        None => SQLITE_MISUSE,
+        Some(b) => {
+            let i = i as usize;
+            if b.rhs_values[i].is_none() {
+                if let Some(v) = &b.rhs[i] {
+                    b.rhs_values[i] = Some(Box::new(v.to_ffi()));
+                }
+            }
+            match b.rhs_values[i].as_mut() {
+                Some(v) => {
+                    value = v.as_mut() as *mut ExtValue as *mut c_void;
+                    SQLITE_OK
+                }
+                None => SQLITE_NOTFOUND,
+            }
+        }
+    };
+    if !out.is_null() {
+        *out = value;
+    }
+    rc
+}
+
+std::thread_local! {
+    /// IN lists handed to the xFilter calls in progress: the address of the
+    /// argument, its values, and the position of sqlite3_vtab_in_next.
+    static IN_LISTS: RefCell<Vec<(usize, Vec<ExtValue>, usize)>> = const { RefCell::new(Vec::new()) };
+}
+
+unsafe fn in_list_value(val: *mut c_void, out: *mut *mut c_void, next: bool) -> c_int {
     if !out.is_null() {
         *out = std::ptr::null_mut();
     }
-    if index_box(p, i).is_none() {
+    if val.is_null() {
         return SQLITE_MISUSE;
     }
-    SQLITE_NOTFOUND
+    IN_LISTS.with(|lists| {
+        let mut lists = lists.borrow_mut();
+        let Some((_, values, pos)) = lists
+            .iter_mut()
+            .rev()
+            .find(|(addr, _, _)| *addr == val as usize)
+        else {
+            return SQLITE_ERROR;
+        };
+        *pos = if next { *pos + 1 } else { 0 };
+        match values.get_mut(*pos) {
+            Some(v) => {
+                if !out.is_null() {
+                    *out = v as *mut ExtValue as *mut c_void;
+                }
+                SQLITE_OK
+            }
+            None => SQLITE_DONE,
+        }
+    })
+}
+
+#[capi_guard]
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_vtab_in_first(val: *mut c_void, out: *mut *mut c_void) -> c_int {
+    in_list_value(val, out, false)
+}
+
+#[capi_guard]
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_vtab_in_next(val: *mut c_void, out: *mut *mut c_void) -> c_int {
+    in_list_value(val, out, true)
+}
+
+/// SQLITE_DBCONFIG_DEFENSIVE: shadow tables become read-only to ordinary SQL.
+pub(crate) unsafe fn db_config_defensive(db: *mut sqlite3, value: c_int, out: *mut c_int) -> c_int {
+    let Some(conn) = db_conn(db) else {
+        return SQLITE_MISUSE;
+    };
+    if value >= 0 {
+        conn.set_defensive(value > 0);
+    }
+    if !out.is_null() {
+        *out = conn.is_defensive() as c_int;
+    }
+    SQLITE_OK
 }

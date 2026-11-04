@@ -24,7 +24,7 @@ use crate::{Connection, IOResult, LimboError, Result, Value};
 use turso_ext::ConstraintOp;
 use turso_ext::ResultCode;
 
-pub(crate) use funcs::{register_functions, VTAB_INTEGRITY_FUNCTION};
+pub(crate) use funcs::register_functions;
 pub use matchfn::{RtreeMatchCall, RtreeMatchFunction, RtreeQueryInfo};
 
 /// The rtree may have between 1 and 5 dimensions.
@@ -456,6 +456,35 @@ impl VirtualTable for RtreeTable {
         Ok(best_index(&self.t, constraints))
     }
 
+    fn best_index_plan(
+        &self,
+        req: &crate::native_ext::IndexRequest,
+    ) -> Result<Option<crate::native_ext::IndexPlan>> {
+        if self.t.kind == RtreeKind::Geopoly {
+            return Ok(Some(geopoly::best_index_plan(req)));
+        }
+        // rtreeBestIndex treats the rowid and column 0 alike.
+        let mut req = req.clone();
+        for c in &mut req.constraints {
+            c.column = c.column.max(0);
+        }
+        for o in &mut req.order_by {
+            o.column = o.column.max(0);
+        }
+        crate::native_ext::best_index_via_legacy(&req, |c, o| self.best_index(c, o))
+    }
+
+    fn find_function(
+        &self,
+        _n_arg: i32,
+        name: &str,
+    ) -> Option<(i32, Arc<crate::function::ExternalFunc>)> {
+        if self.t.kind != RtreeKind::Geopoly {
+            return None;
+        }
+        geopoly::find_function(name)
+    }
+
     fn readonly(&self) -> bool {
         false
     }
@@ -495,7 +524,17 @@ impl VirtualTable for RtreeTable {
         Ok(())
     }
 
-    fn integrity(&self, connection: &Arc<Connection>, _quick: bool) -> Result<Option<String>> {
+    fn has_integrity(&self) -> bool {
+        true
+    }
+
+    fn integrity(
+        &self,
+        connection: &Arc<Connection>,
+        _schema: &str,
+        _table: &str,
+        _quick: bool,
+    ) -> Result<Option<String>> {
         Ok(funcs::check_table(connection, &self.t.db, &self.t.name)?
             .map(|report| format!("In RTree {}.{}:\n{report}", self.t.db, self.t.name)))
     }

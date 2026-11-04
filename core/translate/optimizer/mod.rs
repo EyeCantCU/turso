@@ -11,7 +11,7 @@ use super::{
 };
 use crate::alloc::TursoIteratorExt;
 use crate::schema::GeneratedType;
-use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
+use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess, VtabInArg};
 use crate::translate::planner::{table_mask_from_expr, TableMask};
 use crate::{
     function::{AggFunc, Deterministic, Func},
@@ -79,7 +79,6 @@ use std::{
     collections::{BTreeSet, VecDeque},
     sync::Arc,
 };
-use turso_ext::{ConstraintInfo, ConstraintUsage};
 use turso_parser::ast::RefAct;
 use turso_parser::ast::{self, Expr, SortOrder, SubqueryType, TableInternalId, TriggerEvent};
 
@@ -92,6 +91,7 @@ pub(crate) mod lift_common_subexpressions;
 pub(crate) mod multi_index;
 pub(crate) mod order;
 pub(crate) mod unnest;
+pub(crate) mod vtab;
 
 #[derive(Debug, Default)]
 pub(crate) struct AvailableIndexes {
@@ -1142,6 +1142,11 @@ fn find_select_plan_form(
     }
 
     plan.simple_aggregate = detect_simple_aggregate(plan, resolver)?;
+    let vtab_shape = vtab::VtabQueryShape {
+        distinct: plan.distinctness.is_distinct(),
+        aggregate: !plan.aggregates.is_empty() || plan.group_by.is_some(),
+        all_columns: false,
+    };
     let mut table_plan = find_table_access_plan(
         schema,
         resolver,
@@ -1160,6 +1165,7 @@ fn find_select_plan_form(
         // Every row the WHERE clause keeps reaches the LIMIT unless an aggregate or DISTINCT
         // comes between.
         !plan.distinctness.is_distinct() && plan.aggregates.is_empty(),
+        vtab_shape,
     )?;
 
     if matches!(plan.simple_aggregate, Some(SimpleAggregate::MinMax(_)))
@@ -1347,6 +1353,7 @@ fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()
         &mut None,
         &mut None,
         1.0,
+        vtab::VtabQueryShape::default(),
     )?;
 
     Ok(())
@@ -1409,6 +1416,10 @@ fn optimize_update_plan(
         &mut None,
         &mut None,
         1.0,
+        vtab::VtabQueryShape {
+            all_columns: true,
+            ..Default::default()
+        },
     )?;
     plan.target_table = target_tables
         .joined_tables()
@@ -2485,6 +2496,7 @@ fn optimize_table_access(
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,
     initial_input_cardinality: f64,
+    vtab_shape: vtab::VtabQueryShape,
 ) -> Result<Option<Vec<JoinOrderMember>>> {
     let Some(plan) = find_table_access_plan(
         schema,
@@ -2502,6 +2514,7 @@ fn optimize_table_access(
         initial_input_cardinality,
         None,
         true,
+        vtab_shape,
     )?
     else {
         return Ok(None);
@@ -2539,6 +2552,7 @@ fn find_table_access_plan(
     initial_input_cardinality: f64,
     cost_limit: Option<Cost>,
     rows_pass_through: bool,
+    vtab_shape: vtab::VtabQueryShape,
 ) -> Result<Option<TableAccessPlan>> {
     // When optimizer_params feature is enabled, use lazily-loaded params (cached process-wide).
     // Otherwise, use the compile-time static for zero overhead.
@@ -2703,6 +2717,31 @@ fn find_table_access_plan(
     } else {
         Vec::new()
     };
+    // Virtual tables see the ORDER BY as written, before the GROUP BY merge below.
+    let mut vtab_candidates = Vec::new();
+    for table_index in 0..table_references.joined_tables().len() {
+        if !matches!(
+            table_references.joined_tables()[table_index].table,
+            Table::Virtual(_)
+        ) {
+            continue;
+        }
+        let input = vtab::VtabPlanInput {
+            table_references,
+            table_index,
+            where_clause,
+            subqueries,
+            resolver,
+            order_by,
+            group_by: group_by.as_ref(),
+            result_columns,
+            limit: limit.as_deref(),
+            offset: offset.as_deref(),
+            shape: vtab_shape,
+            exclude_in: false,
+        };
+        vtab_candidates.push((table_index, vtab::plan_vtab(&input)?));
+    }
     let simple_aggregate_target = match simple_aggregate {
         Some(sa) => simple_aggregate_order_target(sa, table_references, resolver)?,
         None => None,
@@ -2722,6 +2761,10 @@ fn find_table_access_plan(
         params,
         resolver,
     )?;
+
+    for (table_index, candidates) in vtab_candidates {
+        constraints_per_table[table_index].vtab = candidates;
+    }
 
     // Enforce INDEXED BY / NOT INDEXED after outer-join rewrites settle, because
     // a null-rejecting WHERE term can turn a LEFT JOIN into an INNER JOIN and
@@ -2911,6 +2954,22 @@ fn plan_unmatched_right_rows(
             resolver,
         )?
         .swap_remove(table_index);
+        if matches!(unmatched_table.table, Table::Virtual(_)) {
+            constraints_for_unmatched_rows.vtab = vtab::plan_vtab(&vtab::VtabPlanInput {
+                table_references: &tables_for_unmatched_rows,
+                table_index,
+                where_clause: &where_clause_for_unmatched_rows,
+                subqueries,
+                resolver,
+                order_by: &[],
+                group_by: None,
+                result_columns: &[],
+                limit: None,
+                offset: None,
+                shape: vtab::VtabQueryShape::default(),
+                exclude_in: true,
+            })?;
+        }
         // The main plan already checked the INDEXED BY index. The unmatched-row
         // read follows the same hint, as in SQLite.
         if let Some(indexed) = &table.indexed {
@@ -3095,18 +3154,13 @@ fn operation_for_unmatched_right_rows(
             )
         }
         AccessMethodParams::VirtualTable {
-            idx_num,
-            idx_str,
-            constraints,
-            constraint_usages,
+            candidates,
+            loop_idx,
         } => build_vtab_scan_op(
             where_clause_for_unmatched_rows,
             table_constraints,
-            &idx_num,
-            &idx_str,
-            &constraints,
-            &constraint_usages,
-            Some(table_references),
+            &candidates,
+            loop_idx,
             false,
         ),
         _ => Err(LimboError::InternalError(
@@ -3404,20 +3458,15 @@ fn apply_table_access_plan(
                 }
             }
             AccessMethodParams::VirtualTable {
-                idx_num,
-                idx_str,
-                constraints,
-                constraint_usages,
+                candidates,
+                loop_idx,
             } => {
                 let table_id = table_references.joined_tables()[table_idx].internal_id;
                 table_references.joined_tables_mut()[table_idx].op = build_vtab_scan_op(
                     where_clause,
                     &constraints_per_table[table_idx],
-                    idx_num,
-                    idx_str,
-                    constraints,
-                    constraint_usages,
-                    Some(table_references),
+                    candidates,
+                    *loop_idx,
                     table_references.outer_join_may_null_extend(table_id),
                 )?;
             }
@@ -3753,91 +3802,96 @@ fn in_seek_source(in_expr: &Expr, affinity: Affinity) -> Result<InSeekSource> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Turn the chosen xBestIndex plan into a scan, and mark the WHERE terms it
+/// makes redundant.
 fn build_vtab_scan_op(
     where_clause: &mut [WhereTerm],
     table_constraints: &TableConstraints,
-    idx_num: &i32,
-    idx_str: &Option<String>,
-    vtab_constraints: &[ConstraintInfo],
-    constraint_usages: &[ConstraintUsage],
-    referenced_tables: Option<&TableReferences>,
+    candidates: &vtab::VtabCandidates,
+    loop_idx: usize,
     outer_join_may_add_nulls: bool,
 ) -> Result<Operation> {
-    if constraint_usages.len() != vtab_constraints.len() {
-        return Err(LimboError::ExtensionError(format!(
-            "Constraint usage count mismatch (expected {}, got {})",
-            vtab_constraints.len(),
-            constraint_usages.len()
-        )));
-    }
-
-    let mut constraints = vec![None; constraint_usages.len()];
-    let mut arg_count = 0;
-
-    for (i, vtab_constraint) in vtab_constraints.iter().enumerate() {
-        let usage = constraint_usages[i];
-        let argv_index = match usage.argv_index {
-            Some(idx) if idx >= 1 && (idx as usize) <= constraint_usages.len() => idx,
-            Some(idx) => {
-                return Err(LimboError::ExtensionError(format!(
-                    "argv_index {} is out of valid range [1..{}]",
-                    idx,
-                    constraint_usages.len()
-                )));
-            }
-            None => continue,
+    use vtab::{VtabRhs, VtabTermKind};
+    let l = &candidates.loops[loop_idx];
+    let table_id = table_constraints.table_id;
+    let mut args = Vec::with_capacity(l.args.len());
+    let mut in_args = Vec::new();
+    // Per term: used with omit (or as a per-value IN loop).
+    let mut covered = vec![false; candidates.terms.len()];
+    for (slot, &ti) in l.args.iter().enumerate() {
+        let t = &candidates.terms[ti];
+        let all_at_once = l.in_all_at_once[slot];
+        let expr = match &t.rhs {
+            VtabRhs::Expr(e) => e.clone(),
+            VtabRhs::None => Expr::Literal(ast::Literal::Null),
+            VtabRhs::InList(values) => Expr::InList {
+                lhs: Box::new(t.lhs.clone()),
+                not: false,
+                rhs: values.iter().cloned().map(Box::new).collect(),
+            },
+            VtabRhs::InSubquery(e) => e.clone(),
         };
-
-        let zero_based_argv_index = (argv_index - 1) as usize;
-        if constraints[zero_based_argv_index].is_some() {
-            return Err(LimboError::ExtensionError(format!(
-                "duplicate argv_index {argv_index}"
-            )));
-        }
-
-        let constraint = &table_constraints.constraints[vtab_constraint.index];
-        let where_term = &mut where_clause[constraint.where_clause_pos.0];
-        // A source argument defines the virtual table, so it never filters a
-        // NULL-extended row. Other omitted terms must test that NULL row.
-        if usage.omit
-            && (!outer_join_may_add_nulls
-                || where_term.origin.is_outer_join()
-                || where_term.origin.table_function_table() == Some(table_constraints.table_id))
-        {
-            where_term.consumed = true;
-        }
-        // MATCH is not a binary operator, so it has no comparison operator to report.
-        let expr = if matches!(constraint.operator, constraints::ConstraintOperator::Match) {
-            constraint.get_constraining_expr_ref(where_clause).clone()
+        if t.is_in() {
+            let per_value = !all_at_once;
+            in_args.push(VtabInArg {
+                arg: slot,
+                all_at_once,
+                recheck: per_value && !l.omit[slot],
+            });
+            covered[ti] = l.omit[slot] || per_value;
         } else {
-            constraint
-                .get_constraining_expr(where_clause, referenced_tables, None)
-                .1
-        };
-        constraints[zero_based_argv_index] = Some(expr);
-        arg_count += 1;
+            covered[ti] = l.omit[slot];
+        }
+        args.push(expr);
     }
-
-    // Verify that used indices form a contiguous sequence starting from 1
-    let constraints = constraints
-        .into_iter()
-        .take(arg_count)
-        .enumerate()
-        .map(|(i, c)| {
-            c.ok_or_else(|| {
-                LimboError::ExtensionError(format!(
-                    "argv_index values must form contiguous sequence starting from 1, missing index {}",
-                    i + 1
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-
+    let may_consume = |term: &WhereTerm| {
+        !outer_join_may_add_nulls
+            || term.origin.is_outer_join()
+            || term.origin.table_function_table() == Some(table_id)
+    };
+    let mut seen = Vec::new();
+    for t in &candidates.terms {
+        if matches!(t.kind, VtabTermKind::Limit | VtabTermKind::Offset)
+            || seen.contains(&t.where_idx)
+        {
+            continue;
+        }
+        seen.push(t.where_idx);
+        let terms_of = || {
+            candidates
+                .terms
+                .iter()
+                .enumerate()
+                .filter(|(_, x)| x.where_idx == t.where_idx)
+        };
+        let direct = terms_of().find(|(_, x)| x.kind == VtabTermKind::Direct);
+        let consume = match direct {
+            Some((i, _)) => covered[i],
+            None => terms_of().all(|(i, x)| covered[i] && !x.like_parent),
+        };
+        if consume && may_consume(&where_clause[t.where_idx]) {
+            where_clause[t.where_idx].consumed = true;
+        }
+    }
     Ok(Operation::Scan(Scan::VirtualTable {
-        idx_num: *idx_num,
-        idx_str: idx_str.clone(),
-        constraints,
+        idx_num: l.plan.idx_num,
+        idx_str: l.plan.idx_str.clone(),
+        explain: if l.plan.idx_flags & crate::native_ext::INDEX_SCAN_HEX != 0 {
+            format!(
+                "0x{:x}:{}",
+                l.plan.idx_num,
+                l.plan.idx_str_display.as_deref().unwrap_or("")
+            )
+        } else {
+            format!(
+                "{}:{}",
+                l.plan.idx_num,
+                l.plan.idx_str_display.as_deref().unwrap_or("")
+            )
+        },
+        constraints: args,
+        in_args,
+        omit_offset: l.omit_offset,
     }))
 }
 

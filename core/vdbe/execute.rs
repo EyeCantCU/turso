@@ -1464,6 +1464,7 @@ pub fn op_vcreate(
             module_name,
             table_name,
             args_reg,
+            db,
         },
         insn
     );
@@ -1484,13 +1485,17 @@ pub fn op_vcreate(
         vec![]
     };
     let conn = program.connection.clone();
+    let schema_name = conn
+        .namespace_name(*db)
+        .unwrap_or_else(|| "main".to_string());
     // No lock is held while the module's constructor runs: it may run
     // statements on this connection.
     let module = conn.syms.read().vtab_module(&module_name).cloned();
     let create = (!conn.vtab_connect_only.load(Ordering::SeqCst)).then_some(&conn);
-    let table = crate::VirtualTable::table_for(
+    let table = crate::VirtualTable::table_in(
         Some(&table_name),
         &module_name,
+        &schema_name,
         args,
         module.as_ref(),
         create,
@@ -1502,6 +1507,28 @@ pub fn op_vcreate(
     {
         conn.syms.write().vtabs.insert(table_name, table);
     }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_vcheck(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(VCheck { data }, insn);
+    let message = data.table.integrity(
+        &program.connection,
+        &data.schema,
+        &data.table.name,
+        data.quick,
+    )?;
+    let value = match message {
+        Some(text) => Value::build_text(text),
+        None => Value::Null,
+    };
+    state.registers[data.dest].set_value(value);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -1520,9 +1547,34 @@ pub fn op_vfilter(
             args_reg,
             idx_str,
             idx_num,
+            in_lists,
         },
         insn
     );
+    // IN lists handled all at once: collect each one's values.
+    let mut lists: Vec<Option<Vec<Value>>> = Vec::new();
+    if !in_lists.is_empty() {
+        lists.resize_with(*arg_count, || None);
+        for (arg, list_cursor) in in_lists {
+            let mut values = Vec::new();
+            let cursor = state.get_cursor(*list_cursor).as_btree_mut();
+            return_if_io!(state, cursor.rewind());
+            let mut more = !cursor.is_empty();
+            while more {
+                let cursor = state.get_cursor(*list_cursor).as_btree_mut();
+                if let Some(record) = return_if_io!(state, cursor.record()) {
+                    values.push(match record.get_value_opt(0) {
+                        Some(v) => v.to_owned()?,
+                        None => Value::Null,
+                    });
+                }
+                let cursor = state.get_cursor(*list_cursor).as_btree_mut();
+                return_if_io!(state, cursor.next());
+                more = cursor.has_record();
+            }
+            lists[*arg] = Some(values);
+        }
+    }
     let has_rows = {
         let cursor = get_cursor!(state, *cursor_id);
         let cursor = cursor.as_virtual_mut();
@@ -1535,10 +1587,17 @@ pub fn op_vfilter(
         } else {
             None
         };
-        return_if_io!(
-            state,
-            cursor.filter(*idx_num as i32, idx_str, *arg_count, args)
-        )
+        if lists.is_empty() {
+            return_if_io!(
+                state,
+                cursor.filter(*idx_num as i32, idx_str, *arg_count, args)
+            )
+        } else {
+            return_if_io!(
+                state,
+                cursor.filter_in(*idx_num as i32, idx_str, args, &lists)
+            )
+        }
     };
     // Increment filter_operations metric for virtual table filter
     state.metrics.filter_operations = state.metrics.filter_operations.wrapping_add(1);
@@ -1563,13 +1622,18 @@ pub fn op_vcolumn(
             cursor_id,
             column,
             dest,
+            nochange,
         },
         insn
     );
     let value = {
         let cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_virtual_mut();
-        return_if_io!(state, cursor.column(*column))
+        if *nochange {
+            return_if_io!(state, cursor.column_nochange(*column))
+        } else {
+            return_if_io!(state, cursor.column(*column))
+        }
     };
     state.registers[*dest].set_value(value);
     state.pc += 1;
@@ -1773,20 +1837,20 @@ pub fn op_vbegin(
     load_insn!(VBegin { cursor_id }, insn);
     let cursor = state.get_cursor(*cursor_id);
     let cursor = cursor.as_virtual_mut();
-    let vtab_id = cursor
-        .vtab_id()
-        .expect("VBegin on non ext-virtual table cursor");
+    // Built-in tables (pragma functions, ...) have no transaction hooks.
+    let Some(vtab_id) = cursor.vtab_id() else {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    };
     let mut states = program.connection.vtab_txn_states.write();
     if states.insert(vtab_id) {
         // Only begin a new transaction if one is not already active for this virtual table module
-        let vtab = program.connection.vtab_by_id(vtab_id);
-        let Some(vtab) = vtab else {
-            return Err(LimboError::InternalError(
-                "Could not find virtual table for VBegin".to_string(),
-            )
-            .into());
-        };
-        vtab.begin()?;
+        // A table that has gone away has nothing to begin.
+        if let Some(vtab) = program.connection.vtab_by_id(vtab_id) {
+            vtab.begin()?;
+        } else {
+            states.remove(&vtab_id);
+        }
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)

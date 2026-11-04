@@ -89,6 +89,14 @@ fn validate(
     {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
+    if crate::translate::planner::is_protected_shadow_table(
+        resolver,
+        conn,
+        namespace.database_id,
+        table_name,
+    ) {
+        crate::bail_parse_error!("table {} may not be modified", table_name);
+    }
     // Check if this table has any incompatible dependent views
     // Check if this is a materialized view. Must look up the schema of the
     // table's own database: a table in an attached database can share a name
@@ -290,9 +298,11 @@ pub fn translate_insert(
     let namespace = resolver.resolve_queried_table(&tbl_name)?;
     let database_id = namespace.database_id;
     let table_name = &tbl_name.name;
-    let table = match resolver.with_schema(database_id, |s| {
-        s.get_table(namespace.id, table_name.as_str())
-    }) {
+    let table = match crate::translate::planner::table_or_eponymous(
+        resolver,
+        namespace,
+        table_name.as_str(),
+    )? {
         Some(table) => table,
         None => {
             return Err(crate::translate::catalog::dml_no_table_error(
@@ -315,9 +325,11 @@ pub fn translate_insert(
             virtual_table.clone(),
             columns,
             body,
+            returning,
             on_conflict,
             resolver,
             connection,
+            namespace,
         )?;
         return Ok(());
     }
@@ -3492,14 +3504,17 @@ fn emit_preflight_constraint_checks(
 }
 
 // TODO: comeback here later to apply the same improvements on select
+#[allow(clippy::too_many_arguments)]
 fn translate_virtual_table_insert(
     program: &mut ProgramBuilder,
     virtual_table: Arc<VirtualTable>,
     columns: Vec<ast::Name>,
     mut body: InsertBody,
+    mut returning: Vec<ResultColumn>,
     on_conflict: Option<ResolveType>,
-    resolver: &Resolver,
+    resolver: &mut Resolver,
     connection: &Arc<crate::Connection>,
+    namespace: NamespaceRef,
 ) -> Result<()> {
     #[cfg(not(feature = "cli_only"))]
     let _ = connection;
@@ -3524,7 +3539,82 @@ fn translate_virtual_table_insert(
                 && matches!(select.body.select, OneSelect::Values(_))
     );
     let table = Table::Virtual(virtual_table.clone());
-    let cursor_id = program.alloc_cursor_id(CursorType::VirtualTable(virtual_table));
+    let cursor_id = program.alloc_cursor_id(CursorType::VirtualTable(virtual_table.clone()));
+    // RETURNING reads the inserted row's registers; rows are buffered so
+    // every xUpdate runs before the first row is returned, as in SQLite.
+    let mut returning_refs = TableReferences::new(
+        vec![JoinedTable {
+            table: table.clone(),
+            identifier: normalize_ident(&virtual_table.name),
+            has_alias: false,
+            internal_id: program.table_reference_counter.next(),
+            op: Operation::default_scan_for(&table),
+            unmatched_right_rows_plan: None,
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            namespace,
+            indexed: None,
+            plan_estimate: None,
+        }],
+        vec![],
+    );
+    let mut returning_subqueries = vec![];
+    plan_subqueries_from_returning(
+        program,
+        &mut returning_subqueries,
+        &mut returning_refs,
+        &mut returning,
+        resolver,
+        connection,
+    )?;
+    let returning_columns =
+        process_returning_clause(&mut returning, &mut returning_refs, resolver)?;
+    let returning_buffer = (!returning_columns.is_empty()).then(|| {
+        let columns = (0..returning_columns.len())
+            .map(|i| {
+                Column::new(
+                    Some(format!("__returning_{i}")),
+                    "BLOB".to_string(),
+                    None,
+                    None,
+                    schema::Type::Blob,
+                    None,
+                    ColDef::default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let buffer_table = Arc::new(BTreeTable::new(
+            0,
+            "vtab_returning_buffer".to_string(),
+            crate::alloc::vec![],
+            columns.into_iter().collect(),
+            schema::BTreeCharacteristics::HAS_ROWID,
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            None,
+        ));
+        let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(buffer_table));
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id,
+            is_table: true,
+        });
+        ReturningBufferCtx {
+            cursor_id,
+            num_columns: returning_columns.len(),
+        }
+    });
+    let layout = ColumnLayout::from_table(&table)?;
+    // SQLite's RETURNING reports -1 as the rowid of a virtual table insert.
+    let returning_rowid = program.alloc_register();
+    if !returning_columns.is_empty() {
+        program.emit_insn(Insn::Integer {
+            value: -1,
+            dest: returning_rowid,
+        });
+    }
     program.emit_insn(Insn::VOpen { cursor_id });
     if !allow_dbpage_write {
         program.emit_insn(Insn::VBegin { cursor_id });
@@ -3650,6 +3740,25 @@ fn translate_virtual_table_insert(
             start_reg: registers_start,
             conflict_action,
         });
+        emit_vtab_returning_subqueries(
+            program,
+            resolver,
+            &returning_refs,
+            &mut returning_subqueries,
+            &insertion,
+            returning_rowid,
+            &layout,
+        )?;
+        emit_returning_results(
+            program,
+            &returning_refs,
+            &returning_columns,
+            insertion.first_col_register(),
+            returning_rowid,
+            resolver,
+            returning_buffer.as_ref(),
+            &layout,
+        )?;
         program.emit_insn(Insn::Next {
             cursor_id: temp_cursor_id,
             pc_if_next: loop_start_label,
@@ -3658,7 +3767,12 @@ fn translate_virtual_table_insert(
         });
         program.preassign_label_to_next_insn(loop_end_label);
         program.emit_insn(Insn::Close { cursor_id });
+        if let Some(buf) = &returning_buffer {
+            emit_returning_scan_back(program, buf);
+        }
         program.preassign_label_to_next_insn(halt_label);
+        program.result_columns = returning_columns;
+        program.table_references.extend(returning_refs);
         return Ok(());
     }
 
@@ -3701,13 +3815,78 @@ fn translate_virtual_table_insert(
             start_reg: registers_start,
             conflict_action,
         });
+        emit_vtab_returning_subqueries(
+            program,
+            resolver,
+            &returning_refs,
+            &mut returning_subqueries,
+            &insertion,
+            returning_rowid,
+            &layout,
+        )?;
+        emit_returning_results(
+            program,
+            &returning_refs,
+            &returning_columns,
+            insertion.first_col_register(),
+            returning_rowid,
+            resolver,
+            returning_buffer.as_ref(),
+            &layout,
+        )?;
     }
 
     program.emit_insn(Insn::Close { cursor_id });
+    if let Some(buf) = &returning_buffer {
+        emit_returning_scan_back(program, buf);
+    }
+    program.result_columns = returning_columns;
+    program.table_references.extend(returning_refs);
 
     program.preassign_label_to_next_insn(halt_label);
 
     Ok(())
+}
+
+/// Evaluates the RETURNING subqueries of a virtual table insert against the
+/// inserted row. A plan is emitted once; later VALUES rows reuse its result.
+#[allow(clippy::too_many_arguments)]
+fn emit_vtab_returning_subqueries(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    table_references: &TableReferences,
+    subqueries: &mut [crate::translate::plan::NonFromClauseSubquery],
+    insertion: &Insertion,
+    rowid_reg: usize,
+    layout: &ColumnLayout,
+) -> Result<()> {
+    if subqueries.iter().all(|s| s.has_been_evaluated()) {
+        return Ok(());
+    }
+    let cache_state = seed_returning_row_image_in_cache(
+        program,
+        table_references,
+        insertion.first_col_register(),
+        rowid_reg,
+        resolver,
+        layout,
+    )?;
+    let result: Result<()> = (|| {
+        for subquery in subqueries.iter_mut().filter(|s| !s.has_been_evaluated()) {
+            let correlated = subquery.correlated;
+            let plan = subquery.consume_plan(EvalAt::Loop(0));
+            emit_non_from_clause_subquery(
+                program,
+                resolver,
+                *plan,
+                &subquery.query_type,
+                correlated,
+            )?;
+        }
+        Ok(())
+    })();
+    restore_returning_row_image_in_cache(resolver, cache_state);
+    result
 }
 
 /// Build the UNIQUE constraint error description as SQLite does:

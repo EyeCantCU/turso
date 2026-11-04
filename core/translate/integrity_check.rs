@@ -133,39 +133,6 @@ fn emit_integrity_result_row(program: &mut ProgramBuilder, registers: &Registers
 }
 
 /// Reports what a virtual table's xIntegrity finds, as one result row.
-fn emit_vtab_integrity_check(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    name: &str,
-    quick: bool,
-    registers: &Registers,
-) -> crate::Result<()> {
-    let Some(func) = resolver.resolve_function(crate::rtree::VTAB_INTEGRITY_FUNCTION, 2)? else {
-        return Ok(());
-    };
-    let args = program.alloc_registers(2);
-    program.emit_string8(name.to_string(), args);
-    program.emit_int(quick as i64, args + 1);
-    program.emit_insn(Insn::Function {
-        constant_mask: 0,
-        start_reg: args,
-        dest: registers.message,
-        func: crate::function::FuncCtx {
-            func,
-            arg_count: 2,
-            collation: crate::translate::collate::CollationSeq::BINARY,
-        },
-    });
-    let ok = program.allocate_label();
-    program.emit_insn(Insn::IsNull {
-        reg: registers.message,
-        target_pc: ok,
-    });
-    emit_integrity_result_row(program, registers);
-    program.preassign_label_to_next_insn(ok);
-    Ok(())
-}
-
 fn emit_row_missing_from_index_error(
     program: &mut ProgramBuilder,
     registers: &Registers,
@@ -285,15 +252,28 @@ fn translate_integrity_check_for_schema(
             .tables(namespace)
             .map(move |table| (namespace, table))
     }) {
-        if let Table::Virtual(vtab) = table.as_ref() {
-            // xIntegrity, as SQLite runs it for each virtual table.
-            if vtab.is_droppable && database_id == crate::MAIN_DB_ID {
-                emit_vtab_integrity_check(program, resolver, &vtab.name, quick, &registers)?;
+        let btree_table = match table.as_ref() {
+            Table::BTree(btree_table) => btree_table,
+            Table::Virtual(vtab) if vtab.has_integrity() => {
+                // SQLite's OP_VCheck: xIntegrity reports problems as text.
+                let ok = program.allocate_label();
+                program.emit_insn(Insn::VCheck {
+                    data: Box::new(crate::vdbe::insn::VCheckData {
+                        table: vtab.clone(),
+                        schema: database_name.clone(),
+                        quick,
+                        dest: registers.message,
+                    }),
+                });
+                program.emit_insn(Insn::IsNull {
+                    reg: registers.message,
+                    target_pc: ok,
+                });
+                emit_integrity_result_row(program, &registers);
+                program.preassign_label_to_next_insn(ok);
+                continue;
             }
-            continue;
-        }
-        let Table::BTree(btree_table) = table.as_ref() else {
-            continue;
+            _ => continue,
         };
 
         if btree_table.root_page <= 0 || !connection_root_pages.contains(&btree_table.root_page) {

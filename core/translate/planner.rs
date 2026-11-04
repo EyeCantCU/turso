@@ -2184,17 +2184,7 @@ fn parse_table(
     // Resolve table using connection's with_schema method
     let namespace = resolver.resolve_queried_table(qualified_name)?;
     let database_id = namespace.database_id;
-    let mut table = resolver.with_schema(database_id, |schema| {
-        schema.get_table(namespace.id, table_name.as_str())
-    });
-    // Eponymous virtual tables live in the main schema only.
-    if table.is_none() && database_id == crate::MAIN_DB_ID && namespace.id.is_root() {
-        table = resolver
-            .catalog
-            .symbol_table
-            .eponymous_table(table_name.as_str())?
-            .map(|vtab| Arc::new(Table::Virtual(vtab)));
-    }
+    let table = table_or_eponymous(resolver, namespace, table_name.as_str())?;
 
     if let Some(table) = table {
         let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
@@ -2746,6 +2736,51 @@ pub fn parse_where(
     } else {
         Ok(())
     }
+}
+
+/// Defensive mode protects shadow tables of virtual tables
+/// (`sqlite3ReadOnlyShadowTables` and `sqlite3ShadowTableName`).
+pub(crate) fn is_protected_shadow_table(
+    resolver: &Resolver,
+    conn: &crate::Connection,
+    database_id: usize,
+    name: &str,
+) -> bool {
+    crate::vtab::readonly_shadow_tables(conn)
+        && resolver.with_schema(database_id, |s| crate::vtab::is_shadow_table_name(s, name))
+}
+
+/// `sqlite3CheckObjectName` for a shadow table name in defensive mode.
+pub(crate) fn check_shadow_object_name(
+    resolver: &Resolver,
+    conn: &crate::Connection,
+    database_id: usize,
+    name: &str,
+) -> Result<()> {
+    if is_protected_shadow_table(resolver, conn, database_id, name) {
+        crate::bail_parse_error!("object name reserved for internal use: {}", name);
+    }
+    Ok(())
+}
+
+/// The table `name` in `namespace`, or the eponymous virtual table of that
+/// name (eponymous tables live in the main schema only).
+pub(crate) fn table_or_eponymous(
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+    name: &str,
+) -> Result<Option<Arc<Table>>> {
+    let table = resolver.with_schema(namespace.database_id, |schema| {
+        schema.get_table(namespace.id, name)
+    });
+    if table.is_some() || namespace.database_id != crate::MAIN_DB_ID || !namespace.id.is_root() {
+        return Ok(table);
+    }
+    Ok(resolver
+        .catalog
+        .symbol_table
+        .eponymous_table(name)?
+        .map(|vtab| Arc::new(Table::Virtual(vtab))))
 }
 
 pub fn rewrite_between_exprs(expr: &mut Expr, resolver: Option<&Resolver<'_>>) -> Result<()> {

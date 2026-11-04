@@ -233,6 +233,8 @@ pub enum EqpDetail {
         join: Option<EqpJoin>,
         subquery: Option<EqpSubquery>,
         estimate: Option<TablePlanEstimate>,
+        /// `idxNum:idxStr` of a virtual table scan.
+        vtab_index: Option<String>,
     },
     /// Seek into a table or index using key constraints.
     Search {
@@ -320,9 +322,16 @@ impl Display for EqpDetail {
         match self {
             Self::ConstantRow => write!(f, "SCAN CONSTANT ROW"),
             Self::Scan {
-                table, index, join, ..
+                table,
+                index,
+                join,
+                vtab_index,
+                ..
             } => {
                 write!(f, "SCAN {}", table.name_with_alias())?;
+                if let Some(vtab_index) = vtab_index {
+                    write!(f, " VIRTUAL TABLE INDEX {vtab_index}")?;
+                }
                 if let Some(index) = index {
                     if index.covering {
                         write!(f, " USING COVERING INDEX {}", index.name)?;
@@ -516,6 +525,10 @@ pub(crate) fn eqp_detail_for_table_op(
                 join,
                 subquery,
                 estimate: table.plan_estimate,
+                vtab_index: match scan {
+                    Scan::VirtualTable { explain, .. } => Some(explain.clone()),
+                    _ => None,
+                },
             }
         }
         Operation::Search(search) => {
@@ -770,6 +783,7 @@ impl EqpDetail {
                 join,
                 subquery,
                 estimate,
+                ..
             } => {
                 obj.str("type", "scan");
                 Self::write_table_fields(&mut obj, table, *join, subquery.as_ref());

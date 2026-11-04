@@ -344,7 +344,8 @@ impl PragmaVirtualTable {
                 continue;
             }
             let visible_count = self.visible_column_count as u32;
-            if c.column_index < visible_count {
+            // The rowid (u32::MAX) and visible columns are not arguments.
+            if c.column_index < visible_count || c.column_index == u32::MAX {
                 continue;
             }
             if !c.usable {

@@ -769,6 +769,7 @@ int sqlite3_declare_vtab(sqlite3*, const char *zSQL);
 int sqlite3_vtab_config(sqlite3*, int op, ...);
 int sqlite3_vtab_on_conflict(sqlite3 *);
 int sqlite3_vtab_nochange(sqlite3_context*);
+int sqlite3_value_nochange(sqlite3_value*);
 const char *sqlite3_vtab_collation(sqlite3_index_info*, int);
 int sqlite3_vtab_distinct(sqlite3_index_info*);
 int sqlite3_vtab_in(sqlite3_index_info*, int iCons, int bHandle);

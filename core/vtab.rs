@@ -10,6 +10,48 @@ use std::ptr::NonNull;
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind, VTabModuleImpl};
 use turso_parser::{ast, parser::Parser};
 
+std::thread_local! {
+    /// Statements executing on this thread (SQLite's `nVdbeExec`).
+    static EXECUTING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts a statement as executing while it steps.
+pub(crate) struct ExecutingGuard;
+
+impl ExecutingGuard {
+    pub(crate) fn new() -> Self {
+        EXECUTING.with(|n| n.set(n.get() + 1));
+        Self
+    }
+}
+
+impl Drop for ExecutingGuard {
+    fn drop(&mut self) {
+        EXECUTING.with(|n| n.set(n.get().saturating_sub(1)));
+    }
+}
+
+/// `sqlite3ReadOnlyShadowTables`: defensive mode, outside any running
+/// statement (virtual table methods run inside one and may write them).
+pub(crate) fn readonly_shadow_tables(conn: &Connection) -> bool {
+    conn.is_defensive() && EXECUTING.with(|n| n.get()) == 0
+}
+
+/// `sqlite3ShadowTableName`: `name` is `<vtab>_<suffix>` and the virtual
+/// table's module claims `suffix` through xShadowName.
+pub(crate) fn is_shadow_table_name(schema: &crate::schema::Schema, name: &str) -> bool {
+    let Some(i) = name.rfind('_') else {
+        return false;
+    };
+    match schema.get_table(crate::namespace::NamespaceId::ROOT, &name[..i]) {
+        Some(table) => match table.as_ref() {
+            crate::schema::Table::Virtual(vtab) => vtab.is_shadow_name(&name[i + 1..]),
+            _ => false,
+        },
+        None => false,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum VirtualTableType {
     Pragma(PragmaVirtualTable),
@@ -151,9 +193,21 @@ impl VirtualTable {
         module: Option<&Arc<crate::ext::VTabImpl>>,
         create: Option<&Arc<Connection>>,
     ) -> crate::Result<Arc<VirtualTable>> {
+        Self::table_in(tbl_name, module_name, "main", args, module, create)
+    }
+
+    /// Like [`Self::table_for`], for a table in schema `schema_name`.
+    pub(crate) fn table_in(
+        tbl_name: Option<&str>,
+        module_name: &str,
+        schema_name: &str,
+        args: Vec<Value>,
+        module: Option<&Arc<crate::ext::VTabImpl>>,
+        create: Option<&Arc<Connection>>,
+    ) -> crate::Result<Arc<VirtualTable>> {
         let info = crate::native_ext::ConnectInfo {
             module_name,
-            schema_name: "main",
+            schema_name,
             table_name: tbl_name.unwrap_or(module_name),
             create: create.is_some(),
             connection: create,
@@ -278,20 +332,6 @@ impl VirtualTable {
         }
     }
 
-    /// xIntegrity of a native module; `None` when there is nothing to report.
-    pub(crate) fn integrity(
-        &self,
-        connection: &Arc<Connection>,
-        quick: bool,
-    ) -> crate::Result<Option<String>> {
-        match &self.vtab_type {
-            VirtualTableType::External(crate::ext::ExtensionTable::Native(table)) => {
-                table.integrity(connection, quick)
-            }
-            _ => Ok(None),
-        }
-    }
-
     pub(crate) fn destroy(&self, connection: &Arc<Connection>) -> crate::Result<()> {
         match &self.vtab_type {
             VirtualTableType::Pragma(_) => Ok(()),
@@ -300,16 +340,68 @@ impl VirtualTable {
         }
     }
 
-    pub(crate) fn best_index(
+    /// SQLite's full xBestIndex; tables without one go through `best_index`.
+    pub(crate) fn best_index_plan(
         &self,
-        constraints: &[ConstraintInfo],
-        order_by: &[OrderByInfo],
-    ) -> Result<IndexInfo, ResultCode> {
+        req: &crate::native_ext::IndexRequest,
+    ) -> crate::Result<Option<crate::native_ext::IndexPlan>> {
         match &self.vtab_type {
-            VirtualTableType::Pragma(table) => table.best_index(constraints),
-            VirtualTableType::External(table) => table.best_index(constraints, order_by),
-            VirtualTableType::Internal(table) => table.read().best_index(constraints, order_by),
+            VirtualTableType::Pragma(table) => {
+                crate::native_ext::best_index_via_legacy(req, |c, _| table.best_index(c))
+            }
+            VirtualTableType::External(table) => table.best_index_plan(req),
+            VirtualTableType::Internal(table) => {
+                crate::native_ext::best_index_via_legacy(req, |c, o| table.read().best_index(c, o))
+            }
         }
+    }
+
+    /// xFindFunction for a function whose first argument is a column of this table.
+    pub(crate) fn find_function(
+        &self,
+        n_arg: i32,
+        name: &str,
+    ) -> Option<(i32, Arc<crate::function::ExternalFunc>)> {
+        match &self.vtab_type {
+            VirtualTableType::External(table) => table.find_function(n_arg, name),
+            _ => None,
+        }
+    }
+
+    /// xIntegrity: an error description, or None when the table is fine.
+    pub(crate) fn integrity(
+        &self,
+        connection: &Arc<Connection>,
+        schema: &str,
+        table: &str,
+        quick: bool,
+    ) -> crate::Result<Option<String>> {
+        match &self.vtab_type {
+            VirtualTableType::External(crate::ext::ExtensionTable::Native(t)) => {
+                t.integrity(connection, schema, table, quick)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Whether PRAGMA integrity_check calls this table's xIntegrity.
+    pub(crate) fn has_integrity(&self) -> bool {
+        matches!(&self.vtab_type,
+            VirtualTableType::External(crate::ext::ExtensionTable::Native(t)) if t.has_integrity())
+    }
+
+    /// xShadowName of the table's module.
+    pub(crate) fn is_shadow_name(&self, suffix: &str) -> bool {
+        match &self.vtab_type {
+            VirtualTableType::External(crate::ext::ExtensionTable::Native(t)) => {
+                t.is_shadow_name(suffix)
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn find_function_op(&self, n_arg: i32, name: &str) -> Option<i32> {
+        self.find_function(n_arg, name).map(|(op, _)| op)
     }
 
     pub(crate) fn begin(&self) -> crate::Result<()> {
@@ -449,6 +541,16 @@ impl VirtualTableCursor {
         result.map(IOResult::Done).map_err(Into::into)
     }
 
+    /// `column` for an UPDATE that passes the column through unchanged.
+    pub(crate) fn column_nochange(&mut self, column: usize) -> IOResultOr<Value> {
+        match &mut self.inner {
+            VirtualTableCursorInner::External(cursor) if !self.null_flag => {
+                cursor.column_nochange(column)
+            }
+            _ => self.column(column),
+        }
+    }
+
     pub(crate) fn filter(
         &mut self,
         idx_num: i32,
@@ -467,6 +569,26 @@ impl VirtualTableCursor {
             }
         };
         result.map(IOResult::Done).map_err(Into::into)
+    }
+
+    /// `filter` where some arguments are IN lists handled all at once.
+    pub(crate) fn filter_in(
+        &mut self,
+        idx_num: i32,
+        idx_str: Option<String>,
+        args: crate::alloc::Vec<Value>,
+        in_lists: &[Option<Vec<Value>>],
+    ) -> IOResultOr<bool> {
+        match &mut self.inner {
+            VirtualTableCursorInner::External(cursor) => {
+                self.null_flag = false;
+                cursor.filter_in(idx_num, idx_str, args, in_lists)
+            }
+            _ => {
+                let n = args.len();
+                self.filter(idx_num, idx_str, n, args)
+            }
+        }
     }
 
     pub(crate) fn vtab_id(&self) -> Option<u64> {

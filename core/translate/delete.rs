@@ -39,9 +39,16 @@ fn validate_delete(
     {
         crate::bail_parse_error!("table {tbl_name} may not be modified");
     }
-    let table = match resolver.with_schema(namespace.database_id, |s| {
-        s.get_table(namespace.id, tbl_name)
-    }) {
+    if crate::translate::planner::is_protected_shadow_table(
+        resolver,
+        connection,
+        namespace.database_id,
+        tbl_name,
+    ) {
+        crate::bail_parse_error!("table {tbl_name} may not be modified");
+    }
+    let table = match crate::translate::planner::table_or_eponymous(resolver, namespace, tbl_name)?
+    {
         Some(table) => table,
         None => {
             return Err(crate::translate::catalog::dml_no_table_error(
@@ -108,6 +115,9 @@ pub fn translate_delete(
         program,
         connection,
     )?;
+    if table.virtual_table().is_some() && !returning.is_empty() {
+        crate::bail_parse_error!("DELETE RETURNING is not available on virtual tables");
+    }
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;

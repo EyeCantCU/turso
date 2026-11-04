@@ -147,6 +147,16 @@ fn foreign_key_action_name(action: ast::RefAct) -> &'static str {
     }
 }
 
+/// The `type` column of PRAGMA table_list: virtual tables and their shadow
+/// tables (xShadowName) are told apart, as in SQLite.
+fn table_list_type(schema: &Schema, table: &Table) -> &'static str {
+    match table {
+        Table::Virtual(_) => "virtual",
+        _ if crate::vtab::is_shadow_table_name(schema, table.get_name()) => "shadow",
+        _ => "table",
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_table_list_rows_for_schema(
     program: &mut ProgramBuilder,
@@ -186,7 +196,7 @@ fn emit_table_list_rows_for_schema(
             emit_table_row(
                 program,
                 table.get_name(),
-                "table",
+                table_list_type(schema, &table),
                 table.columns().len(),
                 wr,
                 strict,
@@ -205,6 +215,19 @@ fn emit_table_list_rows_for_schema(
     }
 
     for table in schema.tables(namespace) {
+        if let Table::Virtual(vtab) = table.as_ref() {
+            if vtab.is_droppable {
+                emit_table_row(
+                    program,
+                    &vtab.name,
+                    "virtual",
+                    vtab.columns.len(),
+                    false,
+                    false,
+                );
+            }
+            continue;
+        }
         let Some(bt) = table.btree() else {
             continue;
         };
@@ -214,7 +237,7 @@ fn emit_table_list_rows_for_schema(
         emit_table_row(
             program,
             &bt.name,
-            "table",
+            table_list_type(schema, table),
             bt.columns().len(),
             !bt.has_rowid,
             bt.is_strict,

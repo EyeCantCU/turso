@@ -20,9 +20,9 @@ info:
 ---
 QUERY PLAN
 |--SCAN virtual_subquery_snapshot_left
-|--SCAN json_each AS virtual_subquery_snapshot_right
+|--SCAN json_each AS virtual_subquery_snapshot_right VIRTUAL TABLE INDEX 1:
 |--RIGHT-JOIN virtual_subquery_snapshot_right
-|  `--SCAN json_each AS virtual_subquery_snapshot_right
+|  `--SCAN json_each AS virtual_subquery_snapshot_right VIRTUAL TABLE INDEX 1:
 |--CORRELATED SCALAR SUBQUERY 1
 |  `--SCAN CONSTANT ROW
 |--CORRELATED SCALAR SUBQUERY 2

@@ -8,6 +8,7 @@ mod dbstat;
 mod lifecycle;
 mod rtree;
 mod vtab;
+mod vtab_plan;
 
 #[repr(C)]
 struct sqlite3 {

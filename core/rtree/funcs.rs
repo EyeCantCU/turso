@@ -339,30 +339,8 @@ fn native(
     ExternalFunc::new_native_scalar(name.to_string(), arity, false, f)
 }
 
-scalar!(VtabIntegrityFn, VtabIntegrityCall, |conn, args| {
-    let name = args[0].get_value().cast_text().unwrap_or_default();
-    let quick = super::value_int64(args[1].get_value()) != 0;
-    let table = conn
-        .schema
-        .read()
-        .get_table(crate::NamespaceId::ROOT, &name);
-    let report = match table.as_deref() {
-        Some(crate::schema::Table::Virtual(vtab)) => vtab.integrity(conn, quick)?,
-        _ => None,
-    };
-    Ok(report.map_or(Value::Null, Value::build_text))
-});
-
-/// The function PRAGMA integrity_check calls for each virtual table.
-pub(crate) const VTAB_INTEGRITY_FUNCTION: &str = "__turso_internal_vtab_integrity";
-
 pub(crate) fn register_functions(syms: &mut SymbolTable) -> Result<()> {
     let mut funcs = vec![
-        native(
-            VTAB_INTEGRITY_FUNCTION,
-            FunctionArity::Exact(2),
-            VtabIntegrityFn,
-        )?,
         native("rtreenode", FunctionArity::Exact(2), RtreeNodeFn)?,
         native("rtreedepth", FunctionArity::Exact(1), RtreeDepthFn)?,
         native("rtreecheck", FunctionArity::Variadic, RtreeCheckFn)?,
