@@ -384,20 +384,38 @@ pub(super) fn emit_table_read_start(
                         idx_num,
                         idx_str,
                         constraints,
+                        in_args,
+                        omit_offset,
+                        ..
                     },
-                    Table::Virtual(_),
+                    Table::Virtual(vtab),
                 ) => {
-                    emit_virtual_table_scan_start(
+                    if *omit_offset {
+                        // The table skipped the OFFSET rows: zero the counter.
+                        if let Some(reg) = t_ctx.reg_offset {
+                            program.emit_insn(Insn::Integer {
+                                value: 0,
+                                dest: reg,
+                            });
+                        }
+                    }
+                    let in_loops = emit_virtual_table_scan_start(
                         program,
                         table_references,
                         &t_ctx.resolver,
                         table_cursor_id.expect("Virtual tables do not support covering indexes"),
+                        vtab,
                         *idx_num,
                         idx_str.as_deref(),
                         constraints,
-                        loop_start,
-                        loop_end,
+                        in_args,
+                        LoopLabels {
+                            loop_start,
+                            loop_end,
+                            next,
+                        },
                     )?;
+                    t_ctx.meta_vtab_in_loops[joined_table_index] = in_loops;
                 }
                 (Scan::Subquery { iter_dir }, Table::FromClauseSubquery(from_clause_subquery)) => {
                     match from_clause_subquery.plan.select_query_destination() {
@@ -764,19 +782,69 @@ pub(super) fn emit_right_join_key(
 /// The main loop and the unmatched-right read must use the argument order
 /// that `best_index` selected.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn emit_virtual_table_scan_start(
     program: &mut ProgramBuilder,
     table_references: &TableReferences,
     resolver: &Resolver<'_>,
     table_cursor_id: CursorID,
+    vtab: &crate::vtab::VirtualTable,
     idx_num: i32,
     idx_str: Option<&str>,
     constraints: &[Expr],
-    loop_start: BranchOffset,
-    loop_end: BranchOffset,
-) -> Result<()> {
+    in_args: &[VtabInArg],
+    labels: LoopLabels,
+) -> Result<Vec<InSeekMetadata>> {
+    let LoopLabels {
+        loop_start,
+        loop_end,
+        next,
+    } = labels;
     let start_reg = program.alloc_registers(constraints.len());
+    // Per-value IN arguments: one loop over the IN values each, outermost first.
+    let mut in_loops = Vec::new();
+    let mut all_at_once = Vec::new();
+    let mut not_found = loop_end;
     for (argument_index, expr) in constraints.iter().enumerate() {
+        let Some(in_arg) = in_args.iter().find(|a| a.arg == argument_index) else {
+            continue;
+        };
+        let source = vtab_in_source(expr, vtab)?;
+        let cursor =
+            open_in_seek_source_cursor(program, table_references, resolver, None, &source)?;
+        if in_arg.all_at_once {
+            all_at_once.push((argument_index, cursor));
+            continue;
+        }
+        program.emit_insn(Insn::Rewind {
+            cursor_id: cursor,
+            pc_if_empty: not_found,
+        });
+        let outer_loop_start = program.allocate_label();
+        program.preassign_label_to_next_insn(outer_loop_start);
+        let next_value = program.allocate_label();
+        program.emit_insn(Insn::Column {
+            cursor_id: cursor,
+            column: 0,
+            dest: start_reg + argument_index,
+            default: None,
+        });
+        // NULL matches no row, so it gets no xFilter call.
+        program.emit_insn(Insn::IsNull {
+            reg: start_reg + argument_index,
+            target_pc: next_value,
+        });
+        not_found = next_value;
+        in_loops.push(InSeekMetadata {
+            ephemeral_cursor_id: cursor,
+            outer_loop_start,
+            next_val_label: next_value,
+        });
+    }
+    for (argument_index, expr) in constraints.iter().enumerate() {
+        if in_args.iter().any(|a| a.arg == argument_index) {
+            continue;
+        }
         translate_expr(
             program,
             Some(table_references),
@@ -800,8 +868,71 @@ fn emit_virtual_table_scan_start(
         args_reg: start_reg,
         idx_str,
         idx_num: idx_num as usize,
-        pc_if_empty: loop_end,
+        pc_if_empty: not_found,
+        in_lists: all_at_once,
     });
     program.preassign_label_to_next_insn(loop_start);
-    Ok(())
+    // A per-value IN the table did not omit: its rows must match the value.
+    for in_arg in in_args.iter().filter(|a| a.recheck) {
+        let (Expr::InList { lhs, .. } | Expr::SubqueryResult { lhs: Some(lhs), .. }) =
+            &constraints[in_arg.arg]
+        else {
+            continue;
+        };
+        let check = Expr::Binary(
+            lhs.clone(),
+            turso_parser::ast::Operator::Equals,
+            Box::new(Expr::Register {
+                register: start_reg + in_arg.arg,
+                custom_type: None,
+            }),
+        );
+        let ok = program.allocate_label();
+        translate_condition_expr(
+            program,
+            table_references,
+            &check,
+            ConditionMetadata {
+                jump_if_condition_is_true: false,
+                jump_target_when_true: ok,
+                jump_target_when_false: next,
+                jump_target_when_null: next,
+            },
+            resolver,
+        )?;
+        program.preassign_label_to_next_insn(ok);
+    }
+    Ok(in_loops)
+}
+
+/// The value source of an IN argument (its whole `IN` expression).
+fn vtab_in_source(expr: &Expr, vtab: &crate::vtab::VirtualTable) -> Result<InSeekSource> {
+    match expr {
+        Expr::InList { lhs, rhs, .. } => {
+            let lhs_affinity = match lhs.as_ref() {
+                Expr::Column { column, .. } => vtab
+                    .columns
+                    .get(*column)
+                    .map(|c| c.affinity())
+                    .unwrap_or(Affinity::Blob),
+                _ => Affinity::Integer,
+            };
+            Ok(InSeekSource::LiteralList {
+                values: rhs.iter().map(|e| *e.clone()).collect(),
+                affinity: crate::translate::expr::do_comparison_affinity(
+                    lhs_affinity,
+                    Affinity::None,
+                ),
+            })
+        }
+        Expr::SubqueryResult {
+            query_type: SubqueryType::In { cursor_id, .. },
+            ..
+        } => Ok(InSeekSource::Subquery {
+            cursor_id: *cursor_id,
+        }),
+        _ => Err(crate::LimboError::InternalError(
+            "a virtual table IN argument is not an IN expression".into(),
+        )),
+    }
 }

@@ -19,7 +19,7 @@ use super::{
         IterationDirection, JoinOrderMember, JoinedTable, MultiIndexBranchAccess, MultiIndexScanOp,
         NonFromClauseSubquery, Operation, QueryDestination, Scan, Search, SeekDef, SeekKey,
         SeekKeyComponent, SelectPlan, SetOperation, SubqueryEvalPhase, SubqueryState,
-        TableReferences, UnmatchedRightRowsPlan, WhereTerm,
+        TableReferences, UnmatchedRightRowsPlan, VtabInArg, WhereTerm,
     },
 };
 use crate::{

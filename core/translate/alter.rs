@@ -809,6 +809,14 @@ pub fn translate_alter_table(
         table_name,
         resolver.catalog.dialect.supports_namespaces(),
     )?;
+    if crate::translate::planner::is_protected_shadow_table(
+        resolver,
+        connection,
+        database_id,
+        table_name,
+    ) {
+        crate::bail_parse_error!("table {} may not be altered", table_name);
+    }
     reject_alter_of_view(&alter_table, table_name, resolver, namespace)?;
 
     let table_indexes = resolver.with_schema(database_id, |s| {
@@ -817,7 +825,8 @@ pub fn translate_alter_table(
             .collect::<Vec<_>>()
     });
 
-    let Some(table) = resolver.with_schema(database_id, |s| s.get_table(namespace.id, table_name))
+    let Some(table) =
+        crate::translate::planner::table_or_eponymous(resolver, namespace, table_name)?
     else {
         return Err(LimboError::ParseError(format!(
             "no such table: {}",
@@ -825,6 +834,23 @@ pub fn translate_alter_table(
         )));
     };
     if let Some(tbl) = table.virtual_table() {
+        // SQLite's errors: ADD COLUMN first, then eponymous tables
+        // (isAlterableTable), then column changes on any virtual table.
+        match &alter_table {
+            ast::AlterTableBody::AddColumn(_) => {
+                crate::bail_parse_error!("virtual tables may not be altered");
+            }
+            _ if !tbl.is_droppable => {
+                crate::bail_parse_error!("table {} may not be altered", tbl.name);
+            }
+            ast::AlterTableBody::RenameColumn { .. } => {
+                crate::bail_parse_error!("cannot rename columns of virtual table \"{}\"", tbl.name);
+            }
+            ast::AlterTableBody::DropColumn(_) => {
+                crate::bail_parse_error!("cannot drop column from virtual table \"{}\"", tbl.name);
+            }
+            _ => {}
+        }
         if let ast::AlterTableBody::RenameTo(new_name) = &alter_table {
             let new_name_norm = normalize_ident(new_name.as_str());
             return translate_rename_virtual_table(

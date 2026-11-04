@@ -354,6 +354,7 @@ impl Database {
         #[cfg(feature = "percentile")]
         crate::percentile::register_extension(&mut ext_api);
         crate::regexp::register_extension(&mut ext_api);
+        crate::rtree::register(&mut self.builtin_syms.write()).map_err(|e| e.to_string())?;
         #[cfg(feature = "fs")]
         {
             let vfslist = add_builtin_vfs_extensions(Some(ext_api)).map_err(|e| e.to_string())?;
@@ -367,20 +368,6 @@ impl Database {
 }
 
 impl Connection {
-    /// The virtual table with id `id`: one this connection created, an
-    /// eponymous table, or one loaded from the schema.
-    pub(crate) fn vtab_by_id(&self, id: u64) -> Option<Arc<VirtualTable>> {
-        if let Some(vtab) = self.syms.read().vtab_by_id(id) {
-            return Some(vtab);
-        }
-        let schema = self.schema.read();
-        let found = schema.all_tables().find_map(|table| match table.as_ref() {
-            crate::schema::Table::Virtual(vtab) if vtab.id() == id => Some(vtab.clone()),
-            _ => None,
-        });
-        found
-    }
-
     /// Registers a virtual table module on this connection only, as
     /// `sqlite3_create_module` does. `creatable` modules back
     /// `CREATE VIRTUAL TABLE`; `eponymous` ones also get a table named after
@@ -478,6 +465,21 @@ impl Connection {
         }
         self.bump_prepare_context_generation();
         Ok(())
+    }
+
+    /// Finds a connected virtual table by id: one this connection created,
+    /// an eponymous one, or one loaded from the schema.
+    pub(crate) fn vtab_by_id(&self, id: u64) -> Option<Arc<VirtualTable>> {
+        if let Some(vtab) = self.syms.read().vtab_by_id(id) {
+            return Some(vtab);
+        }
+        self.schema
+            .read()
+            .all_tables()
+            .find_map(|table| match table.as_ref() {
+                Table::Virtual(vtab) if vtab.id() == id => Some(vtab.clone()),
+                _ => None,
+            })
     }
 
     /// Removes a module registered with [`Self::register_vtab_module_local`].

@@ -940,7 +940,18 @@ fn translate_function_call_expr(
         crate::bail_parse_error!("no such function: {}", name.as_str());
     }
 
-    let func = func_type.unwrap();
+    let mut func = func_type.unwrap();
+    // A virtual table column as the first argument may overload the function.
+    if let Some(first) = args.first() {
+        if let Some(overload) = vtab_overload(
+            referenced_tables,
+            first,
+            args_count,
+            &name.as_str().to_lowercase(),
+        ) {
+            func = overload;
+        }
+    }
     let collation = if func.needs_collation() {
         first_collation(
             args.iter()
@@ -2796,6 +2807,7 @@ fn translate_column_expr(
                 cursor_id,
                 column: *column,
                 dest: target_register,
+                nochange: false,
             });
             Ok(target_register)
         }
@@ -2989,6 +3001,26 @@ fn translate_is_null_expr(
     });
     program.preassign_label_to_next_insn(label);
     Ok(target_register)
+}
+
+/// xFindFunction: the overload a virtual table supplies for a function whose
+/// argument `arg` is one of its columns (`sqlite3VtabOverloadFunction`).
+pub(super) fn vtab_overload(
+    referenced_tables: Option<&TableReferences>,
+    arg: &ast::Expr,
+    n_args: usize,
+    name: &str,
+) -> Option<Func> {
+    let ast::Expr::Column { table, .. } = arg else {
+        return None;
+    };
+    let (_, crate::schema::Table::Virtual(vtab)) =
+        referenced_tables?.find_table_by_internal_id(*table)?
+    else {
+        return None;
+    };
+    let (rc, func) = vtab.find_function(n_args as i32, name)?;
+    (rc != 0).then_some(Func::External(func))
 }
 
 #[inline(never)]

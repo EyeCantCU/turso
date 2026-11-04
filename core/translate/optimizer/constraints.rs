@@ -29,7 +29,6 @@ use crate::{
 use crate::{turso_assert, turso_debug_assert};
 use smallvec::SmallVec;
 use std::{collections::VecDeque, sync::Arc};
-use turso_ext::{ConstraintInfo, ConstraintOp};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 /// Represents a single condition derived from a `WHERE` clause term
@@ -123,7 +122,7 @@ pub enum ConstraintOperator {
     Like {
         not: bool,
     },
-    /// `col MATCH expr`, which only a virtual table can evaluate.
+    /// `x MATCH y`, offered to virtual tables.
     Match,
     In {
         not: bool,
@@ -188,10 +187,9 @@ impl Constraint {
                 affinity = Affinity::Blob;
             }
             (
-                // MATCH has no AST operator; only virtual tables consume it.
                 self.operator
                     .as_ast_operator()
-                    .unwrap_or(ast::Operator::Equals),
+                    .expect("expected an ast operator because as_binary_components returned Some"),
                 lhs.clone(),
                 affinity,
             )
@@ -200,10 +198,9 @@ impl Constraint {
                 affinity = Affinity::Blob;
             }
             (
-                // MATCH has no AST operator; only virtual tables consume it.
                 self.operator
                     .as_ast_operator()
-                    .unwrap_or(ast::Operator::Equals),
+                    .expect("expected an ast operator because as_binary_components returned Some"),
                 rhs.clone(),
                 affinity,
             )
@@ -321,6 +318,8 @@ pub struct TableConstraints {
     pub candidates: Vec<ConstraintUseCandidate>,
     /// Conditions that a temporary index may use for a lookup.
     pub temporary_index_terms: SmallVec<[ConstraintRef; 4]>,
+    /// The planned xBestIndex calls of a virtual table.
+    pub vtab: Option<Arc<super::vtab::VtabCandidates>>,
 }
 
 /// Build the search terms for an automatic index.
@@ -758,6 +757,7 @@ pub fn constraints_from_where_clause(
             table_id: table_reference.internal_id,
             constraints: Vec::new(),
             temporary_index_terms: SmallVec::new(),
+            vtab: None,
             candidates: available_indexes
                 .indexes_for_table(table_reference.internal_id)
                 .map_or(Vec::new(), |indexes| {
@@ -973,12 +973,6 @@ pub fn constraints_from_where_clause(
                         });
                     }
                     _ => {}
-                };
-                // MATCH constrains only the column on its left.
-                let rhs = if matches!(operator, ConstraintOperator::Match) {
-                    &ast::Expr::Literal(ast::Literal::Null)
-                } else {
-                    rhs
                 };
                 match rhs {
                     ast::Expr::Column { table, column, .. } => {
@@ -2049,43 +2043,6 @@ fn estimate_bound_expr_selectivity(
     }
 }
 
-pub fn convert_to_vtab_constraint(
-    constraints: &[Constraint],
-    join_order: &[JoinOrderMember],
-) -> Result<Vec<ConstraintInfo>> {
-    let table_idx = join_order.last().unwrap().original_idx;
-    let lhs_mask: TableMask = join_order
-        .iter()
-        .take(join_order.len() - 1)
-        .map(|j| j.original_idx)
-        .try_collect()?;
-    let constraints = constraints
-        .iter()
-        .enumerate()
-        .filter_map(|(i, constraint)| {
-            // SQLite does not show an outer-join-incompatible term to xBestIndex.
-            // The `usable` field in ConstraintInfo only reports input readiness.
-            if !constraint.outer_join_compatible {
-                return None;
-            }
-            let table_col_pos = constraint.table_col_pos?;
-            let other_side_refers_to_self = constraint.lhs_mask.get(table_idx);
-            if other_side_refers_to_self {
-                return None;
-            }
-            let all_required_tables_are_on_left_side =
-                lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask);
-            to_ext_constraint_op(&constraint.operator).map(|op| ConstraintInfo {
-                column_index: table_col_pos as u32,
-                op,
-                usable: all_required_tables_are_on_left_side,
-                index: i,
-            })
-        })
-        .collect();
-    Ok(constraints)
-}
-
 /// Whether `op` constrains an index column to a single value, making it usable
 /// as an index seek key.
 ///
@@ -2100,24 +2057,6 @@ pub fn is_equality_operator(op: ConstraintOperator) -> bool {
         op.as_ast_operator(),
         Some(ast::Operator::Equals | ast::Operator::Is)
     )
-}
-
-fn to_ext_constraint_op(op: &ConstraintOperator) -> Option<ConstraintOp> {
-    if matches!(op, ConstraintOperator::Match) {
-        return Some(ConstraintOp::Match);
-    }
-    let ConstraintOperator::AstNativeOperator(op) = op else {
-        return None;
-    };
-    match op {
-        ast::Operator::Equals => Some(ConstraintOp::Eq),
-        ast::Operator::Less => Some(ConstraintOp::Lt),
-        ast::Operator::LessEquals => Some(ConstraintOp::Le),
-        ast::Operator::Greater => Some(ConstraintOp::Gt),
-        ast::Operator::GreaterEquals => Some(ConstraintOp::Ge),
-        ast::Operator::NotEquals => Some(ConstraintOp::Ne),
-        _ => None,
-    }
 }
 
 fn opposite_cmp_op(op: ConstraintOperator) -> ConstraintOperator {

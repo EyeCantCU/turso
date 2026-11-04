@@ -13,6 +13,7 @@ use turso_ext::ScalarFunction;
 use turso_ext::Value as ExtValue;
 
 mod fts5;
+mod rtree;
 mod vtab;
 
 /// Global flag: when set, all subsequently opened databases enable experimental features.
@@ -1686,24 +1687,17 @@ pub unsafe extern "C" fn turso_db_config_int(
     if db.is_null() {
         return SQLITE_MISUSE;
     }
-    let _ = (value, p_out);
     match op {
-        // Refused rather than accepted-and-ignored, so a caller that checks
-        // the return cannot be misled into believing it toggled anything.
-        // The protections DEFENSIVE stands for are unconditionally on in
-        // turso_core today:
+        // Only shadow-table protection has a per-connection gate
+        // (core/vtab.rs, readonly_shadow_tables). The other DEFENSIVE
+        // protections are always on in turso_core:
         //   - sqlite_schema DML is rejected with no writable_schema unlock
         //     (core/schema.rs, allow_user_dml)
         //   - PRAGMA schema_version=N is a deliberate no-op
         //     (core/translate/pragma.rs, SchemaVersion write arm)
         //   - PRAGMA journal_mode=OFF is unsupported and silently kept as-is
         //     (core/storage/journal_mode.rs, JournalMode::supported)
-        //   - there are no SQLite-style shadow tables
-        // Callers that need file-corruption protection therefore already
-        // have it; PHP's ext/sqlite3 ignores this return value. Switching to
-        // accept + enforce is safe only if every feature above gains a
-        // per-connection defensive gate in core first.
-        SQLITE_DBCONFIG_DEFENSIVE => SQLITE_ERROR,
+        SQLITE_DBCONFIG_DEFENSIVE => unsafe { vtab::db_config_defensive(db, value, p_out) },
         _ => SQLITE_ERROR,
     }
 }
@@ -3756,10 +3750,19 @@ fn limbo_err_code(err: &LimboError) -> i32 {
     }
 }
 
+/// The message sqlite3_errmsg reports for `err`. Like SQLite, corruption
+/// is reported with the standard text, without turso's details.
+fn limbo_err_msg(err: &LimboError) -> String {
+    match err {
+        LimboError::Corrupt(_) => "database disk image is malformed".to_string(),
+        _ => format!("{err}"),
+    }
+}
+
 fn handle_limbo_err(err: LimboError, container: *mut *mut ffi::c_char) -> i32 {
     let code = limbo_err_code(&err);
     if !container.is_null() {
-        let err_msg = format!("{err}");
+        let err_msg = limbo_err_msg(&err);
         unsafe { *container = CString::new(err_msg).unwrap().into_raw() };
     }
     code
@@ -3767,7 +3770,7 @@ fn handle_limbo_err(err: LimboError, container: *mut *mut ffi::c_char) -> i32 {
 
 /// Store a LimboError on the database handle, returning the SQLite error code.
 unsafe fn set_db_err(db: &mut sqlite3Inner, err: LimboError) -> i32 {
-    set_db_err_msg(db, limbo_err_code(&err), &format!("{err}"))
+    set_db_err_msg(db, limbo_err_code(&err), &limbo_err_msg(&err))
 }
 
 unsafe fn set_db_err_msg(db: &mut sqlite3Inner, code: i32, err_msg: &str) -> i32 {

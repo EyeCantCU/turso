@@ -293,6 +293,45 @@ pub fn emit_program_for_update(
         }
     }
 
+    // As SQLite does, an UPDATE of a virtual table computes every new row
+    // first and calls xUpdate afterwards, so the module is not written while
+    // its own cursor is scanning it.
+    let vtab_buffer = if !uses_write_set && target_table.table.virtual_table().is_some() {
+        let arg_count = target_table.table.columns().len() + 2;
+        let columns = (0..arg_count)
+            .map(|i| {
+                Column::new(
+                    Some(format!("__vtab_update_{i}")),
+                    "BLOB".to_string(),
+                    None,
+                    None,
+                    crate::schema::Type::Blob,
+                    None,
+                    crate::schema::ColDef::default(),
+                )
+            })
+            .try_collect()?;
+        let buffer_table = Arc::new(BTreeTable::new(
+            0,
+            "vtab_update_buffer".to_string(),
+            crate::alloc::vec![],
+            columns,
+            crate::schema::BTreeCharacteristics::HAS_ROWID,
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            None,
+        ));
+        let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(buffer_table));
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id,
+            is_table: true,
+        });
+        Some((cursor_id, arg_count))
+    } else {
+        None
+    };
+
     // Initialize the main loop
     InitLoop::emit(
         program,
@@ -465,6 +504,7 @@ pub fn emit_program_for_update(
         target_table,
         returning_buffer.as_ref(),
         &mut update_subqueries,
+        vtab_buffer.map(|(cursor_id, _)| cursor_id),
     )?;
 
     // Close the main loop
@@ -478,6 +518,37 @@ pub fn emit_program_for_update(
     )?;
 
     program.preassign_label_to_next_insn(after_main_loop_label);
+    if let Some((cursor_id, arg_count)) = vtab_buffer {
+        let args = program.alloc_registers(arg_count);
+        let done = program.allocate_label();
+        let next_row = program.allocate_label();
+        program.emit_insn(Insn::Rewind {
+            cursor_id,
+            pc_if_empty: done,
+        });
+        program.preassign_label_to_next_insn(next_row);
+        for i in 0..arg_count {
+            program.emit_insn(Insn::Column {
+                cursor_id,
+                column: i,
+                dest: args + i,
+                default: None,
+            });
+        }
+        program.emit_insn(Insn::VUpdate {
+            cursor_id: target_table_cursor_id,
+            arg_count,
+            start_reg: args,
+            conflict_action: program.resolve_type.bit_value() as u16,
+        });
+        program.emit_insn(Insn::Next {
+            cursor_id,
+            pc_if_next: next_row,
+            fullscan: false,
+            is_index: false,
+        });
+        program.preassign_label_to_next_insn(done);
+    }
     emit_cdc_autocommit_commit(program, resolver, t_ctx.cdc_cursor_id)?;
     // Emit scan-back loop for buffered RETURNING results.
     // All DML is complete at this point; now yield the buffered rows to the caller.
@@ -992,6 +1063,7 @@ fn emit_update_column_values<'a>(
                             cursor_id: column_ctx.target_table_cursor_id,
                             column: idx,
                             dest: target_reg,
+                            nochange: true,
                         });
                     } else {
                         let cursor_id = column_ctx
@@ -1134,6 +1206,7 @@ fn emit_update_insns<'a>(
     target_table: Arc<JoinedTable>,
     returning_buffer: Option<&ReturningBufferCtx>,
     non_from_clause_subqueries: &mut [NonFromClauseSubquery],
+    vtab_buffer: Option<usize>,
 ) -> crate::Result<()> {
     let uses_write_set = temp_cursor_id.is_some();
     let iteration_cursor_id = temp_cursor_id.unwrap_or(target_table_cursor_id);
@@ -2809,12 +2882,38 @@ fn emit_update_insns<'a>(
         }
         Table::Virtual(_) => {
             let arg_count = col_len + 2;
-            program.emit_insn(Insn::VUpdate {
-                cursor_id: target_table_cursor_id,
-                arg_count,
-                start_reg: beg,
-                conflict_action: 0u16,
-            });
+            if let Some(buffer) = vtab_buffer {
+                let record = program.alloc_register();
+                let rowid = program.alloc_register();
+                program.emit_insn(Insn::MakeRecord {
+                    start_reg: to_u32(beg),
+                    count: to_u32(arg_count),
+                    dest_reg: to_u32(record),
+                    index_name: None,
+                    affinity_str: None,
+                });
+                program.emit_insn(Insn::NewRowid {
+                    cursor: buffer,
+                    rowid_reg: rowid,
+                    prev_largest_reg: 0,
+                });
+                program.emit_insn(Insn::Insert {
+                    cursor: buffer,
+                    key_reg: rowid,
+                    record_reg: record,
+                    flag: InsertFlags::new()
+                        .require_seek()
+                        .is_ephemeral_table_insert(),
+                    table_name: String::new(),
+                });
+            } else {
+                program.emit_insn(Insn::VUpdate {
+                    cursor_id: target_table_cursor_id,
+                    arg_count,
+                    start_reg: beg,
+                    conflict_action: program.resolve_type.bit_value() as u16,
+                });
+            }
         }
         _ => crate::bail_parse_error!("cannot UPDATE a subquery table"),
     }

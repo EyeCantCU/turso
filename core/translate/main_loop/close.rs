@@ -610,6 +610,9 @@ pub(super) fn emit_table_read_advance(
                             .expect("Virtual tables do not support covering indexes"),
                         pc_if_next: loop_start,
                     });
+                    for meta in t_ctx.meta_vtab_in_loops[table_index].iter().rev() {
+                        emit_in_seek_end(program, None, loop_start, meta);
+                    }
                 }
                 Scan::Subquery { iter_dir } => {
                     // Check if this is a materialized CTE (EphemeralTable) or coroutine

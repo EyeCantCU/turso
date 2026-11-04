@@ -500,6 +500,7 @@ pub fn insn_to_row(
                 table_name,
                 module_name,
                 args_reg,
+                ..
             } => (
                 "VCreate",
                 *table_name as i64,
@@ -527,13 +528,14 @@ pub fn insn_to_row(
                 cursor_id,
                 column,
                 dest,
+                nochange,
             } => (
                 "VColumn",
                 *cursor_id as i64,
                 *column as i64,
                 *dest as i64,
                 Value::build_text(""),
-                0,
+                if *nochange { 1 } else { 0 },
                 "".to_string(),
             ),
             Insn::VUpdate {
@@ -2526,6 +2528,15 @@ pub fn insn_to_row(
                 Value::from_i64(*value),
                 0,
                 format!("r[{}]={}", *out_reg, *value),
+            ),
+            Insn::VCheck { data } => (
+                "VCheck",
+                0,
+                data.dest as i64,
+                data.quick as i64,
+                Value::build_text(data.table.name.clone()),
+                0,
+                format!("r[{}]=xIntegrity({})", data.dest, data.table.name),
             ),
             Insn::IntegrityCk { data } => {
                 let IntegrityCkData {

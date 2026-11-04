@@ -250,6 +250,14 @@ pub fn translate_create_trigger(
     if table.virtual_table().is_some() {
         bail_parse_error!("cannot create triggers on virtual tables");
     }
+    if crate::translate::planner::is_protected_shadow_table(
+        resolver,
+        connection,
+        target_table_database_id,
+        tbl_name.name.as_str(),
+    ) {
+        bail_parse_error!("cannot create triggers on shadow tables");
+    }
 
     let opts = ProgramBuilderOpts::new(1, 30, 1);
     program.extend(&opts);

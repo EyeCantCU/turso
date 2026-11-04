@@ -39,16 +39,23 @@ fn validate_delete(
     {
         crate::bail_parse_error!("table {tbl_name} may not be modified");
     }
-    let table = match resolver.with_schema(namespace.database_id, |s| {
-        s.get_table(namespace.id, tbl_name)
-    }) {
+    if crate::translate::planner::is_protected_shadow_table(
+        resolver,
+        connection,
+        namespace.database_id,
+        tbl_name,
+    ) {
+        crate::bail_parse_error!("table {tbl_name} may not be modified");
+    }
+    let table = match crate::translate::planner::table_or_eponymous(resolver, namespace, tbl_name)?
+    {
         Some(table) => table,
         None => crate::bail_parse_error!(
             "no such table: {}",
             crate::util::table_name_for_error(qualified_name)
         ),
     };
-    if program.trigger.is_some() && table.virtual_table().is_some() {
+    if program.trigger.is_some() && table.virtual_table().is_some_and(|vt| !vt.innocuous) {
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name);
     }
     // Engine helper SQL (FTS5 shadow tables) may delete from a WITHOUT ROWID
@@ -107,6 +114,9 @@ pub fn translate_delete(
         program,
         connection,
     )?;
+    if table.virtual_table().is_some() && !returning.is_empty() {
+        crate::bail_parse_error!("DELETE RETURNING is not available on virtual tables");
+    }
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
@@ -365,6 +375,14 @@ fn estimate_num_instructions(plan: &DeletePlan) -> usize {
 
 /// Add post-optimizer reasons that force "collect rowids first, then delete".
 fn record_delete_optimizer_safety(plan: &mut DeletePlan) {
+    if plan
+        .table_references
+        .joined_tables()
+        .first()
+        .is_some_and(|table| table.virtual_table().is_some())
+    {
+        plan.safety.require(DmlSafetyReason::VirtualTable);
+    }
     if plan
         .table_references
         .joined_tables()
