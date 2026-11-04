@@ -6691,11 +6691,10 @@ pub fn create_table(
                             }
                         };
                         let sort_order = column.order.unwrap_or(SortOrder::Asc);
-                        // SQLite ignores a column repeated in the key.
-                        if primary_key_columns
-                            .iter()
-                            .any(|(n, _): &(String, SortOrder)| n.eq_ignore_ascii_case(&col_name))
-                        {
+                        // SQLite ignores a column repeated in the key with the same collation.
+                        if pk_unique_set_columns.iter().any(|c: &UniqueSetColumn| {
+                            c.name.eq_ignore_ascii_case(&col_name) && c.collation == collation
+                        }) {
                             continue;
                         }
                         pk_unique_set_columns.try_push(UniqueSetColumn {
