@@ -556,3 +556,43 @@ fn test_rollback_of_schema_change_trips_readers() {
         sqlite3_close(db);
     }
 }
+
+#[test]
+fn test_write_while_incremental_vacuum_is_stepping() {
+    unsafe {
+        let dir = tempfile::tempdir().unwrap();
+        // auto_vacuum must be set before WAL mode writes the header.
+        let path = CString::new(dir.path().join("il.db").to_str().unwrap()).unwrap();
+        let mut db = ptr::null_mut();
+        assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+        exec(db, "PRAGMA auto_vacuum = INCREMENTAL");
+        exec(db, "PRAGMA journal_mode = WAL");
+        exec(db, "CREATE TABLE t(x); CREATE TABLE u(x)");
+        assert_eq!(rows(db, "PRAGMA auto_vacuum"), v(&["2"]));
+        exec(
+            db,
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 40) \
+             INSERT INTO t SELECT randomblob(2000) FROM n",
+        );
+        exec(db, "DELETE FROM t");
+        let free: i64 = rows(db, "PRAGMA freelist_count")[0].parse().unwrap();
+        assert!(free > 3, "freelist_count {free}");
+        let other = open_db(&dir);
+        // incremental_vacuum returns a row per page it gives back; other
+        // statements may write between those rows.
+        let vac = prepare(db, "PRAGMA incremental_vacuum");
+        assert_eq!(sqlite3_step(vac), SQLITE_ROW);
+        exec(db, "INSERT INTO u VALUES (1)");
+        exec(db, "UPDATE u SET x = x + 1");
+        assert_eq!(rows(db, "SELECT x FROM u"), v(&["2"]));
+        // Nothing commits until the vacuum, the last writer, finishes.
+        assert_eq!(rows(other, "SELECT count(*) FROM u"), v(&["0"]));
+        while sqlite3_step(vac) == SQLITE_ROW {}
+        assert_eq!(sqlite3_finalize(vac), SQLITE_OK);
+        assert_eq!(rows(db, "PRAGMA freelist_count"), v(&["0"]));
+        assert_eq!(rows(db, "PRAGMA integrity_check"), v(&["ok"]));
+        assert_eq!(rows(other, "SELECT x FROM u"), v(&["2"]));
+        sqlite3_close(other);
+        sqlite3_close(db);
+    }
+}
