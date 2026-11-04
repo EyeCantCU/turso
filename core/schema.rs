@@ -1080,6 +1080,10 @@ pub struct Schema {
     /// In MVCC mode, when a table is dropped, the btree pages are not freed until checkpoint.
     /// integrity_check needs to know about these pages to avoid false positives about "page never used".
     pub dropped_root_pages: HashSet<i64>,
+    /// The first sqlite_schema row that failed to load, as SQLite reports it
+    /// ("malformed database schema (NAME) - ..."); the rest of the schema
+    /// is loaded. Statements fail with it (see `translate`).
+    pub load_error: Option<String>,
 
     /// Custom type registry, loaded from sqlite_turso_types
     pub type_registry: HashMap<String, Arc<TypeDef>>,
@@ -1296,6 +1300,7 @@ impl Schema {
             schema_version: 0,
             analyze_stats: AnalyzeStats::default(),
             dropped_root_pages: HashSet::default(),
+            load_error: None,
             type_registry,
             custom_types_enabled: enable_custom_types,
             supports_namespaces: dialect.supports_namespaces(),
@@ -2943,7 +2948,7 @@ impl Schema {
                     // to consult. Any `CREATE TEMP TRIGGER ... ON aux.x` row
                     // maps to `Some(INVALID_DB_ID)` until a connection-scoped
                     // reparse runs with a real resolver.
-                    self.handle_schema_row(
+                    if let Err(e) = self.handle_schema_row(
                         &ty,
                         &name,
                         &table_name,
@@ -2957,7 +2962,11 @@ impl Schema {
                         &mut acc.materialized_view_info,
                         &|_| None,
                         dialect,
-                    )?;
+                    ) {
+                        // A bad row does not fail the open (SQLite reads the
+                        // schema later and reports it then).
+                        self.record_load_error(&name, &e);
+                    }
 
                     state.phase = MakeFromBtreePhase::Advancing;
                 }
@@ -4607,6 +4616,7 @@ impl TryClone for Schema {
             pending_materialized_views: self.pending_materialized_views.clone(),
             roles: self.roles.clone(),
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
+            load_error: self.load_error.clone(),
             type_registry: self.type_registry.try_clone()?,
             custom_types_enabled: self.custom_types_enabled,
         })

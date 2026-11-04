@@ -53,6 +53,9 @@ pub struct DialectError {
 pub enum LimboError {
     #[error("Corrupt database: {0}")]
     Corrupt(String),
+    /// SQLITE_CORRUPT with SQLite's own text ("malformed database schema ...").
+    #[error("{0}")]
+    CorruptSchema(String),
     #[error("File is not a database")]
     NotADB,
     #[error("Internal error: {0}")]
@@ -241,7 +244,7 @@ impl LimboError {
             Self::TableLocked => 6,
             Self::ReadOnly => 8,
             Self::Interrupt => 9,
-            Self::Corrupt(_) => 11,
+            Self::Corrupt(_) | Self::CorruptSchema(_) => 11,
             Self::DatabaseFull | Self::SequenceExhausted { .. } => 13,
             Self::SchemaUpdated | Self::SchemaConflict => 17,
             Self::TooBig => 18,

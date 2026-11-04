@@ -1641,3 +1641,30 @@ fn test_cli_unsupported_file_format() {
         sqlite3_close(db);
     }
 }
+
+#[test]
+fn test_cli_malformed_schema_row() {
+    unsafe {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_file(&dir);
+        exec_ok(
+            db,
+            "CREATE TABLE a(x); CREATE TABLE b(y); INSERT INTO a VALUES(1);
+             PRAGMA writable_schema=ON;
+             UPDATE sqlite_schema SET sql='CREATE TABLE b(' WHERE name='b';
+             PRAGMA writable_schema=OFF",
+        );
+        sqlite3_close(db);
+        // The open succeeds; statements report the bad row.
+        let db = open_file(&dir);
+        let msg = query_err(db, "SELECT x FROM a");
+        assert!(msg.starts_with("malformed database schema (b)"), "{msg}");
+        assert_eq!(super::sqlite3_errcode(db), 11);
+        let msg = query_err(db, "SELECT x FROM a");
+        assert!(msg.starts_with("malformed database schema (b)"), "{msg}");
+        // Under writable_schema the part of the schema that loaded is used.
+        exec_ok(db, "PRAGMA writable_schema=ON");
+        assert_eq!(query(db, "SELECT x FROM a"), ["1"]);
+        sqlite3_close(db);
+    }
+}

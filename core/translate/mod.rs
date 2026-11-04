@@ -88,6 +88,7 @@ pub fn translate(
     origin: crate::statement::StatementOrigin,
 ) -> Result<Program> {
     tracing::trace!("querying {}", input);
+    crate::introspect::check_schema_load_error(schema, &stmt, &connection)?;
     let change_cnt_on = matches!(
         stmt,
         ast::Stmt::CreateIndex { .. }
