@@ -3628,6 +3628,9 @@ fn translate_virtual_table_insert(
         };
         // INSERT ... SELECT: like SQLite, the rows go through a temporary
         // table first, so the SELECT may read the table being written.
+        // A SELECT can produce many rows.
+        program.set_multi_write(true);
+        program.set_may_abort(true);
         let yield_reg = program.alloc_register();
         let jump_on_definition = program.allocate_label();
         let start_offset = program.allocate_label();
@@ -3791,6 +3794,8 @@ fn translate_virtual_table_insert(
         }
         _ => crate::bail_parse_error!("Unsupported INSERT body for virtual tables"),
     };
+    // As in SQLite, one VALUES row is a single write: no statement savepoint.
+    program.set_vtab_single_write(rows.len() <= 1);
     /* *
      * Inserts for virtual tables are done in a single step.
      * argv[0] = (NULL for insert)

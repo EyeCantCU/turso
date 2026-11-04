@@ -30,6 +30,7 @@ baseline = [
     "percentile",
     "autovacuum",
     "fts5",
+    "fts3",
 ]
 tracing_release = ["tracing/release_max_level_info"]
 conn_raw_api = []
@@ -53,6 +54,7 @@ io_memory_yield = []
 serde = ["dep:serde"]
 series = []
 fts5 = []
+fts3 = []
 encryption = []
 pure-rust-crypto = ["aegis/pure-rust"]
 checksum = []

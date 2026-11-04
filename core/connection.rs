@@ -392,6 +392,8 @@ impl Drop for ExplicitCheckpointGuard {
 /// statements know they need to be reprepared.
 pub struct Connection {
     pub(crate) db: Arc<Database>,
+    #[cfg(feature = "fts3")]
+    pub(crate) fts3: crate::fts3::ConnState,
     pub(super) context: Option<Arc<dyn Any + Send + Sync>>,
     pub(super) hooks: Option<Arc<dyn ConnectionHooks>>,
     pub(crate) pager: ArcSwap<Pager>,
@@ -2533,7 +2535,7 @@ impl Connection {
             return Ok(());
         }
         // Virtual tables still in a transaction get xRollback, as in SQLite.
-        if let Err(e) = crate::vdbe::execute::vtab_rollback_all(self) {
+        if let Err(e) = crate::vdbe::execute::vtab_rollback_all_closing(self) {
             tracing::debug!("rolling back virtual tables on close: {e}");
         }
         self.closed.store(true, Ordering::SeqCst);

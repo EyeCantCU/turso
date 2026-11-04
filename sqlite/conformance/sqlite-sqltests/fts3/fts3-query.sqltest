@@ -1,0 +1,204 @@
+@database :memory:
+
+# FTS3 enhanced query syntax and the auxiliary functions.
+# Expected output is SQLite 3.54's.
+
+test fts3-query-setup-precedence {
+    CREATE VIRTUAL TABLE t USING fts3(a, b);
+    INSERT INTO t VALUES('one two three', 'four five');
+    INSERT INTO t VALUES('two four six', 'one');
+    INSERT INTO t VALUES('three five seven', 'two two');
+    SELECT rowid FROM t WHERE t MATCH 'one OR two three';
+    SELECT rowid FROM t WHERE t MATCH '(one OR two) three';
+    SELECT rowid FROM t WHERE t MATCH 'two NOT one';
+    SELECT rowid FROM t WHERE t MATCH 'two AND five';
+    SELECT rowid FROM t WHERE t MATCH 'b:two';
+    SELECT rowid FROM t WHERE b MATCH 'two';
+    SELECT rowid FROM t WHERE t MATCH 'tw*';
+    SELECT rowid FROM t WHERE t MATCH '"two three"';
+    SELECT rowid FROM t WHERE t MATCH 'one NEAR/1 three';
+    SELECT rowid FROM t WHERE t MATCH 'one NEAR/0 three';
+}
+expect {
+    1
+    2
+    3
+    1
+    3
+    3
+    1
+    3
+    3
+    3
+    1
+    2
+    3
+    1
+    1
+}
+
+test fts3-query-malformed {
+    CREATE VIRTUAL TABLE t USING fts3(a);
+    SELECT * FROM t WHERE t MATCH '(one';
+}
+expect error {
+    malformed MATCH expression: \[\(one\]
+}
+
+test fts3-query-too-deep {
+    CREATE VIRTUAL TABLE t USING fts3(a);
+    SELECT * FROM t WHERE t MATCH 'a OR b OR c OR d OR e OR f OR g OR h OR i OR j OR k OR l OR m OR n OR o OR p OR q OR r OR s OR t OR u OR v OR w OR x OR y OR z OR aa OR bb OR cc OR dd OR ee OR ff OR gg OR hh OR ii OR jj OR kk OR ll OR mm OR nn OR oo OR pp OR qq OR rr OR ss OR tt OR uu OR vv OR ww OR xx OR yy OR zz OR a1 OR a2 OR a3 OR a4 OR a5 OR a6 OR a7 OR a8 OR a9 OR b1 OR b2 OR b3 OR b4 OR b5 OR b6 OR b7 OR b8 OR b9 OR c1 OR c2 OR c3 OR c4 OR c5';
+}
+expect {
+}
+
+test fts4-query-first-token {
+    CREATE VIRTUAL TABLE t USING fts4(a);
+    INSERT INTO t VALUES('alpha beta');
+    INSERT INTO t VALUES('beta alpha');
+    SELECT rowid FROM t WHERE t MATCH '^alpha';
+    SELECT rowid FROM t WHERE t MATCH '"^beta alpha"';
+}
+expect {
+    1
+    2
+}
+
+test fts3-query-offsets-snippet {
+    CREATE VIRTUAL TABLE t USING fts3(a, b);
+    INSERT INTO t VALUES('the quick brown fox jumps over the lazy dog', 'a fox and a dog');
+    SELECT offsets(t) FROM t WHERE t MATCH 'fox dog';
+    SELECT snippet(t) FROM t WHERE t MATCH 'fox';
+    SELECT snippet(t, '[', ']', '...', 0, 3) FROM t WHERE t MATCH 'lazy';
+    SELECT snippet(t, '[', ']', '...', -1, -2) FROM t WHERE t MATCH 'jumps OR dog';
+    SELECT quote(snippet(t, '[', ']', '...', 5)) FROM t WHERE t MATCH 'fox';
+}
+expect {
+    0 0 16 3 0 1 40 3 1 0 2 3 1 1 12 3
+    the quick brown <b>fox</b> jumps over the lazy dog
+    ...the [lazy] dog
+    ...fox [jumps]...lazy [dog]
+    ''
+}
+
+test fts3-query-matchinfo-formats {
+    CREATE VIRTUAL TABLE t USING fts4(a, b);
+    INSERT INTO t VALUES('alpha beta alpha', 'gamma');
+    INSERT INTO t VALUES('beta', 'alpha beta gamma beta');
+    SELECT rowid, hex(matchinfo(t)) FROM t WHERE t MATCH 'alpha beta';
+    SELECT rowid, hex(matchinfo(t, 'pcnal')) FROM t WHERE t MATCH 'alpha';
+    SELECT rowid, hex(matchinfo(t, 'sxyb')) FROM t WHERE t MATCH 'alpha beta';
+    SELECT rowid, hex(matchinfo(t, 'x')) FROM t WHERE t MATCH 'beta NEAR/1 gamma';
+}
+expect {
+    1|0200000002000000020000000200000001000000000000000100000001000000010000000200000002000000000000000200000001000000
+    2|0200000002000000000000000200000001000000010000000100000001000000010000000200000002000000020000000200000001000000
+    1|01000000020000000200000002000000030000000300000001000000
+    2|01000000020000000200000002000000030000000100000004000000
+    1|0200000000000000020000000200000001000000000000000100000001000000010000000200000002000000000000000200000001000000020000000000000001000000000000000100000001000000
+    2|0100000002000000000000000200000001000000010000000100000001000000010000000200000002000000020000000200000001000000000000000100000001000000020000000200000003000000
+    2|000000000000000000000000020000000200000001000000000000000000000000000000010000000100000001000000
+}
+
+test fts3-query-matchinfo-bad-format {
+    CREATE VIRTUAL TABLE t USING fts3(a);
+    INSERT INTO t VALUES('x');
+    SELECT matchinfo(t, 'n') FROM t WHERE t MATCH 'x';
+}
+expect error {
+    unrecognized matchinfo request: n
+}
+
+test fts3-query-aux-wrong-argument {
+    CREATE VIRTUAL TABLE t USING fts3(a);
+    INSERT INTO t VALUES('x');
+    SELECT offsets(1);
+}
+expect error {
+    unable to use function offsets in the requested context
+}
+
+test fts3-query-aux-without-match {
+    CREATE VIRTUAL TABLE t USING fts3(a);
+    INSERT INTO t VALUES('x');
+    SELECT quote(offsets(t)), quote(snippet(t)), hex(matchinfo(t)) FROM t;
+}
+expect {
+    ''|''|
+}
+
+test fts3-query-docid-range {
+    CREATE VIRTUAL TABLE t USING fts4(a);
+    INSERT INTO t(docid, a) VALUES(1, 'x'), (5, 'x'), (9, 'x');
+    SELECT docid FROM t WHERE t MATCH 'x' AND docid > 2;
+    SELECT docid FROM t WHERE t MATCH 'x' ORDER BY docid DESC;
+    SELECT docid FROM t WHERE docid BETWEEN 4 AND 9 ORDER BY docid DESC;
+}
+expect {
+    5
+    9
+    9
+    5
+    1
+    9
+    5
+}
+
+test fts3-query-hidden-column-is-null {
+    CREATE VIRTUAL TABLE t USING fts4(a);
+    INSERT INTO t VALUES('one two');
+    SELECT typeof(t), t IS NULL, quote(t) FROM t;
+    SELECT typeof(t) FROM t WHERE t MATCH 'one';
+}
+expect {
+    null|1|NULL
+    null
+}
+
+test fts3-query-aux-illegal-first-argument {
+    CREATE VIRTUAL TABLE t USING fts4(a);
+    INSERT INTO t VALUES('one two');
+    SELECT snippet(a) FROM t WHERE t MATCH 'one';
+}
+expect error {
+    illegal first argument to snippet
+}
+
+test fts3-query-matchinfo-illegal-first-argument {
+    CREATE VIRTUAL TABLE t USING fts4(a);
+    INSERT INTO t VALUES('one two');
+    SELECT matchinfo('pcx') FROM t WHERE t MATCH 'one';
+}
+expect error {
+    unable to use function matchinfo in the requested context
+}
+
+test fts3-query-deferred-tokens {
+    PRAGMA page_size = 1024;
+    CREATE VIRTUAL TABLE t USING fts4(a, b);
+    WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 1500)
+    INSERT INTO t SELECT
+      (SELECT group_concat('alpha beta gamma', ' ') FROM c AS d WHERE d.i <= 20 + c.i % 7)
+        || CASE WHEN c.i % 150 = 0 THEN ' rare' ELSE '' END,
+      'beta alpha' || CASE WHEN c.i % 150 = 0 THEN ' rare' ELSE '' END
+    FROM c;
+    SELECT rowid, hex(matchinfo(t, 'pcnax')) FROM t WHERE t MATCH 'alpha rare';
+    SELECT rowid, hex(matchinfo(t, 'x')) FROM t WHERE t MATCH '"alpha beta" rare' AND rowid > 1300;
+    SELECT rowid, offsets(t) FROM t WHERE t MATCH 'rare NEAR/1 alpha' AND rowid < 400;
+}
+expect {
+    150|0200000002000000DC050000450000000200000017000000DC050000DC05000001000000DC050000DC050000010000000A0000000A000000010000000A0000000A000000
+    300|0200000002000000DC05000045000000020000001A000000DC050000DC05000001000000DC050000DC050000010000000A0000000A000000010000000A0000000A000000
+    450|0200000002000000DC050000450000000200000016000000DC050000DC05000001000000DC050000DC050000010000000A0000000A000000010000000A0000000A000000
+    600|0200000002000000DC050000450000000200000019000000DC050000DC05000001000000DC050000DC050000010000000A0000000A000000010000000A0000000A000000
+    750|0200000002000000DC050000450000000200000015000000DC050000DC05000001000000DC050000DC050000010000000A0000000A000000010000000A0000000A000000
+    900|0200000002000000DC050000450000000200000018000000DC050000DC05000001000000DC050000DC050000010000000A0000000A000000010000000A0000000A000000
+    1050|0200000002000000DC050000450000000200000014000000DC050000DC05000001000000DC050000DC050000010000000A0000000A000000010000000A0000000A000000
+    1200|0200000002000000DC050000450000000200000017000000DC050000DC05000001000000DC050000DC050000010000000A0000000A000000010000000A0000000A000000
+    1350|0200000002000000DC05000045000000020000001A000000DC050000DC05000001000000DC050000DC050000010000000A0000000A000000010000000A0000000A000000
+    1500|0200000002000000DC050000450000000200000016000000DC050000DC05000001000000DC050000DC050000010000000A0000000A000000010000000A0000000A000000
+    1350|1A000000DC050000DC05000000000000DC050000DC050000010000000A0000000A000000010000000A0000000A000000
+    1500|16000000DC050000DC05000000000000DC050000DC050000010000000A0000000A000000010000000A0000000A000000
+    150|1 1 5 5 1 0 11 4
+    300|1 1 5 5 1 0 11 4
+}

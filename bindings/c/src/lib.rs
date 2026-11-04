@@ -1698,6 +1698,18 @@ pub unsafe extern "C" fn turso_db_config_int(
         //   - PRAGMA journal_mode=OFF is unsupported and silently kept as-is
         //     (core/storage/journal_mode.rs, JournalMode::supported)
         SQLITE_DBCONFIG_DEFENSIVE => unsafe { vtab::db_config_defensive(db, value, p_out) },
+        SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER => {
+            // SAFETY: db was checked for NULL; p_out is NULL or writable.
+            let db: &sqlite3 = unsafe { &*db };
+            let inner = db.inner.lock().unwrap();
+            let on = inner
+                .conn
+                .fts3_tokenizer_enabled((value >= 0).then_some(value != 0));
+            if !p_out.is_null() {
+                unsafe { *p_out = on as ffi::c_int };
+            }
+            SQLITE_OK
+        }
         _ => SQLITE_ERROR,
     }
 }
@@ -3726,8 +3738,7 @@ pub unsafe extern "C" fn sqlite3_table_column_metadata(
 
 fn limbo_err_code(err: &LimboError) -> i32 {
     match err {
-        LimboError::Corrupt(..) => SQLITE_CORRUPT,
-        LimboError::CorruptVtab(..) => SQLITE_CORRUPT,
+        LimboError::Corrupt(..) | LimboError::CorruptVtab(..) => SQLITE_CORRUPT,
         LimboError::NotADB => SQLITE_NOTADB,
         // A Raise is a constraint error that carries its own conflict
         // resolution, and SQLite reports it as SQLITE_CONSTRAINT.

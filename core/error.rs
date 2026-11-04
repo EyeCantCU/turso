@@ -53,8 +53,8 @@ pub struct DialectError {
 pub enum LimboError {
     #[error("Corrupt database: {0}")]
     Corrupt(String),
-    /// Corruption a virtual table reports with its own message
-    /// (SQLITE_CORRUPT_VTAB). Displayed bare.
+    /// A virtual table found its shadow tables corrupt
+    /// (SQLITE_CORRUPT_VTAB); the message is shown as is.
     #[error("{0}")]
     CorruptVtab(String),
     #[error("File is not a database")]

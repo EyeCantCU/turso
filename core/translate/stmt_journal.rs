@@ -235,6 +235,21 @@ pub(crate) fn set_insert_stmt_journal_flags(
     program.set_may_abort(may_abort);
 }
 
+/// UPDATE or DELETE of a virtual table: like SQLite, it is a single write
+/// (no statement savepoint for the table) when the plan visits one row.
+/// The journal flags keep their conservative defaults.
+fn set_vtab_write_flags(program: &mut ProgramBuilder, table: &crate::translate::plan::JoinedTable) {
+    use crate::translate::plan::{Operation, Scan};
+    let unique = match (&table.table, &table.op) {
+        (
+            crate::schema::Table::Virtual(vtab),
+            Operation::Scan(Scan::VirtualTable { idx_num, .. }),
+        ) => vtab.unique_scan(*idx_num),
+        _ => false,
+    };
+    program.set_vtab_single_write(unique);
+}
+
 /// Set multi_write / may_abort for UPDATE statements.
 pub(crate) fn set_update_stmt_journal_flags(
     program: &mut ProgramBuilder,
@@ -245,7 +260,8 @@ pub(crate) fn set_update_stmt_journal_flags(
     use crate::alloc::*;
     let target_table = &plan.target_table;
     let Some(btree_table) = target_table.btree() else {
-        return Ok(()); // Virtual table — keep conservative defaults.
+        set_vtab_write_flags(program, target_table);
+        return Ok(());
     };
     let namespace = target_table.namespace;
 
@@ -348,7 +364,8 @@ pub(crate) fn set_delete_stmt_journal_flags(
         crate::bail_parse_error!("DELETE should have one target table");
     };
     let Some(btree_table) = target_table.btree() else {
-        return Ok(()); // Virtual table — keep conservative defaults.
+        set_vtab_write_flags(program, target_table);
+        return Ok(());
     };
     let has_triggers = plan.safety.reasons.contains(&DmlSafetyReason::Trigger);
     let has_fks = table_has_fks(

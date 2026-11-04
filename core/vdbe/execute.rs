@@ -1614,15 +1614,31 @@ pub fn op_vcolumn(
         },
         insn
     );
-    let value = {
+    let (value, pointer) = {
         let cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_virtual_mut();
-        if *nochange {
+        let value = if *nochange {
             return_if_io!(state, cursor.column_nochange(*column))
         } else {
             return_if_io!(state, cursor.column(*column))
-        }
+        };
+        // A pointer-typed NULL (sqlite3_result_pointer in xColumn).
+        let pointer = if matches!(value, Value::Null) {
+            cursor.column_pointer(*column)
+        } else {
+            None
+        };
+        (value, pointer)
     };
+    match pointer {
+        Some(p) => {
+            state.reg_pointers.insert(*dest, p);
+        }
+        None if !state.reg_pointers.is_empty() => {
+            state.reg_pointers.remove(dest);
+        }
+        None => {}
+    }
     state.registers[*dest].set_value(value);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -1735,10 +1751,10 @@ pub fn op_vupdate(
                 LimboError::Constraint(_)
                     | LimboError::ConstraintViolation(_)
                     | LimboError::ReadOnly
-                    // Module errors that carry SQLite's message.
+                    // A module's own error message is reported as is, as in SQLite.
                     | LimboError::SqlError(_)
-                    | LimboError::CorruptVtab(_)
                     | LimboError::Corrupt(_)
+                    | LimboError::CorruptVtab(_)
             ) =>
         {
             mark_unlikely();
@@ -1811,6 +1827,8 @@ pub fn op_vdestroy(
             )
             .into());
         };
+        // A dropped table leaves the transaction.
+        conn.vtab_txn_states.write().remove(&vtab.id());
         vtab.destroy(&conn)?;
     }
 
@@ -1833,13 +1851,26 @@ pub fn op_vbegin(
         return Ok(InsnFunctionStepResult::Step);
     };
     let mut states = program.connection.vtab_txn_states.write();
+    // Only begin a new transaction if one is not already active for this virtual table module
     if states.insert(vtab_id) {
-        // Only begin a new transaction if one is not already active for this virtual table module
-        // A table that has gone away has nothing to begin.
-        if let Some(vtab) = program.connection.vtab_by_id(vtab_id) {
-            vtab.begin()?;
-        } else {
-            states.remove(&vtab_id);
+        let (_, cursor_type) = program
+            .cursor_ref
+            .get(*cursor_id)
+            .expect("cursor_id should exist in cursor_ref");
+        let vtab = match cursor_type {
+            CursorType::VirtualTable(vtab) if vtab.id() == vtab_id => Some(vtab.clone()),
+            _ => program.connection.vtab_by_id(vtab_id),
+        };
+        match vtab {
+            // No lock is held while the hook runs: it may query the connection.
+            Some(vtab) => {
+                drop(states);
+                vtab.hook(&program.connection, crate::native_ext::TableHook::Begin)?;
+            }
+            // A table that has gone away has nothing to begin.
+            None => {
+                states.remove(&vtab_id);
+            }
         }
     }
     state.pc += 1;
@@ -3777,7 +3808,10 @@ pub fn halt(
         }
     }
 
-    if err_code > 0 {
+    // A failing statement ends the virtual tables' transaction only when it
+    // ends the transaction: not inside BEGIN, and not as a helper statement.
+    if err_code > 0 && program.connection.get_auto_commit() && !program.connection.is_nested_stmt()
+    {
         vtab_rollback_all(&program.connection)?;
     }
 
@@ -4065,19 +4099,31 @@ fn build_constraint_violation_error(
 
 /// Call xCommit on all virtual tables that participated in the current transaction.
 pub(crate) fn vtab_commit_all(conn: &Arc<Connection>) -> crate::Result<()> {
-    let ids: Vec<u64> = conn.vtab_txn_states.read().iter().copied().collect();
-    if ids.is_empty() {
-        return Ok(());
-    }
-    // A table can be dropped (or its module replaced) mid-transaction.
-    // No lock is held while a table runs xSync, which may run SQL.
-    let vtabs: Vec<_> = ids.iter().filter_map(|id| conn.vtab_by_id(*id)).collect();
-    for vtab in &vtabs {
-        vtab.sync(conn)?;
-    }
-    conn.vtab_txn_states.write().clear();
-    for vtab in &vtabs {
-        vtab.commit()?;
+    vtab_hook_all(conn, true, crate::native_ext::TableHook::Commit)
+}
+
+/// Runs `hook` on every virtual table in the current transaction, with no
+/// lock held, since a hook may query the connection. `end` ends the
+/// transaction for them.
+fn vtab_hook_all(
+    conn: &Arc<Connection>,
+    end: bool,
+    hook: crate::native_ext::TableHook<'_>,
+) -> crate::Result<()> {
+    let ids: Vec<u64> = if end {
+        let mut set = conn.vtab_txn_states.write();
+        if set.is_empty() {
+            return Ok(());
+        }
+        set.drain().collect()
+    } else {
+        conn.vtab_txn_states.read().iter().copied().collect()
+    };
+    for id in ids {
+        // A table can be dropped (or its module replaced) mid-transaction.
+        if let Some(vtab) = conn.vtab_by_id(id) {
+            vtab.hook(conn, hook)?;
+        }
     }
     Ok(())
 }
@@ -4307,22 +4353,29 @@ fn named_savepoint_level(conn: &Connection, name: &str) -> Option<usize> {
 
 /// Runs a savepoint hook (0 = savepoint, 1 = release, 2 = rollback to) on
 /// every virtual table in the current transaction.
-fn vtab_savepoint_all(conn: &Arc<Connection>, op: u8, level: usize) -> crate::Result<()> {
-    let ids: Vec<u64> = conn.vtab_txn_states.read().iter().copied().collect();
-    if ids.is_empty() {
-        return Ok(());
-    }
-    let vtabs: Vec<_> = ids.iter().filter_map(|id| conn.vtab_by_id(*id)).collect();
-    for vtab in vtabs {
-        vtab.savepoint_op(conn, op, level)?;
-    }
-    Ok(())
+pub(crate) fn vtab_savepoint_all(
+    conn: &Arc<Connection>,
+    op: u8,
+    level: usize,
+) -> crate::Result<()> {
+    use crate::native_ext::TableHook;
+    let hook = match op {
+        0 => TableHook::Savepoint(level),
+        1 => TableHook::Release(level),
+        _ => TableHook::RollbackTo(level),
+    };
+    vtab_hook_all(conn, false, hook)
 }
 
 /// Rollback all virtual tables that are part of the current transaction.
-pub(crate) fn vtab_rollback_all(conn: &Connection) -> crate::Result<()> {
+pub(crate) fn vtab_rollback_all(conn: &Arc<Connection>) -> crate::Result<()> {
+    vtab_hook_all(conn, true, crate::native_ext::TableHook::Rollback)
+}
+
+/// Like [`vtab_rollback_all`], where only a plain connection reference is
+/// available (closing it): modules get xRollback without the connection.
+pub(crate) fn vtab_rollback_all_closing(conn: &Connection) -> crate::Result<()> {
     let ids: Vec<u64> = conn.vtab_txn_states.write().drain().collect();
-    // A table can be dropped (or its module replaced) mid-transaction.
     for id in ids {
         if let Some(vtab) = conn.vtab_by_id(id) {
             vtab.rollback()?;
@@ -5216,7 +5269,13 @@ pub fn op_transaction_inner(
                 *state.active_op_state.transaction() = OpTransactionState::BeginStatement;
             }
             OpTransactionState::BeginStatement => {
-                let needs_stmt_journal = program.needs_stmt_subtransactions.load(Ordering::Relaxed);
+                // A helper statement nested in a statement that holds the
+                // statement journal runs inside that statement's savepoint.
+                let needs_stmt_journal = program.needs_stmt_subtransactions.load(Ordering::Relaxed)
+                    && !(program.connection.is_nested_stmt()
+                        && is_main_db
+                        && mv_store.is_none()
+                        && pager.subjournal_in_use());
                 let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
                 let in_explicit_txn = !auto_commit;
                 if needs_stmt_journal {
@@ -5228,6 +5287,18 @@ pub fn op_transaction_inner(
                         )?;
                         if let IOResult::IO(io) = res {
                             return Ok(state.suspend_on_io(io));
+                        }
+                        // As SQLite's OP_Transaction does, announce the statement
+                        // savepoint to the virtual tables in the transaction.
+                        if statement_writes_db
+                            && in_explicit_txn
+                            && state.vtab_stmt_level.is_none()
+                            && !program.vtab_single_write
+                            && !program.connection.is_nested_stmt()
+                        {
+                            let level = program.connection.named_savepoints.read().len();
+                            vtab_savepoint_all(&program.connection, 0, level)?;
+                            state.vtab_stmt_level = Some(level);
                         }
                     } else if statement_writes_db && in_explicit_txn {
                         if !state.has_stmt_transaction {
@@ -17883,7 +17954,19 @@ pub fn op_rename_table(
                 normalized_to.clone_into(&mut btree.declared_name);
             }
             Table::Virtual(vtab) => {
-                Arc::make_mut(vtab).name.clone_from(&normalized_to);
+                let vtab = Arc::make_mut(vtab);
+                vtab.name.clone_from(&normalized_to);
+                // SQLite reconnects a renamed table; modules such as FTS3
+                // declare a hidden column named after the table.
+                for col in vtab.columns.iter_mut().filter(|c| c.hidden()) {
+                    if col
+                        .name
+                        .as_deref()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(&normalized_from))
+                    {
+                        col.name = Some(to.clone());
+                    }
+                }
             }
             _ => panic!("only btree and virtual tables can be renamed"),
         }

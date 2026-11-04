@@ -2717,6 +2717,8 @@ impl Database {
     ) -> Result<Arc<Connection>> {
         let encryption_cipher = self.encryption_cipher_mode.get();
         let conn = Arc::new(Connection {
+            #[cfg(feature = "fts3")]
+            fts3: Default::default(),
             db: self.clone(),
             context: context.value,
             hooks: context.hooks,

@@ -7,8 +7,6 @@ pub use super::tokenize::{
     TOKENIZE_PREFIX, TOKENIZE_QUERY, TOKEN_COLOCATED,
 };
 
-use crate::function::ExternalFunc;
-use crate::native_ext::FunctionArity;
 use crate::sync::Arc;
 use crate::{Connection, Result, Value};
 use std::sync::OnceLock;
@@ -45,13 +43,15 @@ pub fn register_aux_function(
 ) -> Result<()> {
     let key = name.to_ascii_lowercase();
     super::registry::with_mut(conn, |r| r.aux.insert(key.clone(), f));
-    let func = ExternalFunc::new_native_scalar(
-        key.clone(),
-        FunctionArity::Variadic,
-        false,
-        super::AuxFunction { name: key.clone() },
-    )?;
-    conn.syms.write().functions.insert(key, Arc::new(func));
+    // As sqlite3_overload_function: a placeholder unless the name exists;
+    // tables supply the real function through xFindFunction.
+    let mut syms = conn.syms.write();
+    if !syms.functions.contains_key(&key) {
+        if let Some(f) = super::overload_placeholder(&key) {
+            syms.functions.insert(key, f);
+        }
+    }
+    drop(syms);
     conn.bump_prepare_context_generation();
     Ok(())
 }
