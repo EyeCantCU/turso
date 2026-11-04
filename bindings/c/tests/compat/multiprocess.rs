@@ -329,3 +329,65 @@ fn test_exclusive_locking_mode_locks_out_other_processes() {
         assert_eq!(sqlite3_close(db), SQLITE_OK);
     }
 }
+
+/// Run SQL in the system `sqlite3` shell (real SQLite); None if it is absent.
+fn sqlite_cli(path: &str, sql: &str) -> Option<String> {
+    let out = Command::new("sqlite3")
+        .args(["-batch", "-cmd", ".timeout 5000", path, sql])
+        .stderr(Stdio::inherit())
+        .output()
+        .ok()?;
+    assert!(out.status.success(), "sqlite3 failed on: {sql}");
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+#[test]
+fn test_sqlite_shell_writes_alongside_open_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    unsafe {
+        let (path, db) = setup(&dir);
+        // The checkpoint backfills everything, so the next insert restarts
+        // the WAL into a new generation.
+        let Some(_) = sqlite_cli(
+            &path,
+            "INSERT INTO t VALUES (1, 1); PRAGMA wal_checkpoint(PASSIVE); \
+             INSERT INTO t VALUES (2, 2); INSERT INTO t VALUES (3, 3);",
+        ) else {
+            eprintln!("sqlite3 shell not available, skipping");
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            return;
+        };
+        assert_eq!(query_i64(db, "SELECT count(*) FROM t"), 4);
+        assert_eq!(exec(db, "INSERT INTO t VALUES (4, 4)"), SQLITE_OK);
+        assert_eq!(
+            sqlite_cli(
+                &path,
+                "SELECT count(*), sum(p) FROM t; PRAGMA integrity_check"
+            )
+            .unwrap(),
+            "5|9\nok"
+        );
+        // Again, with this connection's read transaction open meanwhile.
+        assert_eq!(exec(db, "BEGIN"), SQLITE_OK);
+        assert_eq!(query_i64(db, "SELECT count(*) FROM t"), 5);
+        sqlite_cli(
+            &path,
+            "PRAGMA wal_checkpoint(PASSIVE); INSERT INTO t VALUES (5, 5);",
+        )
+        .unwrap();
+        assert_eq!(query_i64(db, "SELECT count(*) FROM t"), 5);
+        assert_eq!(exec(db, "COMMIT"), SQLITE_OK);
+        assert_eq!(query_i64(db, "SELECT count(*) FROM t"), 6);
+        assert_eq!(exec(db, "INSERT INTO t VALUES (6, 6)"), SQLITE_OK);
+        assert_eq!(query_text(db, "PRAGMA integrity_check"), "ok");
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+        assert_eq!(
+            sqlite_cli(
+                &path,
+                "SELECT count(*), sum(p) FROM t; PRAGMA integrity_check"
+            )
+            .unwrap(),
+            "7|20\nok"
+        );
+    }
+}
