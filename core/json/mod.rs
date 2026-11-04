@@ -804,11 +804,16 @@ fn json_path_from_db_value<'a>(
                     ],
                 }));
             }
-            ValueRef::Numeric(Numeric::Float(f)) if !strict => {
+            // SQLite reads a REAL path through its text form ("%!.17g").
+            ValueRef::Numeric(Numeric::Float(f)) => {
+                let text = crate::numeric::format_float(f64::from(f));
+                if strict {
+                    return Ok(Some(json_path(&text)?.into_owned()));
+                }
                 return Ok(Some(JsonPath {
                     elements: vec![
                         PathElement::Root(),
-                        PathElement::Key(Cow::Owned(f64::from(f).to_string()), false),
+                        PathElement::Key(Cow::Owned(text), false),
                     ],
                 }));
             }
@@ -1560,7 +1565,7 @@ mod tests {
 
         match result {
             Ok(_) => panic!("expected error"),
-            Err(e) => assert!(e.to_string().contains("JSON path error")),
+            Err(e) => assert!(e.to_string().contains("bad JSON path: '1.1'"), "{e}"),
         }
     }
 
@@ -1896,18 +1901,14 @@ mod tests {
 
     #[test]
     fn test_json_path_from_db_value_float_non_strict() {
-        let path = Value::from_f64(1.23);
-
-        let result = json_path_from_db_value(&path, false);
-        assert!(result.is_ok());
-
-        let result = result.unwrap();
-        assert!(result.is_some());
-
-        let result = result.unwrap();
-        match &result.elements[..] {
-            [PathElement::Root(), PathElement::Key(field, false)] if *field == "1.23" => {}
-            _ => panic!("Expected root and field"),
+        // The key is the REAL's SQLite text form, not Rust's shortest digits.
+        for (v, want) in [(1.23, "1.23"), (1025.1655084065987, "1025.1655084065988")] {
+            let path = Value::from_f64(v);
+            let result = json_path_from_db_value(&path, false).unwrap().unwrap();
+            match &result.elements[..] {
+                [PathElement::Root(), PathElement::Key(field, false)] if *field == want => {}
+                _ => panic!("Expected root and field {want}"),
+            }
         }
     }
 
