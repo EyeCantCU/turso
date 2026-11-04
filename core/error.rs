@@ -92,6 +92,9 @@ pub enum LimboError {
     CompletionError(#[from] CompletionError),
     #[error("Locking error: {0}")]
     LockingError(String),
+    /// A file the database needs could not be opened (SQLITE_CANTOPEN).
+    #[error("unable to open database file")]
+    CantOpen,
     #[error("Parse error: {0}")]
     ParseIntError(#[from] std::num::ParseIntError),
     #[error("Parse error: {0}")]
@@ -247,6 +250,7 @@ impl LimboError {
             Self::TooBig => 18,
             Self::PermissionDenied(_) => 23,
             Self::NotADB => 26,
+            Self::CantOpen => 14,
             Self::BlobHandleExpired => 4,
             _ => 1,
         }

@@ -50,6 +50,23 @@ pub(crate) struct WalIndexHeader {
     pub big_endian_checksum: bool,
 }
 
+impl WalIndexHeader {
+    pub(crate) fn from_wal_header(
+        header: &crate::storage::sqlite3_ondisk::WalHeader,
+        max_frame: u64,
+        checksum: (u32, u32),
+    ) -> Self {
+        Self {
+            max_frame: max_frame as u32,
+            page_size: header.page_size,
+            salt_1: header.salt_1,
+            salt_2: header.salt_2,
+            checksum,
+            big_endian_checksum: header.magic & 1 == 1,
+        }
+    }
+}
+
 pub(crate) struct SqliteWalIndex {
     shm: Arc<dyn File>,
     wal: std::fs::File,
@@ -190,6 +207,19 @@ impl SqliteWalIndex {
             salt_1: u32::from_be_bytes(w[8].to_ne_bytes()),
             salt_2: u32::from_be_bytes(w[9].to_ne_bytes()),
         }))
+    }
+
+    /// Whether a valid index describes the WAL file as it is on disk: same
+    /// generation (salts) and every indexed frame present.
+    pub(crate) fn matches_wal_file(&self) -> bool {
+        let (Ok(Some(index)), Some(wal)) = (self.read_header(), self.read_wal_header()) else {
+            return false;
+        };
+        let frame_size = u64::from(wal.page_size) + FRAME_HEADER_SIZE;
+        let needed = WAL_HEADER_SIZE + u64::from(index.max_frame) * frame_size;
+        index.salt_1 == wal.salt_1
+            && index.salt_2 == wal.salt_2
+            && self.wal.metadata().is_ok_and(|m| m.len() >= needed)
     }
 
     pub(crate) fn read_wal_header(&self) -> Option<WalFileHeader> {

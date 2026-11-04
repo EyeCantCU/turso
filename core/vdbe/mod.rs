@@ -1590,6 +1590,10 @@ impl ProgramState {
             })
         };
         if connection.n_active_root_statements.load(Ordering::SeqCst) > i32::from(self_counted) {
+            if connection.read_kept_for_siblings() {
+                // Left open by a write for its siblings: the last one ends it.
+                return false;
+            }
             // Readers can finish while sibling readers remain active, but a
             // shared attached transaction may only be finished by the last
             // active statement, like SQLite's btreeEndTransaction keeps the
@@ -1606,7 +1610,8 @@ impl ProgramState {
             return false;
         }
         self.auto_txn_cleanup == TxnCleanup::RollbackTxn
-            || (connection.get_auto_commit() && attached_txn_open())
+            || (connection.get_auto_commit()
+                && (connection.read_kept_for_siblings() || attached_txn_open()))
     }
 
     /// The MvStore this statement runs against: the same answer as
@@ -3390,7 +3395,9 @@ impl Program {
             return Ok(IOResult::Done(()));
         }
         let txn_finish_result = if !rollback {
-            pager.commit_tx(connection, connection.get_sync_mode(), true)
+            // Sibling statements still reading keep the read transaction.
+            let keep_read = connection.take_write_keeps_shared_read();
+            pager.commit_tx_keep_read(connection, connection.get_sync_mode(), true, keep_read)
         } else {
             pager.rollback_tx(connection);
             Ok(IOResult::Done(()))
@@ -3753,7 +3760,8 @@ impl Program {
                 // Transaction errors, e.g. trying to start a nested transaction, do not cause a rollback.
                 Some(LimboError::TxError(_)) => {}
                 // Table locked errors, e.g. trying to checkpoint in an interactive transaction, do not cause a rollback.
-                Some(LimboError::TableLocked) => {}
+                // A writer (DROP refused by OP_Destroy) is rolled back as usual.
+                Some(LimboError::TableLocked) if !unfinished_writer => {}
                 // Busy errors do not cause a rollback.
                 Some(LimboError::Busy) => {}
                 // Same-connection "SQL statements in progress" rejections do

@@ -2101,6 +2101,22 @@ impl Pager {
         }
     }
 
+    /// Save every cursor's position so it re-seeks after a rollback, like
+    /// saveAllCursors in sqlite3BtreeSavepoint. Cursors that can't save are
+    /// invalidated by the rollback.
+    pub(crate) fn save_all_cursor_positions(&self) {
+        let snapshot: smallvec::SmallVec<[RegisteredCursor; 8]> = {
+            let registry = self.cursor_registry.lock();
+            registry.values().flat_map(|b| b.iter().copied()).collect()
+        };
+        for peer in snapshot {
+            // SAFETY: see RegisteredCursor's invariant.
+            let _ = self
+                .io
+                .block(|| unsafe { peer.as_mut().try_save_position_for_external_balance() });
+        }
+    }
+
     /// Invalidate the page stacks of every peer on `except`'s btree. Used
     /// by clear_btree / btree_destroy where every page is freed; saving
     /// positions would just stash keys that no longer exist.
@@ -3414,6 +3430,20 @@ impl Pager {
         sync_mode: SyncMode,
         update_transaction_state: bool,
     ) -> IOResultOr<()> {
+        self.commit_tx_keep_read(connection, sync_mode, update_transaction_state, false)
+    }
+
+    /// Like [Self::commit_tx]. With `keep_read`, the connection stays in a
+    /// read transaction for sibling statements that are still running, as
+    /// SQLite downgrades to TRANS_READ while other statements are active.
+    #[instrument(skip_all, level = Level::DEBUG)]
+    pub fn commit_tx_keep_read(
+        &self,
+        connection: &Connection,
+        sync_mode: SyncMode,
+        update_transaction_state: bool,
+        keep_read: bool,
+    ) -> IOResultOr<()> {
         if connection.is_nested_stmt() {
             // Parent statement will handle the transaction commit.
             return Ok(IOResult::Done(()));
@@ -3424,9 +3454,14 @@ impl Pager {
             return Ok(IOResult::Done(()));
         };
 
+        let end_tx_state = if keep_read {
+            TransactionState::Read
+        } else {
+            TransactionState::None
+        };
         let complete_commit = || {
             if update_transaction_state {
-                connection.set_tx_state(TransactionState::None);
+                connection.set_tx_state(end_tx_state);
             }
             self.commit_wal_end();
         };
@@ -3459,8 +3494,14 @@ impl Pager {
                     return Ok(IOResult::Done(()));
                 }
                 _ => {
+                    // SQLite's auto-checkpoint fails with SQLITE_LOCKED while
+                    // the connection still has a read transaction.
+                    let mut auto_actions = connection.wal_auto_actions();
+                    if keep_read {
+                        auto_actions.remove(WalAutoActions::Checkpoint);
+                    }
                     return_if_io!(self.commit_wal(
-                        connection.wal_auto_actions(),
+                        auto_actions,
                         connection.get_wal_autocheckpoint(),
                         sync_mode,
                         connection.get_data_sync_retry(),
@@ -3472,7 +3513,9 @@ impl Pager {
                     };
 
                     wal.end_write_tx();
-                    wal.end_read_tx();
+                    if !keep_read {
+                        wal.end_read_tx();
+                    }
 
                     tracing::debug!("commit_tx: schema_did_change={schema_did_change}");
                     if schema_did_change {
@@ -3493,7 +3536,7 @@ impl Pager {
                     // checkpoint finishes: a re-entered RELEASE must still find
                     // them (see release_named_savepoint).
                     if update_transaction_state {
-                        connection.set_tx_state(TransactionState::None);
+                        connection.set_tx_state(end_tx_state);
                     }
                 }
             }
@@ -3502,6 +3545,11 @@ impl Pager {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn rollback_tx(&self, connection: &Connection) {
+        self.rollback_tx_keep_read(connection, false)
+    }
+
+    /// Like [Self::rollback_tx]; `keep_read` keeps the read transaction.
+    pub fn rollback_tx_keep_read(&self, connection: &Connection, keep_read: bool) {
         if connection.is_nested_stmt() {
             // Parent statement will handle the transaction rollback.
             return;
@@ -3516,6 +3564,9 @@ impl Pager {
         };
         tracing::trace!("rollback_tx(schema_did_change={})", schema_did_change);
         if is_write {
+            if keep_read {
+                self.save_all_cursor_positions();
+            }
             self.clear_savepoints()
                 .expect("in practice, clear_savepoints() should never fail as it uses memory IO");
             // IMPORTANT: rollback() must be called BEFORE end_write_tx() releases the write_lock.
@@ -3526,7 +3577,9 @@ impl Pager {
         } else {
             self.rollback(schema_did_change, connection, is_write);
         }
-        wal.end_read_tx();
+        if !keep_read {
+            wal.end_read_tx();
+        }
     }
 
     pub(crate) fn cleanup_read_tx(&self) {
