@@ -5,10 +5,10 @@
 use std::ptr;
 
 mod dbstat;
-mod fts5;
-mod lifecycle;
 mod ext_codes;
 mod fts3;
+mod fts5;
+mod lifecycle;
 mod rtree;
 mod vtab;
 mod vtab_plan;

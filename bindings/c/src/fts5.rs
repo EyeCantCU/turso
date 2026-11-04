@@ -4,7 +4,6 @@
 
 use crate::{sqlite3, sqlite3_stmt, SqliteContext, SQLITE_ERROR, SQLITE_MISUSE, SQLITE_OK};
 use std::collections::HashMap;
-use turso_macros::capi_guard;
 use std::ffi::{self, CStr, CString};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use turso_core::fts5_api::{
@@ -13,6 +12,7 @@ use turso_core::fts5_api::{
 };
 use turso_core::{Connection, LimboError, Value};
 use turso_ext::Value as ExtValue;
+use turso_macros::capi_guard;
 
 const SQLITE_DONE: ffi::c_int = 101;
 const SQLITE_NOMEM: ffi::c_int = 7;

@@ -51,7 +51,13 @@ unsafe fn run(db: *mut sqlite3, sql: &str) -> (c_int, c_int, c_int, c_int) {
     let sql = CString::new(sql).unwrap();
     let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
     assert_eq!(
-        sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut::<*const c_char>()),
+        sqlite3_prepare_v2(
+            db,
+            sql.as_ptr(),
+            -1,
+            &mut stmt,
+            ptr::null_mut::<*const c_char>()
+        ),
         0
     );
     let step = sqlite3_step(stmt);
@@ -95,7 +101,13 @@ fn test_extended_result_codes_masking() {
                 assert_eq!(sqlite3_extended_errcode(db), full);
                 let sqlc = CString::new(sql).unwrap();
                 let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
-                sqlite3_prepare_v2(db, sqlc.as_ptr(), -1, &mut stmt, ptr::null_mut::<*const c_char>());
+                sqlite3_prepare_v2(
+                    db,
+                    sqlc.as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut::<*const c_char>(),
+                );
                 sqlite3_step(stmt);
                 assert_eq!(sqlite3_finalize(stmt), want, "finalize {sql}");
             }
