@@ -38,7 +38,11 @@ const KIND: SharedWalLockKind = SharedWalLockKind::LinuxOfd;
 /// A database's interlock, shared with its WAL coordinations.
 pub(crate) type SqliteInterlockCell = Arc<SqliteInterlockSlot>;
 
-type InterlockInit = Box<dyn Fn() -> Result<SqliteShmInterlock> + Send + Sync>;
+/// The live shared WAL state of the database (it is replaced at open).
+pub(crate) type SharedWalHandle = Arc<crate::sync::RwLock<crate::storage::wal::WalFileShared>>;
+
+type InterlockInit =
+    Box<dyn Fn(Option<SharedWalHandle>) -> Result<SqliteShmInterlock> + Send + Sync>;
 
 /// Holds the interlock once it is set up: by the first transaction not in
 /// EXCLUSIVE locking mode, or by any WAL transaction while no EXCLUSIVE hold
@@ -50,6 +54,8 @@ pub(crate) struct SqliteInterlockSlot {
     setup: parking_lot::Mutex<()>,
     /// An exclusive [`DbLock`] replaces the interlock while set.
     exclusive_without_shm: AtomicBool,
+    /// Set by the WAL coordinations; passed to the setup.
+    shared_wal: parking_lot::Mutex<Option<SharedWalHandle>>,
 }
 
 impl SqliteInterlockSlot {
@@ -64,6 +70,10 @@ impl SqliteInterlockSlot {
     }
 
     /// Install how to set the interlock up; until then `ensure` does nothing.
+    pub(crate) fn set_shared_wal(&self, shared: SharedWalHandle) {
+        *self.shared_wal.lock() = Some(shared);
+    }
+
     pub(crate) fn install(&self, init: InterlockInit) {
         let _ = self.init.set(init);
     }
@@ -82,7 +92,8 @@ impl SqliteInterlockSlot {
         };
         let _setup = self.setup.lock();
         if self.cell.get().is_none() {
-            let _ = self.cell.set(Arc::new(init()?));
+            let shared = self.shared_wal.lock().clone();
+            let _ = self.cell.set(Arc::new(init(shared)?));
         }
         Ok(())
     }
@@ -119,16 +130,21 @@ impl SqliteShmInterlock {
         io: &Arc<dyn IO>,
         db_path: &str,
         db: Arc<dyn File>,
+        wal: Option<Arc<dyn File>>,
         build: impl Fn(&SqliteWalIndex) -> Result<()>,
     ) -> Result<Self> {
         let shm = io.open_shared_wal_file(&format!("{db_path}-shm"))?;
-        let wal_path = format!("{db_path}-wal");
+        let wal_source = crate::storage::sqlite_wal_index::WalSource {
+            path: format!("{db_path}-wal"),
+            shared: wal.map(|file| (file, io.clone())),
+        };
+        let wal_path = &wal_source;
         for attempt in 1..=ATTEMPTS {
-            if let Some(index) = Self::try_build_alone(&shm, &wal_path, &build)? {
+            if let Some(index) = Self::try_build_alone(&shm, wal_path, &build)? {
                 return Ok(Self::new(shm, db, index, true));
             }
             if let Some(others) = Self::try_lock(&shm)? {
-                let index = SqliteWalIndex::new(shm.clone(), &wal_path)?;
+                let index = SqliteWalIndex::new(shm.clone(), wal_path)?;
                 if !others {
                     // Nobody maintains the index and it was not built above:
                     // stale contents must not be trusted before the rebuild.
@@ -161,7 +177,7 @@ impl SqliteShmInterlock {
     /// it may be newer than this process's view, which imports it.
     fn try_build_alone(
         shm: &Arc<dyn File>,
-        wal_path: &str,
+        wal_path: &crate::storage::sqlite_wal_index::WalSource,
         build: &impl Fn(&SqliteWalIndex) -> Result<()>,
     ) -> Result<Option<SqliteWalIndex>> {
         if !shm.shared_wal_try_lock_byte(SHM_DMS, true, KIND)? {
@@ -231,11 +247,20 @@ pub(crate) struct DbLock {
 
 impl DbLock {
     /// None while another process holds the database exclusively.
-    pub(crate) fn acquire(io: &Arc<dyn IO>, db_path: &str) -> Result<Option<Self>> {
+    /// `db`: the database's own descriptor, shared (as SQLite's
+    /// unixInodeInfo shares one per file) instead of opening another.
+    pub(crate) fn acquire(
+        io: &Arc<dyn IO>,
+        db_path: &str,
+        db: Option<Arc<dyn File>>,
+    ) -> Result<Option<Self>> {
         // Writable for the exclusive lock; read-only files get a shared one.
-        let db = io
-            .open_file(db_path, crate::io::OpenFlags::NoLock, false)
-            .or_else(|_| io.open_file(db_path, crate::io::OpenFlags::ReadOnly, false))?;
+        let db = match db {
+            Some(db) => db,
+            None => io
+                .open_file(db_path, crate::io::OpenFlags::NoLock, false)
+                .or_else(|_| io.open_file(db_path, crate::io::OpenFlags::ReadOnly, false))?,
+        };
         if db.shared_wal_try_lock_byte(DB_SHARED_FIRST, false, KIND)? {
             Ok(Some(Self { db }))
         } else {

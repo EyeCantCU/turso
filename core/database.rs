@@ -705,6 +705,9 @@ pub struct Database<
     /// from the first non-EXCLUSIVE transaction on.
     #[cfg(all(host_shared_wal, target_os = "linux"))]
     sqlite_shm_interlock: storage::sqlite_shm_interlock::SqliteInterlockCell,
+    /// Autovacuum mode the last connection read from page 1, for a new
+    /// connection that cannot get a read transaction right now.
+    known_auto_vacuum_mode: Mutex<Option<AutoVacuumMode>>,
     /// The database file's SHARED-byte lock, from open on.
     #[cfg(all(host_shared_wal, target_os = "linux"))]
     db_lock: OnceLock<storage::sqlite_shm_interlock::DbLock>,
@@ -890,6 +893,7 @@ impl Database {
             shared_wal_coordination: OnceLock::new(),
             #[cfg(all(host_shared_wal, target_os = "linux"))]
             sqlite_shm_interlock: Default::default(),
+            known_auto_vacuum_mode: Mutex::new(None),
             #[cfg(all(host_shared_wal, target_os = "linux"))]
             db_lock: OnceLock::new(),
             exclusive_lock_holder: parking_lot::Mutex::new(None),
@@ -1148,10 +1152,21 @@ impl Database {
         // Probe with a shared lock: it conflicts with a legacy opener's
         // exclusive lock but not with concurrent multiprocess probes.
         let probe_flags = (flags | OpenFlags::Create | OpenFlags::NoLock) & !OpenFlags::ReadOnly;
-        match io
-            .open_file(path, probe_flags, true)
-            .and_then(|probe_file| probe_file.lock_file(false))
-        {
+        // On Linux only the first SHARED byte, so the coordination locks
+        // other multiprocess openers keep on the database file don't count.
+        #[cfg(target_os = "linux")]
+        let probe = |file: Arc<dyn crate::io::File>| match file.shared_wal_try_lock_byte(
+            0x4000_0002,
+            false,
+            crate::io::SharedWalLockKind::LinuxOfd,
+        ) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(LimboError::LockingError("locked".into())),
+            Err(err) => Err(err),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let probe = |file: Arc<dyn crate::io::File>| file.lock_file(false);
+        match io.open_file(path, probe_flags, true).and_then(probe) {
             Ok(()) => Ok(()),
             Err(LimboError::LockingError(_)) => Err(LimboError::LockingError(format!(
                 "Failed opening database '{path}'. Database is already open without experimental multiprocess WAL in another process"
@@ -2018,6 +2033,13 @@ impl Database {
                             Err(LimboError::Busy) => {
                                 read_tx_attempts += 1;
                                 if read_tx_attempts > 1 {
+                                    // Another connection read page 1 already: open
+                                    // with its mode, like SQLite's lazy open (the
+                                    // first statement reports the lock instead).
+                                    if let Some(mode) = *self.known_auto_vacuum_mode.lock() {
+                                        pager.set_auto_vacuum_mode(mode);
+                                        return Ok(IOResult::Done(pager));
+                                    }
                                     return Err(LimboError::Busy.into());
                                 }
                                 pager.io.yield_now();
@@ -2099,6 +2121,7 @@ impl Database {
 
                     pager.end_read_tx();
                     pager.set_auto_vacuum_mode(mode);
+                    *self.known_auto_vacuum_mode.lock() = Some(mode);
 
                     let InitState::ReadPage1 { pager } = std::mem::take(st) else {
                         unreachable!("state is ReadPage1");
@@ -3247,11 +3270,19 @@ impl Database {
         }
 
         let path = storage::wal::coordination_path_for_wal_path(&self.wal_path);
+        // The .tshm locks move to the file its name derives from; when that
+        // is this database, share its descriptor.
+        let db_fd = if path == format!("{}-tshm", self.path) {
+            self.db_file.file_handle()
+        } else {
+            None
+        };
         let authority = if self.open_flags.contains(OpenFlags::ReadOnly) {
             let Some(authority) = MappedSharedWalCoordination::open_existing_holding_open_lock(
                 &self.io,
                 std::path::Path::new(&path),
                 64,
+                db_fd,
             )?
             else {
                 // Read-only opens cannot create `.tshm`. If no shared
@@ -3268,6 +3299,7 @@ impl Database {
                     &self.io,
                     std::path::Path::new(&path),
                     64,
+                    db_fd,
                 )?,
             )
         };
@@ -3819,20 +3851,25 @@ impl Database {
     #[cfg(all(host_shared_wal, target_os = "linux"))]
     fn install_sqlite_interlock(&self, authority: Arc<MappedSharedWalCoordination>) -> Result<()> {
         if self.db_lock.get().is_none() {
-            let lock = storage::sqlite_shm_interlock::DbLock::acquire(&self.io, &self.path)?
-                .ok_or_else(|| {
-                    LimboError::LockingError(format!(
-                        "Failed opening database '{}'. Database is locked by another process",
-                        self.path
-                    ))
-                })?;
+            let lock = storage::sqlite_shm_interlock::DbLock::acquire(
+                &self.io,
+                &self.path,
+                self.db_file.file_handle(),
+            )?
+            .ok_or_else(|| {
+                LimboError::LockingError(format!(
+                    "Failed opening database '{}'. Database is locked by another process",
+                    self.path
+                ))
+            })?;
             let _ = self.db_lock.set(lock);
         }
         let db = self.db_lock.get().expect("set above").file();
         let io = self.io.clone();
         let path = self.path.clone();
-        let shared_wal = self.shared_wal.clone();
-        self.sqlite_shm_interlock.install(Box::new(move || {
+        let opened_shared_wal = self.shared_wal.clone();
+        self.sqlite_shm_interlock.install(Box::new(move |current| {
+            let shared_wal = current.unwrap_or_else(|| opened_shared_wal.clone());
             let build = |index: &storage::sqlite_wal_index::SqliteWalIndex| {
                 let snapshot = authority.snapshot();
                 // This process's WAL header may predate other processes'
@@ -3850,10 +3887,13 @@ impl Database {
                 );
                 index.rebuild(header, snapshot.nbackfills as u32)
             };
+            // Read WAL frame headers through the WAL's own descriptor.
+            let wal = shared_wal.read().runtime.file.clone();
             let interlock = match storage::sqlite_shm_interlock::SqliteShmInterlock::acquire(
                 &io,
                 &path,
                 db.clone(),
+                wal,
                 build,
             ) {
                 Ok(interlock) => interlock,

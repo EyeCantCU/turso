@@ -69,7 +69,7 @@ impl WalIndexHeader {
 
 pub(crate) struct SqliteWalIndex {
     shm: Arc<dyn File>,
-    wal: std::fs::File,
+    wal: WalReader,
     /// Mapped 32 KiB pages; held only while mapping.
     pages: Mutex<Vec<Box<dyn SharedWalMappedRegion>>>,
     /// Serializes index writes in this process.
@@ -140,16 +140,73 @@ fn checksum_native(words: &[u32]) -> (u32, u32) {
     (s1, s2)
 }
 
+/// Where the index reads WAL frame headers from: the WAL's own descriptor
+/// when the database has it open, else a file opened by path.
+pub(crate) struct WalSource {
+    pub path: String,
+    pub shared: Option<(Arc<dyn File>, Arc<dyn crate::io::IO>)>,
+}
+
+enum WalReader {
+    Shared(Arc<dyn File>, Arc<dyn crate::io::IO>),
+    Host(std::fs::File),
+}
+
+impl WalReader {
+    fn len(&self) -> std::io::Result<u64> {
+        match self {
+            WalReader::Shared(file, _) => file.size().map_err(std::io::Error::other),
+            WalReader::Host(file) => file.metadata().map(|m| m.len()),
+        }
+    }
+
+    fn read_exact_at(&self, out: &mut [u8], offset: u64) -> std::io::Result<()> {
+        let (file, io) = match self {
+            WalReader::Host(file) => return file.read_exact_at(out, offset),
+            WalReader::Shared(file, io) => (file, io),
+        };
+        let buf = Arc::new(crate::Buffer::new_temporary(out.len()));
+        let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = {
+            let read = read.clone();
+            crate::Completion::new_read(
+                buf.clone(),
+                move |res: std::result::Result<
+                    (Arc<crate::Buffer>, i32),
+                    crate::CompletionError,
+                >| {
+                    if let Ok((_buf, n)) = res {
+                        read.store(n.max(0) as usize, Ordering::Release);
+                    }
+                    None
+                },
+            )
+        };
+        let c = file.pread(offset, c).map_err(std::io::Error::other)?;
+        io.wait_for_completion(c).map_err(std::io::Error::other)?;
+        if read.load(Ordering::Acquire) < out.len() {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        out.copy_from_slice(&buf.as_slice()[..out.len()]);
+        Ok(())
+    }
+}
+
 impl SqliteWalIndex {
-    pub(crate) fn new(shm: Arc<dyn File>, wal_path: &str) -> Result<Self> {
-        let wal = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(wal_path)
-            .or_else(|_| std::fs::File::open(wal_path))
-            .map_err(|e| crate::error::io_error(e, "open WAL for wal-index"))?;
+    pub(crate) fn new(shm: Arc<dyn File>, wal: &WalSource) -> Result<Self> {
+        let wal = match &wal.shared {
+            Some((file, io)) => WalReader::Shared(file.clone(), io.clone()),
+            None => WalReader::Host(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&wal.path)
+                    .or_else(|_| std::fs::File::open(&wal.path))
+                    .map_err(|e| crate::error::io_error(e, "open WAL for wal-index"))?,
+            ),
+        };
         Ok(Self {
             shm,
             wal,
@@ -219,7 +276,7 @@ impl SqliteWalIndex {
         let needed = WAL_HEADER_SIZE + u64::from(index.max_frame) * frame_size;
         index.salt_1 == wal.salt_1
             && index.salt_2 == wal.salt_2
-            && self.wal.metadata().is_ok_and(|m| m.len() >= needed)
+            && self.wal.len().is_ok_and(|len| len >= needed)
     }
 
     pub(crate) fn read_wal_header(&self) -> Option<WalFileHeader> {
@@ -311,9 +368,8 @@ impl SqliteWalIndex {
     pub(crate) fn recover(&self) -> Result<IndexSnapshot> {
         let len = self
             .wal
-            .metadata()
-            .map_err(|e| crate::error::io_error(e, "stat WAL for wal-index"))?
-            .len();
+            .len()
+            .map_err(|e| crate::error::io_error(e, "stat WAL for wal-index"))?;
         let mut header = WalIndexHeader {
             max_frame: 0,
             page_size: 4096,
@@ -491,7 +547,15 @@ impl SqliteWalIndex {
         }
         let slot = |k: usize| unsafe { &*(hashes.add(k * 2) as *const AtomicU16) };
         let mut k = hash(pgno);
+        let mut probes = 0;
         while slot(k).load(Ordering::Relaxed) != 0 {
+            // A full table is corrupt, as walIndexAppend's nCollide check says.
+            probes += 1;
+            if probes >= NSLOT {
+                return Err(crate::LimboError::Corrupt(
+                    "SQLite wal-index hash table is full".into(),
+                ));
+            }
             k = (k + 1) & (NSLOT - 1);
         }
         unsafe { (pgnos as *mut u32).add(idx - 1).write_volatile(pgno) };
