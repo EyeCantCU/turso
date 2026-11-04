@@ -220,9 +220,12 @@ fn validate_update(
     if !is_internal_schema_change
         && !conn.is_nested_stmt()
         && !conn.is_mvcc_bootstrap_connection()
-        && !crate::schema::allow_user_dml(table_name)
+        && !conn.allows_user_dml(table_name)
     {
-        crate::bail_parse_error!("table {} may not be modified", table_name);
+        crate::bail_parse_error!(
+            "table {} may not be modified",
+            crate::introspect::dml_error_name(table_name)
+        );
     }
     if crate::translate::planner::is_protected_shadow_table(
         resolver,
@@ -291,6 +294,7 @@ fn prepare_update_plan(
     }
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
+    crate::sqlite_dbpage::begin_writes(program, resolver, connection, &table)?;
     validate_update(
         resolver,
         namespace,

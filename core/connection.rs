@@ -552,6 +552,8 @@ pub struct Connection {
     pub(super) nestedness: AtomicI32,
     /// SQLITE_DBCONFIG_DEFENSIVE: virtual table shadow tables are read-only.
     pub(super) defensive: crate::sync::atomic::AtomicBool,
+    /// PRAGMA writable_schema / SQLITE_DBCONFIG_WRITABLE_SCHEMA.
+    pub(super) writable_schema: crate::sync::atomic::AtomicBool,
     /// Stack of currently compiling triggers to prevent recursive trigger subprogram compilation
     pub(super) compiling_triggers: RwLock<Vec<Arc<Trigger>>>,
     /// Stack of currently executing triggers to prevent recursive trigger execution

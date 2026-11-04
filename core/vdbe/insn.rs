@@ -2826,6 +2826,8 @@ pub enum Cookie {
     ApplicationId = 8,
     /// The page size, as read by the page_size pragma.
     PageSize = 9,
+    /// SQLite's BTREE_DATA_VERSION (`PRAGMA data_version`), not in the header.
+    DataVersion = 15,
 }
 
 #[cfg(test)]

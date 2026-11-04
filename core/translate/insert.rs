@@ -85,9 +85,12 @@ fn validate(
     // Check if this is a system table that should be protected from direct writes
     if !conn.is_nested_stmt()
         && !conn.is_mvcc_bootstrap_connection()
-        && !crate::schema::allow_user_dml(table_name)
+        && !conn.allows_user_dml(table_name)
     {
-        crate::bail_parse_error!("table {} may not be modified", table_name);
+        crate::bail_parse_error!(
+            "table {} may not be modified",
+            crate::introspect::dml_error_name(table_name)
+        );
     }
     if crate::translate::planner::is_protected_shadow_table(
         resolver,
@@ -334,6 +337,7 @@ pub fn translate_insert(
     if let Some(virtual_table) = &table.virtual_table() {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie)?;
+        crate::sqlite_dbpage::begin_writes(program, resolver, connection, &table)?;
         translate_virtual_table_insert(
             program,
             virtual_table.clone(),

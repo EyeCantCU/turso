@@ -556,6 +556,16 @@ fn update_pragma(
             program,
         ),
         PragmaName::ModuleList => Ok(TransactionMode::None),
+        PragmaName::DataVersion => query_pragma(
+            PragmaName::DataVersion,
+            resolver,
+            None,
+            pager,
+            connection,
+            namespace,
+            schema_was_explicit,
+            program,
+        ),
         PragmaName::PageCount => query_pragma(
             PragmaName::PageCount,
             resolver,
@@ -863,6 +873,21 @@ fn update_pragma(
         PragmaName::CountChanges => {
             let enabled = parse_pragma_enabled(&value);
             connection.set_count_changes(enabled);
+            Ok(TransactionMode::None)
+        }
+        PragmaName::WritableSchema => {
+            let reset = matches!(&value, Expr::Name(n) | Expr::Id(n) if n.as_str().eq_ignore_ascii_case("reset"));
+            if reset {
+                // RESET: off, and the schema is read again from the file.
+                connection.set_writable_schema(false);
+                connection.reload_schema()?;
+            } else {
+                let on = parse_pragma_enabled(&value);
+                // Defensive mode refuses to turn it on, as in SQLite.
+                if !on || !connection.is_defensive() {
+                    connection.set_writable_schema(on);
+                }
+            }
             Ok(TransactionMode::None)
         }
         PragmaName::IgnoreCheckConstraints => {
@@ -1207,6 +1232,16 @@ fn query_pragma(
                 program.add_pragma_result_column(col_name.to_string());
             }
             Ok(TransactionMode::None)
+        }
+        PragmaName::DataVersion => {
+            program.emit_insn(Insn::ReadCookie {
+                db: database_id,
+                dest: register,
+                cookie: Cookie::DataVersion,
+            });
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::Read)
         }
         PragmaName::PageCount => {
             program.emit_insn(Insn::PageCount {
@@ -2014,6 +2049,13 @@ fn query_pragma(
             let register = program.alloc_register();
             let enabled = connection.get_dml_require_where();
             program.emit_int(enabled as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::WritableSchema => {
+            let register = program.alloc_register();
+            program.emit_int(connection.writable_schema() as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)

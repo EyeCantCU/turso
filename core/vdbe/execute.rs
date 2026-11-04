@@ -1575,6 +1575,22 @@ pub fn op_vfilter(
             lists[*arg] = Some(values);
         }
     }
+    // Pointer values among the arguments, for native modules
+    // (crate::pointer::arg_pointer), e.g. bytecode(?) with a stmt-pointer.
+    let ptrs: Vec<_> = if state.reg_pointers.is_empty() {
+        Vec::new()
+    } else {
+        (*args_reg..*args_reg + *arg_count)
+            .map(|r| {
+                state
+                    .reg_pointers
+                    .get(&r)
+                    .filter(|_| state.registers[r].is_null())
+                    .cloned()
+            })
+            .collect()
+    };
+    let _ptr_scope = crate::pointer::CallScope::enter(0, &ptrs);
     let has_rows = {
         let cursor = get_cursor!(state, *cursor_id);
         let cursor = cursor.as_virtual_mut();
@@ -9734,10 +9750,18 @@ fn op_agg_step_slow(state: &mut ProgramState, data: &AggStepData) -> InsnResult 
     let func = func.expect_agg();
 
     if let AggFunc::External(ext_func) = func {
-        return_if_io!(
-            state,
-            ext_func.step_aggregate(&mut state.registers, *acc_reg, *col)
-        );
+        // SQLite's OP_AggStep keeps auxdata for the whole statement.
+        // SAFETY: aux_data is not otherwise touched during the call.
+        let aux = unsafe {
+            crate::auxdata::AuxScope::enter(
+                std::ptr::addr_of_mut!(state.aux_data),
+                state.pc as usize,
+                0,
+            )
+        };
+        let result = ext_func.step_aggregate(&mut state.registers, *acc_reg, *col);
+        aux.keep();
+        return_if_io!(state, result);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -17278,6 +17302,12 @@ pub fn op_read_cookie(
 ) -> InsnResult {
     load_insn!(ReadCookie { db, dest, cookie }, insn);
     let pager = program.get_pager_from_database_index(db)?;
+    if matches!(cookie, Cookie::DataVersion) {
+        // SQLite starts at 1 and adds one per change seen from elsewhere.
+        state.registers[*dest].set_int(1 + pager.data_version() as i64);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
     let mv_store = program.connection.mv_store_for_db(*db);
 
     let cookie_value =
@@ -17303,6 +17333,8 @@ pub fn op_read_cookie(
                 Cookie::PageSize => header.page_size.get().into(),
                 Cookie::FreePageCount => header.freelist_pages.get().into(),
                 Cookie::IncrementalVacuum => header.incremental_vacuum_enabled.get().into(),
+                // Answered above; not a header field.
+                Cookie::DataVersion => 0,
             },
         ) {
             Err(_) => 0.into(),
@@ -17408,6 +17440,7 @@ pub fn op_set_cookie(
                 "page size is not set via SetCookie; changing it is deferred to Connection::reset_page_size"
             ),
             Cookie::FreePageCount => unreachable!("freelist page count is not set via SetCookie"),
+            Cookie::DataVersion => unreachable!("data_version is read-only"),
         };
         Ok(())
     })? {

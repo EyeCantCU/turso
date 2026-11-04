@@ -1,4 +1,3 @@
-use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
@@ -105,11 +104,7 @@ pub fn translate_create_trigger(
     input: &str,
 ) -> Result<()> {
     let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
-    if is_reserved_object_name(
-        resolver.catalog.dialect.supports_namespaces(),
-        &normalized_trigger_name,
-    ) && !connection.is_nested_stmt()
-    {
+    if connection.object_name_reserved(&normalized_trigger_name) && !connection.is_nested_stmt() {
         bail_parse_error!(
             "Object name reserved for internal use: {}",
             trigger_name.name.as_str()

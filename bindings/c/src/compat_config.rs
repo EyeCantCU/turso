@@ -618,11 +618,10 @@ fn dbconfig_kind(op: ffi::c_int) -> Option<DbConfigKind> {
         // Triggers and views are always enabled.
         SQLITE_DBCONFIG_ENABLE_TRIGGER | SQLITE_DBCONFIG_ENABLE_VIEW => Fixed(1),
         // No fts3_tokenizer(), always checkpoints on close, no reset via
-        // VACUUM, no writable_schema unlock, no legacy ALTER TABLE behaviour.
+        // VACUUM, no legacy ALTER TABLE behaviour.
         SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER
         | SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE
         | SQLITE_DBCONFIG_RESET_DATABASE
-        | SQLITE_DBCONFIG_WRITABLE_SCHEMA
         | SQLITE_DBCONFIG_LEGACY_ALTER_TABLE => Fixed(0),
         // Double-quoted strings in DDL always work; no untrusted-schema mode.
         SQLITE_DBCONFIG_DQS_DDL | SQLITE_DBCONFIG_TRUSTED_SCHEMA => Fixed(1),

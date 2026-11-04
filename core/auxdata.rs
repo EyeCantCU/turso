@@ -102,6 +102,14 @@ impl AuxScope {
     }
 }
 
+impl AuxScope {
+    /// Ends the call keeping every entry (OP_AggStep).
+    pub(crate) fn keep(self) {
+        let _ = FRAMES.try_with(|f| f.borrow_mut().pop());
+        std::mem::forget(self);
+    }
+}
+
 impl Drop for AuxScope {
     fn drop(&mut self) {
         let _ = FRAMES.try_with(|f| f.borrow_mut().pop());

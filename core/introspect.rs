@@ -180,6 +180,49 @@ impl Connection {
         }
     }
 
+    /// Reads the schema again from the file and makes it the database's
+    /// shared copy (PRAGMA writable_schema=RESET, vtab reconnects).
+    pub fn reload_schema(self: &Arc<Self>) -> Result<()> {
+        self.force_reparse_schema_without_publish()?;
+        let schema = self.schema.read().clone();
+        self.db.replace_schema(schema);
+        Ok(())
+    }
+
+    /// PRAGMA writable_schema: sqlite_schema can be written and `sqlite_`
+    /// names created.
+    pub fn set_writable_schema(&self, on: bool) {
+        self.writable_schema
+            .store(on, crate::sync::atomic::Ordering::SeqCst);
+        self.bump_prepare_context_generation();
+    }
+
+    pub fn writable_schema(&self) -> bool {
+        self.writable_schema
+            .load(crate::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// sqlite3WritableSchema: the flag counts only outside defensive mode.
+    fn schema_writable(&self) -> bool {
+        self.writable_schema() && !self.is_defensive()
+    }
+
+    /// `allow_user_dml` unless writable_schema unlocks the schema table.
+    pub(crate) fn allows_user_dml(&self, table: &str) -> bool {
+        crate::schema::allow_user_dml(table)
+            || (self.schema_writable() && is_schema_table_name(table))
+    }
+
+    /// Whether a new object may not use `name` (sqlite3CheckObjectName);
+    /// writable_schema permits `sqlite_` names.
+    pub(crate) fn object_name_reserved(&self, name: &str) -> bool {
+        crate::namespace::is_reserved_object_name(self.dialect().supports_namespaces(), name)
+            && !(self.schema_writable()
+                && name
+                    .get(..7)
+                    .is_some_and(|p| p.eq_ignore_ascii_case("sqlite_")))
+    }
+
     /// Disconnects the eponymous virtual tables (sqlite3_close's
     /// disconnectAllVtab); they reconnect on next use.
     pub fn disconnect_eponymous_vtabs(&self) {
@@ -188,28 +231,86 @@ impl Connection {
         drop(tables);
     }
 
+    /// Disconnects the virtual tables created in the main schema, as
+    /// sqlite3_close does before it looks for open statements. They are
+    /// gone from the loaded schema until it is reloaded
+    /// (`force_reparse_schema`). Returns whether any were disconnected.
+    pub fn disconnect_created_vtabs(&self) -> Result<bool> {
+        let mut dropped: Vec<Arc<crate::schema::Table>> = Vec::new();
+        let created = |t: &crate::schema::Table| matches!(t, crate::schema::Table::Virtual(v) if v.is_droppable);
+        let take = |s: &mut crate::schema::Schema, dropped: &mut Vec<_>| {
+            let names: Vec<String> = s
+                .all_tables()
+                .filter(|t| created(t))
+                .map(|t| t.get_name().to_string())
+                .collect();
+            for name in &names {
+                if let Some(t) = s.get_table(crate::namespace::NamespaceId::ROOT, name) {
+                    dropped.push(t);
+                }
+                s.remove_table(crate::namespace::NamespaceId::ROOT, name);
+            }
+            !names.is_empty()
+        };
+        let vtabs: Vec<_> = self.syms.write().vtabs.drain().map(|(_, v)| v).collect();
+        let local = self.with_schema_mut(|s| take(s, &mut dropped))?;
+        // The database's shared schema holds them too.
+        self.db.with_schema_mut(|s| {
+            take(s, &mut dropped);
+            Ok(())
+        })?;
+        let any = local || !vtabs.is_empty();
+        // Dropped outside the locks: xDisconnect may call back in.
+        drop(vtabs);
+        drop(dropped);
+        Ok(any)
+    }
+
     /// Whether a function `name` taking `n_arg` arguments exists, as
     /// `sqlite3FindFunction` decides for `sqlite3_overload_function`
     /// (-1 matches only variadic functions).
-    pub fn function_exists(&self, name: &str, n_arg: i32) -> bool {
+    pub fn function_exists(self: &Arc<Self>, name: &str, n_arg: i32) -> bool {
         let user = self
             .get_syms_functions()
             .into_iter()
-            .any(|(n, _, argc, _)| n.eq_ignore_ascii_case(name) && argc == n_arg);
+            .any(|(n, _, argc, _)| {
+                n.eq_ignore_ascii_case(name) && (argc == n_arg || (argc == -1 && n_arg >= 0))
+            });
         if user {
             return true;
         }
-        let builtin = |n: usize| {
-            matches!(
-                crate::function::Func::resolve_function(name, n),
-                Ok(Some(_))
-            )
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return false;
+        }
+        // Whether a call with that many arguments compiles. A built-in that
+        // takes any count is variadic.
+        let compiles = |n: usize| {
+            let args = vec!["NULL"; n].join(",");
+            self.prepare(format!("SELECT {name}({args})")).is_ok()
         };
         if n_arg >= 0 {
-            builtin(n_arg as usize)
+            compiles(n_arg as usize)
         } else {
-            // A built-in that accepts any count is variadic.
-            builtin(1) && builtin(7)
+            compiles(1) && compiles(7)
         }
+    }
+}
+
+fn is_schema_table_name(name: &str) -> bool {
+    [
+        crate::schema::SCHEMA_TABLE_NAME,
+        crate::schema::SCHEMA_TABLE_NAME_ALT,
+    ]
+    .iter()
+    .any(|n| n.eq_ignore_ascii_case(name))
+}
+
+/// The name SQLite reports for a protected table: its schema table is
+/// always "sqlite_master".
+pub(crate) fn dml_error_name(name: &str) -> &str {
+    if is_schema_table_name(name) {
+        "sqlite_master"
+    } else {
+        name
     }
 }

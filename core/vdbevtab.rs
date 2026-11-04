@@ -16,6 +16,15 @@ use crate::{Connection, LimboError, Result, Value};
 use turso_ext::{ConstraintInfo, ConstraintUsage, OrderByInfo, ResultCode};
 
 pub const BYTECODE_MODULE_NAME: &str = "bytecode";
+
+/// Maps a "stmt-pointer" pointer value to the statement it designates.
+pub type StmtPointerResolver = fn(usize) -> Option<*const crate::Statement>;
+static STMT_POINTER: std::sync::OnceLock<StmtPointerResolver> = std::sync::OnceLock::new();
+
+/// Installs the C API's mapping from `sqlite3_stmt*` to its statement.
+pub fn set_stmt_pointer_resolver(f: StmtPointerResolver) {
+    let _ = STMT_POINTER.set(f);
+}
 pub const TABLES_USED_MODULE_NAME: &str = "tables_used";
 
 const BYTECODE_SCHEMA: &str = "CREATE TABLE x(addr INT,opcode TEXT,p1 INT,p2 INT,p3 INT,p4 TEXT,p5 INT,comment TEXT,subprog TEXT,nexec INT,ncycle INT,stmt HIDDEN);";
@@ -134,11 +143,24 @@ impl VirtualTableCursor for BytecodeCursor {
     fn filter(&mut self, args: &[Value], _idx_str: Option<&str>, idx_num: i32) -> IOResultOr<bool> {
         self.rows.clear();
         self.pos = 0;
-        let Some(Value::Text(sql)) = args.first() else {
-            return Err(Box::new(self.invalid()));
+        let mut rows = match args.first() {
+            Some(Value::Text(sql)) => {
+                let stmt = self.conn.prepare(sql.as_str())?;
+                stmt.bytecode(idx_num == 0)?
+            }
+            _ => {
+                // sqlite3_bind_pointer(.., "stmt-pointer"): a statement the
+                // caller holds, mapped by the C API's resolver.
+                let stmt = crate::pointer::arg_pointer(0, b"stmt-pointer")
+                    .and_then(|p| STMT_POINTER.get().and_then(|f| f(p)));
+                match stmt {
+                    // SAFETY: the caller keeps the statement alive while it
+                    // queries bytecode(), as SQLite requires.
+                    Some(s) => unsafe { (*s).bytecode(idx_num == 0)? },
+                    None => return Err(Box::new(self.invalid())),
+                }
+            }
         };
-        let stmt = self.conn.prepare(sql.as_str())?;
-        let mut rows = stmt.bytecode(idx_num == 0)?;
         if self.tables_used {
             rows.retain(|r| r.table.is_some());
         }
