@@ -1674,6 +1674,10 @@ pub struct Pager {
     vacuum_state: RwLock<VacuumState>,
     #[cfg(feature = "autovacuum")]
     av_state: RwLock<autovacuum::AvState>,
+    /// Pages passed to `add_dirty` since the last pointer-map fixup, and
+    /// whether that set is complete (it is not after a savepoint rollback).
+    #[cfg(feature = "autovacuum")]
+    av_touched: RwLock<(bool, RoaringBitmap)>,
     pub(crate) io_ctx: RwLock<IOContext>,
     /// encryption is an opt-in feature. we will enable it only if the flag is passed
     enable_encryption: AtomicBool,
@@ -1992,6 +1996,8 @@ impl Pager {
             }),
             #[cfg(feature = "autovacuum")]
             av_state: RwLock::new(autovacuum::AvState::default()),
+            #[cfg(feature = "autovacuum")]
+            av_touched: RwLock::new((false, RoaringBitmap::new())),
             io_ctx: RwLock::new(IOContext::default()),
             enable_encryption: AtomicBool::new(false),
             ephemeral: AtomicBool::new(false),
@@ -3376,7 +3382,7 @@ impl Pager {
         if self.commit_info.read().state == CommitState::PrepareWal
             && matches!(connection.get_tx_state(), TransactionState::Write { .. })
         {
-            return_if_io!(self.av_commit());
+            return_if_io!(self.av_commit(connection));
         }
         let Some(wal) = self.wal.as_ref() else {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
@@ -3532,6 +3538,11 @@ impl Pager {
             return false;
         };
         wal.holds_write_lock()
+    }
+
+    /// Whether this pager's WAL holds the exclusive VACUUM lock.
+    pub fn holds_vacuum_lock(&self) -> bool {
+        self.wal.as_ref().is_some_and(|wal| wal.holds_vacuum_lock())
     }
 
     /// Rollback and clean up an attached database pager's transaction.
@@ -3873,6 +3884,8 @@ impl Pager {
         self.pages_dirtied_count.fetch_add(1, Ordering::Relaxed);
         let mut dirty_pages = self.dirty_pages.write();
         dirty_pages.insert(page.get().id() as u32);
+        #[cfg(feature = "autovacuum")]
+        self.av_touched.write().1.insert(page.get().id() as u32);
         // Notify cache before marking dirty (page was evictable, now it won't be)
         // Only notify if page wasn't already dirty, or if it was spilled
         // State before set_dirty():

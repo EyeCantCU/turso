@@ -182,12 +182,28 @@ struct Fixup {
     dirty: RoaringBitmap,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum Take {
+    Exact(u32),
+    AtMost(u32),
+}
+
 #[derive(Debug)]
 enum VacuumPhase {
     Fixup,
-    LoadFreelist { next_trunk: u32 },
+    /// Partial incremental vacuum: one page at a time off the end
+    /// (incrVacuumStep with bCommit=0), keeping the rest of the freelist.
+    Step {
+        to: Option<u32>,
+    },
+    StepFinish,
+    LoadFreelist {
+        next_trunk: u32,
+    },
     Relocate,
-    Rewrite { idx: usize },
+    Rewrite {
+        idx: usize,
+    },
     Finish,
 }
 
@@ -259,6 +275,8 @@ pub(crate) struct AvState {
     /// `pages_dirtied_count` when the last fixup finished.
     clean_at: Option<u64>,
     commit_done: bool,
+    /// Pages this commit gives back (FULL mode), once decided.
+    commit_vac: Option<u32>,
     vacuum: Option<VacuumJob>,
     create: CreatePhase,
     drop: DropPhase,
@@ -278,10 +296,12 @@ impl Pager {
 
     pub(crate) fn av_reset(&self) {
         *self.av_state.write() = AvState::default();
+        self.av_touched.write().0 = false;
     }
 
     /// Drops any half-done operation after an error.
     fn av_abort(&self) {
+        self.av_touched.write().0 = false;
         let mut st = self.av_state.write();
         st.fixup = None;
         st.clean_at = None;
@@ -380,8 +400,20 @@ impl Pager {
                     return Ok(IOResult::Done(()));
                 }
                 let dirty = self.dirty_pages.read().clone();
+                // Only pages changed since the last fixup need a visit.
+                let seeds = {
+                    let mut touched = self.av_touched.write();
+                    let seeds = if touched.0 {
+                        std::mem::take(&mut touched.1)
+                    } else {
+                        touched.1.clear();
+                        dirty.clone()
+                    };
+                    touched.0 = true;
+                    seeds
+                };
                 st.fixup = Some(Fixup {
-                    queue: dirty.iter().map(|p| (p, 0)).collect(),
+                    queue: seeds.iter().map(|p| (p, 0)).collect(),
                     done: HashSet::new(),
                     dirty,
                 });
@@ -569,6 +601,8 @@ impl Pager {
                     VacuumPhase::Relocate => 2,
                     VacuumPhase::Rewrite { .. } => 3,
                     VacuumPhase::Finish => 4,
+                    VacuumPhase::Step { .. } => 5,
+                    VacuumPhase::StepFinish => 6,
                 })
             };
             match phase {
@@ -609,8 +643,28 @@ impl Pager {
                     return_if_io!(self.av_fixup());
                     let trunk = return_if_io!(self.with_header(|h| h.freelist_trunk_page.get()));
                     let mut st = self.av_state.write();
-                    st.vacuum.as_mut().expect("vacuum").phase =
-                        VacuumPhase::LoadFreelist { next_trunk: trunk };
+                    let job = st.vacuum.as_mut().expect("vacuum");
+                    job.phase = if job.n_vac < job.n_free {
+                        VacuumPhase::Step { to: None }
+                    } else {
+                        VacuumPhase::LoadFreelist { next_trunk: trunk }
+                    };
+                }
+                Some(5) => return_if_io!(self.av_vacuum_partial_step()),
+                Some(6) => {
+                    let (n_fin, n_vac) = {
+                        let st = self.av_state.read();
+                        let job = st.vacuum.as_ref().expect("vacuum");
+                        (job.n_fin, job.n_vac)
+                    };
+                    return_if_io!(self.with_header_mut(|h| {
+                        h.database_size = n_fin.into();
+                    }));
+                    self.invalidate_all_cursors();
+                    self.av_truncate(n_fin)?;
+                    self.av_state.write().vacuum = None;
+                    self.av_keep_clean();
+                    return Ok(IOResult::Done(n_vac));
                 }
                 Some(1) => return_if_io!(self.av_vacuum_load_trunk()),
                 Some(2) => return_if_io!(self.av_vacuum_relocate_step()),
@@ -637,6 +691,55 @@ impl Pager {
                 }
             }
         }
+    }
+
+    fn av_vacuum_partial_step(&self) -> IOResultOr<()> {
+        let (geom, db_size) =
+            return_if_io!(self.with_header(|h| (self.av_geom(h), h.database_size.get())));
+        let (cur, n_fin, to) = {
+            let mut st = self.av_state.write();
+            let job = st.vacuum.as_mut().expect("vacuum");
+            while job.cur > job.n_fin && geom.skip(job.cur) {
+                job.cur -= 1;
+            }
+            let VacuumPhase::Step { to } = job.phase else {
+                unreachable!()
+            };
+            (job.cur, job.n_fin, to)
+        };
+        if cur <= n_fin {
+            self.av_state.write().vacuum.as_mut().expect("vacuum").phase = VacuumPhase::StepFinish;
+            return Ok(IOResult::Done(()));
+        }
+        let (ty, parent) = return_if_io!(self.av_get(geom, cur));
+        match ty {
+            PTRMAP_FREEPAGE => {
+                return_if_io!(self.av_freelist_take(Take::Exact(cur)));
+            }
+            PTRMAP_BTREE | PTRMAP_OVERFLOW1 | PTRMAP_OVERFLOW2 => {
+                let to = match to {
+                    Some(to) => to,
+                    None => {
+                        let to = return_if_io!(self.av_freelist_take(Take::AtMost(n_fin)));
+                        self.av_state.write().vacuum.as_mut().expect("vacuum").phase =
+                            VacuumPhase::Step { to: Some(to) };
+                        to
+                    }
+                };
+                return_if_io!(self.av_relocate(geom, db_size, cur, to, ty, parent));
+            }
+            _ => {
+                return Err(LimboError::Corrupt(format!(
+                    "page {cur} has ptrmap type {ty} during incremental vacuum"
+                ))
+                .into())
+            }
+        }
+        let mut st = self.av_state.write();
+        let job = st.vacuum.as_mut().expect("vacuum");
+        job.cur -= 1;
+        job.phase = VacuumPhase::Step { to: None };
+        Ok(IOResult::Done(()))
     }
 
     fn av_vacuum_load_trunk(&self) -> IOResultOr<()> {
@@ -784,7 +887,7 @@ impl Pager {
 
     /// autoVacuumCommit: fix the ptrmap and, in FULL mode, give every free
     /// page back to the file system. Runs once per commit.
-    pub(crate) fn av_commit(&self) -> IOResultOr<()> {
+    pub(crate) fn av_commit(&self, connection: &crate::Connection) -> IOResultOr<()> {
         if self.av_state.read().commit_done || self.dirty_pages.read().is_empty() {
             return Ok(IOResult::Done(()));
         }
@@ -795,7 +898,26 @@ impl Pager {
             AutoVacuumMode::Incremental => return_if_io!(self.av_fixup()),
             AutoVacuumMode::Full => {
                 return_if_io!(self.av_fixup());
-                return_if_io!(self.av_vacuum(None));
+                // xAutovacPages decides how much to give back, once per commit.
+                let decided = self.av_state.read().commit_vac;
+                let n_vac = match decided {
+                    Some(n) => n,
+                    None => {
+                        let (n_pages, n_free, page_size) = return_if_io!(self.with_header(|h| (
+                            h.database_size.get(),
+                            h.freelist_pages.get(),
+                            h.page_size.get()
+                        )));
+                        let n = connection
+                            .autovacuum_pages_for(self, n_pages, n_free, page_size)
+                            .map_or(n_free, |n| n.min(n_free));
+                        self.av_state.write().commit_vac = Some(n);
+                        n
+                    }
+                };
+                if n_vac > 0 {
+                    return_if_io!(self.av_vacuum(Some(n_vac)));
+                }
             }
         }
         self.av_state.write().commit_done = true;
@@ -804,13 +926,20 @@ impl Pager {
 
     /// Called once the commit is durable.
     pub(crate) fn av_commit_end(&self) {
+        *self.av_touched.write() = (true, RoaringBitmap::new());
         let mut st = self.av_state.write();
         st.commit_done = false;
+        st.commit_vac = None;
         st.clean_at = None;
     }
 
-    /// Removes page `pgno` from the freelist (allocateBtreePage BTALLOC_EXACT).
-    fn av_freelist_take(&self, pgno: u32) -> IOResultOr<()> {
+    /// Takes a page off the freelist (allocateBtreePage with BTALLOC_EXACT or
+    /// BTALLOC_LE) and returns its number.
+    fn av_freelist_take(&self, want: Take) -> IOResultOr<u32> {
+        let matches = |p: u32| match want {
+            Take::Exact(x) => p == x,
+            Take::AtMost(x) => p <= x,
+        };
         loop {
             let (prev, trunk) = {
                 let st = self.av_state.write();
@@ -828,7 +957,7 @@ impl Pager {
             if trunk == 0 {
                 self.av_state.write().take = None;
                 return Err(
-                    LimboError::Corrupt(format!("page {pgno} is not on the freelist")).into(),
+                    LimboError::Corrupt(format!("no freelist page matches {want:?}")).into(),
                 );
             }
             let mut ids = vec![trunk];
@@ -845,7 +974,23 @@ impl Pager {
                     FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR + i * FREELIST_LEAF_PTR_SIZE,
                 )
             };
-            if trunk == pgno {
+            // A leaf is cheaper to take than the trunk itself.
+            if let Some(i) = (0..count).find(|&i| matches(leaf_at(i))) {
+                let taken = leaf_at(i);
+                self.add_dirty(&tp)?;
+                let last = leaf_at(count - 1);
+                tc.write_u32_no_offset(
+                    FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR + i * FREELIST_LEAF_PTR_SIZE,
+                    last,
+                );
+                tc.write_u32_no_offset(FREELIST_TRUNK_OFFSET_LEAF_COUNT, count as u32 - 1);
+                return_if_io!(self.with_header_mut(|h| {
+                    h.freelist_pages = (h.freelist_pages.get() - 1).into();
+                }));
+                self.av_state.write().take = None;
+                return Ok(IOResult::Done(taken));
+            }
+            if matches(trunk) {
                 // The trunk itself: its first leaf, if any, becomes the trunk.
                 let replacement = if count > 0 {
                     let new_trunk = leaf_at(0);
@@ -881,21 +1026,7 @@ impl Pager {
                     }));
                 }
                 self.av_state.write().take = None;
-                return Ok(IOResult::Done(()));
-            }
-            if let Some(i) = (0..count).find(|&i| leaf_at(i) == pgno) {
-                self.add_dirty(&tp)?;
-                let last = leaf_at(count - 1);
-                tc.write_u32_no_offset(
-                    FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR + i * FREELIST_LEAF_PTR_SIZE,
-                    last,
-                );
-                tc.write_u32_no_offset(FREELIST_TRUNK_OFFSET_LEAF_COUNT, count as u32 - 1);
-                return_if_io!(self.with_header_mut(|h| {
-                    h.freelist_pages = (h.freelist_pages.get() - 1).into();
-                }));
-                self.av_state.write().take = None;
-                return Ok(IOResult::Done(()));
+                return Ok(IOResult::Done(trunk));
             }
             self.av_state.write().take = Some((trunk, next));
         }
@@ -972,7 +1103,7 @@ impl Pager {
                     self.av_state.write().create = CreatePhase::Init { root };
                 }
                 CreatePhase::TakeFree { root } => {
-                    return_if_io!(self.av_freelist_take(root));
+                    return_if_io!(self.av_freelist_take(Take::Exact(root)));
                     self.av_state.write().create = CreatePhase::Init { root };
                 }
                 CreatePhase::Grow { root } => {
