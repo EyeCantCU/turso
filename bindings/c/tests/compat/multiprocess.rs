@@ -181,6 +181,15 @@ fn child_entry() {
                 }
                 rc
             }
+            // Writes, then reports whether a TRUNCATE checkpoint was busy.
+            "update_checkpoint" => {
+                sqlite3_busy_timeout(db, 5000);
+                let rc = exec(db, "UPDATE t SET i = i + 1000");
+                if rc == SQLITE_OK {
+                    report(query_text(db, "PRAGMA wal_checkpoint(TRUNCATE)"));
+                }
+                rc
+            }
             _ => unreachable!("unknown role {role}"),
         };
         assert_eq!(sqlite3_close(db), SQLITE_OK);
@@ -500,4 +509,47 @@ fn test_sqlite_shell_writes_before_first_transaction() {
         .unwrap(),
         "9|1060\nok"
     );
+}
+
+/// A reader that stays active across its connection's ROLLBACK keeps its
+/// snapshot and read mark: another process can commit, but its TRUNCATE
+/// checkpoint is busy while the reader runs.
+#[test]
+fn test_reader_read_mark_survives_rollback_across_processes() {
+    let dir = tempfile::tempdir().unwrap();
+    unsafe {
+        let (path, db) = setup(&dir);
+        assert_eq!(
+            exec(
+                db,
+                "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 199) \
+                 INSERT INTO t SELECT x, x FROM n"
+            ),
+            SQLITE_OK
+        );
+        assert_eq!(exec(db, "BEGIN"), SQLITE_OK);
+        assert_eq!(exec(db, "UPDATE t SET i = i + 1 WHERE p = 1"), SQLITE_OK);
+        let sql = CString::new("SELECT i FROM t ORDER BY p").unwrap();
+        let mut sel = ptr::null_mut();
+        assert_eq!(
+            sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut sel, ptr::null_mut()),
+            SQLITE_OK
+        );
+        assert_eq!(sqlite3_step(sel), SQLITE_ROW);
+        assert_eq!(exec(db, "ROLLBACK"), SQLITE_OK);
+
+        let (rc, busy) = finish(spawn("update_checkpoint", &path, ""));
+        assert_eq!((rc, busy.as_deref()), (SQLITE_OK, Some("1")));
+
+        // The reader and new statements still see the old snapshot.
+        assert_eq!(query_i64(db, "SELECT max(i) FROM t"), 199);
+        let mut max_seen = 0;
+        while sqlite3_step(sel) == SQLITE_ROW {
+            max_seen = max_seen.max(sqlite3_column_int64(sel, 0));
+        }
+        assert_eq!(max_seen, 199);
+        assert_eq!(sqlite3_finalize(sel), SQLITE_OK);
+        assert_eq!(query_i64(db, "SELECT max(i) FROM t"), 1199);
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
 }
