@@ -57,9 +57,11 @@ impl ExtFunc {
         state: &mut ExtensionState,
         connection: &Arc<Connection>,
         args: &[Register],
+        pointers: &[Option<Arc<crate::pointer::PointerValue>>],
     ) -> IOResultOr<Value> {
         match self {
             Self::NativeScalar { function, .. } => {
+                let _scope = crate::pointer::CallScope::enter(0, pointers);
                 crate::native_ext::step_scalar(state, function.as_ref(), connection, args)
             }
             Self::Scalar {
@@ -75,6 +77,7 @@ impl ExtFunc {
                 } else {
                     args.as_ptr()
                 };
+                let _scope = crate::pointer::CallScope::enter(argv as usize, pointers);
                 let result = unsafe {
                     callback(
                         *context,

@@ -23,7 +23,7 @@ pub trait AuxFunction: Send + Sync {
 type AuxRegistry = HashMap<String, Arc<dyn AuxFunction>>;
 
 static AUX: LazyLock<RwLock<AuxRegistry>> = LazyLock::new(|| RwLock::new(HashMap::new()));
-static FTS5_HOOK: OnceLock<fn(&Arc<Connection>, &Value)> = OnceLock::new();
+static FTS5_HOOK: OnceLock<fn(&Arc<Connection>, usize)> = OnceLock::new();
 
 /// Registers (or replaces) a tokenizer.
 pub fn register_tokenizer(name: &str, module: Arc<dyn TokenizerModule>) {
@@ -61,13 +61,13 @@ pub(crate) fn find_aux(name: &str) -> Option<Arc<dyn AuxFunction>> {
 }
 
 /// Sets the handler for the SQL function `fts5(?)`, which the C API uses
-/// to hand out its `fts5_api` pointer.
-pub fn set_fts5_function_hook(f: fn(&Arc<Connection>, &Value)) {
+/// to hand out its `fts5_api`: it gets the `fts5_api_ptr` pointer argument.
+pub fn set_fts5_function_hook(f: fn(&Arc<Connection>, usize)) {
     let _ = FTS5_HOOK.set(f);
 }
 
-pub(crate) fn run_fts5_function_hook(conn: &Arc<Connection>, arg: &Value) {
+pub(crate) fn run_fts5_function_hook(conn: &Arc<Connection>, ptr: usize) {
     if let Some(f) = FTS5_HOOK.get() {
-        f(conn, arg);
+        f(conn, ptr);
     }
 }

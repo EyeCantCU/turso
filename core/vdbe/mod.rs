@@ -1121,6 +1121,10 @@ pub struct ProgramState {
     /// Excludes new root statements while an explicit checkpoint is suspended.
     pub(crate) explicit_checkpoint_guard: Option<crate::connection::ExplicitCheckpointGuard>,
     pub parameters: Vec<Value>,
+    /// Pointer values bound to parameters (sqlite3_bind_pointer), by index.
+    pub(crate) param_pointers: Vec<Option<crate::sync::Arc<crate::pointer::PointerValue>>>,
+    /// Registers holding a pointer value (valid while the register is NULL).
+    pub(crate) reg_pointers: HashMap<usize, crate::sync::Arc<crate::pointer::PointerValue>>,
     commit_state: CommitState,
     /// In-flight commit-state-machine for an autonomous sequence
     /// inner-tx. `Insn::SequenceCommitInnerTx` constructs this on first
@@ -1304,6 +1308,8 @@ impl ProgramState {
             query_deadline: None,
             explicit_checkpoint_guard: None,
             parameters: Vec::new(),
+            param_pointers: Vec::new(),
+            reg_pointers: HashMap::new(),
             commit_state: CommitState::Ready,
             sequence_inner_commit: None,
             sequence_inner_tx_pending: None,
@@ -1372,6 +1378,9 @@ impl ProgramState {
 
     pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) -> Result<()> {
         let i = index.get() - 1;
+        if let Some(p) = self.param_pointers.get_mut(i) {
+            *p = None;
+        }
         if i >= self.parameters.len() {
             self.parameters.resize(i + 1, Value::Null);
         }
@@ -1393,6 +1402,29 @@ impl ProgramState {
 
     pub fn clear_bindings(&mut self) {
         self.parameters.clear();
+        self.param_pointers.clear();
+    }
+
+    /// Binds a pointer value: NULL to SQL, readable by function arguments.
+    pub fn bind_pointer(
+        &mut self,
+        index: NonZero<usize>,
+        p: crate::sync::Arc<crate::pointer::PointerValue>,
+    ) -> Result<()> {
+        self.bind_at(index, Value::Null)?;
+        let i = index.get() - 1;
+        if i >= self.param_pointers.len() {
+            self.param_pointers.resize(i + 1, None);
+        }
+        self.param_pointers[i] = Some(p);
+        Ok(())
+    }
+
+    pub(crate) fn parameter_pointer(
+        &self,
+        index: NonZero<usize>,
+    ) -> Option<crate::sync::Arc<crate::pointer::PointerValue>> {
+        self.param_pointers.get(index.get() - 1).cloned().flatten()
     }
 
     pub fn get_parameter(&self, index: NonZero<usize>) -> Value {
@@ -1402,6 +1434,7 @@ impl ProgramState {
 
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         self.io_completions = None;
+        self.reg_pointers.clear();
         self.extension_state = crate::native_ext::ExtensionState::None;
         self.pc = 0;
 

@@ -18,51 +18,32 @@ const SQLITE_NOMEM: ffi::c_int = 7;
 
 // ------------------------------------------------------------------ pointers
 
-/// A pointer value travels as a BLOB with this prefix, the address and
-/// the type name. SQL sees it as a BLOB rather than NULL.
-const PTR_MAGIC: &[u8; 8] = b"\0tursoP\0";
-
-fn pointer_blob(p: *mut ffi::c_void, ty: &[u8]) -> Vec<u8> {
-    let mut v = PTR_MAGIC.to_vec();
-    v.extend_from_slice(&(p as usize).to_ne_bytes());
-    v.extend_from_slice(ty);
-    v
-}
-
-fn decode_pointer(b: &[u8], ty: &[u8]) -> Option<*mut ffi::c_void> {
-    let n = std::mem::size_of::<usize>();
-    if b.len() < 8 + n || &b[..8] != PTR_MAGIC || &b[8 + n..] != ty {
-        return None;
-    }
-    let mut a = [0u8; std::mem::size_of::<usize>()];
-    a.copy_from_slice(&b[8..8 + n]);
-    Some(usize::from_ne_bytes(a) as *mut ffi::c_void)
-}
-
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_bind_pointer(
     stmt: *mut sqlite3_stmt,
     idx: ffi::c_int,
     p: *mut ffi::c_void,
     ty: *const ffi::c_char,
-    _destructor: Option<unsafe extern "C" fn(*mut ffi::c_void)>,
+    destructor: Option<unsafe extern "C" fn(*mut ffi::c_void)>,
 ) -> ffi::c_int {
     if stmt.is_null() {
         return SQLITE_MISUSE;
     }
     install_hook();
-    if p.is_null() || ty.is_null() {
-        return crate::sqlite3_bind_null(stmt, idx);
-    }
-    let blob = pointer_blob(p, CStr::from_ptr(ty).to_bytes());
-    // SQLITE_TRANSIENT: the blob is copied.
-    crate::sqlite3_bind_blob(
-        stmt,
-        idx,
-        blob.as_ptr().cast(),
-        blob.len() as ffi::c_int,
-        std::mem::transmute::<usize, Option<unsafe extern "C" fn(*mut ffi::c_void)>>(usize::MAX),
-    )
+    let s = &mut *stmt;
+    let Some(index) = crate::sqlite3_bind_index_in_range(s, idx) else {
+        if let Some(d) = destructor {
+            d(p);
+        }
+        return crate::SQLITE_RANGE;
+    };
+    let ty = if ty.is_null() {
+        &[][..]
+    } else {
+        CStr::from_ptr(ty).to_bytes()
+    };
+    let result = s.stmt.bind_pointer(index, p as usize, ty, destructor);
+    crate::sqlite3_bind_result(s, result)
 }
 
 #[no_mangle]
@@ -73,10 +54,8 @@ pub unsafe extern "C" fn sqlite3_value_pointer(
     if value.is_null() || ty.is_null() {
         return std::ptr::null_mut();
     }
-    let v = &*(value as *const ExtValue);
-    v.to_blob()
-        .and_then(|b| decode_pointer(&b, CStr::from_ptr(ty).to_bytes()))
-        .unwrap_or(std::ptr::null_mut())
+    turso_core::pointer::arg_pointer_at(value as usize, CStr::from_ptr(ty).to_bytes())
+        .map_or(std::ptr::null_mut(), |p| p as *mut ffi::c_void)
 }
 
 #[no_mangle]
@@ -84,17 +63,19 @@ pub unsafe extern "C" fn sqlite3_result_pointer(
     ctx: *mut ffi::c_void,
     p: *mut ffi::c_void,
     ty: *const ffi::c_char,
-    _destructor: Option<unsafe extern "C" fn(*mut ffi::c_void)>,
+    destructor: Option<unsafe extern "C" fn(*mut ffi::c_void)>,
 ) {
     if ctx.is_null() {
         return;
     }
     let ctx = &mut *(ctx as *mut SqliteContext);
-    ctx.result = if p.is_null() || ty.is_null() {
-        ExtValue::null()
+    ctx.result = ExtValue::null();
+    let ty = if ty.is_null() {
+        &[][..]
     } else {
-        ExtValue::from_blob(pointer_blob(p, CStr::from_ptr(ty).to_bytes()))
+        CStr::from_ptr(ty).to_bytes()
     };
+    turso_core::pointer::set_result_pointer(p as usize, ty, destructor);
 }
 
 // ------------------------------------------------------------------ fts5_api
@@ -233,9 +214,8 @@ fn api_for(conn: &Arc<Connection>) -> *mut fts5_api {
 
 /// `SELECT fts5(?)` writes the fts5_api pointer through a pointer bound
 /// with type "fts5_api_ptr".
-fn fts5_hook(conn: &Arc<Connection>, arg: &Value) {
-    let Value::Blob(b) = arg else { return };
-    if let Some(pp) = decode_pointer(b, b"fts5_api_ptr") {
+fn fts5_hook(conn: &Arc<Connection>, pp: usize) {
+    if pp != 0 {
         unsafe { *(pp as *mut *mut fts5_api) = api_for(conn) };
     }
 }

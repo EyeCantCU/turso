@@ -1385,6 +1385,23 @@ impl Statement {
         self.state.clear_bindings();
     }
 
+    /// Binds a pointer value (`sqlite3_bind_pointer`): NULL in SQL, but a
+    /// function receiving the parameter as an argument can read it.
+    pub fn bind_pointer(
+        &mut self,
+        index: NonZero<usize>,
+        ptr: usize,
+        ty: &[u8],
+        destructor: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+    ) -> Result<()> {
+        let p = crate::sync::Arc::new(crate::pointer::PointerValue {
+            ptr,
+            ty: ty.to_vec(),
+            destructor,
+        });
+        self.state.bind_pointer(index, p)
+    }
+
     pub fn reset(&mut self) -> Result<()> {
         self.reset_internal(None, None, false)
             .map_err(|error| self.format_error(error))

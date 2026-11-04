@@ -151,6 +151,28 @@ extern "C" {
         d: Option<unsafe extern "C" fn(*mut c_void)>,
     );
     fn sqlite3_result_error(ctx: *mut c_void, s: *const c_char, n: c_int);
+    fn sqlite3_result_pointer(
+        ctx: *mut c_void,
+        p: *mut c_void,
+        ty: *const c_char,
+        d: Option<unsafe extern "C" fn(*mut c_void)>,
+    );
+    fn sqlite3_value_pointer(v: *mut c_void, ty: *const c_char) -> *mut c_void;
+    fn sqlite3_result_int64(ctx: *mut c_void, v: i64);
+    fn sqlite3_create_function_v2(
+        db: *mut sqlite3,
+        name: *const c_char,
+        n_args: c_int,
+        enc: c_int,
+        context: *mut c_void,
+        func: Option<unsafe extern "C" fn(*mut c_void, c_int, *mut *mut c_void)>,
+        step: Option<unsafe extern "C" fn()>,
+        final_: Option<unsafe extern "C" fn()>,
+        destroy: Option<unsafe extern "C" fn(*mut c_void)>,
+    ) -> c_int;
+    fn sqlite3_reset(stmt: *mut sqlite3_stmt) -> c_int;
+    fn sqlite3_clear_bindings(stmt: *mut sqlite3_stmt) -> c_int;
+    fn sqlite3_bind_int64(stmt: *mut sqlite3_stmt, idx: c_int, v: i64) -> c_int;
 }
 
 unsafe fn fts5_api_of(db: *mut sqlite3) -> *mut fts5_api {
@@ -735,6 +757,123 @@ fn test_fts5_tokendata() {
             "NULL NULL NULL NULL NULL NULL NULL NULL NULL",
         ];
         assert_eq!(got, expected);
+        sqlite3_close(db);
+    }
+}
+
+// Pointer values: NULL to SQL, readable through sqlite3_value_pointer.
+static PTR_TARGET: i64 = 7;
+static PTR_FREED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+unsafe extern "C" fn ptr_free(_p: *mut c_void) {
+    PTR_FREED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+unsafe extern "C" fn ptr_get(ctx: *mut c_void, _n: c_int, argv: *mut *mut c_void) {
+    let ty = CString::new("int64ptr").unwrap();
+    let p = sqlite3_value_pointer(*argv, ty.as_ptr()) as *const i64;
+    sqlite3_result_int64(ctx, if p.is_null() { -1 } else { *p });
+}
+
+unsafe extern "C" fn ptr_make(ctx: *mut c_void, _n: c_int, _argv: *mut *mut c_void) {
+    let ty = CString::new("int64ptr").unwrap();
+    sqlite3_result_pointer(
+        ctx,
+        &PTR_TARGET as *const i64 as *mut c_void,
+        ty.as_ptr(),
+        Some(ptr_free),
+    );
+}
+
+unsafe fn bound_rows(db: *mut sqlite3, sql: &str, ty: &str) -> Vec<String> {
+    let c = CString::new(sql).unwrap();
+    let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+    assert_eq!(
+        sqlite3_prepare_v2(db, c.as_ptr(), -1, &mut stmt, ptr::null_mut()),
+        SQLITE_OK,
+        "{sql}"
+    );
+    let ty = CString::new(ty).unwrap();
+    assert_eq!(
+        sqlite3_bind_pointer(
+            stmt,
+            1,
+            &PTR_TARGET as *const i64 as *mut c_void,
+            ty.as_ptr(),
+            Some(ptr_free)
+        ),
+        SQLITE_OK
+    );
+    let mut out = Vec::new();
+    while sqlite3_step(stmt) == SQLITE_ROW {
+        let t = sqlite3_column_text(stmt, 0);
+        out.push(if t.is_null() {
+            "NULL".into()
+        } else {
+            CStr::from_ptr(t as *const c_char)
+                .to_string_lossy()
+                .into_owned()
+        });
+    }
+    sqlite3_finalize(stmt);
+    out
+}
+
+#[test]
+fn test_pointer_values() {
+    unsafe {
+        let mut db: *mut sqlite3 = ptr::null_mut();
+        let name = CString::new(":memory:").unwrap();
+        assert_eq!(sqlite3_open(name.as_ptr(), &mut db), SQLITE_OK);
+        for (n, f) in [
+            ("ptr_get", ptr_get as unsafe extern "C" fn(_, _, _)),
+            ("ptr_make", ptr_make),
+        ] {
+            let cn = CString::new(n).unwrap();
+            let nargs = if n == "ptr_get" { 1 } else { 0 };
+            assert_eq!(
+                sqlite3_create_function_v2(
+                    db,
+                    cn.as_ptr(),
+                    nargs,
+                    1,
+                    ptr::null_mut(),
+                    Some(f),
+                    None,
+                    None,
+                    None
+                ),
+                SQLITE_OK
+            );
+        }
+        PTR_FREED.store(0, std::sync::atomic::Ordering::SeqCst);
+        // SQL sees NULL.
+        assert_eq!(
+            bound_rows(db, "SELECT typeof(?1) || ' ' || ifnull(length(?1), 'n') || ' ' || (?1 IS NULL) || ' ' || quote(?1)", "int64ptr"),
+            ["null n 1 NULL"]
+        );
+        // A function argument reads the pointer, only with the right type.
+        assert_eq!(bound_rows(db, "SELECT ptr_get(?1)", "int64ptr"), ["7"]);
+        assert_eq!(bound_rows(db, "SELECT ptr_get(?1)", "other"), ["-1"]);
+        // Expressions and storage drop it.
+        assert_eq!(bound_rows(db, "SELECT ptr_get(?1 + 0)", "int64ptr"), ["-1"]);
+        exec(db, "CREATE TABLE t(a)");
+        assert_eq!(
+            bound_rows(
+                db,
+                "INSERT INTO t VALUES(?1) RETURNING typeof(a)",
+                "int64ptr"
+            ),
+            ["null"]
+        );
+        // Every binding was released when its statement finalized.
+        assert_eq!(PTR_FREED.load(std::sync::atomic::Ordering::SeqCst), 5);
+        // A function result carries a pointer into an enclosing call.
+        assert_eq!(rows(db, "SELECT ptr_get(ptr_make())").unwrap(), ["7"]);
+        assert_eq!(
+            rows(db, "SELECT typeof(ptr_make()) || ptr_get(NULL)").unwrap(),
+            ["null-1"]
+        );
         sqlite3_close(db);
     }
 }

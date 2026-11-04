@@ -1715,7 +1715,9 @@ impl ScalarCall for SimpleCall {
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         let v = match self.name {
             "fts5" => {
-                api::run_fts5_function_hook(connection, args[0].get_value());
+                if let Some(p) = crate::pointer::arg_pointer(0, b"fts5_api_ptr") {
+                    api::run_fts5_function_hook(connection, p);
+                }
                 Value::Null
             }
             "fts5_source_id" => Value::build_text(FTS5_SOURCE_ID),
