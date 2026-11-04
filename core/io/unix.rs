@@ -159,6 +159,10 @@ pub(crate) fn unix_shared_wal_lock_byte(
             ))
         }
     };
+    #[cfg(target_os = "linux")]
+    if matches!(kind, SharedWalLockKind::LinuxOfd) {
+        super::fork_locks::remember(fd);
+    }
     loop {
         let rc = unsafe { libc::fcntl(fd, cmd, &mut flock) };
         if rc == -1 {
@@ -584,6 +588,8 @@ fn trim_iovecs(iov: &mut Vec<libc::iovec>, mut n: usize) {
 
 impl Drop for UnixFile {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        super::fork_locks::forget(self.file.as_raw_fd());
         self.unlock_file().expect("Failed to unlock file");
     }
 }

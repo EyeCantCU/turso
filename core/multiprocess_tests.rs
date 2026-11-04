@@ -1168,7 +1168,7 @@ fn subprocess_database_open_selects_multiprocess_shm_backend() {
 }
 
 #[test]
-fn plain_vacuum_rejects_multiprocess_wal_database() {
+fn plain_vacuum_runs_on_multiprocess_wal_database_without_peers() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("vacuum-multiprocess.db");
     let db_path_str = db_path.to_str().unwrap();
@@ -1189,18 +1189,8 @@ fn plain_vacuum_rejects_multiprocess_wal_database() {
     conn.execute("insert into test(value) values ('parent')")
         .unwrap();
 
-    let err = conn
-        .execute("VACUUM")
-        .expect_err("VACUUM should reject on a multiprocess-WAL database");
-    assert!(
-        matches!(err, LimboError::ParseError(ref msg) if msg.contains("experimental multiprocess WAL")),
-        "expected explicit multiprocess VACUUM rejection, got {err:?}"
-    );
-    assert_eq!(
-        count_test_rows(&conn),
-        1,
-        "rejecting VACUUM on a multiprocess-WAL database must not disturb the existing connection"
-    );
+    conn.execute("VACUUM").unwrap();
+    assert_eq!(count_test_rows(&conn), 1);
 }
 
 #[test]

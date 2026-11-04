@@ -906,6 +906,7 @@ impl File for UringFile {
 
 impl Drop for UringFile {
     fn drop(&mut self) {
+        super::fork_locks::forget(self.file.as_raw_fd());
         self.unlock_file().expect("Failed to unlock file");
     }
 }

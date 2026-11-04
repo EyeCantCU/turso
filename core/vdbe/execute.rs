@@ -4681,6 +4681,9 @@ pub fn op_transaction_inner(
     let mv_store = mv_store_for_db(program, state, *db);
     let is_main_db = *db == crate::MAIN_DB_ID;
     let is_secondary_db = !is_main_db;
+    if is_main_db {
+        program.connection.apply_locking_mode(write)?;
+    }
     loop {
         match *state.active_op_state.transaction() {
             OpTransactionState::Start => {

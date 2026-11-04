@@ -115,7 +115,17 @@ fn child_entry() {
     let arg = std::env::var(ARG_ENV).unwrap();
     let pid = std::process::id() as i64;
     let rc = unsafe {
-        let db = open(&path);
+        // SQLite opens lazily and reports a lock at first use; turso may
+        // already report it from the open.
+        let c_path = CString::new(path.as_str()).unwrap();
+        let mut db = ptr::null_mut();
+        let rc = sqlite3_open_v2(c_path.as_ptr(), &mut db, SQLITE_OPEN_READWRITE, ptr::null());
+        if rc != SQLITE_OK {
+            let msg = std::ffi::CStr::from_ptr(sqlite3_errmsg(db)).to_string_lossy();
+            assert_eq!(msg, "database is locked");
+            sqlite3_close(db);
+            std::process::exit(rc);
+        }
         let rc = match role.as_str() {
             // arg: busy timeout in ms
             "insert" => {
@@ -129,8 +139,20 @@ fn child_entry() {
                 rc
             }
             "count" => {
-                report(query_i64(db, "SELECT count(*) FROM t"));
-                SQLITE_OK
+                let sql = CString::new("SELECT count(*) FROM t").unwrap();
+                let mut stmt = ptr::null_mut();
+                let mut rc = sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut());
+                if rc == SQLITE_OK {
+                    rc = match sqlite3_step(stmt) {
+                        SQLITE_ROW => {
+                            report(sqlite3_column_int64(stmt, 0));
+                            SQLITE_OK
+                        }
+                        rc => rc,
+                    };
+                }
+                sqlite3_finalize(stmt);
+                rc
             }
             // arg: rows; inserted five per transaction, retrying on BUSY
             "stress" => {
@@ -286,6 +308,24 @@ fn test_locking_mode_pragma() {
         assert_eq!(query_text(db, "PRAGMA locking_mode=EXCLUSIVE"), "exclusive");
         assert_eq!(query_text(db, "PRAGMA locking_mode"), "exclusive");
         assert_eq!(query_text(db, "PRAGMA locking_mode=normal"), "normal");
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}
+
+#[test]
+fn test_exclusive_locking_mode_locks_out_other_processes() {
+    let dir = tempfile::tempdir().unwrap();
+    unsafe {
+        let (path, db) = setup(&dir);
+        assert_eq!(query_text(db, "PRAGMA locking_mode=EXCLUSIVE"), "exclusive");
+        // The lock is taken by the next write and kept after it.
+        assert_eq!(exec(db, "INSERT INTO t VALUES (-2, 0)"), SQLITE_OK);
+        assert_eq!(finish(spawn("count", &path, "")).0, SQLITE_BUSY);
+        assert_eq!(query_text(db, "PRAGMA locking_mode=NORMAL"), "normal");
+        // NORMAL releases it at the next access.
+        assert_eq!(query_i64(db, "SELECT count(*) FROM t"), 2);
+        let (rc, count) = finish(spawn("count", &path, ""));
+        assert_eq!((rc, count.as_deref()), (SQLITE_OK, Some("2")));
         assert_eq!(sqlite3_close(db), SQLITE_OK);
     }
 }

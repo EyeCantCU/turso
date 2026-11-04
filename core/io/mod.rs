@@ -52,6 +52,8 @@ cfg_block! {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) mod fork_locks;
 mod memory;
 #[cfg(feature = "io_memory_yield")]
 mod memory_yield;

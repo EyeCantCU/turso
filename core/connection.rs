@@ -2594,6 +2594,10 @@ impl Connection {
 
     /// Close a connection and checkpoint.
     pub fn close(&self) -> Result<()> {
+        // Give back an EXCLUSIVE locking-mode hold.
+        let _ = self
+            .db
+            .apply_locking_mode(self as *const Self as usize, false, false);
         if self.is_closed() {
             return Ok(());
         }
@@ -3225,6 +3229,11 @@ impl Connection {
         self.db.experimental_mvcc_passive_checkpoint_enabled()
     }
 
+    /// Whether another process has this multiprocess-WAL database open.
+    pub fn multiprocess_peers_live(&self) -> bool {
+        self.db.multiprocess_peers_live()
+    }
+
     pub fn experimental_multiprocess_wal_enabled(&self) -> bool {
         self.db.experimental_multiprocess_wal_enabled()
     }
@@ -3836,6 +3845,16 @@ impl Connection {
     pub fn set_full_column_names(&self, value: bool) {
         self.full_column_names.store(value, Ordering::SeqCst);
         self.bump_prepare_context_generation();
+    }
+
+    /// Enforce `PRAGMA locking_mode` at the start of a transaction. As in
+    /// SQLite's WAL mode, EXCLUSIVE takes the lock at the first write.
+    pub(crate) fn apply_locking_mode(&self, write: bool) -> Result<()> {
+        self.db.apply_locking_mode(
+            self as *const Self as usize,
+            self.get_locking_mode_exclusive(),
+            write,
+        )
     }
 
     pub fn get_locking_mode_exclusive(&self) -> bool {

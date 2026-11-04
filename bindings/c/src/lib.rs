@@ -495,6 +495,12 @@ pub unsafe extern "C" fn sqlite3_open(
         }
         Err(e) => {
             trace!("error opening database {}: {:?}", filename_str, e);
+            if multiprocess::is_locked(&e) {
+                if let Some(handle) = multiprocess::locked_handle(filename_str) {
+                    *db_out = handle;
+                    return SQLITE_BUSY;
+                }
+            }
             compat_lifecycle::open_failed_err(db_out, &e)
         }
     }
@@ -745,6 +751,12 @@ pub unsafe extern "C" fn sqlite3_open_v2(
             Ok(db) => (io, db),
             Err(e) => {
                 trace!("error opening database {effective_filename}: {e:?}");
+                if multiprocess::is_locked(&e) {
+                    if let Some(handle) = multiprocess::locked_handle(&effective_filename) {
+                        *db_out = handle;
+                        return SQLITE_BUSY;
+                    }
+                }
                 return compat_lifecycle::open_failed_err(db_out, &e);
             }
         }
