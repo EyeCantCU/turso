@@ -4309,6 +4309,50 @@ mod tests {
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
     }
+
+    #[test]
+    fn defer_foreign_keys_applies_to_statements_prepared_before() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let exec = |sql: &std::ffi::CStr| {
+                sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut())
+            };
+            assert_eq!(
+                exec(c"PRAGMA foreign_keys = ON; CREATE TABLE p(id INTEGER PRIMARY KEY); CREATE TABLE c(x REFERENCES p);"),
+                SQLITE_OK
+            );
+            let mut child = ptr::null_mut();
+            let mut parent = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"INSERT INTO c VALUES (5)".as_ptr(),
+                    -1,
+                    &mut child,
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"INSERT INTO p VALUES (5)".as_ptr(),
+                    -1,
+                    &mut parent,
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(exec(c"BEGIN; PRAGMA defer_foreign_keys = ON;"), SQLITE_OK);
+            assert_eq!(sqlite3_step(child), SQLITE_DONE);
+            assert_eq!(sqlite3_step(parent), SQLITE_DONE);
+            assert_eq!(exec(c"COMMIT"), SQLITE_OK);
+            assert_eq!(sqlite3_finalize(child), SQLITE_OK);
+            assert_eq!(sqlite3_finalize(parent), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
 }
 
 mod wrappers {

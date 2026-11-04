@@ -254,3 +254,57 @@ test without-rowid-add-column-check-rejects-primary-key-value {
 expect error {
     CHECK constraint failed: a = 5
 }
+
+test without-rowid-secondary-index-lookup {
+    CREATE TABLE u(k TEXT PRIMARY KEY, v UNIQUE, w, x) WITHOUT ROWID;
+    CREATE INDEX uw ON u(w);
+    INSERT INTO u VALUES ('a', 1, 'p', 10), ('b', 2, 'q', 20), ('c', 3, 'p', 30);
+    SELECT k, x FROM u WHERE w = 'p' ORDER BY k;
+    SELECT x FROM u WHERE v = 3;
+    SELECT k, x FROM u INDEXED BY uw WHERE w = 'q';
+}
+expect {
+    a|10
+    c|30
+    30
+    b|20
+}
+
+test without-rowid-indexed-by-in-writes {
+    CREATE TABLE u(k TEXT PRIMARY KEY, w, x) WITHOUT ROWID;
+    CREATE INDEX uw ON u(w);
+    INSERT INTO u VALUES ('a', 'p', 1), ('b', 'q', 2);
+    UPDATE u INDEXED BY uw SET x = x + 1 WHERE w = 'p';
+    DELETE FROM u INDEXED BY uw WHERE w = 'q';
+    SELECT * FROM u;
+}
+expect {
+    a|p|2
+}
+
+test without-rowid-eqp-index {
+    CREATE TABLE u(k TEXT PRIMARY KEY, v UNIQUE, w, x) WITHOUT ROWID;
+    CREATE INDEX uw ON u(w);
+    EXPLAIN QUERY PLAN SELECT k, x FROM u WHERE w = 'p';
+}
+expect pattern {
+    SEARCH u USING INDEX uw \(w=\?\)
+}
+
+test without-rowid-eqp-covering-index {
+    CREATE TABLE u(k TEXT PRIMARY KEY, v UNIQUE, w, x) WITHOUT ROWID;
+    CREATE INDEX uw ON u(w);
+    EXPLAIN QUERY PLAN SELECT k FROM u WHERE w = 'p';
+}
+expect pattern {
+    SEARCH u USING COVERING INDEX uw \(w=\?\)
+}
+
+test without-rowid-eqp-primary-key {
+    CREATE TABLE u(k TEXT PRIMARY KEY, v UNIQUE, w, x) WITHOUT ROWID;
+    CREATE INDEX uw ON u(w);
+    EXPLAIN QUERY PLAN SELECT x FROM u WHERE k = 'a';
+}
+expect pattern {
+    SEARCH u USING PRIMARY KEY \(k=\?\)
+}

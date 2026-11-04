@@ -96,18 +96,24 @@ pub(crate) mod vtab;
 #[derive(Debug, Default)]
 pub(crate) struct AvailableIndexes {
     indexes_by_table_id: HashMap<TableInternalId, VecDeque<Arc<Index>>>,
+    /// Indexes of WITHOUT ROWID tables that a write cannot plan with; an
+    /// INDEXED BY naming one is accepted and the table is scanned instead.
+    unplannable_indexes: HashMap<TableInternalId, std::vec::Vec<String>>,
 }
 
 impl AvailableIndexes {
     fn for_table_references(resolver: &Resolver, table_references: &TableReferences) -> Self {
-        Self::build(resolver, table_references)
+        Self::build(resolver, table_references, false)
     }
 
-    /// Like `for_table_references`, and a read-only query can also seek the
-    /// primary key of a WITHOUT ROWID table, through an index over its b-tree.
+    /// Like `for_table_references`, and a read-only query can also use the
+    /// indexes of a WITHOUT ROWID table and seek its primary key through an
+    /// index over its b-tree.
     fn for_select(resolver: &Resolver, table_references: &TableReferences) -> Self {
-        let mut available = Self::build(resolver, table_references);
-        if table_references.has_right_or_full_join() {
+        // A RIGHT/FULL join records matched WITHOUT ROWID rows from the table cursor.
+        let with_without_rowid = !table_references.has_right_or_full_join();
+        let mut available = Self::build(resolver, table_references, with_without_rowid);
+        if !with_without_rowid {
             return available;
         }
         for jt in table_references.joined_tables() {
@@ -128,12 +134,29 @@ impl AvailableIndexes {
         available
     }
 
-    fn build(resolver: &Resolver, table_references: &TableReferences) -> Self {
+    fn build(
+        resolver: &Resolver,
+        table_references: &TableReferences,
+        with_without_rowid: bool,
+    ) -> Self {
+        let mut unplannable_indexes = HashMap::default();
         let indexes_by_table_id: HashMap<TableInternalId, VecDeque<Arc<Index>>> = table_references
             .joined_tables()
             .iter()
             .filter(|jt| matches!(jt.table, Table::BTree(_) | Table::Virtual(_))) // only b-tree tables can have indexes
-            .filter(|jt| jt.btree().is_none_or(|btree| btree.has_rowid))
+            .filter(|jt| {
+                let usable = with_without_rowid || jt.btree().is_none_or(|btree| btree.has_rowid);
+                if !usable {
+                    let names = resolver.with_schema(jt.namespace.database_id, |schema| {
+                        schema
+                            .get_indices(jt.namespace.id, jt.table.get_name())
+                            .map(|idx| idx.name.clone())
+                            .collect::<std::vec::Vec<_>>()
+                    });
+                    unplannable_indexes.insert(jt.internal_id, names);
+                }
+                usable
+            })
             .filter_map(|jt| {
                 let indexes: VecDeque<_> =
                     resolver.with_schema(jt.namespace.database_id, |schema| {
@@ -151,6 +174,7 @@ impl AvailableIndexes {
 
         Self {
             indexes_by_table_id,
+            unplannable_indexes,
         }
     }
 
@@ -2473,16 +2497,17 @@ fn enforce_indexed_by_hints(
         match indexed {
             ast::Indexed::IndexedBy(name) => {
                 let idx_name = name.as_str();
-                if table_ref.btree().is_some_and(|btree| !btree.has_rowid) {
-                    crate::bail_parse_error!(
-                        "INDEXED BY is not supported on WITHOUT ROWID tables: {}",
-                        idx_name
-                    );
-                }
                 // Verify the index exists and belongs to this table.
                 let forced_index =
                     available_indexes.btree_index_by_name(table_ref.internal_id, idx_name);
                 let Some(forced_index) = forced_index else {
+                    if available_indexes
+                        .unplannable_indexes
+                        .get(&table_ref.internal_id)
+                        .is_some_and(|names| names.iter().any(|n| n.eq_ignore_ascii_case(idx_name)))
+                    {
+                        continue;
+                    }
                     crate::bail_parse_error!("no such index: {}", idx_name);
                 };
                 // A partial index can omit rows that a later RIGHT or FULL JOIN must keep.

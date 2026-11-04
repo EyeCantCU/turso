@@ -1112,8 +1112,6 @@ pub fn translate_insert(
             program,
             &btree_table,
             &insertion,
-            on_replace,
-            connection.defer_foreign_keys(),
             resolver,
             namespace,
         )?;
@@ -4685,15 +4683,12 @@ fn build_parent_key_image_for_insert(
 
 /// Parent-side: when inserting into the parent, decrement the counter
 /// if any child rows reference the NEW parent key.
-/// We *always* do this for deferred FKs, and we *also* do it for
-/// self-referential FKs (even if immediate) because the insert can
-/// “repair” a prior child-insert count recorded earlier in the same statement.
+/// Done for every FK: the insert can repay a deferred violation, one counted
+/// earlier in the same statement, or one PRAGMA defer_foreign_keys deferred.
 pub fn emit_parent_side_fk_decrement_on_insert(
     program: &mut ProgramBuilder,
     parent_table: &BTreeTable,
     insertion: &Insertion,
-    force_immediate: bool,
-    defer_all: bool,
     resolver: &Resolver,
     namespace: NamespaceRef,
 ) -> crate::Result<()> {
@@ -4706,12 +4701,9 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 .child_table
                 .name
                 .eq_ignore_ascii_case(&parent_table.name);
-        // PRAGMA defer_foreign_keys (as of prepare time) makes every FK deferred.
-        let deferred = pref.fk.deferred || defer_all;
-        // Skip only when it cannot repair anything: non-deferred and not self-referencing
-        if !force_immediate && !deferred && !is_self_ref {
-            continue;
-        }
+        // An immediate FK is repaid too: PRAGMA defer_foreign_keys, checked at
+        // run time, may have counted its violations as deferred.
+        let deferred = pref.fk.deferred;
         // Nothing to do if the parent counter is 0
         let skip_fk = program.allocate_label();
         program.emit_insn(Insn::FkIfZero {

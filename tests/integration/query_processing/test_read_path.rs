@@ -171,6 +171,8 @@ fn test_without_rowid_table_with_secondary_index(_tmp_db: TempDatabase) -> anyho
         "SELECT c0, c1 FROM t3 ORDER BY c1",
         "SELECT c0 FROM t3 WHERE c1 = 4",
         "SELECT t2.c0, t3.c0 FROM t2 JOIN t3 ON t3.c1 = t2.c0 + 1 ORDER BY t2.c0",
+        "SELECT c0 FROM t3 INDEXED BY t3_i0 WHERE c1 = 4",
+        "SELECT c1, c0 FROM t3 INDEXED BY t3_i0 ORDER BY c1",
     ];
 
     let sqlite_rows = {
@@ -198,11 +200,6 @@ fn test_without_rowid_table_with_secondary_index(_tmp_db: TempDatabase) -> anyho
     for (query, sqlite_rows) in queries.iter().zip(sqlite_rows) {
         assert_eq!(limbo_exec_rows(&conn, query), sqlite_rows, "{query}");
     }
-
-    assert_that!(conn.prepare("SELECT c0 FROM t3 INDEXED BY t3_i0 WHERE c1 = 4"))
-        .err()
-        .display_string()
-        .contains("INDEXED BY is not supported on WITHOUT ROWID tables");
 
     Ok(())
 }
