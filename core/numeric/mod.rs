@@ -687,8 +687,8 @@ pub fn str_to_f64(input: impl AsRef<str>) -> Option<StrToF64> {
         crate::functions::fpdecode::fp10_convert2(significant, exponent)
     };
 
-    let result = NonNan::new(result * sign)
-        .unwrap_or_else(|| NonNan::new(sign * f64::INFINITY).unwrap());
+    let result =
+        NonNan::new(result * sign).unwrap_or_else(|| NonNan::new(sign * f64::INFINITY).unwrap());
 
     if !valid_exponent || input.count() > 0 {
         if is_fractional {
@@ -857,8 +857,10 @@ fn float_digits_dump() {
 #[ignore]
 fn float_parse_dump() {
     use std::io::Write;
-    let (Ok(inp), Ok(out)) = (std::env::var("FLOAT_STRS"), std::env::var("FLOAT_PARSE_OUT"))
-    else {
+    let (Ok(inp), Ok(out)) = (
+        std::env::var("FLOAT_STRS"),
+        std::env::var("FLOAT_PARSE_OUT"),
+    ) else {
         return;
     };
     let mut w = std::io::BufWriter::new(std::fs::File::create(out).unwrap());

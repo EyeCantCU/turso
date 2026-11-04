@@ -7183,7 +7183,6 @@ dependencies = [
  "rusqlite",
  "rustc-hash 2.1.1",
  "rustix 1.0.7",
- "ryu",
  "serde",
  "serde_json",
  "shuttle",
