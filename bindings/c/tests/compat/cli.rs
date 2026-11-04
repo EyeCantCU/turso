@@ -1315,6 +1315,7 @@ unsafe extern "C" fn holder_connect(
     out: *mut *mut c_void,
     _err: *mut *mut c_char,
 ) -> c_int {
+    #[allow(clashing_extern_declarations)]
     extern "C" {
         fn sqlite3_declare_vtab(db: *mut sqlite3, sql: *const c_char) -> c_int;
     }
@@ -1398,6 +1399,7 @@ fn holder_module() -> &'static Module {
 }
 
 unsafe fn open_with_holder(dir: &tempfile::TempDir) -> *mut sqlite3 {
+    #[allow(clashing_extern_declarations)]
     extern "C" {
         fn sqlite3_create_module(
             db: *mut sqlite3,
