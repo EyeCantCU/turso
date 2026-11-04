@@ -3560,6 +3560,15 @@ fn translate_virtual_table_insert(
         }],
         vec![],
     );
+    let mut returning_subqueries = vec![];
+    plan_subqueries_from_returning(
+        program,
+        &mut returning_subqueries,
+        &mut returning_refs,
+        &mut returning,
+        resolver,
+        connection,
+    )?;
     let returning_columns =
         process_returning_clause(&mut returning, &mut returning_refs, resolver)?;
     let returning_buffer = (!returning_columns.is_empty()).then(|| {
@@ -3731,6 +3740,15 @@ fn translate_virtual_table_insert(
             start_reg: registers_start,
             conflict_action,
         });
+        emit_vtab_returning_subqueries(
+            program,
+            resolver,
+            &returning_refs,
+            &mut returning_subqueries,
+            &insertion,
+            returning_rowid,
+            &layout,
+        )?;
         emit_returning_results(
             program,
             &returning_refs,
@@ -3797,6 +3815,15 @@ fn translate_virtual_table_insert(
             start_reg: registers_start,
             conflict_action,
         });
+        emit_vtab_returning_subqueries(
+            program,
+            resolver,
+            &returning_refs,
+            &mut returning_subqueries,
+            &insertion,
+            returning_rowid,
+            &layout,
+        )?;
         emit_returning_results(
             program,
             &returning_refs,
@@ -3819,6 +3846,47 @@ fn translate_virtual_table_insert(
     program.preassign_label_to_next_insn(halt_label);
 
     Ok(())
+}
+
+/// Evaluates the RETURNING subqueries of a virtual table insert against the
+/// inserted row. A plan is emitted once; later VALUES rows reuse its result.
+#[allow(clippy::too_many_arguments)]
+fn emit_vtab_returning_subqueries(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    table_references: &TableReferences,
+    subqueries: &mut [crate::translate::plan::NonFromClauseSubquery],
+    insertion: &Insertion,
+    rowid_reg: usize,
+    layout: &ColumnLayout,
+) -> Result<()> {
+    if subqueries.iter().all(|s| s.has_been_evaluated()) {
+        return Ok(());
+    }
+    let cache_state = seed_returning_row_image_in_cache(
+        program,
+        table_references,
+        insertion.first_col_register(),
+        rowid_reg,
+        resolver,
+        layout,
+    )?;
+    let result: Result<()> = (|| {
+        for subquery in subqueries.iter_mut().filter(|s| !s.has_been_evaluated()) {
+            let correlated = subquery.correlated;
+            let plan = subquery.consume_plan(EvalAt::Loop(0));
+            emit_non_from_clause_subquery(
+                program,
+                resolver,
+                *plan,
+                &subquery.query_type,
+                correlated,
+            )?;
+        }
+        Ok(())
+    })();
+    restore_returning_row_image_in_cache(resolver, cache_state);
+    result
 }
 
 /// Build the UNIQUE constraint error description to match sqlite
