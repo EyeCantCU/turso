@@ -1825,20 +1825,20 @@ pub fn op_vbegin(
     load_insn!(VBegin { cursor_id }, insn);
     let cursor = state.get_cursor(*cursor_id);
     let cursor = cursor.as_virtual_mut();
-    let vtab_id = cursor
-        .vtab_id()
-        .expect("VBegin on non ext-virtual table cursor");
+    // Built-in tables (pragma functions, ...) have no transaction hooks.
+    let Some(vtab_id) = cursor.vtab_id() else {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    };
     let mut states = program.connection.vtab_txn_states.write();
     if states.insert(vtab_id) {
         // Only begin a new transaction if one is not already active for this virtual table module
-        let vtab = program.connection.vtab_by_id(vtab_id);
-        let Some(vtab) = vtab else {
-            return Err(LimboError::InternalError(
-                "Could not find virtual table for VBegin".to_string(),
-            )
-            .into());
-        };
-        vtab.begin()?;
+        // A table that has gone away has nothing to begin.
+        if let Some(vtab) = program.connection.vtab_by_id(vtab_id) {
+            vtab.begin()?;
+        } else {
+            states.remove(&vtab_id);
+        }
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)

@@ -1411,3 +1411,60 @@ fn test_vtab_plan_shadow_tables_defensive() {
         sqlite3_close(db);
     }
 }
+
+#[test]
+fn test_vtab_plan_alter_and_transactions() {
+    unsafe {
+        let db = open_rec();
+        set_mode(Mode::All);
+        exec_ok(db, "CREATE VIRTUAL TABLE pv USING rec");
+        for (sql, err) in [
+            (
+                "ALTER TABLE rec RENAME TO x",
+                "table rec may not be altered",
+            ),
+            (
+                "ALTER TABLE rec ADD COLUMN q",
+                "virtual tables may not be altered",
+            ),
+            (
+                "ALTER TABLE rec RENAME a TO z",
+                "table rec may not be altered",
+            ),
+            (
+                "ALTER TABLE rec DROP COLUMN a",
+                "table rec may not be altered",
+            ),
+            (
+                "ALTER TABLE pv ADD COLUMN q",
+                "virtual tables may not be altered",
+            ),
+            (
+                "ALTER TABLE pv RENAME a TO z",
+                "cannot rename columns of virtual table \"pv\"",
+            ),
+            (
+                "ALTER TABLE pv DROP COLUMN a",
+                "cannot drop column from virtual table \"pv\"",
+            ),
+        ] {
+            assert_eq!(
+                strip_error_prefix(run(db, sql)),
+                vec![format!("error: {err}")],
+                "{sql}"
+            );
+        }
+        exec_ok(db, "ALTER TABLE pv RENAME TO pv2");
+        // Writes inside transactions, to a created and to an eponymous table.
+        exec_ok(db, "BEGIN");
+        exec_ok(db, "INSERT INTO pv2(a) VALUES (1)");
+        exec_ok(db, "ROLLBACK");
+        exec_ok(db, "BEGIN");
+        exec_ok(db, "INSERT INTO rec(a) VALUES (1)");
+        exec_ok(db, "SAVEPOINT s");
+        exec_ok(db, "INSERT INTO rec(a) VALUES (2)");
+        exec_ok(db, "ROLLBACK TO s");
+        exec_ok(db, "COMMIT");
+        sqlite3_close(db);
+    }
+}

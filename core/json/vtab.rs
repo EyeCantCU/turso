@@ -83,7 +83,7 @@ impl InternalVirtualTable for JsonVirtualTable {
     fn best_index(
         &self,
         constraints: &[turso_ext::ConstraintInfo],
-        _order_by: &[turso_ext::OrderByInfo],
+        order_by: &[turso_ext::OrderByInfo],
     ) -> Result<turso_ext::IndexInfo, ResultCode> {
         let mut usages = vec![
             ConstraintUsage {
@@ -163,7 +163,10 @@ impl InternalVirtualTable for JsonVirtualTable {
                 _ => 0,
             },
             idx_str: None,
-            order_by_consumed: false,
+            // Rows come in rowid order (rowid is column u32::MAX here).
+            order_by_consumed: order_by
+                .first()
+                .is_some_and(|o| o.column_index == u32::MAX && !o.desc),
             estimated_cost: cost,
             estimated_rows: rows,
             constraint_usages: usages,
