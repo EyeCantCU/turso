@@ -709,7 +709,9 @@ pub(crate) struct CursorState {
     sorted: bool,
 }
 
-type TokenMap = Arc<HashMap<i64, Vec<(i64, Vec<u8>)>>>;
+/// rowid -> (position, token).
+type TokenMapInner = HashMap<i64, Vec<(i64, Vec<u8>)>>;
+type TokenMap = Arc<TokenMapInner>;
 
 impl CursorState {
     fn new(id: i64, inner: Arc<TableInner>, conn: Arc<Connection>) -> Self {
@@ -1581,11 +1583,7 @@ impl CursorState {
 
     /// rowid -> (position, token) for every index term a prefix or
     /// tokendata query for `q` covers.
-    fn build_token_map(
-        &mut self,
-        q: &[u8],
-        prefix: bool,
-    ) -> Result<HashMap<i64, Vec<(i64, Vec<u8>)>>> {
+    fn build_token_map(&mut self, q: &[u8], prefix: bool) -> Result<TokenMapInner> {
         let vals = self.vals()?;
         let index = Index::new(&self.conn, &self.inner.cfg, &vals);
         let (s, _) = index.store.read_structure()?;
@@ -1598,7 +1596,7 @@ impl CursorState {
         } else {
             expr::tokendata_terms(&index, &s, pending, q)?
         };
-        let mut map: HashMap<i64, Vec<(i64, Vec<u8>)>> = HashMap::new();
+        let mut map: TokenMapInner = HashMap::new();
         for (t, dl) in terms {
             for (rowid, pl) in dl {
                 let e = map.entry(rowid).or_default();

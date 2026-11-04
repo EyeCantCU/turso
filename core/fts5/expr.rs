@@ -1763,7 +1763,7 @@ fn tokendata_doclist(
                         }
                     }
                 }
-                all.sort();
+                all.sort_unstable();
                 positions_to_poslist(&all)
             };
             (rowid, pl)
