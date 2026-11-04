@@ -67,6 +67,8 @@ fn default_db_opts() -> DatabaseOpts {
     opts
 }
 
+mod autovacuum;
+
 macro_rules! stub {
     () => {
         todo!("{} is not implemented", stringify!($fn));

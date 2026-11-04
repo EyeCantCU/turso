@@ -2794,6 +2794,7 @@ impl Database {
             enable_load_extension: AtomicBool::new(self.can_load_extensions()),
             fk_pragma: AtomicBool::new(false),
             next_auto_vacuum: AtomicU8::new(u8::MAX),
+            autovacuum_pages: RwLock::new(None),
             fk_deferred_violations: AtomicIsize::new(0),
             triggers_enabled: AtomicBool::new(true),
             n_active_writes: AtomicI32::new(0),

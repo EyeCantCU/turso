@@ -551,6 +551,8 @@ pub struct Connection {
     pub(super) fk_pragma: AtomicBool,
     /// Auto-vacuum mode the next VACUUM switches to (db->nextAutovac), or u8::MAX.
     pub(super) next_auto_vacuum: AtomicU8,
+    /// sqlite3_autovacuum_pages callback.
+    pub(super) autovacuum_pages: RwLock<Option<AutovacuumPagesFn>>,
     pub(crate) fk_deferred_violations: AtomicIsize,
     /// Whether non-TEMP triggers fire for statements prepared on this
     /// connection. TEMP triggers always fire, matching SQLite's
@@ -2020,6 +2022,34 @@ impl Connection {
     pub(crate) fn set_next_auto_vacuum(&self, mode: Option<AutoVacuumMode>) {
         self.next_auto_vacuum
             .store(mode.map_or(u8::MAX, u8::from), Ordering::Release);
+    }
+
+    /// sqlite3_autovacuum_pages: on each FULL-mode commit, called with the
+    /// schema name, database pages, free pages and page size; returns how
+    /// many free pages to give back.
+    pub fn set_autovacuum_pages(&self, callback: Option<AutovacuumPagesFn>) {
+        *self.autovacuum_pages.write() = callback;
+    }
+
+    /// Asks the sqlite3_autovacuum_pages callback, if any, how many of the
+    /// free pages of the database using `pager` to give back.
+    pub(crate) fn autovacuum_pages_for(
+        &self,
+        pager: &Pager,
+        n_pages: u32,
+        n_free: u32,
+        page_size: u32,
+    ) -> Option<u32> {
+        let callback = self.autovacuum_pages.read().clone()?;
+        let schema = self
+            .list_all_databases()
+            .into_iter()
+            .find(|(idx, _, _)| {
+                self.get_pager_from_database_index(idx)
+                    .is_ok_and(|p| std::ptr::eq(Arc::as_ptr(&p), pager))
+            })
+            .map_or_else(|| "main".to_string(), |(_, name, _)| name);
+        Some(callback(&schema, n_pages, n_free, page_size))
     }
 
     pub(crate) fn next_auto_vacuum(&self) -> Option<AutoVacuumMode> {
@@ -5811,3 +5841,6 @@ mod tests {
         Ok(())
     }
 }
+
+/// Callback of sqlite3_autovacuum_pages: (schema, pages, free pages, page size) -> pages to free.
+pub type AutovacuumPagesFn = Arc<dyn Fn(&str, u32, u32, u32) -> u32 + Send + Sync>;
