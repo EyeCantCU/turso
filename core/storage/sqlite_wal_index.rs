@@ -441,20 +441,20 @@ impl SqliteWalIndex {
             let mark = Self::u32_at(base, CKPT_READMARK + i as usize * 4);
             let value = mark.load(Ordering::Acquire);
             if (value as u64) < max_safe {
-                if state.read_holders[i as usize] == 0
-                    && self
-                        .shm
-                        .shared_wal_try_lock_byte(READ_LOCK_0 + i, true, KIND)?
-                {
-                    mark.store(
-                        if i == 1 {
-                            max_safe as u32
-                        } else {
-                            READMARK_NOT_USED
-                        },
-                        Ordering::Release,
-                    );
-                    self.shm.shared_wal_unlock_byte(READ_LOCK_0 + i, KIND)?;
+                if self.exclusive(&state, i as usize)? {
+                    // A mark this process holds keeps its value: SQLite
+                    // checkpointers must not backfill past our readers.
+                    if state.read_holders[i as usize] == 0 {
+                        mark.store(
+                            if i == 1 {
+                                max_safe as u32
+                            } else {
+                                READMARK_NOT_USED
+                            },
+                            Ordering::Release,
+                        );
+                    }
+                    self.unexclusive(&state, i as usize)?;
                 } else {
                     max_safe = value as u64;
                 }
@@ -463,13 +463,35 @@ impl SqliteWalIndex {
         Ok(max_safe)
     }
 
+    /// Take READ(i) exclusively. The kernel keeps one lock per mark for the
+    /// whole process, so when this process holds it shared this converts the
+    /// lock and succeeds exactly when no other process holds it.
+    fn exclusive(&self, _state: &State, i: usize) -> Result<bool> {
+        self.shm
+            .shared_wal_try_lock_byte(READ_LOCK_0 + i as u64, true, KIND)
+    }
+
+    /// Undo [`Self::exclusive`], back to shared while this process's readers
+    /// still hold the mark.
+    fn unexclusive(&self, state: &State, i: usize) -> Result<()> {
+        if state.read_holders[i] > 0 {
+            self.shm
+                .shared_wal_lock_byte(READ_LOCK_0 + i as u64, false, KIND)
+        } else {
+            self.shm
+                .shared_wal_unlock_byte(READ_LOCK_0 + i as u64, KIND)
+        }
+    }
+
     /// READ(0) exclusively, held while backfilling the database file.
     pub(crate) fn try_lock_read0(&self) -> Result<bool> {
-        self.shm.shared_wal_try_lock_byte(READ_LOCK_0, true, KIND)
+        let state = self.state.lock();
+        self.exclusive(&state, 0)
     }
 
     pub(crate) fn unlock_read0(&self) {
-        let _ = self.shm.shared_wal_unlock_byte(READ_LOCK_0, KIND);
+        let state = self.state.lock();
+        let _ = self.unexclusive(&state, 0);
     }
 
     pub(crate) fn publish_backfill(&self, nbackfills: u64) -> Result<()> {
@@ -483,21 +505,18 @@ impl SqliteWalIndex {
     /// Restart the index with the WAL, if no SQLite reader holds a mark.
     /// Returns false (and changes nothing) while one does.
     pub(crate) fn try_restart(&self, header: WalIndexHeader) -> Result<bool> {
-        if self.state.lock().read_holders[1..].iter().any(|&n| n > 0) {
-            return Ok(false);
-        }
         let mut held = Vec::new();
-        for i in 1..NREADER {
-            if !self
-                .shm
-                .shared_wal_try_lock_byte(READ_LOCK_0 + i, true, KIND)?
-            {
-                for j in held {
-                    self.shm.shared_wal_unlock_byte(READ_LOCK_0 + j, KIND)?;
+        {
+            let state = self.state.lock();
+            for i in 1..NREADER as usize {
+                if !self.exclusive(&state, i)? {
+                    for j in held {
+                        self.unexclusive(&state, j)?;
+                    }
+                    return Ok(false);
                 }
-                return Ok(false);
+                held.push(i);
             }
-            held.push(i);
         }
         let result = (|| {
             let mut state = self.state.lock();
@@ -518,8 +537,11 @@ impl SqliteWalIndex {
                 0,
             )
         })();
-        for j in held {
-            self.shm.shared_wal_unlock_byte(READ_LOCK_0 + j, KIND)?;
+        {
+            let state = self.state.lock();
+            for j in held {
+                self.unexclusive(&state, j)?;
+            }
         }
         result.map(|_| true)
     }

@@ -1467,6 +1467,9 @@ struct ShmWalCoordination {
     /// SQLite read mark this connection holds for its read transaction.
     #[cfg(target_os = "linux")]
     sqlite_mark: Mutex<Option<usize>>,
+    /// Whether this connection's checkpoint holds SQLite's READ(0).
+    #[cfg(target_os = "linux")]
+    sqlite_read0_held: Mutex<bool>,
 }
 
 #[cfg(host_shared_wal)]
@@ -1529,6 +1532,8 @@ impl ShmWalCoordination {
             sqlite: None,
             #[cfg(target_os = "linux")]
             sqlite_mark: Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            sqlite_read0_held: Mutex::new(false),
         };
         coordination.seed_or_sync_authority();
         coordination
@@ -1606,14 +1611,15 @@ impl ShmWalCoordination {
                 self.release_checkpoint_guard_without_sqlite(guard);
                 return Err(LimboError::Busy);
             }
-            if !index.try_lock_read0().unwrap_or(false) {
-                index.unlock_ckpt();
-                self.release_checkpoint_guard_without_sqlite(guard);
-                return Err(LimboError::Busy);
-            }
+            // A reader of the database file alone holds READ(0): back off
+            // from backfilling, like walCheckpoint, but keep the checkpoint.
+            let read0 = index.try_lock_read0().unwrap_or(false);
+            *self.sqlite_read0_held.lock() = read0;
             if matches!(guard, CoordinationCheckpointGuardKind::Writer) {
                 if !index.try_lock_write().unwrap_or(false) {
-                    index.unlock_read0();
+                    if std::mem::take(&mut *self.sqlite_read0_held.lock()) {
+                        index.unlock_read0();
+                    }
                     index.unlock_ckpt();
                     self.release_checkpoint_guard_without_sqlite(guard);
                     return Err(LimboError::Busy);
@@ -2556,7 +2562,9 @@ impl WalCoordination for ShmWalCoordination {
             if matches!(guard, CoordinationCheckpointGuardKind::Writer) {
                 sqlite.index().unlock_write();
             }
-            sqlite.index().unlock_read0();
+            if std::mem::take(&mut *self.sqlite_read0_held.lock()) {
+                sqlite.index().unlock_read0();
+            }
             sqlite.index().unlock_ckpt();
         }
         self.release_checkpoint_guard_without_sqlite(guard);
@@ -2604,6 +2612,9 @@ impl WalCoordination for ShmWalCoordination {
         #[cfg(target_os = "linux")]
         if let Some(limited) = self.sqlite_index(|index| index.limit_backfill(max_safe_frame)) {
             max_safe_frame = limited.unwrap_or_else(|_| self.load_snapshot().nbackfills);
+            if !*self.sqlite_read0_held.lock() {
+                max_safe_frame = max_safe_frame.min(self.load_snapshot().nbackfills);
+            }
         }
         match self.authority.min_active_reader_frame() {
             Some(shared_min) => max_safe_frame.min(shared_min),
@@ -2665,7 +2676,20 @@ impl WalCoordination for ShmWalCoordination {
                 }
             }
         }
-        Ok(self.restart_snapshot_from_authority(self.authority.snapshot(), io))
+        let snapshot = self.restart_snapshot_from_authority(self.authority.snapshot(), io);
+        // Publish the new generation's salts so the restart is not later
+        // mistaken for one made by SQLite.
+        #[cfg(target_os = "linux")]
+        {
+            let header = self.sqlite_index_header(0, snapshot.last_checksum);
+            let _ = self.sqlite_index(|index| index.commit(header));
+            if let Some(sqlite) = self.sqlite.as_ref() {
+                if let Ok(Some(h)) = sqlite.index().read_header() {
+                    sqlite.note_change(h.change);
+                }
+            }
+        }
+        Ok(snapshot)
     }
 
     fn end_restart(&self) {
