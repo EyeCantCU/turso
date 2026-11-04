@@ -13068,8 +13068,7 @@ pub fn op_insert(
                 };
                 let is_schema_root = root_page == 1
                     || root_page == i64::from(crate::mvcc::database::SQLITE_SCHEMA_MVCC_TABLE_ID);
-                let target = if has_rowid
-                    && !is_schema_root
+                let target = if !is_schema_root
                     && !flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT)
                     && !flag.has(InsertFlags::SKIP_ALL_CHANGE_COUNTS)
                 {
@@ -13082,9 +13081,14 @@ pub fn op_insert(
                     state.active_op_state.insert().sub_state = OpInsertSubState::Insert;
                     continue;
                 };
-                let key = match &state.registers[*key_reg].get_value() {
-                    Value::Numeric(Numeric::Integer(i)) => *i,
-                    _ => unreachable!("expected integer key"),
+                // A WITHOUT ROWID row reports key 0, as in SQLite.
+                let key = if has_rowid {
+                    match &state.registers[*key_reg].get_value() {
+                        Value::Numeric(Numeric::Integer(i)) => *i,
+                        _ => unreachable!("expected integer key"),
+                    }
+                } else {
+                    0
                 };
                 let is_update = flag.has(InsertFlags::SKIP_LAST_ROWID);
                 // The UPDATE's own Delete, if it removed the old row first.
@@ -13110,7 +13114,28 @@ pub fn op_insert(
                 if (is_update && own.is_none()) || (!is_update && !has_pending) {
                     let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
-                    if return_if_io!(state, cursor.rowid()) == Some(key) {
+                    let same_row = if has_rowid {
+                        return_if_io!(state, cursor.rowid()) == Some(key)
+                    } else {
+                        // The cursor is on the row this record overwrites if the keys match.
+                        let n_key = target.table.without_rowid_pk_columns()?.len();
+                        let new_key = match &state.registers[*record_reg] {
+                            Register::Record(r) => r.get_values_owned()?,
+                            _ => crate::alloc::Vec::new(),
+                        };
+                        let cursor = state.get_cursor(*cursor_id);
+                        let cursor = cursor.as_btree_mut();
+                        match return_if_io!(state, cursor.record()) {
+                            Some(record) => {
+                                let old = record.get_values_owned()?;
+                                old.len() >= n_key
+                                    && new_key.len() >= n_key
+                                    && old[..n_key] == new_key[..n_key]
+                            }
+                            None => false,
+                        }
+                    };
+                    if same_row {
                         let cursor = state.get_cursor(*cursor_id);
                         let cursor = cursor.as_btree_mut();
                         if let Some(record) = return_if_io!(state, cursor.record()) {
@@ -13537,7 +13562,13 @@ pub fn op_delete(
                     {
                         let cursor = state.get_cursor(*cursor_id);
                         let cursor = cursor.as_btree_mut();
-                        if let Some(rowid) = return_if_io!(state, cursor.rowid()) {
+                        // A WITHOUT ROWID row reports key 0, as in SQLite.
+                        let rowid = if target.table.has_rowid {
+                            return_if_io!(state, cursor.rowid())
+                        } else {
+                            Some(0)
+                        };
+                        if let Some(rowid) = rowid {
                             let values = if program.connection.data_hooks.has_preupdate_hook() {
                                 let cursor = state.get_cursor(*cursor_id);
                                 let cursor = cursor.as_btree_mut();

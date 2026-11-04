@@ -46,7 +46,8 @@ pub(crate) fn hook_target(
         return None;
     }
     let table = match program.cursor_ref.get(cursor_id) {
-        Some((_, CursorType::BTreeTable(table))) if table.has_rowid => table.clone(),
+        // SQLite reports WITHOUT ROWID tables to the preupdate hook only.
+        Some((_, CursorType::BTreeTable(table))) if table.has_rowid || preupdate => table.clone(),
         _ => return None,
     };
     let is_stat1 = preupdate && table.name.eq_ignore_ascii_case("sqlite_stat1");
@@ -66,6 +67,22 @@ pub(crate) fn row_values(
     rowid: i64,
     values: crate::alloc::Vec<Value>,
 ) -> Result<crate::alloc::Vec<Value>> {
+    // A WITHOUT ROWID record starts with the primary key; hooks see column order.
+    let values = if table.has_rowid {
+        values
+    } else {
+        let mut logical = crate::alloc::Vec::new();
+        for (i, column) in table.columns().iter().enumerate() {
+            if column.is_virtual_generated() {
+                continue;
+            }
+            match values.get(table.logical_to_physical_column(i)) {
+                Some(v) => crate::alloc::TursoVecExt::try_push(&mut logical, v.clone())?,
+                None => break,
+            }
+        }
+        logical
+    };
     let mut values = normalize_table_change_record(table, rowid, values)?;
     for (value, column) in values.iter_mut().zip(table.columns()) {
         if column.affinity() == Affinity::Real {
