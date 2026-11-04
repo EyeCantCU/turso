@@ -27,6 +27,7 @@ const NSLOT: usize = 8192;
 const HASH_OFFSET: usize = NPAGE as usize * 4;
 const WRITE_LOCK: u64 = 120;
 const CKPT_LOCK: u64 = 121;
+const RECOVER_LOCK: u64 = 122;
 const READ_LOCK_0: u64 = 123;
 const NREADER: u64 = 5;
 const READMARK_NOT_USED: u32 = 0xffff_ffff;
@@ -93,6 +94,23 @@ fn hash(pgno: u32) -> usize {
     (pgno.wrapping_mul(383) as usize) & (NSLOT - 1)
 }
 
+/// walChecksumBytes over `data` as big- or little-endian u32 pairs.
+fn wal_checksum(big_endian: bool, data: &[u8], (mut s1, mut s2): (u32, u32)) -> (u32, u32) {
+    for pair in data.chunks_exact(8) {
+        let word = |b: &[u8]| {
+            let b: [u8; 4] = b.try_into().unwrap();
+            if big_endian {
+                u32::from_be_bytes(b)
+            } else {
+                u32::from_le_bytes(b)
+            }
+        };
+        s1 = s1.wrapping_add(word(&pair[0..4])).wrapping_add(s2);
+        s2 = s2.wrapping_add(word(&pair[4..8])).wrapping_add(s1);
+    }
+    (s1, s2)
+}
+
 /// SQLite's walChecksumBytes over native-order u32 pairs.
 fn checksum_native(words: &[u32]) -> (u32, u32) {
     let (mut s1, mut s2) = (0u32, 0u32);
@@ -152,7 +170,7 @@ impl SqliteWalIndex {
             for (i, w) in words.iter_mut().enumerate() {
                 *w = Self::u32_at(base, copy * 48 + i * 4).load(Ordering::Relaxed);
             }
-            fence(Ordering::SeqCst);
+            self.shm.shared_wal_barrier();
         }
         let w = copies[0];
         if copies[0] != copies[1] || w[3].to_ne_bytes()[0] == 0 {
@@ -243,6 +261,81 @@ impl SqliteWalIndex {
 
     pub(crate) fn unlock_write(&self) {
         let _ = self.shm.shared_wal_unlock_byte(WRITE_LOCK, KIND);
+    }
+
+    /// WAL_RECOVER_LOCK exclusively, held while rebuilding the index.
+    pub(crate) fn try_lock_recover(&self) -> Result<bool> {
+        self.shm.shared_wal_try_lock_byte(RECOVER_LOCK, true, KIND)
+    }
+
+    pub(crate) fn unlock_recover(&self) {
+        let _ = self.shm.shared_wal_unlock_byte(RECOVER_LOCK, KIND);
+    }
+
+    /// Rebuild an invalid index from the WAL file, as walIndexRecover does:
+    /// keep frames up to the last commit frame whose salts and cumulative
+    /// checksum are valid. The caller holds WAL_WRITE_LOCK, WAL_CKPT_LOCK and
+    /// WAL_RECOVER_LOCK. Returns the new header.
+    pub(crate) fn recover(&self) -> Result<IndexSnapshot> {
+        let len = self
+            .wal
+            .metadata()
+            .map_err(|e| crate::error::io_error(e, "stat WAL for wal-index"))?
+            .len();
+        let mut header = WalIndexHeader {
+            max_frame: 0,
+            page_size: 4096,
+            salt_1: 0,
+            salt_2: 0,
+            checksum: (0, 0),
+            big_endian_checksum: false,
+        };
+        let mut hdr = [0u8; 32];
+        let be = |b: &[u8]| u32::from_be_bytes(b.try_into().unwrap());
+        if len >= WAL_HEADER_SIZE && self.wal.read_exact_at(&mut hdr, 0).is_ok() {
+            let magic = be(&hdr[0..4]);
+            let page_size = be(&hdr[8..12]);
+            let valid_size = (512..=65536).contains(&page_size) && page_size.is_power_of_two();
+            if (magic & !1) == 0x377f_0682 && be(&hdr[4..8]) == 3007000 && valid_size {
+                let big = magic & 1 == 1;
+                let sum = wal_checksum(big, &hdr[..24], (0, 0));
+                if sum == (be(&hdr[24..28]), be(&hdr[28..32])) {
+                    header.page_size = page_size;
+                    header.big_endian_checksum = big;
+                    header.salt_1 = be(&hdr[16..20]);
+                    header.salt_2 = be(&hdr[20..24]);
+                    header.checksum = sum;
+                    let frame_len = FRAME_HEADER_SIZE + page_size as u64;
+                    let mut frame = vec![0u8; frame_len as usize];
+                    let mut running = sum;
+                    let mut n = 0u32;
+                    while WAL_HEADER_SIZE + (n as u64 + 1) * frame_len <= len {
+                        let offset = WAL_HEADER_SIZE + n as u64 * frame_len;
+                        if self.wal.read_exact_at(&mut frame, offset).is_err()
+                            || (be(&frame[8..12]), be(&frame[12..16]))
+                                != (header.salt_1, header.salt_2)
+                            || be(&frame[0..4]) == 0
+                        {
+                            break;
+                        }
+                        let s = wal_checksum(big, &frame[..8], running);
+                        let s = wal_checksum(big, &frame[24..], s);
+                        if s != (be(&frame[16..20]), be(&frame[20..24])) {
+                            break;
+                        }
+                        running = s;
+                        n += 1;
+                        if be(&frame[4..8]) != 0 {
+                            header.max_frame = n;
+                            header.checksum = s;
+                        }
+                    }
+                }
+            }
+        }
+        self.rebuild(header, 0)?;
+        self.read_header()?
+            .ok_or_else(|| crate::LimboError::InternalError("wal-index recovery failed".into()))
     }
 
     /// WAL_CKPT_LOCK exclusively: the one SQLite or turso checkpointer.
@@ -409,7 +502,7 @@ impl SqliteWalIndex {
             for (i, w) in words.iter().enumerate() {
                 Self::u32_at(base, copy * 48 + i * 4).store(*w, Ordering::Relaxed);
             }
-            fence(Ordering::SeqCst);
+            self.shm.shared_wal_barrier();
         }
         Ok(())
     }

@@ -1908,17 +1908,25 @@ impl ShmWalCoordination {
         let Some(sqlite) = self.sqlite.as_ref() else {
             return;
         };
-        let Ok(Some(header)) = sqlite.index().read_header() else {
-            return;
+        let index = sqlite.index();
+        let valid = match index.read_header() {
+            Ok(Some(header)) if sqlite.change_seen(header.change) => return,
+            Ok(Some(_)) => true,
+            // An invalid header: recover it under WAL_WRITE_LOCK, as a
+            // SQLite reader does in walIndexReadHdr.
+            Ok(None) => false,
+            Err(_) => return,
         };
-        if sqlite.change_seen(header.change) {
-            return;
-        }
         if !self.authority.try_acquire_writer(self.owner) {
             return;
         }
         if self.fallback.try_write_lock() {
-            self.import_sqlite_commits(false, false);
+            if valid {
+                self.import_sqlite_commits(false, false);
+            } else if index.try_lock_write().unwrap_or(false) {
+                self.import_sqlite_commits(true, false);
+                index.unlock_write();
+            }
             self.fallback.unlock_write_lock();
         }
         self.authority.release_writer(self.owner);
@@ -1939,8 +1947,12 @@ impl ShmWalCoordination {
         let (mark, header) = if write_locked {
             match index.read_header() {
                 Ok(Some(header)) => (None, header),
-                // No valid header: nothing SQLite committed can be found.
-                Ok(None) => return true,
+                // Invalid (a writer died mid-update, or the VFS reset it):
+                // recover it from the WAL file first, as SQLite would.
+                Ok(None) => match self.recover_sqlite_index(ckpt_held) {
+                    Some(header) => (None, header),
+                    None => return false,
+                },
                 Err(_) => return false,
             }
         } else {
@@ -1957,6 +1969,33 @@ impl ShmWalCoordination {
             sqlite.note_change(header.change);
         }
         imported
+    }
+
+    /// Rebuild SQLite's invalid wal-index from the WAL file, like
+    /// walIndexRecover. The caller holds WAL_WRITE_LOCK; `ckpt_held` says it
+    /// also holds WAL_CKPT_LOCK. None if the locks are busy.
+    #[cfg(target_os = "linux")]
+    fn recover_sqlite_index(
+        &self,
+        ckpt_held: bool,
+    ) -> Option<crate::storage::sqlite_wal_index::IndexSnapshot> {
+        let index = self.sqlite.as_ref()?.index();
+        if !ckpt_held && !index.try_lock_ckpt().unwrap_or(false) {
+            return None;
+        }
+        let recovered = if index.try_lock_recover().unwrap_or(false) {
+            let header = index.recover();
+            index.unlock_recover();
+            header
+                .inspect_err(|err| tracing::error!("recovering SQLite wal-index failed: {err}"))
+                .ok()
+        } else {
+            None
+        };
+        if !ckpt_held {
+            index.unlock_ckpt();
+        }
+        recovered
     }
 
     /// See [`Self::import_sqlite_commits`]; `header` cannot change meanwhile.

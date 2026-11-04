@@ -391,3 +391,42 @@ fn test_sqlite_shell_writes_alongside_open_connection() {
         );
     }
 }
+
+#[test]
+fn test_invalid_wal_index_is_recovered_from_the_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    unsafe {
+        let (path, db) = setup(&dir);
+        let Some(_) = sqlite_cli(
+            &path,
+            "INSERT INTO t VALUES (1, 1); INSERT INTO t VALUES (2, 2);",
+        ) else {
+            eprintln!("sqlite3 shell not available, skipping");
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+            return;
+        };
+        // Zero the wal-index header, as a writer dying mid-update can leave
+        // it: the next access rebuilds it from the WAL, including the
+        // shell's commits.
+        {
+            use std::os::unix::fs::FileExt;
+            let shm = std::fs::OpenOptions::new()
+                .write(true)
+                .open(format!("{path}-shm"))
+                .unwrap();
+            shm.write_all_at(&[0u8; 136], 0).unwrap();
+        }
+        assert_eq!(query_i64(db, "SELECT count(*) FROM t"), 3);
+        assert_eq!(exec(db, "INSERT INTO t VALUES (3, 3)"), SQLITE_OK);
+        assert_eq!(query_text(db, "PRAGMA integrity_check"), "ok");
+        assert_eq!(
+            sqlite_cli(
+                &path,
+                "SELECT count(*), sum(p) FROM t; PRAGMA integrity_check"
+            )
+            .unwrap(),
+            "4|5\nok"
+        );
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}
