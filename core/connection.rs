@@ -1037,6 +1037,27 @@ impl Connection {
         !self.auto_commit.load(Ordering::SeqCst)
             || (!self.is_nested_stmt() && self.n_active_root_statements.load(Ordering::SeqCst) > 1)
     }
+    /// Faults the write cursors of every active statement (all cursors
+    /// unless `write_only`) before a rollback, like SQLite's
+    /// sqlite3RollbackAll with SQLITE_ABORT_ROLLBACK. The other cursors keep
+    /// their positions.
+    pub(crate) fn trip_cursors(&self, pager: &Arc<Pager>, write_only: bool) {
+        pager.trip_cursors(write_only);
+        self.with_all_attached_pagers_with_index(|pagers| {
+            for (_, attached) in pagers {
+                attached.trip_cursors(write_only);
+            }
+        });
+    }
+    /// Whether the current transaction changed the schema.
+    pub(crate) fn tx_schema_did_change(&self) -> bool {
+        matches!(
+            self.get_tx_state(),
+            TransactionState::Write {
+                schema_did_change: true
+            }
+        )
+    }
     /// Whether another write statement is suspended in the middle of a step
     /// (returned IO). No other write may run until it resumes.
     pub(crate) fn has_suspended_write(&self) -> bool {

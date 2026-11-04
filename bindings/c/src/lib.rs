@@ -1275,13 +1275,14 @@ pub(crate) unsafe fn step_impl(stmt: *mut sqlite3_stmt) -> ffi::c_int {
             let mut db_inner = db.inner.lock().unwrap();
             let rc = set_db_err(&mut db_inner, err);
             // A UDF's result_error_toobig/nomem/code decides the code.
-            match misc::take_udf_code() {
+            let rc = match misc::take_udf_code() {
                 Some(code) if rc == SQLITE_ERROR => {
                     db_inner.err_code = code;
                     code
                 }
                 _ => rc,
-            }
+            };
+            rc & db_inner.err_mask
         }
     };
     stmt.last_step_rc = if rc == SQLITE_ROW || rc == SQLITE_DONE {
@@ -3719,6 +3720,9 @@ fn limbo_err_code(err: &LimboError) -> i32 {
         // SQLite reports operations on an expired blob handle (its row's table was
         // written after sqlite3_blob_open) as SQLITE_ABORT.
         LimboError::BlobHandleExpired => SQLITE_ABORT,
+        // A write cursor tripped by a ROLLBACK run while its statement was
+        // active (sqlite3BtreeTripAllCursors).
+        LimboError::AbortRollback => SQLITE_ABORT_ROLLBACK,
         // SQLite reports its "SQL statements in progress" rejections as
         // error-class SQLITE_BUSY (vdbe.c, OP_AutoCommit / OP_Savepoint).
         LimboError::StatementsInProgress(_) => SQLITE_BUSY,

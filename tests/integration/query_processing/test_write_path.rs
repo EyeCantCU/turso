@@ -1159,36 +1159,92 @@ pub fn concurrent_rollback_and_insert_over_single_connection(limbo: TempDatabase
     let mut stmt1 = conn1
         .prepare("INSERT INTO t VALUES (1), (2), (3) RETURNING x")
         .unwrap();
+    let mut rows = 0;
     loop {
         match stmt1.step().unwrap() {
             StepResult::Row => {
-                // ROLLBACK while a write statement is in progress is an
-                // error-class BUSY rejection: Turso cannot abort the
-                // suspended writer the way SQLite does, so the rollback is
-                // refused and the transaction stays open.
-                let mut stmt2 = conn1.prepare("ROLLBACK").unwrap();
-                let err = loop {
-                    match stmt2.step() {
-                        Ok(StepResult::IO) => stmt2._io().step().unwrap(),
-                        Err(err) => break err,
-                        r => panic!("unexpected step result: {r:?}"),
-                    }
-                };
-                assert!(
-                    matches!(err, LimboError::StatementsInProgress(_)),
-                    "expected StatementsInProgress, got {err:?}"
-                );
+                rows += 1;
+                if rows == 1 {
+                    // Like SQLite, ROLLBACK runs while a write statement is
+                    // in progress. The RETURNING statement only reads its
+                    // buffered rows from here on, so it keeps returning them.
+                    conn1.execute("ROLLBACK").unwrap();
+                    assert!(conn1.get_auto_commit());
+                }
             }
             StepResult::Done => break,
             StepResult::IO => stmt1._io().step().unwrap(),
             r => panic!("unexpected step result: {r:?}"),
         }
     }
+    assert_eq!(rows, 3);
+    drop(stmt1);
     let rows: Vec<(i64,)> = conn1.exec_rows("SELECT * FROM t");
-    assert_eq!(rows, vec![(1,), (2,), (3,)]);
-    conn1.execute("COMMIT").unwrap();
-    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT * FROM t");
-    assert_eq!(rows, vec![(1,), (2,), (3,)]);
+    assert!(rows.is_empty());
+}
+
+/// An I/O error in a writer that shares the transaction with another active
+/// writer rolls back the whole transaction, like SQLite's "special errors"
+/// in sqlite3VdbeHalt; the other writer keeps returning its buffered rows.
+#[test]
+fn io_error_in_joined_writer_rolls_back_the_transaction() {
+    use crate::queued_io::{QueuedIo, QueuedIoOpKind};
+    use turso_core::{Database, DatabaseOpts, OpenFlags, SqliteDialect};
+
+    let io = Arc::new(QueuedIo::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        "queued-interleave-ioerr.db",
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let setup = db.connect(ConnectOpts::new()).unwrap();
+    setup.execute("CREATE TABLE small (x)").unwrap();
+    setup.execute("CREATE TABLE big (x)").unwrap();
+    setup.execute("BEGIN").unwrap();
+    for i in 0..200 {
+        setup
+            .execute(format!("INSERT INTO big VALUES ({i} || zeroblob(1000))"))
+            .unwrap();
+    }
+    setup.execute("COMMIT").unwrap();
+    setup.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    // A fresh connection has none of big's pages cached.
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let mut ins = conn
+        .prepare("INSERT INTO small VALUES (1), (2) RETURNING x")
+        .unwrap();
+    let next_row = |stmt: &mut Statement| loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => break Some(stmt.row().unwrap().get::<i64>(0).unwrap()),
+            StepResult::Done => break None,
+            StepResult::IO => stmt._io().step().unwrap(),
+            r => panic!("unexpected step result: {r:?}"),
+        }
+    };
+    assert_eq!(next_row(&mut ins), Some(1));
+
+    io.fault_after("queued-interleave-ioerr.db", QueuedIoOpKind::Pread, 0);
+    let err = conn.execute("UPDATE big SET x = length(x)").unwrap_err();
+    assert!(
+        matches!(err, LimboError::CompletionError(_)),
+        "expected an I/O error, got {err:?}"
+    );
+    io.clear_fault();
+
+    assert_eq!(next_row(&mut ins), Some(2));
+    assert_eq!(next_row(&mut ins), None);
+    drop(ins);
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM small");
+    assert_eq!(rows, vec![(0,)]);
+    conn.execute("INSERT INTO small VALUES (3)").unwrap();
+    let observer = db.connect(ConnectOpts::new()).unwrap();
+    let rows: Vec<(i64,)> = observer.exec_rows("SELECT x FROM small");
+    assert_eq!(rows, vec![(3,)]);
 }
 
 #[test]

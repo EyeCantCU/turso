@@ -5558,9 +5558,17 @@ pub fn op_auto_commit(
     );
 
     if valid_transition {
-        if matches!(tx_op, TxOp::Commit | TxOp::Rollback)
-            && conn.n_active_writes.load(Ordering::SeqCst) > 0
-        {
+        // Like SQLite, COMMIT waits for the active writers, while ROLLBACK
+        // aborts them: their write cursors fail with SQLITE_ABORT_ROLLBACK
+        // from then on. Outside MVCC, and not while a writer is suspended
+        // inside an instruction.
+        let active_writers = conn.n_active_writes.load(Ordering::SeqCst) > 0;
+        let refuse = match tx_op {
+            TxOp::Commit => active_writers,
+            TxOp::Rollback => active_writers && (mv_store.is_some() || conn.has_suspended_write()),
+            TxOp::Begin => false,
+        };
+        if refuse {
             return Err(LimboError::StatementsInProgress(match tx_op {
                 TxOp::Commit => "cannot commit transaction",
                 TxOp::Rollback => "cannot rollback transaction",
@@ -5578,6 +5586,7 @@ pub fn op_auto_commit(
                     pager.end_read_tx();
                     conn.rollback_attached_mvcc_txs(true);
                 } else {
+                    conn.trip_cursors(pager, !conn.tx_schema_did_change());
                     pager.rollback_tx(&conn);
                 }
                 conn.rollback_attached_wal_txns();
@@ -5719,17 +5728,19 @@ pub fn op_savepoint(
     let conn = program.connection.clone();
     let mv_store = conn.mv_store();
 
-    // No savepoint operation may run while a write statement on this
-    // connection is suspended mid-execution. SQLite rejects SAVEPOINT and
-    // RELEASE with SQLITE_BUSY while write statements are in progress
-    // (vdbe.c, OP_Savepoint: "cannot open/release savepoint - SQL statements
-    // in progress"). SQLite does allow ROLLBACK TO there because it trips all
-    // open cursors so the affected statements abort instead of resuming;
-    // Turso has no cursor-tripping mechanism, and letting a suspended writer
-    // resume on top of pages restored by ROLLBACK TO would interleave two
-    // inconsistent page states. Rejecting all three keeps the rule simple:
-    // finish or reset the active writer first.
-    if !conn.is_nested_stmt() && conn.n_active_writes.load(Ordering::SeqCst) > 0 {
+    // SQLite rejects SAVEPOINT and RELEASE with SQLITE_BUSY while write
+    // statements are in progress (vdbe.c, OP_Savepoint: "cannot open/release
+    // savepoint - SQL statements in progress"). It allows ROLLBACK TO, and
+    // trips the active writers' write cursors so their later steps fail with
+    // SQLITE_ABORT_ROLLBACK. ROLLBACK TO is still refused in MVCC, while a
+    // writer is suspended inside an instruction, or while view changes are
+    // pending.
+    let active_writers = !conn.is_nested_stmt() && conn.n_active_writes.load(Ordering::SeqCst) > 0;
+    let rollback_to_allowed = matches!(*op, SavepointOp::RollbackTo)
+        && mv_store.is_none()
+        && !conn.has_suspended_write()
+        && conn.transaction_changes.is_empty();
+    if active_writers && !rollback_to_allowed {
         return Err(LimboError::StatementsInProgress(match *op {
             SavepointOp::Begin => "cannot open savepoint",
             SavepointOp::Release => "cannot release savepoint",
@@ -5937,6 +5948,14 @@ pub fn op_savepoint(
                     None => None,
                 }
             } else {
+                let exists = conn.with_named_savepoints(|savepoints| {
+                    savepoints
+                        .iter()
+                        .any(|savepoint| savepoint.name.eq_ignore_ascii_case(name))
+                });
+                if exists {
+                    conn.trip_cursors(pager, !conn.tx_schema_did_change());
+                }
                 pager.rollback_to_named_savepoint(name)?
             };
 
@@ -15176,9 +15195,10 @@ pub fn op_open_write(
     };
 
     if !can_reuse_cursor {
-        let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<BTreeCursor>,
+        let maybe_promote_to_mvcc_cursor = |mut btree_cursor: Box<BTreeCursor>,
                                             mv_cursor_type: MvccCursorType|
          -> Result<OpenedBTree> {
+            btree_cursor.mark_write_cursor();
             if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
                 let mv_store = mv_store
                     .as_ref()
