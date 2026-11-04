@@ -2921,7 +2921,7 @@ impl Program {
                 // its own rows, so roll back the whole transaction while
                 // returning the real preparation error to the caller.
                 let rollback_error =
-                    LimboError::Raise(ResolveType::Rollback, prepare_error.to_string());
+                    LimboError::Raise(ResolveType::Rollback, prepare_error.to_string(), 0);
                 if let Err(abort_err) = self.abort(pager, Some(&rollback_error), state, true) {
                     tracing::error!(
                         "Abort also failed after FAIL index-method preparation: \
@@ -3062,7 +3062,7 @@ impl Program {
                 || matches!(err, LimboError::ConstraintViolation(_)))
                 && !err.is_foreign_key_constraint()
                 && self.resolve_type == ResolveType::Fail)
-                || matches!(err, LimboError::Raise(ResolveType::Fail, _)) =>
+                || matches!(err, LimboError::Raise(ResolveType::Fail, ..)) =>
             {
                 state.pending_fail_prepare_error = Some(err);
                 None
@@ -3744,7 +3744,7 @@ impl Program {
         // would deliver a rollback outcome for work that commits below.
         let keeps_prior_changes = match err {
             Some(LimboError::RaiseIgnore) => true,
-            Some(LimboError::Raise(ResolveType::Fail, _)) => true,
+            Some(LimboError::Raise(ResolveType::Fail, ..)) => true,
             Some(error @ (LimboError::Constraint(_) | LimboError::ConstraintViolation(_))) => {
                 !error.is_foreign_key_constraint() && self.resolve_type == ResolveType::Fail
             }
@@ -3853,7 +3853,7 @@ impl Program {
                     || matches!(err, Some(LimboError::ConstraintViolation(_))))
                     && !err.is_some_and(LimboError::is_foreign_key_constraint)
                     && self.resolve_type == ResolveType::Fail)
-                    || matches!(err, Some(LimboError::Raise(ResolveType::Fail, _)));
+                    || matches!(err, Some(LimboError::Raise(ResolveType::Fail, ..)));
                 if !is_fail_constraint {
                     if let Err(end_stmt_err) = state.end_statement(
                         &self.connection,
@@ -3926,9 +3926,9 @@ impl Program {
                 // - ABORT (default): rollback statement, rollback txn if autocommit
                 Some(LimboError::Constraint(_))
                 | Some(LimboError::ConstraintViolation(_))
-                | Some(LimboError::Raise(_, _)) => {
+                | Some(LimboError::Raise(..)) => {
                     let effective_resolve = match err {
-                        Some(LimboError::Raise(rt, _)) => *rt,
+                        Some(LimboError::Raise(rt, ..)) => *rt,
                         _ => self.resolve_type,
                     };
                     match effective_resolve {

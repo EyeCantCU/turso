@@ -147,3 +147,38 @@ fn test_extended_result_codes_masking_corrupt_vtab() {
         sqlite3_close(db);
     }
 }
+
+#[test]
+fn test_extended_result_codes_raise_in_trigger() {
+    const TRIGGER: c_int = 19 | (7 << 8);
+    unsafe {
+        let mut db: *mut sqlite3 = ptr::null_mut();
+        let path = CString::new(":memory:").unwrap();
+        assert_eq!(sqlite3_open(path.as_ptr(), &mut db), 0);
+        assert_eq!(
+            exec(
+                db,
+                "CREATE TABLE t(a UNIQUE); \
+                 CREATE TRIGGER r BEFORE INSERT ON t WHEN new.a = 99 \
+                 BEGIN SELECT RAISE(FAIL, 'nope'); END; \
+                 INSERT INTO t VALUES (1);"
+            ),
+            0
+        );
+        for extended in [false, true] {
+            sqlite3_extended_result_codes(db, extended as c_int);
+            let raise = if extended { TRIGGER } else { SQLITE_CONSTRAINT };
+            assert_eq!(exec(db, "INSERT INTO t VALUES (99)"), raise);
+            assert_eq!(sqlite3_extended_errcode(db), TRIGGER);
+            let (step, errcode, ..) = run(db, "INSERT INTO t VALUES (99)");
+            assert_eq!((step, errcode), (raise, raise));
+            // A plain UNIQUE violation with an OR clause keeps its own code.
+            let unique = if extended { UNIQUE } else { SQLITE_CONSTRAINT };
+            assert_eq!(exec(db, "INSERT OR FAIL INTO t VALUES (1)"), unique);
+            assert_eq!(sqlite3_extended_errcode(db), UNIQUE);
+            assert_eq!(exec(db, "INSERT OR ROLLBACK INTO t VALUES (1)"), unique);
+            assert_eq!(sqlite3_extended_errcode(db), UNIQUE);
+        }
+        sqlite3_close(db);
+    }
+}

@@ -1380,6 +1380,7 @@ impl FtsCursor {
                          a trigger cannot write the FTS-indexed table its firing \
                          statement is writing"
                             .to_string(),
+                        0,
                     ));
                 }
                 // A claim from another (or dead) connection: cross-connection

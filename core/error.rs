@@ -125,7 +125,7 @@ pub enum LimboError {
     /// so instead of matching on the string, we introduce a specific ForeignKeyConstraint error
     ForeignKeyConstraint(String),
     #[error("{1}")]
-    Raise(turso_parser::ast::ResolveType, String),
+    Raise(turso_parser::ast::ResolveType, String, i32),
     #[error("RaiseIgnore")]
     RaiseIgnore,
     /// The commit hook vetoed the commit; the transaction was rolled back.

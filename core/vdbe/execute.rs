@@ -3869,7 +3869,7 @@ pub fn halt(
         // CONFLICT clause, or a trigger step's OR clause) is embedded in the
         // error, so whichever program aborts applies it instead of its own.
         if let Some(resolve_type) = on_error {
-            return Err(LimboError::Raise(resolve_type, error.to_string()).into());
+            return Err(LimboError::Raise(resolve_type, error.to_string(), err_code as i32).into());
         }
         // For FAIL mode with autocommit, commit partial changes before returning error.
         // This matches SQLite behavior where FAIL keeps changes made before the error.
