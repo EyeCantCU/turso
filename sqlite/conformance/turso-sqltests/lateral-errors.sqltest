@@ -18,7 +18,7 @@ test lateral-first-cannot-read-a-table-on-its-right {
     SELECT * FROM LATERAL (SELECT t1.a) AS s, t1;
 }
 expect error {
-    no such table: t1
+    no such column: t1.a
 }
 
 @setup data
@@ -26,7 +26,7 @@ test lateral-cannot-read-a-table-after-it-in-a-comma-list {
     SELECT * FROM t1, LATERAL (SELECT t2.c) AS s, t2;
 }
 expect error {
-    no such table: t2
+    no such column: t2.c
 }
 
 @setup data
@@ -34,7 +34,7 @@ test lateral-cannot-read-a-table-joined-after-it {
     SELECT * FROM t1 JOIN LATERAL (SELECT t2.c) AS s ON true JOIN t2 ON t2.a = t1.a;
 }
 expect error {
-    no such table: t2
+    no such column: t2.c
 }
 
 @setup data
@@ -42,7 +42,7 @@ test lateral-cannot-read-a-later-lateral {
     SELECT * FROM t1, LATERAL (SELECT u.v AS w) AS s, LATERAL (SELECT 1 AS v) AS u;
 }
 expect error {
-    no such table: u
+    no such column: u.v
 }
 
 @setup data
@@ -50,7 +50,7 @@ test lateral-cannot-read-its-own-alias {
     SELECT * FROM t1, LATERAL (SELECT s.x AS x) AS s;
 }
 expect error {
-    no such table: s
+    no such column: s.x
 }
 
 @setup data
@@ -58,7 +58,7 @@ test lateral-in-a-where-subquery-cannot-read-a-later-table {
     SELECT * FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.c = t3.c) AS s, t3;
 }
 expect error {
-    no such table: t3
+    no such column: t3.c
 }
 
 @setup data
@@ -66,7 +66,7 @@ test nested-lateral-cannot-read-a-table-on-the-right-of-the-outer-lateral {
     SELECT * FROM t1, LATERAL (SELECT u.v FROM LATERAL (SELECT t3.c AS v) AS u) AS s, t3;
 }
 expect error {
-    no such table: t3
+    no such column: t3.c
 }
 
 @setup data
@@ -74,7 +74,7 @@ test lateral-cannot-read-a-table-name-hidden-by-an-alias {
     SELECT * FROM t1 AS x, LATERAL (SELECT t1.a AS v) AS s;
 }
 expect error {
-    no such table: t1
+    no such column: t1.a
 }
 
 @setup data
@@ -90,7 +90,7 @@ test lateral-cannot-read-an-unknown-table {
     SELECT * FROM t1, LATERAL (SELECT t9.a AS v) AS s;
 }
 expect error {
-    no such table: t9
+    no such column: t9.a
 }
 
 @setup data
@@ -194,7 +194,7 @@ test subquery-without-lateral-cannot-read-the-left-table {
     SELECT * FROM t1, (SELECT t1.a AS v) AS s;
 }
 expect error {
-    no such table: t1
+    no such column: t1.a
 }
 
 @setup data
@@ -202,7 +202,7 @@ test joined-subquery-without-lateral-cannot-read-the-left-table {
     SELECT * FROM t1 JOIN (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true;
 }
 expect error {
-    no such table: t1
+    no such column: t1.a
 }
 
 @setup data
@@ -210,7 +210,7 @@ test left-joined-subquery-without-lateral-cannot-read-the-left-table {
     SELECT * FROM t1 LEFT JOIN (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ON true;
 }
 expect error {
-    no such table: t1
+    no such column: t1.a
 }
 
 @setup data
@@ -218,7 +218,7 @@ test subquery-without-lateral-cannot-read-an-earlier-lateral {
     SELECT * FROM t1, LATERAL (SELECT t1.a AS v) AS x, (SELECT x.v AS w) AS y;
 }
 expect error {
-    no such table: x
+    no such column: x.v
 }
 
 @setup data
@@ -226,7 +226,7 @@ test values-without-lateral-cannot-read-the-left-table {
     SELECT * FROM t1, (VALUES (t1.a)) AS s;
 }
 expect error {
-    no such table: t1
+    no such column: t1.a
 }
 
 @setup data
@@ -258,7 +258,7 @@ test on-clause-cannot-read-a-later-lateral {
     SELECT * FROM t1 JOIN t2 ON t2.c = s.v, LATERAL (SELECT t1.a * 10 AS v) AS s;
 }
 expect error {
-    no such table: s
+    no such column: s.v
 }
 
 @setup data

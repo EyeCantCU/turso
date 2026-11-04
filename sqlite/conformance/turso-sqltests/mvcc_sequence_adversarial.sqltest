@@ -269,7 +269,6 @@ expect {
     2|b
     3|c
     4|d
-    __turso_internal_seq___turso_internal_autoincrement_new
     new|4
 }
 

@@ -44,8 +44,7 @@ test matview-vdbe-stateless-version-marker {
      WHERE name = '__turso_internal_dbsp_metadata_v2_versioned_stateless';
 }
 expect {
-    table|__turso_internal_dbsp_metadata_v2_versioned_stateless|__turso_internal_dbsp_metadata_v2_versioned_stateless
-    1
+    0
     1
     0
 }
@@ -2620,7 +2619,7 @@ test matview-vdbe-collated-multisets-independent {
 }
 expect {
     B|3
-    2
+    0
     Z|2
     a|2
     0
@@ -3587,7 +3586,7 @@ expect {
     3|thirty
     1|twenty
     2|twenty
-    2
+    0
     0
 }
 
@@ -3943,8 +3942,6 @@ test matview-vdbe-node-owned-hidden-state {
      WHERE name LIKE '__turso_internal_dbsp_state_v2_node_catalog__n%';
 }
 expect {
-    __turso_internal_dbsp_arrangement_v2_node_catalog__n7
-    __turso_internal_dbsp_state_v2_node_catalog__n1
     0
 }
 

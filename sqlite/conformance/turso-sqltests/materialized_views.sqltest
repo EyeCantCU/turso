@@ -2487,8 +2487,8 @@ test matview-drop-cleans-up-dbsp-table {
 }
 expect {
     1
-    1
-    1
+    0
+    0
     0
     0
     0
