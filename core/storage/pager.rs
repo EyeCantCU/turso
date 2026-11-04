@@ -1691,6 +1691,11 @@ pub struct Pager {
     /// The boxes are the point: each one is a cursor-sized allocation.
     #[allow(clippy::vec_box)]
     cursor_allocations: Mutex<Vec<Box<std::mem::MaybeUninit<crate::storage::btree::BTreeCursor>>>>,
+    /// Times another connection's changes reset the cache (`PRAGMA data_version`).
+    data_version: AtomicU64,
+    /// (base, written) of this pager's last change-counter bump while page 1
+    /// stays cached: SQLite counts from the value it last loaded (dbFileVers).
+    change_counter_bump: Mutex<Option<(u32, u32)>>,
 }
 
 /// Retired record buffers kept per pager. Each holds a page-sized allocation.
@@ -1987,6 +1992,8 @@ impl Pager {
             cursor_registry: Mutex::new(rustc_hash::FxHashMap::default()),
             record_pool: Mutex::new(Vec::new()),
             cursor_allocations: Mutex::new(Vec::new()),
+            data_version: AtomicU64::new(0),
+            change_counter_bump: Mutex::new(None),
         })
     }
 
@@ -3304,12 +3311,19 @@ impl Pager {
         };
         let changed = wal.begin_read_tx()?;
         if changed {
+            self.data_version.fetch_add(1, Ordering::SeqCst);
             // Someone else changed the database -> assume our page cache is invalid (this is default SQLite behavior, we can probably do better with more granular invalidation)
             self.clear_page_cache(false);
             // Invalidate cached schema cookie to force re-read on next access
             self.set_schema_cookie(None);
         }
         Ok(())
+    }
+
+    /// SQLite's `sqlite3PagerDataVersion`: changes when another connection
+    /// has committed since this one last read.
+    pub fn data_version(&self) -> u64 {
+        self.data_version.load(Ordering::SeqCst)
     }
 
     /// MVCC-only: refresh connection-private WAL change counters without starting a read tx and invalidate cache if needed.
@@ -4579,7 +4593,29 @@ impl Pager {
                     }
                 }
                 CommitState::GetDbSize => {
-                    let db_size = return_if_io!(self.with_header(|h| h.database_size));
+                    // A commit that writes page 1 bumps the change counter
+                    // (SQLite's pager_write_changecounter in WAL mode).
+                    let page1_dirty = self.dirty_pages.read().contains(1);
+                    let db_size = if page1_dirty {
+                        let bump = *self.change_counter_bump.lock();
+                        let (base, n) = return_if_io!(self.with_header_mut(|h| {
+                            let cur = h.change_counter.get();
+                            let base = match bump {
+                                Some((base, written)) if written == cur => base,
+                                _ => cur,
+                            };
+                            let n = base.wrapping_add(1);
+                            h.change_counter = n.into();
+                            h.version_valid_for = n.into();
+                            h.version_number =
+                                (crate::dialect::sqlite::SQLITE_VERSION_NUMBER as u32).into();
+                            (base, n)
+                        }));
+                        *self.change_counter_bump.lock() = Some((base, n));
+                        return_if_io!(self.with_header(|h| h.database_size))
+                    } else {
+                        return_if_io!(self.with_header(|h| h.database_size))
+                    };
                     self.commit_info.write().state = CommitState::ScanAndIssueReads {
                         db_size: db_size.get(),
                     };
@@ -5477,6 +5513,7 @@ impl Pager {
 
     pub fn clear_page_cache(&self, clear_dirty: bool) {
         self.invalidate_all_cursors();
+        *self.change_counter_bump.lock() = None;
         let dirty_pages = self.dirty_pages.write();
         let mut cache = self.page_cache.write();
         for page_id in dirty_pages.iter() {

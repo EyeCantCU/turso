@@ -85,7 +85,7 @@ fn validate(
     // Check if this is a system table that should be protected from direct writes
     if !conn.is_nested_stmt()
         && !conn.is_mvcc_bootstrap_connection()
-        && !crate::schema::allow_user_dml(table_name)
+        && !conn.allows_user_dml(table_name)
     {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }

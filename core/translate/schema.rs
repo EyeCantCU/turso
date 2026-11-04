@@ -4,7 +4,6 @@ use crate::LimboError;
 
 use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, ResultType, ReturnType};
-use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
@@ -1194,10 +1193,7 @@ pub fn translate_create_table(
     program.extend(&opts);
 
     if !connection.is_mvcc_bootstrap_connection()
-        && is_reserved_object_name(
-            connection.dialect().supports_namespaces(),
-            &normalized_tbl_name,
-        )
+        && connection.object_name_reserved(&normalized_tbl_name)
         && !connection.is_nested_stmt()
     {
         bail_parse_error!(

@@ -180,6 +180,35 @@ impl Connection {
         }
     }
 
+    /// PRAGMA writable_schema: sqlite_schema can be written and `sqlite_`
+    /// names created.
+    pub fn set_writable_schema(&self, on: bool) {
+        self.writable_schema
+            .store(on, crate::sync::atomic::Ordering::SeqCst);
+        self.bump_prepare_context_generation();
+    }
+
+    pub fn writable_schema(&self) -> bool {
+        self.writable_schema
+            .load(crate::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// `allow_user_dml` unless writable_schema unlocks the schema table.
+    pub(crate) fn allows_user_dml(&self, table: &str) -> bool {
+        crate::schema::allow_user_dml(table)
+            || (self.writable_schema() && is_schema_table_name(table))
+    }
+
+    /// Whether a new object may not use `name` (sqlite3CheckObjectName);
+    /// writable_schema permits `sqlite_` names.
+    pub(crate) fn object_name_reserved(&self, name: &str) -> bool {
+        crate::namespace::is_reserved_object_name(self.dialect().supports_namespaces(), name)
+            && !(self.writable_schema()
+                && name
+                    .get(..7)
+                    .is_some_and(|p| p.eq_ignore_ascii_case("sqlite_")))
+    }
+
     /// Disconnects the eponymous virtual tables (sqlite3_close's
     /// disconnectAllVtab); they reconnect on next use.
     pub fn disconnect_eponymous_vtabs(&self) {
@@ -212,4 +241,13 @@ impl Connection {
             builtin(1) && builtin(7)
         }
     }
+}
+
+fn is_schema_table_name(name: &str) -> bool {
+    [
+        crate::schema::SCHEMA_TABLE_NAME,
+        crate::schema::SCHEMA_TABLE_NAME_ALT,
+    ]
+    .iter()
+    .any(|n| n.eq_ignore_ascii_case(name))
 }

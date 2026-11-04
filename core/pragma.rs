@@ -55,6 +55,14 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::Result0 | PragmaFlags::NoColumns1,
             &["data_sync_retry"],
         ),
+        WritableSchema => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["writable_schema"],
+        ),
+        DataVersion => Pragma::new(
+            PragmaFlags::ReadOnly | PragmaFlags::Result0 | PragmaFlags::NoColumns1,
+            &["data_version"],
+        ),
         DatabaseList => Pragma::new(PragmaFlags::Result0, &["seq", "name", "file"]),
         Encoding => Pragma::new(
             PragmaFlags::Result0 | PragmaFlags::NoColumns1,

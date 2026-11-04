@@ -2,7 +2,7 @@ use crate::alloc::{TryClone, TursoIteratorExt, TursoVecExt};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::Func;
 use crate::index_method::IndexMethodConfiguration;
-use crate::namespace::{is_reserved_object_name, NamespaceId, NamespaceRef};
+use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::numeric::Numeric;
 use crate::schema::{
     Column, GeneratedType, Schema, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES,
@@ -86,7 +86,7 @@ fn validate(
     if tbl_name.eq_ignore_ascii_case("sqlite_sequence") {
         crate::bail_parse_error!("table sqlite_sequence may not be indexed");
     }
-    if (is_reserved_object_name(connection.dialect().supports_namespaces(), idx_name)
+    if (connection.object_name_reserved(idx_name)
         || RESERVED_TABLE_PREFIXES
             .iter()
             .any(|prefix| tbl_name.starts_with(prefix)))

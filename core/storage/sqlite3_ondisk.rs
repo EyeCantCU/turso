@@ -188,7 +188,8 @@ impl CacheSize {
 
 impl Default for CacheSize {
     fn default() -> Self {
-        Self(I32BE::new(Self::DEFAULT))
+        // Stored as 0, as SQLite writes it; `get` reads 0 as DEFAULT.
+        Self(I32BE::new(0))
     }
 }
 
@@ -382,6 +383,7 @@ impl Default for DatabaseHeader {
             max_embed_frac: 64,
             min_embed_frac: 32,
             leaf_frac: 32,
+            // As after SQLite's `PRAGMA journal_mode=WAL` on a new database.
             change_counter: U32BE::new(1),
             database_size: U32BE::new(0),
             freelist_trunk_page: U32BE::new(0),
@@ -395,8 +397,8 @@ impl Default for DatabaseHeader {
             incremental_vacuum_enabled: U32BE::new(0),
             application_id: I32BE::new(0),
             _padding: [0; 20],
-            version_valid_for: U32BE::new(3047000),
-            version_number: U32BE::new(3047000),
+            version_valid_for: U32BE::new(1),
+            version_number: U32BE::new(crate::dialect::sqlite::SQLITE_VERSION_NUMBER as u32),
         }
     }
 }

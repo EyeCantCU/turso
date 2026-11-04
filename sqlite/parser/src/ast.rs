@@ -1969,6 +1969,10 @@ pub enum PragmaName {
     EncryptionCipher,
     /// Control fsync error retry behavior (0 = off/panic, 1 = on/retry)
     DataSyncRetry,
+    /// Changes when another connection commits (read-only)
+    DataVersion,
+    /// Allows writes to sqlite_schema and sqlite_ object names (ON, OFF, RESET)
+    WritableSchema,
     /// List databases
     DatabaseList,
     /// Encoding - only support utf8
