@@ -842,7 +842,9 @@ impl Drop for Buffer {
         match self {
             Self::Heap(buf) | Self::HeapView { data: buf, .. } => {
                 let underlying_len = buf.len();
-                TEMP_BUFFER_CACHE.with(|cache| {
+                // try_with: the TLS may already be gone when a connection is
+                // closed from an atexit handler or a static destructor.
+                let _ = TEMP_BUFFER_CACHE.try_with(|cache| {
                     let mut cache = cache.borrow_mut();
                     // take ownership of the buffer by swapping it with a dummy
                     let buffer = std::mem::replace(buf, Pin::new(vec![].into_boxed_slice()));
@@ -899,13 +901,12 @@ impl Buffer {
     }
 
     pub fn new_temporary(size: usize) -> Self {
-        TEMP_BUFFER_CACHE.with(|cache| {
-            if let Some(buffer) = cache.borrow_mut().get_buffer(size) {
-                Self::Heap(buffer)
-            } else {
-                Self::Heap(Pin::new(vec![0; size].into_boxed_slice()))
-            }
-        })
+        TEMP_BUFFER_CACHE
+            .try_with(|cache| cache.borrow_mut().get_buffer(size))
+            .ok()
+            .flatten()
+            .map(Self::Heap)
+            .unwrap_or_else(|| Self::Heap(Pin::new(vec![0; size].into_boxed_slice())))
     }
 
     pub fn len(&self) -> usize {

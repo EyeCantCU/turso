@@ -408,6 +408,19 @@ fn update_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::Encoding => {
+            // Every database is UTF-8, so asking for UTF-8 is a no-op.
+            let requested = match &value {
+                Expr::Name(name) => Some(name.as_str().to_string()),
+                Expr::Literal(Literal::Keyword(kw)) => Some(kw.clone()),
+                other => parse_string(other).ok(),
+            };
+            let is_utf8 = requested.is_some_and(|r| {
+                let r = r.trim_matches(|c| c == '"' || c == '\'' || c == '`');
+                r.eq_ignore_ascii_case("utf-8") || r.eq_ignore_ascii_case("utf8")
+            });
+            if is_utf8 {
+                return Ok(TransactionMode::None);
+            }
             let year = chrono::Local::now().year();
             bail_parse_error!("It's {year}. UTF-8 won.");
         }
