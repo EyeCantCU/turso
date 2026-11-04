@@ -1242,6 +1242,12 @@ pub enum Insn {
         dest: usize,
     },
 
+    /// Like String8, for a literal whose bytes are not valid UTF-8.
+    RawString {
+        value: Vec<u8>,
+        dest: usize,
+    },
+
     /// Write a blob value into a register.
     Blob {
         value: crate::ValueBlob,
@@ -2521,6 +2527,7 @@ impl InsnVariants {
             InsnVariants::Real => execute::op_real,
             InsnVariants::RealAffinity => execute::op_real_affinity,
             InsnVariants::String8 => execute::op_string8,
+            InsnVariants::RawString => execute::op_raw_string,
             InsnVariants::Blob => execute::op_blob,
             InsnVariants::RowData => execute::op_row_data,
             InsnVariants::RowId => execute::op_row_id,

@@ -1026,7 +1026,10 @@ macro_rules! comparison_opcode {
             ) = (&state.registers[*lhs], &state.registers[*rhs])
             {
                 if texts_compare_as_bytes(lhs_value, rhs_value, *flags, *collation) {
-                    state.pc = if comparison_matches_order($op, l.as_bytes().cmp(r.as_bytes())) {
+                    state.pc = if comparison_matches_order(
+                        $op,
+                        crate::types::binary_cmp_text(l.as_text_ref(), r.as_text_ref()),
+                    ) {
                         target_pc
                     } else {
                         state.pc + 1
@@ -6296,6 +6299,18 @@ pub fn op_string8(
 ) -> InsnResult {
     load_insn!(String8 { value, dest }, insn);
     state.registers[*dest].set_text(Text::new(value.clone()))?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_raw_string(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(RawString { value, dest }, insn);
+    state.registers[*dest].set_text(Text::from_bytes(value.clone()))?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -20361,7 +20376,7 @@ pub fn extract_int_value<V: AsValueRef>(value: V) -> i64 {
     match value {
         ValueRef::Numeric(Numeric::Integer(i)) => i,
         ValueRef::Numeric(Numeric::Float(f)) => real_to_i64(f64::from(f)),
-        ValueRef::Text(t) => crate::numeric::str_to_i64(t.as_str()).unwrap_or(0),
+        ValueRef::Text(t) => crate::numeric::str_to_i64(&*t.to_str_lossy()).unwrap_or(0),
         ValueRef::Blob(b) => {
             crate::numeric::str_to_i64(String::from_utf8_lossy(b).as_ref()).unwrap_or(0)
         }

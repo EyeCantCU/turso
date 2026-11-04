@@ -25181,3 +25181,31 @@ fn empty_version_chain() -> RowVersionChain<TursoAllocator> {
         TursoAllocator,
     )
 }
+
+/// TEXT that is not UTF-8 survives the MVCC logical log and recovery.
+#[test]
+fn test_mvcc_log_keeps_invalid_utf8_text() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(x TEXT)").unwrap();
+        let mut stmt = conn.prepare("INSERT INTO t VALUES (?)").unwrap();
+        stmt.bind_at(
+            std::num::NonZero::new(1).unwrap(),
+            Value::Text(crate::types::Text::from_bytes(b"a\xfab".to_vec())),
+        )
+        .unwrap();
+        stmt.run_ignore_rows().unwrap();
+    }
+    db.restart();
+    let conn = db.connect();
+    let rows = conn
+        .prepare("SELECT x FROM t")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    let Value::Text(t) = &rows[0][0] else {
+        panic!("expected text, got {rows:?}");
+    };
+    assert_eq!(t.as_bytes(), b"a\xfab");
+}

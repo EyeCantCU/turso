@@ -260,6 +260,325 @@ pub(crate) fn quote_bytes(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Text encoding of the database whose program is running on this thread.
+/// Records store TEXT in this encoding; values in registers are always UTF-8.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DbEncoding {
+    Utf8 = 1,
+    Utf16Le = 2,
+    Utf16Be = 3,
+}
+
+impl DbEncoding {
+    pub(crate) fn from_u8(v: u8) -> Self {
+        match v {
+            2 => Self::Utf16Le,
+            3 => Self::Utf16Be,
+            _ => Self::Utf8,
+        }
+    }
+
+    pub(crate) fn from_header(enc: crate::storage::sqlite3_ondisk::TextEncoding) -> Self {
+        use crate::storage::sqlite3_ondisk::TextEncoding;
+        if enc == TextEncoding::Utf16Le {
+            Self::Utf16Le
+        } else if enc == TextEncoding::Utf16Be {
+            Self::Utf16Be
+        } else {
+            Self::Utf8
+        }
+    }
+
+    pub(crate) fn to_header(self) -> crate::storage::sqlite3_ondisk::TextEncoding {
+        use crate::storage::sqlite3_ondisk::TextEncoding;
+        match self {
+            Self::Utf8 => TextEncoding::Utf8,
+            Self::Utf16Le => TextEncoding::Utf16Le,
+            Self::Utf16Be => TextEncoding::Utf16Be,
+        }
+    }
+
+    /// Parses a PRAGMA encoding value as SQLite does.
+    pub(crate) fn parse(name: &str) -> Option<Self> {
+        let le = cfg!(target_endian = "little");
+        Some(match name.to_ascii_lowercase().as_str() {
+            "utf-8" | "utf8" => Self::Utf8,
+            "utf-16le" | "utf16le" => Self::Utf16Le,
+            "utf-16be" | "utf16be" => Self::Utf16Be,
+            "utf-16" | "utf16" if le => Self::Utf16Le,
+            "utf-16" | "utf16" => Self::Utf16Be,
+            _ => return None,
+        })
+    }
+
+    #[inline]
+    pub(crate) fn is_utf8(self) -> bool {
+        self == Self::Utf8
+    }
+}
+
+thread_local! {
+    static DB_ENCODING: std::cell::Cell<DbEncoding> = const { std::cell::Cell::new(DbEncoding::Utf8) };
+}
+
+/// The record text encoding in effect on this thread.
+#[inline(always)]
+pub(crate) fn db_encoding() -> DbEncoding {
+    DB_ENCODING.with(|e| e.get())
+}
+
+/// Sets the record text encoding for this thread until dropped.
+pub(crate) struct EncodingGuard(DbEncoding);
+
+impl EncodingGuard {
+    #[inline]
+    pub(crate) fn set(enc: DbEncoding) -> Self {
+        Self(DB_ENCODING.with(|e| e.replace(enc)))
+    }
+}
+
+impl Drop for EncodingGuard {
+    #[inline]
+    fn drop(&mut self) {
+        DB_ENCODING.with(|e| e.set(self.0));
+    }
+}
+
+/// UTF-16 to UTF-8, as sqlite3VdbeMemTranslate does it (an odd trailing byte
+/// is dropped; a surrogate always pairs with the next unit).
+pub(crate) fn utf16_to_utf8(bytes: &[u8], big_endian: bool) -> Vec<u8> {
+    let n = bytes.len() & !1;
+    let mut out = Vec::with_capacity(n + n / 2);
+    let unit = |i: usize| -> u32 {
+        if big_endian {
+            ((bytes[i] as u32) << 8) | bytes[i + 1] as u32
+        } else {
+            bytes[i] as u32 | ((bytes[i + 1] as u32) << 8)
+        }
+    };
+    let mut i = 0;
+    while i < n {
+        let mut c = unit(i);
+        i += 2;
+        if (0xd800..0xe000).contains(&c) && i < n {
+            let c2 = unit(i);
+            i += 2;
+            c = (c2 & 0x03FF) + ((c & 0x003F) << 10) + (((c & 0x03C0) + 0x0040) << 10);
+        }
+        if c < 0x80 {
+            out.push(c as u8);
+        } else if c < 0x800 {
+            out.extend_from_slice(&[0xC0 + ((c >> 6) & 0x1F) as u8, 0x80 + (c & 0x3F) as u8]);
+        } else if c < 0x10000 {
+            out.extend_from_slice(&[
+                0xE0 + ((c >> 12) & 0x0F) as u8,
+                0x80 + ((c >> 6) & 0x3F) as u8,
+                0x80 + (c & 0x3F) as u8,
+            ]);
+        } else {
+            out.extend_from_slice(&[
+                0xF0 + ((c >> 18) & 0x07) as u8,
+                0x80 + ((c >> 12) & 0x3F) as u8,
+                0x80 + ((c >> 6) & 0x3F) as u8,
+                0x80 + (c & 0x3F) as u8,
+            ]);
+        }
+    }
+    out
+}
+
+/// UTF-8 (possibly invalid) to UTF-16, as sqlite3VdbeMemTranslate does it.
+pub(crate) fn utf8_to_utf16(bytes: &[u8], big_endian: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() * 2);
+    let mut push = |u: u16| {
+        let b = if big_endian {
+            u.to_be_bytes()
+        } else {
+            u.to_le_bytes()
+        };
+        out.extend_from_slice(&b);
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        let (c, n) = if bytes[i] < 0x80 {
+            (bytes[i] as u32, 1)
+        } else {
+            sqlite_utf8_read(&bytes[i..])
+        };
+        i += n;
+        if c <= 0xFFFF {
+            push(c as u16);
+        } else {
+            // WRITE_UTF16 surrogates, including SQLite's handling above U+10FFFF.
+            let hi = (((c >> 10) & 0x003F) + (((c.wrapping_sub(0x10000)) >> 10) & 0x00C0))
+                | ((0x00D8 + ((c.wrapping_sub(0x10000) >> 18) & 0x03)) << 8);
+            let lo = (c & 0x00FF) | ((0x00DC + ((c >> 8) & 0x03)) << 8);
+            push(hi as u16);
+            push(lo as u16);
+        }
+    }
+    out
+}
+
+/// Bytes of UTF-8 text in the record encoding `enc`.
+pub(crate) fn encode_for(enc: DbEncoding, utf8: &[u8]) -> Vec<u8> {
+    match enc {
+        DbEncoding::Utf8 => utf8.to_vec(),
+        DbEncoding::Utf16Le => utf8_to_utf16(utf8, false),
+        DbEncoding::Utf16Be => utf8_to_utf16(utf8, true),
+    }
+}
+
+/// UTF-8 text as the bytes of the current record encoding.
+#[inline]
+pub(crate) fn db_encoded(utf8: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    match db_encoding() {
+        DbEncoding::Utf8 => std::borrow::Cow::Borrowed(utf8),
+        enc => std::borrow::Cow::Owned(encode_for(enc, utf8)),
+    }
+}
+
+/// Bytes in the current record encoding (a blob read as text) as UTF-8.
+#[inline]
+pub(crate) fn db_decoded(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    match db_encoding() {
+        DbEncoding::Utf8 => std::borrow::Cow::Borrowed(bytes),
+        enc => std::borrow::Cow::Owned(utf16_to_utf8(bytes, enc == DbEncoding::Utf16Be)),
+    }
+}
+
+/// BINARY order of two UTF-8 texts in a database of encoding `enc`: SQLite
+/// memcmp()s the stored form, which for UTF-16 differs from UTF-8 order.
+pub(crate) fn binary_cmp_utf8_in(enc: DbEncoding, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let ord = a.cmp(b);
+    if enc.is_utf8() || ord.is_eq() {
+        return ord;
+    }
+    // The orders agree unless the first difference involves a non-ASCII byte.
+    let i = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    match (a.get(i), b.get(i)) {
+        (Some(&x), Some(&y)) if x >= 0x80 || y >= 0x80 => {
+            encode_for(enc, a).cmp(&encode_for(enc, b))
+        }
+        _ => ord,
+    }
+}
+
+const ESCAPE_BASE: u32 = 0x10FF00;
+
+/// Escapes bytes into a `String`: bytes that are not part of valid UTF-8, and
+/// characters in U+10FF00..=U+10FFFF, become one code point U+10FF00 + byte
+/// each. Returns whether anything was escaped. [`unescape_str`] reverses it.
+pub fn escape_bytes(bytes: &[u8]) -> (String, bool) {
+    let mut out = String::with_capacity(bytes.len());
+    let mut escaped = false;
+    let push = |out: &mut String, b: u8| {
+        out.push(char::from_u32(ESCAPE_BASE + b as u32).expect("valid code point"));
+    };
+    for chunk in bytes.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            if (c as u32) >= ESCAPE_BASE {
+                let mut buf = [0u8; 4];
+                for &b in c.encode_utf8(&mut buf).as_bytes() {
+                    push(&mut out, b);
+                }
+                escaped = true;
+            } else {
+                out.push(c);
+            }
+        }
+        for &b in chunk.invalid() {
+            push(&mut out, b);
+            escaped = true;
+        }
+    }
+    (out, escaped)
+}
+
+/// Reverses [`escape_bytes`].
+pub fn unescape_str(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    for c in s.chars() {
+        let v = c as u32;
+        if v >= ESCAPE_BASE {
+            out.push((v - ESCAPE_BASE) as u8);
+        } else {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+    out
+}
+
+/// Marks SQL text produced by [`encode_raw_sql`]. A comment, so the parser skips it.
+const RAW_SQL_MARKER: &str = "/*\u{10FFFF}*/";
+
+/// SQL text as given to sqlite3_prepare, which may contain bytes that are not
+/// UTF-8 (in string literals, as SQLite stores them byte for byte). Valid
+/// UTF-8 is returned unchanged; otherwise the text is escaped and marked.
+pub fn encode_raw_sql(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        if !s.starts_with(RAW_SQL_MARKER) {
+            return std::borrow::Cow::Borrowed(s);
+        }
+    }
+    let (escaped, _) = escape_bytes(bytes);
+    std::borrow::Cow::Owned(format!("{RAW_SQL_MARKER}{escaped}"))
+}
+
+/// The original bytes of SQL text from [`encode_raw_sql`].
+pub fn decode_raw_sql(sql: &str) -> std::borrow::Cow<'_, [u8]> {
+    match sql.strip_prefix(RAW_SQL_MARKER) {
+        Some(rest) => std::borrow::Cow::Owned(unescape_str(rest)),
+        None => std::borrow::Cow::Borrowed(sql.as_bytes()),
+    }
+}
+
+/// Maps a byte offset in SQL text from [`encode_raw_sql`] to the original bytes.
+pub fn raw_sql_offset(sql: &str, offset: usize) -> usize {
+    match sql.strip_prefix(RAW_SQL_MARKER) {
+        Some(rest) => {
+            let off = offset.saturating_sub(RAW_SQL_MARKER.len()).min(rest.len());
+            let mut off = off;
+            while !rest.is_char_boundary(off) {
+                off -= 1;
+            }
+            unescape_str(&rest[..off]).len()
+        }
+        None => offset,
+    }
+}
+
+thread_local! {
+    static RAW_SQL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the SQL being translated came from [`encode_raw_sql`] with escapes.
+pub(crate) fn translating_raw_sql() -> bool {
+    RAW_SQL.with(|r| r.get())
+}
+
+/// Marks, until dropped, whether the SQL being translated is escaped.
+pub(crate) struct RawSqlGuard(bool);
+
+impl RawSqlGuard {
+    pub(crate) fn set(input: &str) -> Self {
+        Self(RAW_SQL.with(|r| r.replace(input.starts_with(RAW_SQL_MARKER))))
+    }
+}
+
+impl Drop for RawSqlGuard {
+    fn drop(&mut self) {
+        RAW_SQL.with(|r| r.set(self.0));
+    }
+}
+
+/// Whether an escaped string holds any escape.
+pub(crate) fn has_escapes(s: &str) -> bool {
+    s.chars().any(|c| c as u32 >= ESCAPE_BASE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,6 +625,56 @@ mod tests {
         assert_eq!(sqlite_instr(b"xxx\xfayyy", b"z"), 0);
         assert_eq!(replace_bytes(b"a\xfab\xfa", b"\xfa", b"--"), b"a--b--");
         assert_eq!(quote_bytes(b"it's\xfa"), b"'it''s\xfa'");
+    }
+
+    #[test]
+    fn raw_sql_round_trips_and_maps_offsets() {
+        for raw in [&b"plain"[..], b"a\xfab", "\u{10FF41}".as_bytes(), b"\xc3"] {
+            let (s, _) = escape_bytes(raw);
+            assert_eq!(unescape_str(&s), raw);
+        }
+        assert!(!escape_bytes(b"plain").1);
+        assert!(matches!(
+            encode_raw_sql(b"SELECT 1"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let sql = b"SELECT '\xff'; SELECT 2";
+        let enc = encode_raw_sql(sql);
+        assert_eq!(decode_raw_sql(&enc), &sql[..]);
+        let semi = enc.find(';').unwrap() + 1;
+        assert_eq!(raw_sql_offset(&enc, semi), 11);
+    }
+
+    #[test]
+    fn utf16_transcoding_round_trips() {
+        for s in ["", "abc", "héllo", "\u{20AC}", "\u{1F600}x", "\u{FFFD}"] {
+            for be in [false, true] {
+                let u = utf8_to_utf16(s.as_bytes(), be);
+                let expected: Vec<u8> = s
+                    .encode_utf16()
+                    .flat_map(|c| if be { c.to_be_bytes() } else { c.to_le_bytes() })
+                    .collect();
+                assert_eq!(u, expected);
+                assert_eq!(utf16_to_utf8(&u, be), s.as_bytes());
+            }
+        }
+        // Invalid UTF-8 becomes U+FFFD; an odd trailing byte is dropped.
+        assert_eq!(utf8_to_utf16(b"\xff", false), [0xFD, 0xFF]);
+        assert_eq!(utf16_to_utf8(b"a\0b", false), b"a");
+    }
+
+    #[test]
+    fn binary_order_follows_the_stored_encoding() {
+        use std::cmp::Ordering::*;
+        // U+0100 sorts before 'b' in UTF-16LE bytes (00 01 vs 62 00).
+        let (a, b) = ("a\u{100}".as_bytes(), "ab".as_bytes());
+        assert_eq!(binary_cmp_utf8_in(DbEncoding::Utf8, a, b), Greater);
+        assert_eq!(binary_cmp_utf8_in(DbEncoding::Utf16Le, a, b), Less);
+        assert_eq!(binary_cmp_utf8_in(DbEncoding::Utf16Be, a, b), Greater);
+        // U+FF5E sorts after U+1F600 in UTF-8 but before it in UTF-16BE.
+        let (c, d) = ("\u{FF5E}".as_bytes(), "\u{1F600}".as_bytes());
+        assert_eq!(binary_cmp_utf8_in(DbEncoding::Utf8, c, d), Less);
+        assert_eq!(binary_cmp_utf8_in(DbEncoding::Utf16Be, c, d), Greater);
     }
 }
 
@@ -407,6 +776,24 @@ mod sql_tests {
         assert_eq!(q("SELECT ?1 = 'xxx' || x'fa' || 'yyy'"), Value::from_i64(1));
         assert_eq!(q("SELECT ?1 < 'xxx' || x'fb'"), Value::from_i64(1));
         assert_eq!(bytes(&q("SELECT group_concat(?1, x'ff')")), b"xxx\xfayyy");
+        // printf and the JSON functions keep the bytes (expected values from SQLite 3.54).
+        let hex = |sql: &str| one(&conn, &format!("SELECT hex({sql})"), &[raw(b"a\xfab")]);
+        assert_eq!(hex("json_quote(?1)"), Value::build_text("2261FA6222"));
+        assert_eq!(hex("json(json_quote(?1))"), Value::build_text("2261FA6222"));
+        assert_eq!(
+            hex("json_extract('[\"' || ?1 || '\"]', '$[0]')"),
+            Value::build_text("61FA62")
+        );
+        assert_eq!(
+            hex("json_object('k', ?1)"),
+            Value::build_text("7B226B223A2261FA62227D")
+        );
+        let p = one(
+            &conn,
+            "SELECT hex(printf('%s|%q', ?1, ?1))",
+            &[raw(b"a\xfa'")],
+        );
+        assert_eq!(p, Value::build_text("61FA277C61FA2727"));
         // Concatenating halves of a character yields valid UTF-8.
         let e = one(
             &conn,
@@ -414,5 +801,103 @@ mod sql_tests {
             &[],
         );
         assert_eq!(e, Value::build_text("é"));
+    }
+}
+
+#[cfg(test)]
+mod utf16_tests {
+    use crate::sync::Arc;
+    use crate::{
+        ConnectOpts, Connection, Database, DatabaseOpts, MemoryIO, OpenFlags, SqliteDialect, Value,
+        IO,
+    };
+
+    fn connect() -> Arc<Connection> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        db.connect(ConnectOpts::new()).unwrap()
+    }
+
+    fn col(conn: &Arc<Connection>, sql: &str) -> Vec<Value> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        stmt.run_collect_rows()
+            .unwrap()
+            .into_iter()
+            .map(|mut r| r.remove(0))
+            .collect()
+    }
+
+    fn text(s: &str) -> Value {
+        Value::build_text(s.to_string())
+    }
+
+    #[test]
+    fn utf16_databases_store_and_order_text_like_sqlite() {
+        for (enc, name, e_hex, order) in [
+            // memcmp() of the little-endian bytes: 3D D8.., 5E FF, 61 00 00 01, 61 00 62 00.
+            (
+                "UTF-16le",
+                "UTF-16le",
+                "E900",
+                ["\u{1F600}", "\u{FF5E}", "a\u{100}", "ab"],
+            ),
+            (
+                "UTF-16be",
+                "UTF-16be",
+                "00E9",
+                ["ab", "a\u{100}", "\u{1F600}", "\u{FF5E}"],
+            ),
+        ] {
+            let conn = connect();
+            conn.execute(format!("PRAGMA encoding = '{enc}'")).unwrap();
+            assert_eq!(col(&conn, "PRAGMA encoding"), [text(name)]);
+            conn.execute("CREATE TABLE t(x TEXT, y TEXT COLLATE NOCASE)")
+                .unwrap();
+            conn.execute("CREATE INDEX tx ON t(x)").unwrap();
+            conn.execute("CREATE INDEX ty ON t(y)").unwrap();
+            for v in ["ab", "a\u{100}", "\u{FF5E}", "\u{1F600}"] {
+                conn.execute(format!("INSERT INTO t VALUES ('{v}', upper('{v}'))"))
+                    .unwrap();
+            }
+            // Once the database has content the encoding no longer changes.
+            conn.execute("PRAGMA encoding = 'UTF-8'").unwrap();
+            assert_eq!(col(&conn, "PRAGMA encoding"), [text(name)]);
+            let got = col(&conn, "SELECT x FROM t ORDER BY x");
+            assert_eq!(got, order.map(text));
+            let got = col(
+                &conn,
+                "SELECT x FROM t INDEXED BY tx WHERE x > '' ORDER BY x",
+            );
+            assert_eq!(got, order.map(text));
+            assert_eq!(col(&conn, "SELECT x FROM t WHERE x = 'ab'"), [text("ab")]);
+            assert_eq!(col(&conn, "SELECT x FROM t WHERE y = 'AB'"), [text("ab")]);
+            assert_eq!(col(&conn, "SELECT hex('\u{e9}')"), [text(e_hex)]);
+            assert_eq!(
+                col(&conn, "SELECT octet_length('\u{e9}')"),
+                [Value::from_i64(2)]
+            );
+            assert_eq!(
+                col(&conn, "SELECT length('\u{1F600}')"),
+                [Value::from_i64(1)]
+            );
+            let blob = if enc == "UTF-16le" {
+                "x'6100'"
+            } else {
+                "x'0061'"
+            };
+            assert_eq!(
+                col(&conn, &format!("SELECT CAST({blob} AS TEXT)")),
+                [text("a")]
+            );
+            assert_eq!(col(&conn, "PRAGMA integrity_check"), [text("ok")]);
+        }
     }
 }

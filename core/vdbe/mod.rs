@@ -2593,6 +2593,8 @@ impl Program {
         waker: Option<&Waker>,
     ) -> ProgramStep {
         state.execution_state = ProgramExecutionState::Running;
+        // Records of a UTF-16 database store TEXT as UTF-16.
+        let _encoding = crate::text_bytes::EncodingGuard::set(self.connection.db.text_encoding());
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         let vdbe_trace = self.connection.get_vdbe_trace();
         let result = if enable_tracing || vdbe_trace {
@@ -4403,6 +4405,19 @@ fn start_text_register(dest: &mut Register, text_data: &[u8]) -> Result<()> {
     dest.set_text(Text::from_bytes(text_data.to_vec()))
 }
 
+/// Puts UTF-16 record text into a register as UTF-8.
+#[cold]
+#[inline(never)]
+fn decode_utf16_text(
+    dest: &mut Register,
+    text_data: &[u8],
+    enc: crate::text_bytes::DbEncoding,
+) -> Result<()> {
+    let utf8 =
+        crate::text_bytes::utf16_to_utf8(text_data, enc == crate::text_bytes::DbEncoding::Utf16Be);
+    dest.set_text(crate::types::Text::from_bytes(utf8))
+}
+
 /// Puts a BLOB value in a register that does not hold a blob yet.
 #[cold]
 #[inline(never)]
@@ -4540,11 +4555,16 @@ pub(crate) fn decode_serial_type_into_register(
                 return Err(LimboError::Corrupt("Invalid Text value".into()));
             }
             let text_data = &data[..content_size];
-            match dest {
-                Register::Value(Value::Text(existing_text)) => {
-                    existing_text.replace_with_bytes(text_data)?;
+            let enc = crate::text_bytes::db_encoding();
+            if !enc.is_utf8() {
+                decode_utf16_text(dest, text_data, enc)?;
+            } else {
+                match dest {
+                    Register::Value(Value::Text(existing_text)) => {
+                        existing_text.replace_with_bytes(text_data)?;
+                    }
+                    _ => start_text_register(dest, text_data)?,
                 }
-                _ => start_text_register(dest, text_data)?,
             }
             *data = &data[content_size..];
         }

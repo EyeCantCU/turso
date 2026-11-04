@@ -408,6 +408,7 @@ double sqlite3_value_double(sqlite3_value*);
 const unsigned char *sqlite3_value_text(sqlite3_value*);
 
 const void *sqlite3_value_blob(sqlite3_value*);
+int sqlite3_value_encoding(sqlite3_value*);
 
 int sqlite3_value_bytes(sqlite3_value*);
 

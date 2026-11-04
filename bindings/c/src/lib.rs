@@ -358,7 +358,8 @@ impl sqlite3_stmt {
     pub fn new(db: Arc<sqlite3>, mut stmt: turso_core::Statement) -> Self {
         stmt.set_structured_errors(true);
         let n_cols = stmt.num_columns();
-        let sql = CString::new(stmt.get_sql()).unwrap_or_default();
+        let sql = CString::new(turso_core::decode_raw_sql(stmt.get_sql()).into_owned())
+            .unwrap_or_default();
         Self {
             db,
             stmt,
@@ -1076,12 +1077,9 @@ pub(crate) unsafe fn prepare_v2_impl(
             .position(|&b| b == 0)
             .map_or(bounded, |i| &bounded[..i])
     };
-    let sql_str = match std::str::from_utf8(sql_bytes) {
-        Ok(s) => s,
-        Err(_) => {
-            return set_db_err_code(&mut db, SQLITE_MISUSE);
-        }
-    };
+    // SQL may hold bytes that are not UTF-8 (string literals keep them).
+    let sql_enc = turso_core::encode_raw_sql(sql_bytes);
+    let sql_str: &str = &sql_enc;
     // Prepare without the handle lock: an authorizer callback may re-enter
     // the API on this handle.
     let conn = db.conn.clone();
@@ -1118,7 +1116,7 @@ pub(crate) unsafe fn prepare_v2_impl(
         // the statement ends without a semicolon, the consumed position is
         // already the answer, so only step back over whitespace that
         // follows a ';'.
-        let mut off = stmt.tail_offset();
+        let mut off = turso_core::raw_sql_offset(sql_str, stmt.tail_offset());
         let mut p = off;
         while p > 0 && (*(sql.add(p - 1).cast::<u8>())).is_ascii_whitespace() {
             p -= 1;
@@ -1612,7 +1610,7 @@ pub unsafe extern "C" fn turso_printf_va(
     // SAFETY: fmt checked non-null; caller guarantees a NUL-terminated string.
     let fmt_str = unsafe { CStr::from_ptr(fmt) };
     // Strings are escaped so that bytes that are not UTF-8 come out unchanged.
-    let (fmt_str, mut escaped) = textbytes::escape(fmt_str.to_bytes());
+    let (fmt_str, mut escaped) = turso_core::escape_bytes(fmt_str.to_bytes());
 
     let mut args = Vec::new();
     for slot in turso_core::printf_c_arg_plan(&fmt_str) {
@@ -1638,7 +1636,7 @@ pub unsafe extern "C" fn turso_printf_va(
                     let value = if s.is_null() {
                         turso_core::Value::Null
                     } else {
-                        let (text, esc) = textbytes::escape(CStr::from_ptr(s).to_bytes());
+                        let (text, esc) = turso_core::escape_bytes(CStr::from_ptr(s).to_bytes());
                         escaped |= esc;
                         turso_core::Value::build_text(text)
                     };
@@ -1670,7 +1668,7 @@ pub unsafe extern "C" fn turso_printf_va(
     let rendered = match turso_core::exec_printf_values(&fmt_value, &arg_refs) {
         // The SQL function returns NULL for an empty format or an unknown
         // specifier before any output; the C API returns "" there.
-        Ok(turso_core::Value::Text(t)) if escaped => textbytes::unescape(t.as_str()),
+        Ok(turso_core::Value::Text(t)) if escaped => turso_core::unescape_str(t.as_str()),
         Ok(turso_core::Value::Text(t)) => t.as_str().as_bytes().to_vec(),
         Ok(_) => Vec::new(),
         Err(_) => return std::ptr::null_mut(),
@@ -1877,12 +1875,10 @@ pub unsafe extern "C" fn sqlite3_expanded_sql(stmt: *mut sqlite3_stmt) -> *mut f
     let full = stmt.sql.to_string_lossy();
     let lead = full.len() - full.trim_start().len();
     let trail = full.len() - full.trim_end().len();
-    let expanded = format!(
-        "{}{}{}",
-        &full[..lead],
-        stmt.stmt.expanded_sql(),
-        &full[full.len() - trail..]
-    );
+    let core_expanded = stmt.stmt.expanded_sql();
+    let mut expanded: Vec<u8> = full[..lead].as_bytes().to_vec();
+    expanded.extend_from_slice(&turso_core::decode_raw_sql(&core_expanded));
+    expanded.extend_from_slice(full[full.len() - trail..].as_bytes());
     let n = expanded.len();
     // SQLite gives up when the text would exceed SQLITE_LIMIT_LENGTH.
     if n > misc::length_limit(&stmt.db) {
@@ -3081,7 +3077,7 @@ pub unsafe extern "C" fn sqlite3_strnicmp(
 pub unsafe extern "C" fn sqlite3_create_collation_v2(
     db: *mut sqlite3,
     name: *const ffi::c_char,
-    _enc: ffi::c_int,
+    enc: ffi::c_int,
     context: *mut ffi::c_void,
     cmp: Option<unsafe extern "C" fn() -> ffi::c_int>,
     destroy: Option<unsafe extern "C" fn()>,
@@ -3089,6 +3085,9 @@ pub unsafe extern "C" fn sqlite3_create_collation_v2(
     if db.is_null() || name.is_null() {
         return SQLITE_MISUSE;
     }
+    let Some(enc) = textbytes::collation_encoding(enc) else {
+        return SQLITE_MISUSE;
+    };
     let name = match CStr::from_ptr(name).to_str() {
         Ok(s) => s.to_owned(),
         Err(_) => return SQLITE_MISUSE,
@@ -3120,11 +3119,12 @@ pub unsafe extern "C" fn sqlite3_create_collation_v2(
             std::mem::transmute::<unsafe extern "C" fn(), unsafe extern "C" fn(*mut ffi::c_void)>(f)
         }),
     });
-    inner.conn.register_external_collation(
+    inner.conn.register_external_collation_with_encoding(
         name,
         Box::into_raw(bridge) as usize,
         collation_bridge_compare,
         Some(collation_bridge_destroy),
+        enc,
     );
     SQLITE_OK
 }

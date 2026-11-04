@@ -3170,7 +3170,7 @@ impl Schema {
     /// which is (name TEXT PRIMARY KEY, sql TEXT).
     pub(crate) fn type_sql_from_record(record: &ImmutableRecordRef) -> Result<String> {
         match record.get_value_opt(1) {
-            Some(ValueRef::Text(sql)) => Ok(sql.as_str().to_string()),
+            Some(ValueRef::Text(sql)) => Ok(sql.to_str_lossy().into_owned()),
             _ => Err(LimboError::Corrupt(format!(
                 "{TURSO_TYPES_TABLE_NAME} contains a row without CREATE TYPE sql"
             ))),

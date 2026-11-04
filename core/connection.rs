@@ -4665,14 +4665,34 @@ impl Connection {
         callback: crate::ContextCollationFunction,
         context_destructor: Option<crate::ContextDestructor>,
     ) {
+        self.register_external_collation_with_encoding(
+            name,
+            context,
+            callback,
+            context_destructor,
+            1,
+        );
+    }
+
+    /// `encoding`: SQLITE_UTF8 (1), SQLITE_UTF16LE (2) or SQLITE_UTF16BE (3),
+    /// the encoding in which the callback receives its texts.
+    pub fn register_external_collation_with_encoding(
+        &self,
+        name: String,
+        context: usize,
+        callback: crate::ContextCollationFunction,
+        context_destructor: Option<crate::ContextDestructor>,
+        encoding: u8,
+    ) {
         let normalized_name = crate::util::normalize_ident(&name);
         self.syms.write().collations.insert(
             normalized_name.clone(),
-            function::ExternalCollation::new(
+            function::ExternalCollation::new_with_encoding(
                 normalized_name,
                 context,
                 callback,
                 context_destructor,
+                encoding,
             ),
         );
         self.bump_prepare_context_generation();

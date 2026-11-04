@@ -230,9 +230,11 @@ impl Value {
 
     pub fn exec_octet_length(&self) -> Self {
         match self {
-            Value::Text(s) => Value::from_i64(s.as_bytes().len() as i64),
+            Value::Text(s) => Value::from_i64(text_bytes::db_encoded(s.as_bytes()).len() as i64),
             Value::Blob(blob) => Value::from_i64(blob.len() as i64),
-            Value::Numeric(_) => Value::from_i64(self.to_string().len() as i64),
+            Value::Numeric(_) => {
+                Value::from_i64(text_bytes::db_encoded(self.to_string().as_bytes()).len() as i64)
+            }
             _ => self.to_owned(),
         }
     }
@@ -708,10 +710,13 @@ impl Value {
 
     pub fn exec_hex(&self) -> Value {
         match self {
-            Value::Text(t) => Value::build_text(hex::encode_upper(t.as_bytes())),
+            // hex() reads text in the database encoding, as sqlite3_value_blob does.
+            Value::Text(t) => {
+                Value::build_text(hex::encode_upper(text_bytes::db_encoded(t.as_bytes())))
+            }
             Value::Numeric(_) => {
                 let text = self.to_string();
-                Value::build_text(hex::encode_upper(text))
+                Value::build_text(hex::encode_upper(text_bytes::db_encoded(text.as_bytes())))
             }
             Value::Blob(blob_bytes) => Value::build_text(hex::encode_upper(blob_bytes)),
             Value::Null => Value::build_text(""),
@@ -1063,20 +1068,21 @@ impl Value {
                 if let Value::Blob(blob) = self {
                     return Value::from_slice(blob);
                 }
+                // Text becomes the bytes of its database encoding.
                 if let Value::Text(text) = self {
-                    return Value::from_slice(text.as_bytes());
+                    return Value::from_slice(&text_bytes::db_encoded(text.as_bytes()));
                 }
-                // Convert to TEXT first, then interpret as BLOB
-                // TODO: handle encoding
                 let text = self.to_string();
-                return Value::from_slice(text.as_bytes());
+                return Value::from_slice(&text_bytes::db_encoded(text.as_bytes()));
             }
             // TEXT To cast a BLOB value to TEXT, the sequence of bytes that make up the BLOB is interpreted as text encoded using the database encoding.
             // Casting an INTEGER or REAL value into TEXT renders the value as if via sqlite3_snprintf() except that the resulting TEXT uses the encoding of the database connection.
             Affinity::Text => match self {
                 // Text and blob bytes are kept as they are, as in SQLite.
                 Value::Text(text) => Value::Text(text.clone()),
-                Value::Blob(blob) => Value::text_from_bytes(blob.to_vec(), false),
+                Value::Blob(blob) => {
+                    Value::text_from_bytes(text_bytes::db_decoded(blob).into_owned(), false)
+                }
                 // TODO: handle encoding and whatever sqlite3_snprintf does
                 _ => Value::build_text(self.to_string()),
             },
