@@ -2837,6 +2837,8 @@ impl Database {
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
             full_column_names: AtomicBool::new(false),
             locking_mode_exclusive: AtomicBool::new(false),
+            write_upgraded_shared_read: AtomicBool::new(false),
+            read_kept_for_siblings: AtomicBool::new(false),
             short_column_names: AtomicBool::new(true),
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: crate::connection::AtomicSubqueryUnnestingMode::new(

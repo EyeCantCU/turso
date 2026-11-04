@@ -3218,3 +3218,59 @@ fn exclusive_reopen_after_restart_checkpoint_reads_the_database_file() {
         .unwrap();
     assert_eq!(count_test_rows(&conn), 4);
 }
+
+/// Step `stmt` to its next row; false when done.
+fn step_row(stmt: &mut crate::Statement) -> bool {
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => return true,
+            StepResult::Done => return false,
+            StepResult::IO => stmt._io().step().unwrap(),
+            other => panic!("unexpected step result {other:?}"),
+        }
+    }
+}
+
+/// tkt-b72787b1: a schema change committed on the connection while another
+/// statement is mid-scan leaves the read transaction open for that scan,
+/// and DROP is refused with TableLocked.
+#[test]
+fn nested_schema_change_keeps_sibling_read_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nested.db");
+    let db = open_multiprocess_db(multiprocess_test_io(), path.to_str().unwrap()).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute(
+        "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<2000) \
+         INSERT INTO t SELECT i FROM c",
+    )
+    .unwrap();
+
+    let mut outer = conn.prepare("SELECT x FROM t").unwrap();
+    assert!(step_row(&mut outer));
+    let pager = conn.pager.load().clone();
+    for sql in [
+        "CREATE TABLE t4(q)",
+        "CREATE INDEX i4 ON t4(q)",
+        "ALTER TABLE t4 ADD w",
+    ] {
+        conn.execute(sql).unwrap();
+        assert_eq!(conn.get_tx_state(), TransactionState::Read, "{sql}");
+        assert!(pager.holds_read_lock(), "{sql}");
+    }
+    let err = conn.execute("DROP TABLE t4").unwrap_err();
+    assert!(matches!(err, LimboError::TableLocked), "{err:?}");
+    assert!(pager.holds_read_lock());
+
+    let mut rows = 1;
+    while step_row(&mut outer) {
+        rows += 1;
+    }
+    assert_eq!(rows, 2000);
+    drop(outer);
+    assert_eq!(conn.get_tx_state(), TransactionState::None);
+    assert!(!pager.holds_read_lock());
+    let names = get_rows(&conn, "SELECT name FROM sqlite_schema WHERE name LIKE '%4'");
+    assert_eq!(names.len(), 2);
+}
