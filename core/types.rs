@@ -786,6 +786,19 @@ impl AnyText for Text {
     }
 }
 
+/// An extension value for valid UTF-8 text. In a UTF-16 database it also
+/// carries the stored UTF-16 bytes, which sqlite3_value_blob returns.
+fn text_to_ffi(text: &str) -> ExtValue {
+    match crate::text_bytes::db_encoding() {
+        crate::text_bytes::DbEncoding::Utf8 => ExtValue::from_text(text.to_string()),
+        enc => {
+            let be = enc == crate::text_bytes::DbEncoding::Utf16Be;
+            let utf16 = crate::text_bytes::utf8_to_utf16(text.as_bytes(), be);
+            ExtValue::from_text_with_utf16(text.to_string(), utf16, be)
+        }
+    }
+}
+
 /// BINARY order of two texts, as SQLite compares them: memcmp() of the
 /// stored form, which in a UTF-16 database is the UTF-16 encoding.
 #[inline(always)]
@@ -1388,7 +1401,7 @@ impl Value {
             Self::Null => ExtValue::null(),
             Self::Numeric(Numeric::Integer(i)) => ExtValue::from_integer(*i),
             Self::Numeric(Numeric::Float(fl)) => ExtValue::from_float(f64::from(*fl)),
-            Self::Text(text) if text.is_utf8() => ExtValue::from_text(text.as_str().to_string()),
+            Self::Text(text) if text.is_utf8() => text_to_ffi(text.as_str()),
             Self::Text(text) => ExtValue::from_text_bytes(text.as_bytes().to_vec()),
             Self::Blob(blob) => ExtValue::from_blob(blob.to_vec()),
         }
@@ -2940,7 +2953,7 @@ impl<'a> ValueRef<'a> {
             Self::Null => ExtValue::null(),
             Self::Numeric(Numeric::Integer(i)) => ExtValue::from_integer(*i),
             Self::Numeric(Numeric::Float(fl)) => ExtValue::from_float(f64::from(*fl)),
-            Self::Text(text) if text.is_utf8() => ExtValue::from_text(text.as_str().to_string()),
+            Self::Text(text) if text.is_utf8() => text_to_ffi(text.as_str()),
             Self::Text(text) => ExtValue::from_text_bytes(text.as_bytes().to_vec()),
             Self::Blob(blob) => ExtValue::from_blob(blob.to_vec()),
         }

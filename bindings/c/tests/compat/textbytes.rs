@@ -490,3 +490,140 @@ fn test_sql_text_with_invalid_utf8_literals() {
         sqlite3_close(db);
     }
 }
+
+static UDF_BLOB: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+/// Records sqlite3_value_blob of its argument (4 bytes: two UTF-16 units).
+unsafe extern "C" fn record_blob(ctx: *mut libc::c_void, _argc: i32, argv: *mut *mut libc::c_void) {
+    let p = sqlite3_value_blob(*argv) as *const u8;
+    *UDF_BLOB.lock().unwrap() = std::slice::from_raw_parts(p, 4).to_vec();
+    sqlite3_result_int64(ctx, 1);
+}
+
+#[test]
+fn test_blob_of_text_in_utf16_database_is_stored_bytes() {
+    unsafe {
+        for (enc, expected) in [
+            ("UTF-16le", [b'h', 0, 0xe9, 0]),
+            ("UTF-16be", [0, b'h', 0, 0xe9]),
+        ] {
+            let db = open_memory();
+            exec(db, &format!("PRAGMA encoding='{enc}'"));
+            exec(
+                db,
+                "CREATE TABLE t(x TEXT); INSERT INTO t VALUES ('h\u{e9}')",
+            );
+            let rc = sqlite3_create_function_v2(
+                db,
+                c"record_blob".as_ptr(),
+                1,
+                SQLITE_UTF8,
+                ptr::null_mut(),
+                Some(record_blob),
+                None,
+                None,
+                None,
+            );
+            assert_eq!(rc, SQLITE_OK);
+            let stmt = prepare(db, "SELECT x, x, record_blob(x) FROM t");
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let p = sqlite3_column_blob(stmt, 0) as *const u8;
+            assert_eq!(
+                std::slice::from_raw_parts(p, 4),
+                expected,
+                "{enc} column_blob"
+            );
+            let v = sqlite3_column_value(stmt, 1);
+            let p = sqlite3_value_blob(v) as *const u8;
+            assert_eq!(
+                std::slice::from_raw_parts(p, 4),
+                expected,
+                "{enc} value_blob"
+            );
+            assert_eq!(*UDF_BLOB.lock().unwrap(), expected, "{enc} udf value_blob");
+            sqlite3_finalize(stmt);
+            sqlite3_close(db);
+        }
+    }
+}
+
+struct Tagged {
+    tag: &'static str,
+    calls: std::sync::Mutex<Vec<&'static str>>,
+}
+
+unsafe extern "C" fn tagged_collation(
+    ctx: *mut libc::c_void,
+    n1: i32,
+    p1: *const libc::c_void,
+    n2: i32,
+    p2: *const libc::c_void,
+) -> i32 {
+    let t = &*(ctx as *const Tagged);
+    t.calls.lock().unwrap().push(t.tag);
+    let a = std::slice::from_raw_parts(p1 as *const u8, n1 as usize);
+    let b = std::slice::from_raw_parts(p2 as *const u8, n2 as usize);
+    a.cmp(b) as i32
+}
+
+unsafe fn used_version(db: *mut sqlite3, all: &[&Tagged]) -> Vec<&'static str> {
+    for t in all {
+        t.calls.lock().unwrap().clear();
+    }
+    one_text(
+        db,
+        "SELECT group_concat(v) FROM (SELECT column1 v FROM (VALUES ('b'), ('a')) ORDER BY v COLLATE vv)",
+    );
+    let mut used: Vec<&'static str> = all
+        .iter()
+        .flat_map(|t| t.calls.lock().unwrap().clone())
+        .collect();
+    used.dedup();
+    used
+}
+
+#[test]
+fn test_collation_versions_per_encoding() {
+    unsafe {
+        let utf8 = Tagged {
+            tag: "utf8",
+            calls: Default::default(),
+        };
+        let le = Tagged {
+            tag: "le",
+            calls: Default::default(),
+        };
+        let all = [&utf8, &le];
+        for (enc, first, after_le_removed) in [
+            ("UTF-8", "utf8", "utf8"),
+            ("UTF-16le", "le", "utf8"),
+            // No UTF-16BE version: SQLite tries UTF-16BE, then UTF-16LE, then UTF-8.
+            ("UTF-16be", "le", "utf8"),
+        ] {
+            let db = open_memory();
+            exec(db, &format!("PRAGMA encoding='{enc}'"));
+            for (t, e) in [(&utf8, 1), (&le, 2)] {
+                let rc = sqlite3_create_collation_v2(
+                    db,
+                    c"vv".as_ptr(),
+                    e,
+                    (t as *const Tagged as *mut Tagged).cast(),
+                    Some(tagged_collation),
+                    None,
+                );
+                assert_eq!(rc, SQLITE_OK);
+            }
+            assert_eq!(used_version(db, &all), [first], "{enc}");
+            // Removing the UTF-16LE version keeps the UTF-8 one.
+            let rc =
+                sqlite3_create_collation_v2(db, c"vv".as_ptr(), 2, ptr::null_mut(), None, None);
+            assert_eq!(rc, SQLITE_OK);
+            assert_eq!(
+                used_version(db, &all),
+                [after_le_removed],
+                "{enc} after removal"
+            );
+            sqlite3_close(db);
+        }
+    }
+}

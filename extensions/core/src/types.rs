@@ -135,6 +135,11 @@ enum TextSubtype {
     Json,
     /// Text whose bytes are not valid UTF-8.
     Bytes,
+    /// UTF-8 text from a UTF-16LE database; the buffer also holds the stored
+    /// UTF-16 bytes (see `TextValue::stored_bytes`).
+    Utf16Le,
+    /// As `Utf16Le`, for a UTF-16BE database.
+    Utf16Be,
 }
 
 impl std::fmt::Debug for Value {
@@ -214,12 +219,55 @@ impl TextValue {
         })
     }
 
+    /// UTF-8 text plus its UTF-16 stored form: the buffer is the text, a NUL,
+    /// the UTF-16 length (u32 LE) and the UTF-16 bytes.
+    fn new_boxed_with_utf16(s: String, utf16: Vec<u8>, sub: TextSubtype) -> Box<Self> {
+        let len = s.len();
+        let mut buffer = s.into_bytes();
+        buffer.push(0);
+        buffer.extend_from_slice(&(utf16.len() as u32).to_le_bytes());
+        buffer.extend_from_slice(&utf16);
+        let strbox = Box::into_raw(buffer.into_boxed_slice());
+        Box::new(Self {
+            _type: sub,
+            text: strbox as *const u8,
+            len: len as u32,
+        })
+    }
+
+    fn utf16_len(&self) -> Option<usize> {
+        if !matches!(self._type, TextSubtype::Utf16Le | TextSubtype::Utf16Be) || self.text.is_null()
+        {
+            return None;
+        }
+        let mut n = [0u8; 4];
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.text.add(self.len as usize + 1), n.as_mut_ptr(), 4)
+        };
+        Some(u32::from_le_bytes(n) as usize)
+    }
+
+    /// The bytes as the database stores them: UTF-16 for text from a UTF-16
+    /// database, else the text bytes.
+    fn stored_bytes(&self) -> &[u8] {
+        match self.utf16_len() {
+            Some(n) => unsafe {
+                std::slice::from_raw_parts(self.text.add(self.len as usize + 5), n)
+            },
+            None => self.as_bytes(),
+        }
+    }
+
     #[cfg(feature = "core_only")]
     fn free(self) {
         if !self.text.is_null() {
-            // The buffer was allocated with a trailing NUL (len + 1); free all of it.
-            let ptr =
-                std::ptr::slice_from_raw_parts_mut(self.text as *mut u8, self.len as usize + 1);
+            // The buffer was allocated with a trailing NUL (len + 1), plus the
+            // UTF-16 copy for text from a UTF-16 database; free all of it.
+            let extra = self.utf16_len().map_or(0, |n| 4 + n);
+            let ptr = std::ptr::slice_from_raw_parts_mut(
+                self.text as *mut u8,
+                self.len as usize + 1 + extra,
+            );
             let _ = unsafe { Box::from_raw(ptr) };
         }
     }
@@ -353,6 +401,33 @@ impl Value {
             } else {
                 None
             }
+        }
+    }
+
+    /// Text bytes as the database stores them (UTF-16 in a UTF-16 database),
+    /// which is what sqlite3_value_blob returns for text.
+    pub fn text_stored_bytes(&self) -> Option<&[u8]> {
+        unsafe {
+            if self.value_type == ValueType::Text && !self.value.text.is_null() {
+                Some((*self.value.text).stored_bytes())
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Creates a text Value from a UTF-16 database: `utf16` is the stored
+    /// form (`big_endian` selects UTF-16BE), `s` the UTF-8 text.
+    pub fn from_text_with_utf16(s: String, utf16: Vec<u8>, big_endian: bool) -> Self {
+        let sub = if big_endian {
+            TextSubtype::Utf16Be
+        } else {
+            TextSubtype::Utf16Le
+        };
+        let ptr = Box::into_raw(TextValue::new_boxed_with_utf16(s, utf16, sub));
+        Self {
+            value_type: ValueType::Text,
+            value: ValueData { text: ptr },
         }
     }
 

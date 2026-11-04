@@ -1805,6 +1805,11 @@ impl Statement {
         &self.program.sql
     }
 
+    /// The database text encoding: SQLITE_UTF8 (1), SQLITE_UTF16LE (2) or SQLITE_UTF16BE (3).
+    pub fn text_encoding(&self) -> u8 {
+        self.program.connection.text_encoding()
+    }
+
     pub fn is_busy(&self) -> bool {
         self.busy
     }
