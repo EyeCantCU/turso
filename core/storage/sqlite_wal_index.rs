@@ -188,6 +188,19 @@ impl SqliteWalIndex {
         }))
     }
 
+    /// Whether a valid index describes the WAL file as it is on disk: same
+    /// generation (salts) and every indexed frame present.
+    pub(crate) fn matches_wal_file(&self) -> bool {
+        let (Ok(Some(index)), Some(wal)) = (self.read_header(), self.read_wal_header()) else {
+            return false;
+        };
+        let frame_size = u64::from(wal.page_size) + FRAME_HEADER_SIZE;
+        let needed = WAL_HEADER_SIZE + u64::from(index.max_frame) * frame_size;
+        index.salt_1 == wal.salt_1
+            && index.salt_2 == wal.salt_2
+            && self.wal.metadata().is_ok_and(|m| m.len() >= needed)
+    }
+
     pub(crate) fn read_wal_header(&self) -> Option<WalFileHeader> {
         let mut buf = [0u8; 32];
         self.wal.read_exact_at(&mut buf, 0).ok()?;

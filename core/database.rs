@@ -704,9 +704,9 @@ pub struct Database<
     /// from the first non-EXCLUSIVE transaction on.
     #[cfg(all(host_shared_wal, target_os = "linux"))]
     sqlite_shm_interlock: storage::sqlite_shm_interlock::SqliteInterlockCell,
-    /// EXCLUSIVE locking mode's database lock when there is no interlock.
+    /// The database file's SHARED-byte lock, from open on.
     #[cfg(all(host_shared_wal, target_os = "linux"))]
-    exclusive_db_lock: parking_lot::Mutex<Option<storage::sqlite_shm_interlock::ExclusiveDbLock>>,
+    db_lock: OnceLock<storage::sqlite_shm_interlock::DbLock>,
     /// Connection (by address) holding `PRAGMA locking_mode=EXCLUSIVE`.
     exclusive_lock_holder: parking_lot::Mutex<Option<usize>>,
     pub(crate) open_flags: OpenFlags,
@@ -876,7 +876,7 @@ impl Database {
             #[cfg(all(host_shared_wal, target_os = "linux"))]
             sqlite_shm_interlock: Default::default(),
             #[cfg(all(host_shared_wal, target_os = "linux"))]
-            exclusive_db_lock: parking_lot::Mutex::new(None),
+            db_lock: OnceLock::new(),
             exclusive_lock_holder: parking_lot::Mutex::new(None),
             db_file,
             builtin_syms: parking_lot::RwLock::new(syms),
@@ -3223,7 +3223,7 @@ impl Database {
             )?)
         };
         #[cfg(target_os = "linux")]
-        self.install_sqlite_interlock(authority.clone());
+        self.install_sqlite_interlock(authority.clone())?;
         let _ = self.shared_wal_coordination.set(authority.clone());
         Ok(Some(
             self.shared_wal_coordination
@@ -3710,34 +3710,28 @@ impl Database {
             return self.ensure_sqlite_interlock();
         }
         #[cfg(all(host_shared_wal, target_os = "linux"))]
-        if self.sqlite_shm_interlock.get().is_none() && self.shared_wal_coordination.get().is_some()
-        {
-            // EXCLUSIVE before the first access: lock the database now and
-            // never create SQLite's wal-index, like its heap-memory mode.
-            match storage::sqlite_shm_interlock::ExclusiveDbLock::try_acquire(&self.io, &self.path)
-            {
-                Ok(Some(lock)) => {
-                    self.sqlite_shm_interlock.set_exclusive_without_shm(true);
-                    *self.exclusive_db_lock.lock() = Some(lock);
-                    *holder = Some(conn);
-                    return Ok(());
-                }
-                Ok(None) => return Err(LimboError::Busy),
-                // E.g. a read-only file: lock through the interlock instead.
-                Err(_) => {}
+        if let Some(db_lock) = self.db_lock.get() {
+            let without_shm = self.sqlite_shm_interlock.get().is_none();
+            if !without_shm && !write {
+                // As in SQLite's WAL mode, EXCLUSIVE takes the lock at the first write.
+                return Ok(());
             }
-        }
-        self.ensure_sqlite_interlock()?;
-        if !write {
-            return Ok(());
-        }
-        #[cfg(all(host_shared_wal, target_os = "linux"))]
-        if let Some(interlock) = self.sqlite_shm_interlock.get() {
-            if !interlock.try_exclusive()? {
+            if !db_lock.try_exclusive()? {
                 return Err(LimboError::Busy);
             }
+            if without_shm {
+                // EXCLUSIVE before the first access: never create SQLite's
+                // wal-index, like its heap-memory mode. Nobody else has the
+                // database open, so an index left behind is dropped too.
+                self.sqlite_shm_interlock.set_exclusive_without_shm(true);
+                let _ = std::fs::remove_file(format!("{}-shm", self.path));
+            }
+            *holder = Some(conn);
+            return Ok(());
         }
-        *holder = Some(conn);
+        if write {
+            *holder = Some(conn);
+        }
         Ok(())
     }
 
@@ -3752,10 +3746,9 @@ impl Database {
 
     fn release_exclusive_locked(&self, holder: &mut Option<usize>) -> Result<()> {
         #[cfg(all(host_shared_wal, target_os = "linux"))]
-        if self.exclusive_db_lock.lock().take().is_some() {
+        if let Some(db_lock) = self.db_lock.get() {
+            db_lock.release_exclusive()?;
             self.sqlite_shm_interlock.set_exclusive_without_shm(false);
-        } else if let Some(interlock) = self.sqlite_shm_interlock.get() {
-            interlock.release_exclusive()?;
         }
         *holder = None;
         Ok(())
@@ -3772,7 +3765,18 @@ impl Database {
 
     /// How [`Self::ensure_sqlite_interlock`] sets the interlock up.
     #[cfg(all(host_shared_wal, target_os = "linux"))]
-    fn install_sqlite_interlock(&self, authority: Arc<MappedSharedWalCoordination>) {
+    fn install_sqlite_interlock(&self, authority: Arc<MappedSharedWalCoordination>) -> Result<()> {
+        if self.db_lock.get().is_none() {
+            let lock = storage::sqlite_shm_interlock::DbLock::acquire(&self.io, &self.path)?
+                .ok_or_else(|| {
+                    LimboError::LockingError(format!(
+                        "Failed opening database '{}'. Database is locked by another process",
+                        self.path
+                    ))
+                })?;
+            let _ = self.db_lock.set(lock);
+        }
+        let db = self.db_lock.get().expect("set above").file();
         let io = self.io.clone();
         let path = self.path.clone();
         let shared_wal = self.shared_wal.clone();
@@ -3794,15 +3798,18 @@ impl Database {
                 );
                 index.rebuild(header, snapshot.nbackfills as u32)
             };
-            let interlock =
-                match storage::sqlite_shm_interlock::SqliteShmInterlock::acquire(&io, &path, build)
-                {
-                    Ok(interlock) => interlock,
-                    Err(LimboError::LockingError(_)) => return Err(LimboError::Busy),
-                    // SQLite reports a wal-index it cannot open as SQLITE_CANTOPEN.
-                    Err(LimboError::CompletionError(_)) => return Err(LimboError::CantOpen),
-                    Err(err) => return Err(err),
-                };
+            let interlock = match storage::sqlite_shm_interlock::SqliteShmInterlock::acquire(
+                &io,
+                &path,
+                db.clone(),
+                build,
+            ) {
+                Ok(interlock) => interlock,
+                Err(LimboError::LockingError(_)) => return Err(LimboError::Busy),
+                // SQLite reports a wal-index it cannot open as SQLITE_CANTOPEN.
+                Err(LimboError::CompletionError(_)) => return Err(LimboError::CantOpen),
+                Err(err) => return Err(err),
+            };
             if interlock.claim_index_rebuild() {
                 // Under WAL_WRITE_LOCK so no SQLite recovery runs meanwhile;
                 // otherwise a SQLite process that joined recovers it.
@@ -3821,6 +3828,7 @@ impl Database {
             }
             Ok(interlock)
         }));
+        Ok(())
     }
 
     /// Whether another process has this multiprocess-WAL database open.

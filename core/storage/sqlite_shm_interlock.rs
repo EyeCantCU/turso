@@ -17,9 +17,9 @@
 //! with no turso peer alive knows SQLite owns the database, and joins it.
 //!
 //! Like SQLite's wal-index, the interlock is set up at the first transaction,
-//! not at open. A connection in EXCLUSIVE locking mode at that point takes
-//! [`ExclusiveDbLock`] instead and creates no `-shm`, like SQLite's
-//! heap-memory wal-index.
+//! not at open. A connection in EXCLUSIVE locking mode at that point locks the
+//! database exclusively through [`DbLock`] instead and creates no `-shm`,
+//! like SQLite's heap-memory wal-index.
 //!
 //! OFD locks conflict with SQLite's POSIX locks, are released when the
 //! descriptor closes, and are not wiped when turso opens and closes other
@@ -48,7 +48,7 @@ pub(crate) struct SqliteInterlockSlot {
     cell: std::sync::OnceLock<Arc<SqliteShmInterlock>>,
     init: std::sync::OnceLock<InterlockInit>,
     setup: parking_lot::Mutex<()>,
-    /// An [`ExclusiveDbLock`] replaces the interlock while set.
+    /// An exclusive [`DbLock`] replaces the interlock while set.
     exclusive_without_shm: AtomicBool,
 }
 
@@ -113,23 +113,21 @@ impl SqliteShmInterlock {
     /// Take the interlock for `db_path`. A process that finds nobody holding
     /// DMS builds the index with `build` while it holds DMS exclusively, as
     /// SQLite resets its wal-index, so no process joins a stale index.
+    /// `db` is the database's [`DbLock`] descriptor, already holding the
+    /// shared SHARED-byte lock.
     pub(crate) fn acquire(
         io: &Arc<dyn IO>,
         db_path: &str,
+        db: Arc<dyn File>,
         build: impl Fn(&SqliteWalIndex) -> Result<()>,
     ) -> Result<Self> {
         let shm = io.open_shared_wal_file(&format!("{db_path}-shm"))?;
-        // Writable for locking_mode=EXCLUSIVE's write lock; a shared lock
-        // needs only read access, for read-only files.
-        let db = io
-            .open_file(db_path, crate::io::OpenFlags::NoLock, false)
-            .or_else(|_| io.open_file(db_path, crate::io::OpenFlags::ReadOnly, false))?;
         let wal_path = format!("{db_path}-wal");
         for attempt in 1..=ATTEMPTS {
-            if let Some(index) = Self::try_build_alone(&shm, &db, &wal_path, &build)? {
+            if let Some(index) = Self::try_build_alone(&shm, &wal_path, &build)? {
                 return Ok(Self::new(shm, db, index, true));
             }
-            if let Some(others) = Self::try_lock(&shm, &db)? {
+            if let Some(others) = Self::try_lock(&shm)? {
                 let index = SqliteWalIndex::new(shm.clone(), &wal_path)?;
                 if !others {
                     // Nobody maintains the index and it was not built above:
@@ -159,22 +157,21 @@ impl SqliteShmInterlock {
     }
 
     /// With DMS free, take it exclusively, build the index, then downgrade.
+    /// An index a SQLite process left that still matches the WAL file is kept:
+    /// it may be newer than this process's view, which imports it.
     fn try_build_alone(
         shm: &Arc<dyn File>,
-        db: &Arc<dyn File>,
         wal_path: &str,
         build: &impl Fn(&SqliteWalIndex) -> Result<()>,
     ) -> Result<Option<SqliteWalIndex>> {
         if !shm.shared_wal_try_lock_byte(SHM_DMS, true, KIND)? {
             return Ok(None);
         }
-        if !db.shared_wal_try_lock_byte(DB_SHARED_FIRST, false, KIND)? {
-            shm.shared_wal_unlock_byte(SHM_DMS, KIND)?;
-            return Ok(None);
-        }
         let built = SqliteWalIndex::new(shm.clone(), wal_path).and_then(|index| {
-            index.invalidate()?;
-            build(&index)?;
+            if !index.matches_wal_file() {
+                index.invalidate()?;
+                build(&index)?;
+            }
             Ok(index)
         });
         match built {
@@ -183,7 +180,6 @@ impl SqliteShmInterlock {
                 Ok(Some(index))
             }
             Err(err) => {
-                let _ = db.shared_wal_unlock_byte(DB_SHARED_FIRST, KIND);
                 let _ = shm.shared_wal_unlock_byte(SHM_DMS, KIND);
                 Err(err)
             }
@@ -208,28 +204,11 @@ impl SqliteShmInterlock {
         !self.index_ready.swap(true, Ordering::AcqRel)
     }
 
-    /// Upgrade the database SHARED-byte lock to exclusive, for
-    /// `PRAGMA locking_mode=EXCLUSIVE`. Fails while any other process (turso
-    /// or SQLite) has the database open.
-    pub(crate) fn try_exclusive(&self) -> Result<bool> {
-        self._db
-            .shared_wal_try_lock_byte(DB_SHARED_FIRST, true, KIND)
-    }
-
-    /// Downgrade back to the shared lock.
-    pub(crate) fn release_exclusive(&self) -> Result<()> {
-        self._db.shared_wal_lock_byte(DB_SHARED_FIRST, false, KIND)
-    }
-
-    /// Take the shared locks, or None on a conflict with nothing left held.
-    /// Some(true) when another process (turso or SQLite) already holds DMS.
-    fn try_lock(shm: &Arc<dyn File>, db: &Arc<dyn File>) -> Result<Option<bool>> {
+    /// Take DMS shared, or None on a conflict. Some(true) when another
+    /// process (turso or SQLite) already holds it.
+    fn try_lock(shm: &Arc<dyn File>) -> Result<Option<bool>> {
         let others = !shm.shared_wal_probe_exclusive_byte(SHM_DMS, KIND)?;
         if !shm.shared_wal_try_lock_byte(SHM_DMS, false, KIND)? {
-            return Ok(None);
-        }
-        if !db.shared_wal_try_lock_byte(DB_SHARED_FIRST, false, KIND)? {
-            shm.shared_wal_unlock_byte(SHM_DMS, KIND)?;
             return Ok(None);
         }
         Ok(Some(others))
@@ -242,27 +221,40 @@ impl std::fmt::Debug for SqliteShmInterlock {
     }
 }
 
-/// The database lock of EXCLUSIVE locking mode without a wal-index: the
-/// SHARED range locked exclusively, so no other process (turso or SQLite) can
-/// read the database while it is held.
-pub(crate) struct ExclusiveDbLock {
+/// The database file's SHARED-byte lock, held shared from open on: SQLite
+/// then cannot take the database exclusively (its close-time checkpoint that
+/// deletes the WAL and `-shm`, exclusive locking mode, rollback journal).
+/// EXCLUSIVE locking mode upgrades it.
+pub(crate) struct DbLock {
     db: Arc<dyn File>,
 }
 
-impl ExclusiveDbLock {
-    /// None while another process has the database open.
-    pub(crate) fn try_acquire(io: &Arc<dyn IO>, db_path: &str) -> Result<Option<Self>> {
-        let db = io.open_file(db_path, crate::io::OpenFlags::NoLock, false)?;
-        if db.shared_wal_try_lock_byte(DB_SHARED_FIRST, true, KIND)? {
+impl DbLock {
+    /// None while another process holds the database exclusively.
+    pub(crate) fn acquire(io: &Arc<dyn IO>, db_path: &str) -> Result<Option<Self>> {
+        // Writable for the exclusive lock; read-only files get a shared one.
+        let db = io
+            .open_file(db_path, crate::io::OpenFlags::NoLock, false)
+            .or_else(|_| io.open_file(db_path, crate::io::OpenFlags::ReadOnly, false))?;
+        if db.shared_wal_try_lock_byte(DB_SHARED_FIRST, false, KIND)? {
             Ok(Some(Self { db }))
         } else {
             Ok(None)
         }
     }
-}
 
-impl Drop for ExclusiveDbLock {
-    fn drop(&mut self) {
-        let _ = self.db.shared_wal_unlock_byte(DB_SHARED_FIRST, KIND);
+    pub(crate) fn file(&self) -> Arc<dyn File> {
+        self.db.clone()
+    }
+
+    /// Lock the database from every other process, for EXCLUSIVE locking
+    /// mode; false while another process has it open.
+    pub(crate) fn try_exclusive(&self) -> Result<bool> {
+        self.db
+            .shared_wal_try_lock_byte(DB_SHARED_FIRST, true, KIND)
+    }
+
+    pub(crate) fn release_exclusive(&self) -> Result<()> {
+        self.db.shared_wal_lock_byte(DB_SHARED_FIRST, false, KIND)
     }
 }

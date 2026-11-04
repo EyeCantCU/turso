@@ -427,3 +427,38 @@ fn test_exclusive_before_first_access_creates_no_shm() {
         assert_eq!(sqlite3_close(db), SQLITE_OK);
     }
 }
+
+/// The sqlite3 shell restarts the WAL and writes while this connection is
+/// open but has not run a transaction yet (and so holds no wal-index locks).
+#[test]
+fn test_sqlite_shell_writes_before_first_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idle.db").to_str().unwrap().to_string();
+    let Some(_) = sqlite_cli(
+        &path,
+        "PRAGMA journal_mode=WAL; CREATE TABLE t(x); INSERT INTO t VALUES (1), (2);",
+    ) else {
+        eprintln!("sqlite3 shell not available, skipping");
+        return;
+    };
+    unsafe {
+        let db = open(&path);
+        sqlite_cli(
+            &path,
+            "INSERT INTO t VALUES (3); PRAGMA wal_checkpoint(TRUNCATE); \
+             INSERT INTO t VALUES (4); INSERT INTO t SELECT x + 10 FROM t;",
+        )
+        .unwrap();
+        assert_eq!(query_text(db, "SELECT sum(x) FROM t"), "60");
+        assert_eq!(exec(db, "INSERT INTO t VALUES (1000)"), SQLITE_OK);
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+    assert_eq!(
+        sqlite_cli(
+            &path,
+            "SELECT count(*), sum(x) FROM t; PRAGMA integrity_check"
+        )
+        .unwrap(),
+        "9|1060\nok"
+    );
+}
