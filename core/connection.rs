@@ -502,6 +502,12 @@ pub struct Connection {
     pub(super) full_column_names: AtomicBool,
     /// `PRAGMA locking_mode`: true for EXCLUSIVE, false for NORMAL.
     pub(super) locking_mode_exclusive: AtomicBool,
+    /// The write transaction upgraded a read transaction that sibling
+    /// statements share; it ends back in that read transaction.
+    pub(super) write_upgraded_shared_read: AtomicBool,
+    /// A write ended in the read transaction of sibling statements; only the
+    /// last active statement may end it.
+    pub(super) read_kept_for_siblings: AtomicBool,
     /// Deprecated pragma: when ON (default), column refs use just the column name
     pub(super) short_column_names: AtomicBool,
     /// Simulator-only planner control used by the differential fuzzer.
@@ -740,6 +746,33 @@ impl Connection {
 
     pub fn has_active_root_statement(&self) -> bool {
         self.n_active_root_statements.load(Ordering::SeqCst) > 0
+    }
+
+    /// Whether root statements other than the running one are active,
+    /// ignoring parked blob handles. They share the read transaction.
+    pub(crate) fn has_sibling_statements(&self) -> bool {
+        self.n_active_root_statements.load(Ordering::SeqCst)
+            - self.n_active_blob_statements.load(Ordering::SeqCst)
+            > 1
+    }
+
+    /// Whether the ending write transaction must leave its read transaction
+    /// open for sibling statements, as SQLite downgrades to TRANS_READ.
+    pub(crate) fn take_write_keeps_shared_read(&self) -> bool {
+        let keep = self
+            .write_upgraded_shared_read
+            .swap(false, Ordering::SeqCst)
+            && self.has_sibling_statements();
+        if keep {
+            self.read_kept_for_siblings.store(true, Ordering::SeqCst);
+        }
+        keep
+    }
+
+    /// Whether the read transaction is one a write left open for siblings.
+    pub(crate) fn read_kept_for_siblings(&self) -> bool {
+        self.read_kept_for_siblings.load(Ordering::SeqCst)
+            && self.get_tx_state() == TransactionState::Read
     }
 
     pub(crate) fn hooks(&self) -> Option<&dyn ConnectionHooks> {
@@ -2705,9 +2738,7 @@ impl Connection {
     /// Close a connection and checkpoint.
     pub fn close(&self) -> Result<()> {
         // Give back an EXCLUSIVE locking-mode hold.
-        let _ = self
-            .db
-            .apply_locking_mode(self as *const Self as usize, false, false);
+        let _ = self.db.release_locking_mode(self as *const Self as usize);
         if self.is_closed() {
             return Ok(());
         }
@@ -5148,8 +5179,9 @@ impl Connection {
     }
 
     pub(crate) fn set_tx_state(&self, state: TransactionState) {
-        // Like SQLite, defer_foreign_keys switches off when a transaction ends.
-        if matches!(state, TransactionState::None) {
+        if state == TransactionState::None {
+            self.read_kept_for_siblings.store(false, Ordering::SeqCst);
+            // Like SQLite, defer_foreign_keys switches off when a transaction ends.
             self.defer_foreign_keys.store(false, Ordering::Release);
         }
         self.transaction_state.set(state);
@@ -5498,6 +5530,7 @@ impl Connection {
         clear_attached_schemas: bool,
     ) {
         let fire_rollback_hook = self.in_write_or_explicit_txn();
+        let mut end_state = TransactionState::None;
         if let Some(mv_store) = self.mv_store().as_ref() {
             if let Some(tx_id) = self.get_mv_tx_id() {
                 self.auto_commit.store(true, Ordering::SeqCst);
@@ -5510,7 +5543,14 @@ impl Connection {
             pager.end_read_tx();
             self.rollback_attached_mvcc_txs(clear_attached_schemas);
         } else {
-            pager.rollback_tx(self);
+            // Like SQLite, a rolled-back write leaves a read transaction for
+            // sibling statements that are still reading.
+            if matches!(self.get_tx_state(), TransactionState::Write { .. })
+                && self.take_write_keeps_shared_read()
+            {
+                end_state = TransactionState::Read;
+            }
+            pager.rollback_tx_keep_read(self, end_state == TransactionState::Read);
             self.auto_commit.store(true, Ordering::SeqCst);
         }
         self.rollback_attached_wal_txns();

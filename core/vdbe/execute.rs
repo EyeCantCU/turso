@@ -5239,6 +5239,15 @@ pub fn op_transaction_inner(
                             });
                             return Ok(state.suspend_on_io(io));
                         }
+                        let upgraded_read = matches!(
+                            current_state,
+                            TransactionState::Read
+                                | TransactionState::PendingUpgrade { has_read_txn: true }
+                        );
+                        conn.write_upgraded_shared_read.store(
+                            upgraded_read && mv_store.is_none() && conn.has_sibling_statements(),
+                            Ordering::SeqCst,
+                        );
                     }
                 }
 
@@ -15572,6 +15581,19 @@ pub fn op_destroy(
         // MVCC only does pager operations in checkpoint
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
+    }
+    // Like SQLite's OP_Destroy: other active statements may still read the
+    // btree's pages.
+    if matches!(
+        state.active_op_state.destroy(),
+        OpDestroyState::CreateCursor
+    ) && program
+        .connection
+        .n_active_root_statements
+        .load(Ordering::SeqCst)
+        > 1
+    {
+        return Err(LimboError::TableLocked.into());
     }
 
     let destroy_pager = if *db != MAIN_DB_ID {

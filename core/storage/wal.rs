@@ -1471,7 +1471,7 @@ struct ShmWalCoordination {
     owner: SharedOwnerRecord,
     /// SQLite's `-shm` wal-index, kept current for real SQLite readers.
     #[cfg(target_os = "linux")]
-    sqlite: Option<Arc<crate::storage::sqlite_shm_interlock::SqliteShmInterlock>>,
+    sqlite: crate::storage::sqlite_shm_interlock::SqliteInterlockCell,
     /// SQLite read mark this connection holds for its read transaction.
     #[cfg(target_os = "linux")]
     sqlite_mark: Mutex<Option<usize>>,
@@ -1550,7 +1550,7 @@ impl ShmWalCoordination {
             authority,
             active_reader: Mutex::new(None),
             #[cfg(target_os = "linux")]
-            sqlite: None,
+            sqlite: Default::default(),
             #[cfg(target_os = "linux")]
             sqlite_mark: Mutex::new(None),
             #[cfg(target_os = "linux")]
@@ -1563,7 +1563,7 @@ impl ShmWalCoordination {
     #[cfg(target_os = "linux")]
     fn with_sqlite_index(
         mut self,
-        sqlite: Option<Arc<crate::storage::sqlite_shm_interlock::SqliteShmInterlock>>,
+        sqlite: crate::storage::sqlite_shm_interlock::SqliteInterlockCell,
     ) -> Self {
         self.sqlite = sqlite;
         let authority = self.authority.clone();
@@ -1574,17 +1574,15 @@ impl ShmWalCoordination {
     /// See [`Self::with_sqlite_index`]; runs under the open lock.
     #[cfg(target_os = "linux")]
     fn seed_with_sqlite_index(&self) {
-        if self.sqlite.is_some() {
-            let locked = self.lock_authority_for_seed();
-            self.seed_or_sync_authority_locked(locked);
-            if locked {
-                self.authority.release_checkpoint(self.owner);
-                self.authority.release_writer(self.owner);
-            }
-        } else {
-            self.seed_or_sync_authority();
+        // SQLite may share the WAL even before this process sets up its
+        // interlock: seed as if it does.
+        let locked = self.lock_authority_for_seed();
+        self.seed_or_sync_authority_locked(locked);
+        if locked {
+            self.authority.release_checkpoint(self.owner);
+            self.authority.release_writer(self.owner);
         }
-        if let Some(interlock) = self.sqlite.as_ref() {
+        if let Some(interlock) = self.sqlite.get() {
             if interlock.claim_index_rebuild() {
                 // Under WAL_WRITE_LOCK so no SQLite recovery runs meanwhile.
                 let mut locked = false;
@@ -1652,7 +1650,7 @@ impl ShmWalCoordination {
         &self,
         f: impl FnOnce(&crate::storage::sqlite_wal_index::SqliteWalIndex) -> Result<T>,
     ) -> Option<Result<T>> {
-        self.sqlite.as_ref().map(|s| f(s.index()))
+        self.sqlite.get().map(|s| f(s.index()))
     }
 
     /// Hold SQLite's READ(0) exclusively for a checkpoint, like walCheckpoint
@@ -1663,7 +1661,7 @@ impl ShmWalCoordination {
         guard: CoordinationCheckpointGuardKind,
     ) -> Result<CoordinationCheckpointGuardKind> {
         #[cfg(target_os = "linux")]
-        if let Some(sqlite) = self.sqlite.as_ref() {
+        if let Some(sqlite) = self.sqlite.get() {
             let index = sqlite.index();
             if !index.try_lock_ckpt().unwrap_or(false) {
                 self.release_checkpoint_guard_without_sqlite(guard);
@@ -1709,7 +1707,7 @@ impl ShmWalCoordination {
     /// Whether SQLite's wal-index is on the authority's WAL generation.
     #[cfg(target_os = "linux")]
     fn sqlite_generation_matches(&self) -> bool {
-        let Some(sqlite) = self.sqlite.as_ref() else {
+        let Some(sqlite) = self.sqlite.get() else {
             return true;
         };
         match sqlite.index().read_header() {
@@ -1823,7 +1821,7 @@ impl ShmWalCoordination {
                 tracing::error!("updating SQLite wal-index failed: {err}");
                 let _ = self.sqlite_index(|index| index.invalidate());
             }
-            if let Some(sqlite) = self.sqlite.as_ref() {
+            if let Some(sqlite) = self.sqlite.get() {
                 if let Ok(Some(h)) = sqlite.index().read_header() {
                     sqlite.note_change(h.change);
                 }
@@ -1856,7 +1854,7 @@ impl ShmWalCoordination {
     /// at once, so SQLite and turso readers never see it as a foreign one.
     #[cfg(target_os = "linux")]
     fn publish_generation_to_sqlite(&self) {
-        let Some(sqlite) = self.sqlite.as_ref() else {
+        let Some(sqlite) = self.sqlite.get() else {
             return;
         };
         let snapshot = self.authority.snapshot();
@@ -1885,7 +1883,7 @@ impl ShmWalCoordination {
     /// mark really pins its frames and no SQLite checkpoint went past it.
     #[cfg(target_os = "linux")]
     fn sqlite_pin_is_valid(&self, snapshot: WalSnapshot) -> bool {
-        let Some(sqlite) = self.sqlite.as_ref() else {
+        let Some(sqlite) = self.sqlite.get() else {
             return true;
         };
         let index = sqlite.index();
@@ -1913,7 +1911,7 @@ impl ShmWalCoordination {
     /// WAL_WRITE_LOCK is not needed: a read mark pins the committed frames.
     #[cfg(target_os = "linux")]
     fn try_import_sqlite_commits(&self) {
-        let Some(sqlite) = self.sqlite.as_ref() else {
+        let Some(sqlite) = self.sqlite.get() else {
             return;
         };
         let index = sqlite.index();
@@ -1948,7 +1946,7 @@ impl ShmWalCoordination {
     /// Returns false if nothing consistent could be imported right now.
     #[cfg(target_os = "linux")]
     fn import_sqlite_commits(&self, write_locked: bool, ckpt_held: bool) -> bool {
-        let Some(sqlite) = self.sqlite.as_ref() else {
+        let Some(sqlite) = self.sqlite.get() else {
             return true;
         };
         let index = sqlite.index();
@@ -1987,7 +1985,7 @@ impl ShmWalCoordination {
         &self,
         ckpt_held: bool,
     ) -> Option<crate::storage::sqlite_wal_index::IndexSnapshot> {
-        let index = self.sqlite.as_ref()?.index();
+        let index = self.sqlite.get()?.index();
         if !ckpt_held && !index.try_lock_ckpt().unwrap_or(false) {
             return None;
         }
@@ -2013,7 +2011,7 @@ impl ShmWalCoordination {
         header: crate::storage::sqlite_wal_index::IndexSnapshot,
         ckpt_held: bool,
     ) -> bool {
-        let Some(sqlite) = self.sqlite.as_ref() else {
+        let Some(sqlite) = self.sqlite.get() else {
             return true;
         };
         let index = sqlite.index();
@@ -2453,6 +2451,7 @@ impl ShmWalCoordination {
     ///    snapshot as our local state. If our local view also came from a
     ///    disk scan and the authority's frame index is empty, backfill it
     ///    from our local frame cache.
+    #[cfg(any(test, not(target_os = "linux")))]
     fn seed_or_sync_authority(&self) {
         self.seed_or_sync_authority_locked(false);
     }
@@ -2472,15 +2471,25 @@ impl ShmWalCoordination {
         // commit at any time: write the authority only under the locks, and
         // otherwise adopt it and import SQLite's commits from the index.
         #[cfg(target_os = "linux")]
-        let adopt_only = self.sqlite.is_some() && !locked;
+        let adopt_only = self.sqlite.is_installed() && !locked;
         #[cfg(not(target_os = "linux"))]
         let adopt_only = false;
         let may_initialize = !adopt_only;
         let others_idle = || locked || !self.authority.writer_or_checkpoint_lock_active();
+        let first_in_process = !self
+            .shared
+            .read()
+            .runtime
+            .authority_reconciled
+            .swap(true, Ordering::AcqRel);
         if Self::authority_is_uninitialized(snapshot) && may_initialize {
             self.sync_authority_from_local();
             self.sync_authority_frames_from_local();
-        } else if local_wal_view_loaded_from_disk && !adopt_only && others_idle() {
+        } else if local_wal_view_loaded_from_disk
+            && first_in_process
+            && !adopt_only
+            && others_idle()
+        {
             self.repair_or_reseed_authority_from_local_disk_scan(snapshot);
         } else {
             let needs_zero_frame_header_rewrite = snapshot.max_frame == 0 && {
@@ -2718,7 +2727,7 @@ impl WalCoordination for ShmWalCoordination {
         let guard = self.try_begin_read_tx_tshm(snapshot)?;
         // Pin the snapshot's frames against SQLite checkpoints and restarts.
         #[cfg(target_os = "linux")]
-        if let Some(sqlite) = self.sqlite.as_ref() {
+        if let Some(sqlite) = self.sqlite.get() {
             match sqlite
                 .index()
                 .acquire_read_mark(snapshot.max_frame, snapshot.nbackfills)
@@ -2746,13 +2755,19 @@ impl WalCoordination for ShmWalCoordination {
             self.authority.unregister_reader_for_snapshot(reader);
         }
         #[cfg(target_os = "linux")]
-        if let (Some(sqlite), Some(mark)) = (self.sqlite.as_ref(), self.sqlite_mark.lock().take()) {
+        if let (Some(sqlite), Some(mark)) = (self.sqlite.get(), self.sqlite_mark.lock().take()) {
             sqlite.index().release_read_mark(mark);
         }
         self.fallback.end_read_tx(guard);
     }
 
     fn try_begin_write_tx(&self) -> bool {
+        // Every commit must reach SQLite's wal-index, also from paths that
+        // begin a write outside the Transaction opcode.
+        #[cfg(target_os = "linux")]
+        if self.sqlite.ensure().is_err() {
+            return false;
+        }
         if !self.authority.try_acquire_writer(self.owner) {
             return false;
         }
@@ -2762,7 +2777,7 @@ impl WalCoordination for ShmWalCoordination {
         }
         // SQLite writers take the same lock; then catch up with their commits.
         #[cfg(target_os = "linux")]
-        if let Some(sqlite) = self.sqlite.as_ref() {
+        if let Some(sqlite) = self.sqlite.get() {
             if !sqlite.index().try_lock_write().unwrap_or(false) {
                 self.fallback.unlock_write_lock();
                 self.authority.release_writer(self.owner);
@@ -2780,7 +2795,7 @@ impl WalCoordination for ShmWalCoordination {
 
     fn end_write_tx(&self) {
         #[cfg(target_os = "linux")]
-        if let Some(sqlite) = self.sqlite.as_ref() {
+        if let Some(sqlite) = self.sqlite.get() {
             sqlite.index().unlock_write();
         }
         self.fallback.unlock_write_lock();
@@ -2867,7 +2882,7 @@ impl WalCoordination for ShmWalCoordination {
 
     fn release_checkpoint_guard(&self, guard: CoordinationCheckpointGuardKind) {
         #[cfg(target_os = "linux")]
-        if let Some(sqlite) = self.sqlite.as_ref() {
+        if let Some(sqlite) = self.sqlite.get() {
             if matches!(guard, CoordinationCheckpointGuardKind::Writer) {
                 sqlite.index().unlock_write();
             }
@@ -3626,6 +3641,9 @@ pub struct WalSharedRuntime {
     /// Tracks how far the process-local `frame_cache` is known to be complete
     /// for overflow fallback in the current WAL generation.
     pub overflow_fallback_coverage: Arc<SpinLock<OverflowFallbackCoverage>>,
+    /// The first coordination of this process reconciled the shared
+    /// authority with the disk scan; later connections share the live state.
+    pub authority_reconciled: AtomicBool,
     #[cfg(test)]
     pub(crate) frames_compared: AtomicU64,
 }
@@ -5481,9 +5499,8 @@ impl WalFile {
         io: Arc<dyn IO>,
         shared: Arc<RwLock<WalFileShared>>,
         authority: Arc<MappedSharedWalCoordination>,
-        #[cfg(target_os = "linux")] sqlite: Option<
-            Arc<crate::storage::sqlite_shm_interlock::SqliteShmInterlock>,
-        >,
+        #[cfg(target_os = "linux")]
+        sqlite: crate::storage::sqlite_shm_interlock::SqliteInterlockCell,
         _last_checksum_and_max_frame: ((u32, u32), u64),
         buffer_pool: Arc<BufferPool>,
     ) -> Self {
@@ -6589,6 +6606,7 @@ impl WalFileShared {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
+                authority_reconciled: AtomicBool::new(false),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
             },
@@ -6667,6 +6685,7 @@ impl WalFileShared {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
+                authority_reconciled: AtomicBool::new(false),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
             },
@@ -6711,6 +6730,7 @@ impl WalFileShared {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
+                authority_reconciled: AtomicBool::new(false),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
             },
@@ -9385,7 +9405,7 @@ pub mod test {
             shared.clone(),
             reopened_authority.clone(),
             #[cfg(target_os = "linux")]
-            None,
+            Default::default(),
             ((0, 0), 0),
             buffer_pool,
         );
@@ -9535,7 +9555,7 @@ pub mod test {
             shared,
             authority,
             #[cfg(target_os = "linux")]
-            None,
+            Default::default(),
             ((0, 0), 0),
             buffer_pool,
         );

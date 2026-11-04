@@ -50,18 +50,37 @@ pub(crate) struct WalIndexHeader {
     pub big_endian_checksum: bool,
 }
 
+impl WalIndexHeader {
+    pub(crate) fn from_wal_header(
+        header: &crate::storage::sqlite3_ondisk::WalHeader,
+        max_frame: u64,
+        checksum: (u32, u32),
+    ) -> Self {
+        Self {
+            max_frame: max_frame as u32,
+            page_size: header.page_size,
+            salt_1: header.salt_1,
+            salt_2: header.salt_2,
+            checksum,
+            big_endian_checksum: header.magic & 1 == 1,
+        }
+    }
+}
+
 pub(crate) struct SqliteWalIndex {
     shm: Arc<dyn File>,
     wal: std::fs::File,
-    state: Mutex<State>,
-}
-
-struct State {
-    pages: Vec<Box<dyn SharedWalMappedRegion>>,
-    change: u32,
+    /// Mapped 32 KiB pages; held only while mapping.
+    pages: Mutex<Vec<Box<dyn SharedWalMappedRegion>>>,
+    /// Serializes index writes in this process.
+    writes: Mutex<()>,
+    /// Serializes read-mark changes in this process. Reentrant and never
+    /// held with other state: VFS lock callbacks may use this database again
+    /// on the same thread.
+    marks: parking_lot::ReentrantMutex<()>,
     /// This process's holders of each SQLite read mark: the kernel keeps
     /// one OFD lock per mark however many connections share it.
-    read_holders: [u32; NREADER as usize],
+    read_holders: [AtomicU32; NREADER as usize],
 }
 
 /// A consistent copy of the index header.
@@ -134,26 +153,28 @@ impl SqliteWalIndex {
         Ok(Self {
             shm,
             wal,
-            state: Mutex::new(State {
-                pages: Vec::new(),
-                change: 0,
-                read_holders: [0; NREADER as usize],
-            }),
+            pages: Mutex::new(Vec::new()),
+            writes: Mutex::new(()),
+            marks: parking_lot::ReentrantMutex::new(()),
+            read_holders: Default::default(),
         })
     }
 
-    fn base(&self, state: &mut State, page: usize) -> Result<*mut u8> {
-        while state.pages.len() <= page {
-            let n = state.pages.len();
+    fn base(&self, page: usize) -> Result<*mut u8> {
+        let mut pages = self.pages.lock();
+        while pages.len() <= page {
+            let n = pages.len();
             let len = ((n + 1) * PAGE) as u64;
             if self.shm.size()? < len {
                 self.shm.shared_wal_set_len(len)?;
             }
-            state
-                .pages
-                .push(self.shm.shared_wal_map((n * PAGE) as u64, PAGE)?);
+            pages.push(self.shm.shared_wal_map((n * PAGE) as u64, PAGE)?);
         }
-        Ok(state.pages[page].ptr().as_ptr())
+        Ok(pages[page].ptr().as_ptr())
+    }
+
+    fn holders(&self, i: usize) -> &AtomicU32 {
+        &self.read_holders[i]
     }
 
     fn u32_at(base: *mut u8, offset: usize) -> &'static AtomicU32 {
@@ -163,14 +184,13 @@ impl SqliteWalIndex {
     /// Read the header the way walIndexTryHdr does: both copies equal,
     /// initialised and with a valid checksum.
     pub(crate) fn read_header(&self) -> Result<Option<IndexSnapshot>> {
-        let mut state = self.state.lock();
-        let base = self.base(&mut state, 0)?;
+        let base = self.base(0)?;
         let mut copies = [[0u32; 12]; 2];
         for (copy, words) in copies.iter_mut().enumerate() {
             for (i, w) in words.iter_mut().enumerate() {
                 *w = Self::u32_at(base, copy * 48 + i * 4).load(Ordering::Relaxed);
             }
-            self.shm.shared_wal_barrier();
+            fence(Ordering::SeqCst);
         }
         let w = copies[0];
         if copies[0] != copies[1] || w[3].to_ne_bytes()[0] == 0 {
@@ -187,6 +207,19 @@ impl SqliteWalIndex {
             salt_1: u32::from_be_bytes(w[8].to_ne_bytes()),
             salt_2: u32::from_be_bytes(w[9].to_ne_bytes()),
         }))
+    }
+
+    /// Whether a valid index describes the WAL file as it is on disk: same
+    /// generation (salts) and every indexed frame present.
+    pub(crate) fn matches_wal_file(&self) -> bool {
+        let (Ok(Some(index)), Some(wal)) = (self.read_header(), self.read_wal_header()) else {
+            return false;
+        };
+        let frame_size = u64::from(wal.page_size) + FRAME_HEADER_SIZE;
+        let needed = WAL_HEADER_SIZE + u64::from(index.max_frame) * frame_size;
+        index.salt_1 == wal.salt_1
+            && index.salt_2 == wal.salt_2
+            && self.wal.metadata().is_ok_and(|m| m.len() >= needed)
     }
 
     pub(crate) fn read_wal_header(&self) -> Option<WalFileHeader> {
@@ -226,8 +259,7 @@ impl SqliteWalIndex {
 
     /// WalCkptInfo.nBackfill.
     pub(crate) fn backfill(&self) -> Result<u32> {
-        let mut state = self.state.lock();
-        let base = self.base(&mut state, 0)?;
+        let base = self.base(0)?;
         Ok(Self::u32_at(base, CKPT_NBACKFILL).load(Ordering::Acquire))
     }
 
@@ -355,22 +387,22 @@ impl SqliteWalIndex {
         max_frame: u64,
         nbackfills: u64,
     ) -> Result<Option<usize>> {
-        let mut state = self.state.lock();
+        let _marks = self.marks.lock();
         if max_frame <= nbackfills {
             // Reads only the database file: READ(0), which holds off
             // backfills but not WAL restarts.
-            if state.read_holders[0] == 0
+            if self.holders(0).load(Ordering::Acquire) == 0
                 && !self
                     .shm
                     .shared_wal_try_lock_byte(READ_LOCK_0, false, KIND)?
             {
                 return Ok(None);
             }
-            state.read_holders[0] += 1;
+            self.holders(0).fetch_add(1, Ordering::AcqRel);
             return Ok(Some(0));
         }
         let max_frame = max_frame as u32;
-        let base = self.base(&mut state, 0)?;
+        let base = self.base(0)?;
         let mark = |i: usize| Self::u32_at(base, CKPT_READMARK + i * 4);
         for _ in 0..8 {
             let mut best: Option<usize> = None;
@@ -383,7 +415,7 @@ impl SqliteWalIndex {
             if best.is_none_or(|b| mark(b).load(Ordering::Acquire) < max_frame) {
                 // Point a mark nobody holds at our frame.
                 for i in 1..NREADER as usize {
-                    if state.read_holders[i] == 0
+                    if self.holders(i).load(Ordering::Acquire) == 0
                         && self
                             .shm
                             .shared_wal_try_lock_byte(READ_LOCK_0 + i as u64, true, KIND)?
@@ -399,39 +431,36 @@ impl SqliteWalIndex {
             let Some(i) = best else {
                 return Ok(None);
             };
-            if state.read_holders[i] == 0
+            if self.holders(i).load(Ordering::Acquire) == 0
                 && !self
                     .shm
                     .shared_wal_try_lock_byte(READ_LOCK_0 + i as u64, false, KIND)?
             {
                 continue;
             }
-            state.read_holders[i] += 1;
+            self.holders(i).fetch_add(1, Ordering::AcqRel);
             // The mark may have moved before our lock landed.
             if mark(i).load(Ordering::Acquire) <= max_frame {
                 return Ok(Some(i));
             }
-            Self::release_mark(&self.shm, &mut state, i);
+            self.release_read_mark(i);
         }
         Ok(None)
     }
 
-    fn release_mark(shm: &Arc<dyn File>, state: &mut State, i: usize) {
-        state.read_holders[i] -= 1;
-        if state.read_holders[i] == 0 {
-            let _ = shm.shared_wal_unlock_byte(READ_LOCK_0 + i as u64, KIND);
-        }
-    }
-
     pub(crate) fn release_read_mark(&self, i: usize) {
-        let mut state = self.state.lock();
-        Self::release_mark(&self.shm, &mut state, i);
+        let _marks = self.marks.lock();
+        if self.holders(i).fetch_sub(1, Ordering::AcqRel) == 1 {
+            let _ = self
+                .shm
+                .shared_wal_unlock_byte(READ_LOCK_0 + i as u64, KIND);
+        }
     }
 
     /// Mark the header invalid so SQLite will not trust stale contents.
     pub(crate) fn invalidate(&self) -> Result<()> {
-        let mut state = self.state.lock();
-        let base = self.base(&mut state, 0)?;
+        let _writes = self.writes.lock();
+        let base = self.base(0)?;
         unsafe { std::ptr::write_bytes(base, 0, HDR_SIZE) };
         fence(Ordering::SeqCst);
         Ok(())
@@ -446,9 +475,9 @@ impl SqliteWalIndex {
         Ok(buf)
     }
 
-    fn append(&self, state: &mut State, frame: u32, pgno: u32) -> Result<()> {
+    fn append(&self, frame: u32, pgno: u32) -> Result<()> {
         let page = frame_page(frame);
-        let base = self.base(state, page)?;
+        let base = self.base(page)?;
         let (pgnos, zero) = if page == 0 {
             (unsafe { base.add(HDR_SIZE) }, 0)
         } else {
@@ -470,11 +499,11 @@ impl SqliteWalIndex {
         Ok(())
     }
 
-    fn write_header(&self, state: &mut State, header: WalIndexHeader, n_page: u32) -> Result<()> {
-        let base = self.base(state, 0)?;
+    fn write_header(&self, header: WalIndexHeader, n_page: u32) -> Result<()> {
+        let base = self.base(0)?;
         // iChange must advance whoever wrote last: SQLite readers compare it
         // to decide whether their page cache is still valid.
-        state.change = Self::u32_at(base, 8)
+        let change = Self::u32_at(base, 8)
             .load(Ordering::Relaxed)
             .wrapping_add(1);
         let size_field = ((header.page_size & 0xff00) | (header.page_size >> 16)) as u16;
@@ -484,7 +513,7 @@ impl SqliteWalIndex {
         let mut words = [
             3007000,
             0,
-            state.change,
+            change,
             flags,
             header.max_frame,
             n_page,
@@ -502,15 +531,15 @@ impl SqliteWalIndex {
             for (i, w) in words.iter().enumerate() {
                 Self::u32_at(base, copy * 48 + i * 4).store(*w, Ordering::Relaxed);
             }
-            self.shm.shared_wal_barrier();
+            fence(Ordering::SeqCst);
         }
         Ok(())
     }
 
     /// Rebuild the whole index for the committed WAL (first turso process).
     pub(crate) fn rebuild(&self, header: WalIndexHeader, nbackfills: u32) -> Result<()> {
-        let mut state = self.state.lock();
-        let base = self.base(&mut state, 0)?;
+        let writes = self.writes.lock();
+        let base = self.base(0)?;
         unsafe { std::ptr::write_bytes(base, 0, PAGE) };
         let mut n_page = 0;
         for frame in 1..=header.max_frame {
@@ -520,7 +549,7 @@ impl SqliteWalIndex {
             if commit != 0 {
                 n_page = commit;
             }
-            self.append(&mut state, frame, pgno)?;
+            self.append(frame, pgno)?;
         }
         Self::u32_at(base, CKPT_NBACKFILL).store(nbackfills, Ordering::Relaxed);
         Self::u32_at(base, CKPT_NBACKFILL_ATTEMPTED).store(nbackfills, Ordering::Relaxed);
@@ -532,13 +561,16 @@ impl SqliteWalIndex {
             };
             Self::u32_at(base, CKPT_READMARK + i * 4).store(mark, Ordering::Relaxed);
         }
-        self.write_header(&mut state, header, n_page)
+        let result = self.write_header(header, n_page);
+        drop(writes);
+        self.shm.shared_wal_barrier();
+        result
     }
 
     /// Index the frames of a commit and publish the new header.
     pub(crate) fn commit(&self, header: WalIndexHeader) -> Result<()> {
-        let mut state = self.state.lock();
-        let base = self.base(&mut state, 0)?;
+        let writes = self.writes.lock();
+        let base = self.base(0)?;
         let previous = Self::u32_at(base, 16).load(Ordering::Relaxed);
         let previous = if previous > header.max_frame {
             0
@@ -552,28 +584,29 @@ impl SqliteWalIndex {
             if commit != 0 {
                 n_page = commit;
             }
-            self.append(
-                &mut state,
-                frame,
-                u32::from_be_bytes(hdr[0..4].try_into().unwrap()),
-            )?;
+            self.append(frame, u32::from_be_bytes(hdr[0..4].try_into().unwrap()))?;
         }
-        self.write_header(&mut state, header, n_page)
+        let result = self.write_header(header, n_page);
+        drop(writes);
+        // The VFS's xShmBarrier, outside the write lock: a VFS callback may
+        // re-enter this database (the header copies are fenced already).
+        self.shm.shared_wal_barrier();
+        result
     }
 
     /// Lower `max_safe` below every frame a SQLite reader still needs from
     /// the WAL, retiring read marks nobody holds, like walCheckpoint.
     pub(crate) fn limit_backfill(&self, mut max_safe: u64) -> Result<u64> {
-        let mut state = self.state.lock();
-        let base = self.base(&mut state, 0)?;
+        let _marks = self.marks.lock();
+        let base = self.base(0)?;
         for i in 1..NREADER {
             let mark = Self::u32_at(base, CKPT_READMARK + i as usize * 4);
             let value = mark.load(Ordering::Acquire);
             if (value as u64) < max_safe {
-                if self.exclusive(&state, i as usize)? {
+                if self.exclusive(i as usize)? {
                     // A mark this process holds keeps its value: SQLite
                     // checkpointers must not backfill past our readers.
-                    if state.read_holders[i as usize] == 0 {
+                    if self.holders(i as usize).load(Ordering::Acquire) == 0 {
                         mark.store(
                             if i == 1 {
                                 max_safe as u32
@@ -583,7 +616,7 @@ impl SqliteWalIndex {
                             Ordering::Release,
                         );
                     }
-                    self.unexclusive(&state, i as usize)?;
+                    self.unexclusive(i as usize)?;
                 } else {
                     max_safe = value as u64;
                 }
@@ -595,15 +628,15 @@ impl SqliteWalIndex {
     /// Take READ(i) exclusively. The kernel keeps one lock per mark for the
     /// whole process, so when this process holds it shared this converts the
     /// lock and succeeds exactly when no other process holds it.
-    fn exclusive(&self, _state: &State, i: usize) -> Result<bool> {
+    fn exclusive(&self, i: usize) -> Result<bool> {
         self.shm
             .shared_wal_try_lock_byte(READ_LOCK_0 + i as u64, true, KIND)
     }
 
     /// Undo [`Self::exclusive`], back to shared while this process's readers
     /// still hold the mark.
-    fn unexclusive(&self, state: &State, i: usize) -> Result<()> {
-        if state.read_holders[i] > 0 {
+    fn unexclusive(&self, i: usize) -> Result<()> {
+        if self.holders(i).load(Ordering::Acquire) > 0 {
             self.shm
                 .shared_wal_lock_byte(READ_LOCK_0 + i as u64, false, KIND)
         } else {
@@ -614,18 +647,17 @@ impl SqliteWalIndex {
 
     /// READ(0) exclusively, held while backfilling the database file.
     pub(crate) fn try_lock_read0(&self) -> Result<bool> {
-        let state = self.state.lock();
-        self.exclusive(&state, 0)
+        let _marks = self.marks.lock();
+        self.exclusive(0)
     }
 
     pub(crate) fn unlock_read0(&self) {
-        let state = self.state.lock();
-        let _ = self.unexclusive(&state, 0);
+        let _marks = self.marks.lock();
+        let _ = self.unexclusive(0);
     }
 
     pub(crate) fn publish_backfill(&self, nbackfills: u64) -> Result<()> {
-        let mut state = self.state.lock();
-        let base = self.base(&mut state, 0)?;
+        let base = self.base(0)?;
         Self::u32_at(base, CKPT_NBACKFILL).store(nbackfills as u32, Ordering::Release);
         Self::u32_at(base, CKPT_NBACKFILL_ATTEMPTED).store(nbackfills as u32, Ordering::Release);
         Ok(())
@@ -634,22 +666,20 @@ impl SqliteWalIndex {
     /// Restart the index with the WAL, if no SQLite reader holds a mark.
     /// Returns false (and changes nothing) while one does.
     pub(crate) fn try_restart(&self, header: WalIndexHeader) -> Result<bool> {
+        let _marks = self.marks.lock();
         let mut held = Vec::new();
-        {
-            let state = self.state.lock();
-            for i in 1..NREADER as usize {
-                if !self.exclusive(&state, i)? {
-                    for j in held {
-                        self.unexclusive(&state, j)?;
-                    }
-                    return Ok(false);
+        for i in 1..NREADER as usize {
+            if !self.exclusive(i)? {
+                for j in held {
+                    self.unexclusive(j)?;
                 }
-                held.push(i);
+                return Ok(false);
             }
+            held.push(i);
         }
         let result = (|| {
-            let mut state = self.state.lock();
-            let base = self.base(&mut state, 0)?;
+            let _writes = self.writes.lock();
+            let base = self.base(0)?;
             Self::u32_at(base, CKPT_NBACKFILL).store(0, Ordering::Release);
             Self::u32_at(base, CKPT_NBACKFILL_ATTEMPTED).store(0, Ordering::Release);
             Self::u32_at(base, CKPT_READMARK + 4).store(0, Ordering::Release);
@@ -658,7 +688,6 @@ impl SqliteWalIndex {
                     .store(READMARK_NOT_USED, Ordering::Release);
             }
             self.write_header(
-                &mut state,
                 WalIndexHeader {
                     max_frame: 0,
                     ..header
@@ -666,11 +695,9 @@ impl SqliteWalIndex {
                 0,
             )
         })();
-        {
-            let state = self.state.lock();
-            for j in held {
-                self.unexclusive(&state, j)?;
-            }
+        self.shm.shared_wal_barrier();
+        for j in held {
+            self.unexclusive(j)?;
         }
         result.map(|_| true)
     }

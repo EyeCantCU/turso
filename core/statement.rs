@@ -1024,7 +1024,13 @@ impl Statement {
             || conn.next_attached_mv_tx().is_some()
             || attached_leaked
             || self.state.auto_txn_cleanup != vdbe::TxnCleanup::None;
-        if conn.get_auto_commit() && has_implicit_txn_state {
+        // A read transaction a write left open for sibling statements stays
+        // open: their cursors still use its snapshot.
+        let siblings = conn.n_active_root_statements.load(Ordering::SeqCst)
+            > i32::from(self.counted_as_active_root);
+        if siblings && conn.read_kept_for_siblings() {
+            self.state.auto_txn_cleanup = vdbe::TxnCleanup::None;
+        } else if conn.get_auto_commit() && has_implicit_txn_state {
             conn.rollback_current_txn_state(&main_pager, true);
             self.state.auto_txn_cleanup = vdbe::TxnCleanup::None;
         }
