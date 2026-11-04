@@ -511,6 +511,8 @@ pub struct Connection {
     /// Modules registered at open whose stored tables are not connected yet;
     /// connected when a statement fails to find a table.
     pub(crate) pending_vtab_connect: Mutex<Vec<String>>,
+    /// Virtual tables whose xDestroy is running (SQLite's nVDestroy).
+    pub(crate) n_vtab_destroy: AtomicI32,
     /// Deprecated pragma: when ON (default), column refs use just the column name
     pub(super) short_column_names: AtomicBool,
     /// Simulator-only planner control used by the differential fuzzer.

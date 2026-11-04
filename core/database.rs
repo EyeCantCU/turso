@@ -2877,6 +2877,7 @@ impl Database {
             write_upgraded_shared_read: AtomicBool::new(false),
             read_kept_for_siblings: AtomicBool::new(false),
             pending_vtab_connect: Mutex::new(Vec::new()),
+            n_vtab_destroy: AtomicI32::new(0),
             short_column_names: AtomicBool::new(true),
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: crate::connection::AtomicSubqueryUnnestingMode::new(

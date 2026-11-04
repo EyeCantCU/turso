@@ -15583,8 +15583,7 @@ pub fn op_destroy(
         return Ok(InsnFunctionStepResult::Step);
     }
     // Like SQLite's OP_Destroy: other active statements may still read the
-    // btree's pages. Statements on the call stack (a virtual table's xDestroy
-    // running SQL inside DROP TABLE) are finishing work, not reading.
+    // btree's pages. SQL run by a virtual table's xDestroy does not count.
     if matches!(
         state.active_op_state.destroy(),
         OpDestroyState::CreateCursor
@@ -15592,11 +15591,8 @@ pub fn op_destroy(
         .connection
         .n_active_root_statements
         .load(Ordering::SeqCst)
-        - program
-            .connection
-            .n_stepping_root_statements
-            .load(Ordering::SeqCst)
-        > 0
+        - program.connection.n_vtab_destroy.load(Ordering::SeqCst)
+        > 1
     {
         return Err(LimboError::TableLocked.into());
     }

@@ -388,7 +388,11 @@ impl VirtualTable {
     pub(crate) fn destroy(&self, connection: &Arc<Connection>) -> crate::Result<()> {
         match &self.vtab_type {
             VirtualTableType::External(table) => {
-                table.hook(connection, crate::native_ext::TableHook::Destroy)
+                // SQLite's nVDestroy: SQL run by xDestroy is not another reader.
+                connection.n_vtab_destroy.fetch_add(1, Ordering::SeqCst);
+                let result = table.hook(connection, crate::native_ext::TableHook::Destroy);
+                connection.n_vtab_destroy.fetch_sub(1, Ordering::SeqCst);
+                result
             }
             _ => Ok(()),
         }
