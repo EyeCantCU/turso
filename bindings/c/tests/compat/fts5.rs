@@ -951,3 +951,126 @@ fn test_fts5_registrations_are_per_connection() {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+/// Column `col` of every row of `sql`.
+unsafe fn col_rows(db: *mut sqlite3, sql: &str, col: c_int) -> Vec<String> {
+    let c = CString::new(sql).unwrap();
+    let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+    assert_eq!(
+        sqlite3_prepare_v2(db, c.as_ptr(), -1, &mut stmt, ptr::null_mut()),
+        SQLITE_OK,
+        "{sql}"
+    );
+    let mut out = Vec::new();
+    while sqlite3_step(stmt) == SQLITE_ROW {
+        let t = sqlite3_column_text(stmt, col);
+        out.push(if t.is_null() {
+            "NULL".into()
+        } else {
+            CStr::from_ptr(t as *const c_char)
+                .to_string_lossy()
+                .into_owned()
+        });
+    }
+    sqlite3_finalize(stmt);
+    out
+}
+
+// xBestIndex: SQLite's idxNum/idxStr, costs and ORDER BY decisions, and the
+// rows each plan returns.
+#[test]
+fn test_fts5_plans() {
+    unsafe {
+        let mut db: *mut sqlite3 = ptr::null_mut();
+        let name = CString::new(":memory:").unwrap();
+        assert_eq!(sqlite3_open(name.as_ptr(), &mut db), SQLITE_OK);
+        exec(db, "CREATE VIRTUAL TABLE t USING fts5(a, b)");
+        exec(db, "INSERT INTO t(rowid, a, b) VALUES(1, 'x y', 'z'), (5, 'x', 'x x'), (9, 'y z', 'x'), (12, 'x y z', 'y'), (20, 'z', 'z')");
+        let mut got = Vec::new();
+        for q in [
+            "SELECT rowid FROM t WHERE t MATCH 'x'",
+            "SELECT rowid FROM t WHERE t MATCH 'x' ORDER BY rowid",
+            "SELECT rowid FROM t WHERE t MATCH 'x' ORDER BY rowid DESC",
+            "SELECT rowid FROM t WHERE t MATCH 'x' ORDER BY rank",
+            "SELECT rowid FROM t WHERE t MATCH 'x' ORDER BY rank DESC",
+            "SELECT rowid FROM t WHERE t MATCH 'x OR y' ORDER BY rowid DESC LIMIT 2",
+            "SELECT rowid FROM t WHERE t MATCH 'x OR y' ORDER BY rank LIMIT 2",
+            "SELECT rowid FROM t WHERE t MATCH 'x' AND rowid = 5",
+            "SELECT rowid FROM t WHERE t MATCH 'x OR z' AND rowid IN (1, 9, 20)",
+            "SELECT rowid FROM t WHERE t MATCH 'x OR z' AND rowid > 5",
+            "SELECT rowid FROM t WHERE t MATCH 'x OR z' AND rowid > 1 AND rowid < 20 ORDER BY rowid DESC",
+            "SELECT rowid FROM t WHERE rowid = 9",
+            "SELECT rowid FROM t WHERE rowid >= 9 ORDER BY rowid DESC",
+            "SELECT rowid FROM t ORDER BY rank",
+            "SELECT rowid FROM t WHERE b MATCH 'x' ORDER BY rowid DESC",
+            "SELECT rowid FROM t('y') ORDER BY rowid DESC",
+        ] {
+            got.push(q.to_string());
+            for d in col_rows(db, &format!("EXPLAIN QUERY PLAN {q}"), 3) {
+                // turso words its sorter line differently (not an FTS5 matter).
+                let d = d.replace("USE SORTER FOR ORDER BY", "USE TEMP B-TREE FOR ORDER BY");
+                got.push(format!("  plan: {d}"));
+            }
+            got.push(format!("  rows: {}", col_rows(db, q, 0).join(" ")));
+        }
+        if std::env::var("FTS5_PRINT").is_ok() {
+            for g in &got {
+                println!("{g:?},");
+            }
+        }
+        // Expected output from SQLite 3.54.1 (FTS5_PRINT=1 with --features sqlite3).
+        let expected: &[&str] = &[
+            "SELECT rowid FROM t WHERE t MATCH 'x'",
+            "  plan: SCAN t VIRTUAL TABLE INDEX 0:M2",
+            "  rows: 1 5 9 12",
+            "SELECT rowid FROM t WHERE t MATCH 'x' ORDER BY rowid",
+            "  plan: SCAN t VIRTUAL TABLE INDEX 64:M2",
+            "  rows: 1 5 9 12",
+            "SELECT rowid FROM t WHERE t MATCH 'x' ORDER BY rowid DESC",
+            "  plan: SCAN t VIRTUAL TABLE INDEX 192:M2",
+            "  rows: 12 9 5 1",
+            "SELECT rowid FROM t WHERE t MATCH 'x' ORDER BY rank",
+            "  plan: SCAN t VIRTUAL TABLE INDEX 32:M2",
+            "  rows: 5 1 9 12",
+            "SELECT rowid FROM t WHERE t MATCH 'x' ORDER BY rank DESC",
+            "  plan: SCAN t VIRTUAL TABLE INDEX 160:M2",
+            "  rows: 12 1 9 5",
+            "SELECT rowid FROM t WHERE t MATCH 'x OR y' ORDER BY rowid DESC LIMIT 2",
+            "  plan: SCAN t VIRTUAL TABLE INDEX 192:M2",
+            "  rows: 12 9",
+            "SELECT rowid FROM t WHERE t MATCH 'x OR y' ORDER BY rank LIMIT 2",
+            "  plan: SCAN t VIRTUAL TABLE INDEX 32:M2",
+            "  rows: 12 1",
+            "SELECT rowid FROM t WHERE t MATCH 'x' AND rowid = 5",
+            "  plan: SCAN t VIRTUAL TABLE INDEX 0:=M2",
+            "  rows: 5",
+            "SELECT rowid FROM t WHERE t MATCH 'x OR z' AND rowid IN (1, 9, 20)",
+            "  plan: SCAN t VIRTUAL TABLE INDEX 0:=M2",
+            "  rows: 1 9 20",
+            "SELECT rowid FROM t WHERE t MATCH 'x OR z' AND rowid > 5",
+            "  plan: SCAN t VIRTUAL TABLE INDEX 0:M2>",
+            "  rows: 9 12 20",
+            "SELECT rowid FROM t WHERE t MATCH 'x OR z' AND rowid > 1 AND rowid < 20 ORDER BY rowid DESC",
+            "  plan: SCAN t VIRTUAL TABLE INDEX 192:M2><",
+            "  rows: 12 9 5",
+            "SELECT rowid FROM t WHERE rowid = 9",
+            "  plan: SCAN t VIRTUAL TABLE INDEX 0:=",
+            "  rows: 9",
+            "SELECT rowid FROM t WHERE rowid >= 9 ORDER BY rowid DESC",
+            "  plan: SCAN t VIRTUAL TABLE INDEX 192:>",
+            "  rows: 20 12 9",
+            "SELECT rowid FROM t ORDER BY rank",
+            "  plan: SCAN t VIRTUAL TABLE INDEX 0:",
+            "  plan: USE TEMP B-TREE FOR ORDER BY",
+            "  rows: 1 5 9 12 20",
+            "SELECT rowid FROM t WHERE b MATCH 'x' ORDER BY rowid DESC",
+            "  plan: SCAN t VIRTUAL TABLE INDEX 192:M1",
+            "  rows: 9 5",
+            "SELECT rowid FROM t('y') ORDER BY rowid DESC",
+            "  plan: SCAN t VIRTUAL TABLE INDEX 192:M2",
+            "  rows: 12 9 1",
+        ];
+        assert_eq!(got, expected);
+        sqlite3_close(db);
+    }
+}

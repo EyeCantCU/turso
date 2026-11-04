@@ -46,9 +46,10 @@ use turso_ext::{ConstraintOp, ResultCode};
 const FTS5_SOURCE_ID: &str = "turso fts5";
 const SMALLEST_INT64: i64 = i64::MIN;
 const LARGEST_INT64: i64 = i64::MAX;
-const BI_ORDER_RANK: i32 = 0x01;
-const BI_ORDER_ROWID: i32 = 0x02;
-const BI_ORDER_DESC: i32 = 0x04;
+// idxNum bits, as fts5.c's FTS5_BI_ORDER_*.
+const BI_ORDER_RANK: i32 = 0x20;
+const BI_ORDER_ROWID: i32 = 0x40;
+const BI_ORDER_DESC: i32 = 0x80;
 
 /// Registers the fts5 and fts5vocab modules and the FTS5 SQL functions.
 pub(crate) fn register(syms: &mut SymbolTable) {
@@ -301,6 +302,7 @@ impl VirtualTable for Fts5Table {
         let mut ncons = 0u32;
         let mut seen_match = 0;
         let mut seen_rank = false;
+        let mut seen_eq = false;
         for (i, c) in constraints.iter().enumerate() {
             let col = c.column_index as i64;
             let is_rowid = c.column_index == u32::MAX;
@@ -325,34 +327,31 @@ impl VirtualTable for Fts5Table {
                     argv_index: Some(ncons),
                     omit: true,
                 };
-            } else if c.usable
-                && !is_rowid
-                && col < ncol
-                && ((pattern == tokenize::Pattern::Glob && c.op == ConstraintOp::Glob)
-                    || (pattern == tokenize::Pattern::Like
-                        && matches!(c.op, ConstraintOp::Like | ConstraintOp::Glob)))
-            {
-                idx_str.push(if c.op == ConstraintOp::Like { 'L' } else { 'G' });
-                idx_str.push_str(&col.to_string());
-                ncons += 1;
-                usages[i].argv_index = Some(ncons);
-                seen_match += 1;
+            } else if c.usable {
+                if !is_rowid
+                    && col < ncol
+                    && ((pattern == tokenize::Pattern::Glob && c.op == ConstraintOp::Glob)
+                        || (pattern == tokenize::Pattern::Like
+                            && matches!(c.op, ConstraintOp::Like | ConstraintOp::Glob)))
+                {
+                    idx_str.push(if c.op == ConstraintOp::Like { 'L' } else { 'G' });
+                    idx_str.push_str(&col.to_string());
+                    ncons += 1;
+                    usages[i].argv_index = Some(ncons);
+                    seen_match += 1;
+                } else if !seen_eq && c.op == ConstraintOp::Eq && is_rowid {
+                    idx_str.push('=');
+                    seen_eq = true;
+                    ncons += 1;
+                    usages[i] = ConstraintUsage {
+                        argv_index: Some(ncons),
+                        omit: true,
+                    };
+                }
             }
         }
-        let mut seen_eq = false;
         let mut seen_lt = false;
         let mut seen_gt = false;
-        for (i, c) in constraints.iter().enumerate() {
-            if c.column_index == u32::MAX && c.usable && !seen_eq && c.op == ConstraintOp::Eq {
-                idx_str.push('=');
-                seen_eq = true;
-                ncons += 1;
-                usages[i] = ConstraintUsage {
-                    argv_index: Some(ncons),
-                    omit: true,
-                };
-            }
-        }
         if !seen_eq {
             for (i, c) in constraints.iter().enumerate() {
                 if c.column_index != u32::MAX || !c.usable {
@@ -707,6 +706,10 @@ pub(crate) struct CursorState {
     token_maps: HashMap<(usize, usize), TokenMap>,
     /// ORDER BY rank: SQLite's sorter plan, which keeps tokendata maps.
     sorted: bool,
+    /// The sorter's rows once built (FTS5_PLAN_SORTED_MATCH): rowid and,
+    /// per phrase, the position list (detail=full) or column list
+    /// (detail=column) captured while the rank was computed.
+    sorter: Option<Vec<(i64, Vec<Vec<u8>>)>>,
 }
 
 /// rowid -> (position, token).
@@ -734,6 +737,7 @@ impl CursorState {
             insts: None,
             token_maps: HashMap::new(),
             sorted: false,
+            sorter: None,
             auxdata: HashMap::new(),
             current_aux: String::new(),
             scan_cache: HashMap::new(),
@@ -753,6 +757,9 @@ impl CursorState {
     }
 
     fn eof(&self) -> bool {
+        if let Some(rows) = &self.sorter {
+            return self.pos >= rows.len();
+        }
         match (&self.plan, &self.eval) {
             (Plan::Match, Some(ev)) => ev.eof(),
             _ => self.pos >= self.rows.len(),
@@ -760,6 +767,9 @@ impl CursorState {
     }
 
     fn rowid(&self) -> i64 {
+        if let Some(rows) = &self.sorter {
+            return rows.get(self.pos).map_or(0, |r| r.0);
+        }
         match (&self.plan, &self.eval) {
             (Plan::Special, _) => 0,
             (Plan::Match, Some(ev)) => ev.rowid(),
@@ -777,6 +787,7 @@ impl CursorState {
     /// fts5FilterMethod
     fn filter(&mut self, args: &[Value], idx_str: Option<&str>, idx_num: i32) -> Result<bool> {
         self.plan = Plan::None;
+        self.sorter = None;
         self.rows.clear();
         self.pos = 0;
         self.expr = None;
@@ -887,17 +898,27 @@ impl CursorState {
             }
             let w = self.inner.peek_writes(&self.conn);
             let (s, _) = index.store.read_structure()?;
+            // The rank sorter's source cursor always runs in ascending order.
+            let ev_desc = self.desc && !self.sorted;
             let ev = Evaluator::new(
                 &e,
                 &index,
                 &s,
                 w.as_ref().map(|w| &w.pending),
-                (first, last),
+                if ev_desc {
+                    (!last, !first)
+                } else {
+                    (first, last)
+                },
+                ev_desc,
             )?;
             self.eval = Some(ev);
             self.expr = Some(e);
             self.token_maps.clear();
             self.plan = Plan::Match;
+            if self.sorted {
+                self.build_sorter()?;
+            }
         } else if cfg.content_table.is_none() {
             return Err(err(format!(
                 "{}: table does not support scanning",
@@ -965,7 +986,9 @@ impl CursorState {
             self.pos = self.rows.len();
             return false;
         }
-        if let (Plan::Match, Some(ev)) = (&self.plan, &mut self.eval) {
+        if self.sorter.is_some() {
+            self.pos += 1;
+        } else if let (Plan::Match, Some(ev)) = (&self.plan, &mut self.eval) {
             ev.next();
         } else {
             self.pos += 1;
@@ -1054,9 +1077,61 @@ impl CursorState {
         r
     }
 
+    /// fts5CursorFirstSorted: runs the whole match computing each row's rank
+    /// (as the inner "SELECT rowid, rank ... ORDER BY rank" does), keeps
+    /// what SQLite's sorter keeps, and orders the rows by rank.
+    fn build_sorter(&mut self) -> Result<()> {
+        let (name, args) = self.rank.clone().unwrap_or_default();
+        let nphrase = self.phrase_count().max(0) as usize;
+        let detail = self.cfg().detail;
+        let mut rows: Vec<(Value, i64, Vec<Vec<u8>>)> = Vec::new();
+        while !self.eof() {
+            self.new_row();
+            let rank = self.call_aux(&name, &args)?;
+            let ev = self.eval.as_ref().expect("eval");
+            let lists = (0..nphrase)
+                .map(|i| match detail {
+                    Detail::Full => ev.phrase_poslist(i).map(<[u8]>::to_vec).unwrap_or_default(),
+                    Detail::Columns => ev.phrase_collist(i).unwrap_or_default(),
+                    Detail::None => Vec::new(),
+                })
+                .collect();
+            rows.push((rank, self.rowid(), lists));
+            if let Some(ev) = self.eval.as_mut() {
+                ev.next();
+            }
+        }
+        if self.desc {
+            rows.sort_by(|a, b| b.0.cmp(&a.0));
+        } else {
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        self.sorter = Some(rows.into_iter().map(|(_, r, l)| (r, l)).collect());
+        self.pos = 0;
+        self.new_row();
+        Ok(())
+    }
+
     fn poslists(&mut self) -> Result<Vec<Vec<u8>>> {
         if let Some(p) = &self.poslists {
             return Ok(p.clone());
+        }
+        if let Some(rows) = &self.sorter {
+            let lists = rows.get(self.pos).map(|r| r.1.clone()).unwrap_or_default();
+            let p = if self.cfg().detail == Detail::Full {
+                lists
+            } else {
+                // fts5CsrPoslist with a sorter: every phrase is populated from
+                // the text, then sqlite3Fts5ExprCheckPoslists prunes them.
+                let all = vec![Some(Vec::new()); lists.len()];
+                let mut p = self.populate_poslists(&all)?;
+                if let Some(e) = &self.expr {
+                    expr::check_poslists(&e.root, &mut p);
+                }
+                p
+            };
+            self.poslists = Some(p.clone());
+            return Ok(p);
         }
         let p: Vec<Option<Vec<u8>>> = match (&self.expr, &self.eval) {
             (Some(e), Some(ev)) => (0..e.phrase_count())
@@ -1343,6 +1418,7 @@ impl AuxApi for CursorState {
             &s,
             w.as_ref().map(|w| &w.pending),
             (SMALLEST_INT64, LARGEST_INT64),
+            false,
         )?;
         let mut n = 0;
         while !ev.eof() {
@@ -1410,6 +1486,12 @@ impl AuxApi for CursorState {
         if self.cfg().detail != Detail::Columns {
             return self.phrase_poslist(phrase);
         }
+        if let Some(rows) = &self.sorter {
+            return Ok(rows
+                .get(self.pos)
+                .and_then(|r| r.1.get(phrase as usize).cloned())
+                .unwrap_or_default());
+        }
         Ok(self
             .eval
             .as_ref()
@@ -1439,6 +1521,7 @@ impl AuxApi for CursorState {
             &s,
             w.as_ref().map(|w| &w.pending),
             (SMALLEST_INT64, LARGEST_INT64),
+            false,
         )?;
         let mut sub = CursorState::new(0, self.inner.clone(), self.conn.clone());
         sub.plan = Plan::Match;

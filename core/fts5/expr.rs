@@ -936,6 +936,8 @@ pub(crate) struct Evaluator {
     /// Iterator positions (first iterator of each term) before the last
     /// next(); None until next() is first called.
     snapshot: Option<Vec<Vec<usize>>>,
+    /// Descending rowid order (keys are !rowid).
+    desc: bool,
 }
 
 fn rowid_cmp(a: i64, b: i64) -> std::cmp::Ordering {
@@ -944,13 +946,17 @@ fn rowid_cmp(a: i64, b: i64) -> std::cmp::Ordering {
 
 impl Evaluator {
     /// Builds the iterators for `expr` and positions on the first match in
-    /// [first, last] (sqlite3Fts5ExprFirst).
+    /// [first, last] (sqlite3Fts5ExprFirst). With `desc`, rows are visited in
+    /// descending rowid order: internally each rowid r becomes the key !r,
+    /// which reverses the order without overflow, and `rowid_range` is given
+    /// in key space.
     pub(crate) fn new(
         expr: &Expr,
         index: &Index,
         s: &Structure,
         pending: Option<&Pending>,
         rowid_range: (i64, i64),
+        desc: bool,
     ) -> Result<Self> {
         let cfg = index.cfg;
         let detail = cfg.detail;
@@ -961,6 +967,7 @@ impl Evaluator {
             root: 0,
             last: rowid_range.1,
             snapshot: None,
+            desc,
         };
         // Phrases first, with their doclists (colset-filtered).
         for (pi, phrase) in expr.phrases.iter().enumerate() {
@@ -985,6 +992,9 @@ impl Evaluator {
                         if term.prefix && !has_prefix_index(index, alt) {
                             dl.retain(|(_, pl)| !pl.is_empty());
                         }
+                    }
+                    if desc {
+                        dl = dl.into_iter().rev().map(|(r, d)| (!r, d)).collect();
                     }
                     iters.push(TermIter {
                         entries: std::sync::Arc::new(dl),
@@ -1089,7 +1099,12 @@ impl Evaluator {
     }
 
     pub(crate) fn rowid(&self) -> i64 {
-        self.nodes[self.root].rowid
+        let k = self.nodes[self.root].rowid;
+        if self.desc {
+            !k
+        } else {
+            k
+        }
     }
 
     /// sqlite3Fts5ExprNext
@@ -1695,6 +1710,68 @@ fn near_match(lists: &mut [Vec<i64>], sizes: &[usize], near: i32) -> bool {
         *l = o;
     }
     ok
+}
+
+/// sqlite3Fts5ExprCheckPoslists over populated phrase lists: a leaf counts
+/// if its first phrase has positions; a failing AND or NOT clears its
+/// leaves' first phrases.
+pub(crate) fn check_poslists(node: &Node, lists: &mut [Vec<u8>]) -> bool {
+    fn first_phrase(n: &Option<Nearset>) -> Option<usize> {
+        n.as_ref().and_then(|n| n.phrases.first().copied())
+    }
+    fn clear(node: &Node, lists: &mut [Vec<u8>]) {
+        match node {
+            Node::String(n) => {
+                if let Some(l) = n.phrases.first().and_then(|&p| lists.get_mut(p)) {
+                    l.clear();
+                }
+            }
+            Node::Eof(n) => {
+                if let Some(l) = first_phrase(n).and_then(|p| lists.get_mut(p)) {
+                    l.clear();
+                }
+            }
+            Node::And(c) | Node::Or(c) => c.iter().for_each(|c| clear(c, lists)),
+            Node::Not(a, b) => {
+                clear(a, lists);
+                clear(b, lists);
+            }
+        }
+    }
+    match node {
+        Node::String(n) => n
+            .phrases
+            .first()
+            .is_some_and(|&p| lists.get(p).is_some_and(|l| !l.is_empty())),
+        Node::Eof(n) => {
+            first_phrase(n).is_some_and(|p| lists.get(p).is_some_and(|l| !l.is_empty()))
+        }
+        Node::And(c) => {
+            for child in c {
+                if !check_poslists(child, lists) {
+                    clear(node, lists);
+                    return false;
+                }
+            }
+            true
+        }
+        Node::Or(c) => {
+            let mut any = false;
+            for child in c {
+                if check_poslists(child, lists) {
+                    any = true;
+                }
+            }
+            any
+        }
+        Node::Not(a, b) => {
+            if !check_poslists(a, lists) || check_poslists(b, lists) {
+                clear(node, lists);
+                return false;
+            }
+            true
+        }
+    }
 }
 
 /// The part of a query token used for lookups: with tokendata=1, the bytes

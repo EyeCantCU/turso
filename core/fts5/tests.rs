@@ -421,6 +421,24 @@ fn fuzz_case(seed: u64, case: &Case, nops: usize, nqueries: usize) {
                 "SELECT rowid, highlight(t, 0, '[', ']'), snippet(t, -1, '<', '>', '...', 5) FROM t WHERE t MATCH '{q}' ORDER BY rowid"
             ));
         }
+        // Plans the module orders itself: descending rowid, the rank sorter,
+        // rowid constraints and LIMIT.
+        let hl = if content {
+            "highlight(t, 1, '[', ']')"
+        } else {
+            "NULL"
+        };
+        let lo = rng.below(80);
+        for sql in [
+            format!("SELECT rowid, bm25(t), {hl} FROM t WHERE t MATCH '{q}' ORDER BY rowid DESC"),
+            format!("SELECT rowid, rank, {hl} FROM t WHERE t MATCH '{q}' ORDER BY rank"),
+            format!("SELECT rowid, rank FROM t WHERE t MATCH '{q}' ORDER BY rank DESC LIMIT 5"),
+            format!("SELECT rowid, bm25(t) FROM t WHERE t MATCH '{q}' AND rowid > {lo} ORDER BY rowid DESC LIMIT 7"),
+            format!("SELECT rowid FROM t WHERE t MATCH '{q}' AND rowid IN ({lo}, {}, {})", lo + 3, lo + 11),
+            format!("SELECT rowid, {hl} FROM t WHERE t MATCH '{q}' AND rowid = {lo}"),
+        ] {
+            both(&sql);
+        }
     }
     both("INSERT INTO t(t) VALUES('integrity-check')");
     for (name, kind) in [("v_row", "row"), ("v_col", "col"), ("v_inst", "instance")] {
