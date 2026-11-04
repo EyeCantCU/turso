@@ -24,7 +24,8 @@ pub(crate) fn view_target(
     resolver: &Resolver,
     tbl_name: &ast::QualifiedName,
 ) -> Result<Option<(NamespaceRef, Arc<View>)>> {
-    let Some(namespace) = resolver.find_existing_table(tbl_name)? else {
+    // Name errors are left to the table path, which reports them as SQLite does.
+    let Ok(Some(namespace)) = resolver.find_existing_table(tbl_name) else {
         return Ok(None);
     };
     let name = crate::util::normalize_ident(tbl_name.name.as_str());
