@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::ffi::{self, c_char, c_int, c_void, CStr, CString};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::ThreadId;
+use turso_macros::capi_guard;
 
 use turso_core::native_ext::{
     IndexInfo, IndexPlan, IndexRequest, VirtualTable, VirtualTableCursor, VirtualTableModule,
@@ -206,6 +207,7 @@ unsafe fn conn_key(db: *mut sqlite3) -> usize {
     Arc::as_ptr(&inner.conn) as usize
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_get_clientdata(
     db: *mut sqlite3,
@@ -224,6 +226,7 @@ pub unsafe extern "C" fn sqlite3_get_clientdata(
 
 /// Replacing or clearing an entry runs the old destructor; a NULL pointer
 /// removes the entry.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_set_clientdata(
     db: *mut sqlite3,
@@ -259,6 +262,7 @@ pub unsafe extern "C" fn sqlite3_set_clientdata(
 
 // ------------------------------------------------------------ auxdata
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_get_auxdata(ctx: *mut c_void, n: c_int) -> *mut c_void {
     if ctx.is_null() {
@@ -267,6 +271,7 @@ pub unsafe extern "C" fn sqlite3_get_auxdata(ctx: *mut c_void, n: c_int) -> *mut
     turso_core::auxdata::get_auxdata(n).map_or(std::ptr::null_mut(), |p| p as *mut c_void)
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_set_auxdata(
     ctx: *mut c_void,
@@ -283,6 +288,7 @@ pub unsafe extern "C" fn sqlite3_set_auxdata(
 
 // ------------------------------------------------------------ results
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_result_blob64(
     ctx: *mut c_void,
@@ -377,6 +383,7 @@ unsafe fn result_text16(
     run_destructor(destructor, z);
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_result_text16le(
     ctx: *mut c_void,
@@ -387,6 +394,7 @@ pub unsafe extern "C" fn sqlite3_result_text16le(
     result_text16(ctx, z, n, destructor, false);
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_result_text16be(
     ctx: *mut c_void,
@@ -400,6 +408,7 @@ pub unsafe extern "C" fn sqlite3_result_text16be(
 // ------------------------------------------------------------ statements
 
 /// Binds a copy of `value`, as sqlite3_bind_value does.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_bind_value(
     stmt: *mut sqlite3_stmt,
@@ -450,6 +459,7 @@ fn intern(name: String) -> *const c_char {
     names.last().unwrap().as_ptr()
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_database_name(
     stmt: *mut sqlite3_stmt,
@@ -469,11 +479,13 @@ pub unsafe extern "C" fn sqlite3_column_database_name(
 
 /// `sqlite3_db_filename` hands out the database name itself, so it is its
 /// own database filename.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_filename_database(f: *const c_char) -> *const c_char {
     f
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_txn_state(db: *mut sqlite3, schema: *const c_char) -> c_int {
     if db.is_null() {
@@ -507,6 +519,7 @@ unsafe extern "C" fn free_cstring(p: *mut c_void) {
 
 /// Makes sure a function `name` with `n_arg` arguments exists, so a virtual
 /// table can overload it; the placeholder fails when called.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_overload_function(
     db: *mut sqlite3,
@@ -747,6 +760,7 @@ fn pattern_compare(
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_strglob(pattern: *const c_char, s: *const c_char) -> c_int {
     if s.is_null() {
@@ -760,6 +774,7 @@ pub unsafe extern "C" fn sqlite3_strglob(pattern: *const c_char, s: *const c_cha
     pattern_compare(p, 0, s, 0, &GLOB_INFO, b'[' as u32)
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_strlike(
     pattern: *const c_char,
@@ -781,6 +796,7 @@ pub unsafe extern "C" fn sqlite3_strlike(
 
 /// Fills the buffer with random bytes; N <= 0 or NULL only reseeds in
 /// SQLite, which needs nothing here.
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_randomness(n: c_int, p: *mut c_void) {
     if n <= 0 || p.is_null() {
@@ -863,6 +879,7 @@ fn static_mutexes() -> &'static [sqlite3_mutex; N_STATIC] {
     M.get_or_init(|| std::array::from_fn(|_| sqlite3_mutex::new(false, true)))
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_mutex_alloc(id: c_int) -> *mut sqlite3_mutex {
     match id {
@@ -875,6 +892,7 @@ pub unsafe extern "C" fn sqlite3_mutex_alloc(id: c_int) -> *mut sqlite3_mutex {
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_mutex_free(m: *mut sqlite3_mutex) {
     if m.is_null() || (*m).is_static {
@@ -883,6 +901,7 @@ pub unsafe extern "C" fn sqlite3_mutex_free(m: *mut sqlite3_mutex) {
     drop(Box::from_raw(m));
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_mutex_enter(m: *mut sqlite3_mutex) {
     if m.is_null() {
@@ -895,6 +914,7 @@ pub unsafe extern "C" fn sqlite3_mutex_enter(m: *mut sqlite3_mutex) {
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_mutex_try(m: *mut sqlite3_mutex) -> c_int {
     if m.is_null() {
@@ -909,6 +929,7 @@ pub unsafe extern "C" fn sqlite3_mutex_try(m: *mut sqlite3_mutex) -> c_int {
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_mutex_leave(m: *mut sqlite3_mutex) {
     if m.is_null() {
@@ -925,6 +946,7 @@ pub unsafe extern "C" fn sqlite3_mutex_leave(m: *mut sqlite3_mutex) {
     }
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_mutex_held(m: *mut sqlite3_mutex) -> c_int {
     if m.is_null() {
@@ -933,6 +955,7 @@ pub unsafe extern "C" fn sqlite3_mutex_held(m: *mut sqlite3_mutex) -> c_int {
     ((*m).state.lock().unwrap().owner == Some(std::thread::current().id())) as c_int
 }
 
+#[capi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_mutex_notheld(m: *mut sqlite3_mutex) -> c_int {
     if m.is_null() {

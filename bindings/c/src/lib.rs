@@ -26,8 +26,8 @@ mod compat_stubs;
 mod hooks;
 mod session;
 
-mod fts5;
 mod cli;
+mod fts5;
 mod rtree;
 pub mod vfs;
 pub mod vfs_unix;
