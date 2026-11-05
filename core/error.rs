@@ -57,6 +57,9 @@ pub enum LimboError {
     /// (SQLITE_CORRUPT_VTAB). Displayed bare.
     #[error("{0}")]
     CorruptVtab(String),
+    /// SQLITE_CORRUPT with SQLite's own text ("malformed database schema ...").
+    #[error("{0}")]
+    CorruptSchema(String),
     #[error("File is not a database")]
     NotADB,
     #[error("Internal error: {0}")]
@@ -259,7 +262,7 @@ impl LimboError {
             Self::TableLocked => 6,
             Self::ReadOnly => 8,
             Self::Interrupt => 9,
-            Self::Corrupt(_) | Self::CorruptVtab(_) => 11,
+            Self::Corrupt(_) | Self::CorruptVtab(_) | Self::CorruptSchema(_) => 11,
             Self::DatabaseFull | Self::SequenceExhausted { .. } => 13,
             Self::SchemaUpdated | Self::SchemaConflict => 17,
             Self::TooBig => 18,

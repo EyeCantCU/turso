@@ -93,6 +93,7 @@ pub fn translate(
 ) -> Result<Program> {
     tracing::trace!("querying {}", input);
     let _raw_sql = crate::text_bytes::RawSqlGuard::set(input);
+    crate::introspect::check_schema_load_error(schema, &stmt, &connection)?;
     let change_cnt_on = matches!(
         stmt,
         ast::Stmt::CreateIndex { .. }

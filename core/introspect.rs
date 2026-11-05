@@ -203,7 +203,7 @@ impl Connection {
     }
 
     /// sqlite3WritableSchema: the flag counts only outside defensive mode.
-    fn schema_writable(&self) -> bool {
+    pub(crate) fn schema_writable(&self) -> bool {
         self.writable_schema() && !self.is_defensive()
     }
 
@@ -312,5 +312,58 @@ pub(crate) fn dml_error_name(name: &str) -> &str {
         "sqlite_master"
     } else {
         name
+    }
+}
+
+/// Statements fail when the schema did not load (SQLite's sqlite3Init
+/// errors) with "malformed database schema (NAME) - ...", except under
+/// writable_schema, which uses the part of the schema that loaded. PRAGMAs that need no schema still run.
+pub(crate) fn check_schema_load_error(
+    schema: &crate::schema::Schema,
+    stmt: &turso_parser::ast::Stmt,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let Some(err) = &schema.load_error else {
+        return Ok(());
+    };
+    if let turso_parser::ast::Stmt::Pragma { name, .. } = stmt {
+        let needs_schema = name
+            .name
+            .as_str()
+            .to_ascii_lowercase()
+            .parse::<turso_parser::ast::PragmaName>()
+            .map_or(true, |p| {
+                crate::pragma::pragma_for(&p)
+                    .flags
+                    .contains(crate::pragma::PragmaFlags::NeedSchema)
+            });
+        if !needs_schema {
+            return Ok(());
+        }
+    }
+    if connection.schema_writable() {
+        // NoSchemaError: the loaded part of the schema is used.
+        connection.with_schema_mut(|s| s.load_error = None)?;
+        return Ok(());
+    }
+    Err(crate::LimboError::CorruptSchema(err.clone()))
+}
+
+impl crate::schema::Schema {
+    /// Keeps the first sqlite_schema row error, in SQLite's words.
+    pub(crate) fn record_load_error(&mut self, name: &str, e: &crate::LimboError) {
+        if self.load_error.is_some() {
+            return;
+        }
+        use crate::LimboError as E;
+        let detail = match e {
+            E::ParseError(m)
+            | E::Corrupt(m)
+            | E::InvalidArgument(m)
+            | E::SqlError(m)
+            | E::InternalError(m) => m.clone(),
+            other => other.to_string(),
+        };
+        self.load_error = Some(format!("malformed database schema ({name}) - {detail}"));
     }
 }

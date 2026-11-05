@@ -326,7 +326,7 @@ pub fn parse_schema_rows(
             let table_name = row.get::<&str>(2)?;
             let root_page = row.get::<i64>(3)?;
             let sql = row.get::<&str>(4).ok();
-            schema.handle_schema_row(
+            let loaded = schema.handle_schema_row(
                 ty,
                 name,
                 table_name,
@@ -340,7 +340,13 @@ pub fn parse_schema_rows(
                 materialized_view_info,
                 resolve_attached_db,
                 dialect,
-            )
+            );
+            // As in SQLite, a bad row does not stop the open: the rest
+            // loads and statements report the first error.
+            if let Err(e) = loaded {
+                schema.record_load_error(name, &e);
+            }
+            Ok(())
         }));
     }
 

@@ -3702,7 +3702,7 @@ fn limbo_err_code(err: &LimboError) -> i32 {
         LimboError::Constraint(m) if m == "datatype mismatch" => SQLITE_MISMATCH,
         LimboError::ConstraintViolation(v) if v.message == "datatype mismatch" => SQLITE_MISMATCH,
         LimboError::TooBig => SQLITE_TOOBIG,
-        LimboError::Corrupt(..) => SQLITE_CORRUPT,
+        LimboError::Corrupt(..) | LimboError::CorruptSchema(..) => SQLITE_CORRUPT,
         LimboError::CorruptVtab(..) => SQLITE_CORRUPT,
         LimboError::NotADB => SQLITE_NOTADB,
         LimboError::CantOpen => SQLITE_CANTOPEN,
