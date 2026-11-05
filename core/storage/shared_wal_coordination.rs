@@ -2688,7 +2688,10 @@ impl MappedSharedWalCoordination {
         };
         let required_blocks = (slot / FRAME_INDEX_BLOCK_CAPACITY) + 1;
         // Out of descriptors: readers fall back to scanning the WAL.
-        if self.ensure_mapped_frame_index_blocks(required_blocks).is_err() {
+        if self
+            .ensure_mapped_frame_index_blocks(required_blocks)
+            .is_err()
+        {
             header.frame_index_overflowed.store(1, Ordering::Release);
             return;
         }
