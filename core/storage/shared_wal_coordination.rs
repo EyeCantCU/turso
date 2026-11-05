@@ -93,10 +93,9 @@ impl LockRedirectFile {
             // if the file allows one (a read-only open of a writable file).
             Err(_) => match io.open_file(db_path, OpenFlags::NoLock, false) {
                 Ok(rw) if rw.shared_wal_try_lock_byte(probe, true, kind).is_ok() => (rw, false),
-                _ => {
-                    locks.shared_wal_try_lock_byte(probe, false, kind).ok()?;
-                    (locks, true)
-                }
+                // Reader slots need exclusive locks: a database nobody can
+                // open for writing keeps the locks on the .tshm.
+                _ => return None,
             },
         };
         let _ = locks.shared_wal_unlock_byte(probe, kind);
