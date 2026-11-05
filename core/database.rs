@@ -1151,7 +1151,10 @@ impl Database {
 
         // Probe with a shared lock: it conflicts with a legacy opener's
         // exclusive lock but not with concurrent multiprocess probes.
-        let probe_flags = (flags | OpenFlags::Create | OpenFlags::NoLock) & !OpenFlags::ReadOnly;
+        // Never create the file here: an open without SQLITE_OPEN_CREATE of a
+        // missing database must fail with CANTOPEN, and no file means no
+        // legacy holder.
+        let probe_flags = (flags | OpenFlags::NoLock) & !OpenFlags::ReadOnly;
         // On Linux only the first SHARED byte, so the coordination locks
         // other multiprocess openers keep on the database file don't count.
         #[cfg(target_os = "linux")]
@@ -1168,6 +1171,10 @@ impl Database {
         let probe = |file: Arc<dyn crate::io::File>| file.lock_file(false);
         match io.open_file(path, probe_flags, true).and_then(probe) {
             Ok(()) => Ok(()),
+            Err(LimboError::CompletionError(CompletionError::IOError(
+                std::io::ErrorKind::NotFound,
+                _,
+            ))) => Ok(()),
             Err(LimboError::LockingError(_)) => Err(LimboError::LockingError(format!(
                 "Failed opening database '{path}'. Database is already open without experimental multiprocess WAL in another process"
             ))),
@@ -1350,13 +1357,24 @@ impl Database {
         let file = io.open_file(path, effective_flags, true)?;
 
         // 3. legacy open re-checks after `open_file()` in case a multiprocess
-        //    authority appeared between the initial probe and the actual open
-        Self::reject_live_multiprocess_wal_for_legacy_open(
-            io,
-            path,
-            options.wal_path.as_deref(),
-            options.db_opts,
-        )?;
+        //    authority appeared between the initial probe and the actual open.
+        //    When the `.tshm` locks live on this database file, the exclusive
+        //    file lock just taken already excludes them (probing would only
+        //    meet our own lock).
+        let wal_path = options
+            .wal_path
+            .clone()
+            .unwrap_or_else(|| format!("{path}-wal"));
+        if storage::wal::coordination_path_for_wal_path(&wal_path) != format!("{path}-tshm")
+            || !cfg!(target_os = "linux")
+        {
+            Self::reject_live_multiprocess_wal_for_legacy_open(
+                io,
+                path,
+                options.wal_path.as_deref(),
+                options.db_opts,
+            )?;
+        }
         options.flags = effective_flags;
         options.storage = Some(Arc::new(DatabaseFile::new(file)));
         Ok(None)

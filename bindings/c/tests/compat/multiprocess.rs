@@ -553,3 +553,42 @@ fn test_reader_read_mark_survives_rollback_across_processes() {
         assert_eq!(sqlite3_close(db), SQLITE_OK);
     }
 }
+
+/// Daemons such as heimdal's KDC open the database, then fork workers that
+/// keep using the connection: a child must still read the data.
+#[test]
+fn test_forked_child_reads_through_inherited_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    unsafe {
+        let (_path, db) = setup(&dir);
+        // Small cache and many pages, so the child reads the files.
+        exec(db, "PRAGMA cache_size = 10");
+        assert_eq!(
+            exec(
+                db,
+                "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 999) \
+                 INSERT INTO t SELECT randomblob(1000), x FROM n"
+            ),
+            SQLITE_OK
+        );
+        // The data in the database file itself, not only the WAL.
+        query_text(db, "PRAGMA wal_checkpoint(TRUNCATE)");
+        let pid = libc::fork();
+        assert!(pid >= 0);
+        if pid == 0 {
+            let db_addr = db as usize;
+            let ok = std::panic::catch_unwind(move || {
+                query_i64(
+                    db_addr as *mut sqlite3,
+                    "SELECT count(*) FROM t WHERE length(p) > 0",
+                ) == 1000
+            })
+            .unwrap_or(false);
+            libc::_exit(if ok { 0 } else { 1 });
+        }
+        let mut status = 0;
+        assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}
