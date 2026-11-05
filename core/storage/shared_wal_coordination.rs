@@ -2687,8 +2687,11 @@ impl MappedSharedWalCoordination {
             break len;
         };
         let required_blocks = (slot / FRAME_INDEX_BLOCK_CAPACITY) + 1;
-        self.ensure_mapped_frame_index_blocks(required_blocks)
-            .expect("shared WAL frame index block missing");
+        // Out of descriptors: readers fall back to scanning the WAL.
+        if self.ensure_mapped_frame_index_blocks(required_blocks).is_err() {
+            header.frame_index_overflowed.store(1, Ordering::Release);
+            return;
+        }
         let mappings = self.frame_index_blocks.read();
         if slot > 0 {
             let previous = Self::frame_index_entry(&mappings, slot - 1);
@@ -2739,8 +2742,10 @@ impl MappedSharedWalCoordination {
             return;
         }
         let old_blocks = len.div_ceil(FRAME_INDEX_BLOCK_CAPACITY);
-        self.ensure_mapped_frame_index_blocks(old_blocks)
-            .expect("shared WAL frame index block missing");
+        if self.ensure_mapped_frame_index_blocks(old_blocks).is_err() {
+            header.frame_index_overflowed.store(1, Ordering::Release);
+            return;
+        }
         let mappings = self.frame_index_blocks.read();
         let mut new_len = len;
         while new_len > 0 {
